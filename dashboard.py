@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.1"
+_VERSION_FALLBACK = "1.0.2"
 
 
 def get_dashboard_version():
@@ -6560,7 +6560,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <span class="nav">
     {% if not is_client_only %}<a href="/" title="Локальный мониторинг xray/Caddy/портов на этом PC">← дашборд</a>{% endif %}
     <a href="javascript:restartDashboard()" title="Перезапустить панель прямо отсюда — кнопка отправит запрос на /api/xkeen/restart-dashboard, подождёт ~8 сек и обновит страницу. Если не сработает — откроется help с альтернативами.">🔄 рестарт панели</a>
-    <a href="https://github.com/yuran2000/xray-dashboard/releases/latest" target="_blank" class="health-badge" style="background:#f0e6ff; color:#5a3a99; border:1px solid #c9b3e0; text-decoration:none;" title="Версия панели. Клик → страница последнего релиза на GitHub. Сравни с тем что у тебя — если есть свежее, обнови через update.bat.">v{{ dashboard_version }}</a>
+    <a href="https://github.com/yuran2000/xkeen-windows-dashboard/releases/latest" target="_blank" class="health-badge" style="background:#f0e6ff; color:#5a3a99; border:1px solid #c9b3e0; text-decoration:none;" title="Версия панели. Клик → страница последнего релиза на GitHub. Сравни с тем что у тебя — если есть свежее, обнови через update.bat.">v{{ dashboard_version }}</a>
     <span id="xray-status-badge" class="health-badge xs-pending" title="Состояние xray на роутере — обновляется каждые 60 сек. Клик → перейти к секции 📊 Статус XKeen.">⏳ xray ...</span>
     <span id="dashboard-health-badge" class="health-badge health-pending" title="Проверка состояния процесса панели — обновляется автоматически каждые 15 сек">⏳ проверка...</span>
     {% if is_first_run %}
@@ -8819,7 +8819,7 @@ schtasks /Delete /TN XrayDashboard /F</pre>
       <ol>
         <li>Установи <strong>Git for Windows</strong>: <a href="https://git-scm.com/download/win" target="_blank">git-scm.com</a> (~50MB, 1 минута)</li>
         <li>Открой PowerShell в любой папке → выполни:
-          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">git clone https://github.com/yuran2000/xray-dashboard.git C:\xray-dashboard
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">git clone https://github.com/yuran2000/xkeen-windows-dashboard.git C:\xray-dashboard
 cd C:\xray-dashboard
 .\install.bat</pre>
         </li>
@@ -8834,8 +8834,8 @@ cd C:\xray-dashboard
       <h4>🥈 Путь 2 (для разовой установки): ZIP-архив</h4>
       <p>Если Git ставить не хочется (например на чужой PC, или гость в чужой Windows), можно скачать ZIP:</p>
       <ul>
-        <li><strong>Последняя версия</strong>: <a href="https://github.com/yuran2000/xray-dashboard/archive/refs/heads/main.zip" target="_blank">main.zip</a> (всегда свежайший с main)</li>
-        <li><strong>Конкретная версия</strong>: на странице <a href="https://github.com/yuran2000/xray-dashboard/releases" target="_blank">Releases</a> у каждого тега есть «Source code (zip)» и «Source code (tar.gz)»</li>
+        <li><strong>Последняя версия</strong>: <a href="https://github.com/yuran2000/xkeen-windows-dashboard/archive/refs/heads/main.zip" target="_blank">main.zip</a> (всегда свежайший с main)</li>
+        <li><strong>Конкретная версия</strong>: на странице <a href="https://github.com/yuran2000/xkeen-windows-dashboard/releases" target="_blank">Releases</a> у каждого тега есть «Source code (zip)» и «Source code (tar.gz)»</li>
       </ul>
       <p>Распакуй в <code>C:\xray-dashboard\</code> (содержимое одной папки внутри ZIP — переименуй так чтобы было правильно). Дальше как в Путь 1 с шага 3 (<code>install.bat</code>).</p>
 
@@ -8872,7 +8872,7 @@ git reset --hard origin/main      # config_local.py не тронется (он 
       <p>Если ставил из ZIP, а потом передумал и хочешь иметь возможность обновляться через <code>update.bat</code>:</p>
       <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">cd C:\xray-dashboard
 git init
-git remote add origin https://github.com/yuran2000/xray-dashboard.git
+git remote add origin https://github.com/yuran2000/xkeen-windows-dashboard.git
 git fetch origin
 git reset --hard origin/main
 git branch -M main</pre>

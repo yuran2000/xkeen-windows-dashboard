@@ -12,7 +12,7 @@ Issue → **«💡 Feature request»**. Опиши **что** хочешь и **
 
 ## ❓ Задать вопрос
 
-Issue → **«❓ Вопрос»** или в **[Discussions](https://github.com/yuran2000/xray-dashboard/discussions)** (категория Q&A).
+Issue → **«❓ Вопрос»** или в **[Discussions](https://github.com/yuran2000/xkeen-windows-dashboard/discussions)** (категория Q&A).
 
 Перед вопросом — проверь Quick Start в README и Help-секцию в самой панели (она большая и покрывает 90% вопросов).
 
@@ -26,7 +26,7 @@ Issue → **«❓ Вопрос»** или в **[Discussions](https://github.com/
    - **Зависимости**: минимизировать. Стандартная библиотека Python > pip-пакеты
    - **Commit messages**: короткий заголовок (≤72 chars) + опционально пояснение через пустую строку
 4. **Версионирование**: bump `_VERSION_FALLBACK` в `dashboard.py` (последняя цифра — патч)
-5. Push в свой fork → открой PR в `yuran2000/xray-dashboard:main`
+5. Push в свой fork → открой PR в `yuran2000/xkeen-windows-dashboard:main`
 6. В описании PR — что изменилось, зачем, как тестировал
 
 ## 🧪 Перед PR — minimal-чеклист
