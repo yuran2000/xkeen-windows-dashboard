@@ -1,10 +1,10 @@
 blank_issues_enabled: false
 contact_links:
   - name: 💬 Discussions
-    url: https://github.com/yuran2000/xkeen-windows-dashboard/discussions
+    url: https://github.com/yuran2000/xray-dashboard/discussions
     about: Для общих обсуждений и Q&A где не нужен tracking бага
   - name: 📚 README — Quick Start
-    url: https://github.com/yuran2000/xkeen-windows-dashboard#-quick-start-5-минут
+    url: https://github.com/yuran2000/xray-dashboard#-quick-start-5-минут
     about: Сначала проверь README — там пошаговая инструкция и ответы на типичные вопросы
   - name: 🛠 Corvus-Malus/XKeen
     url: https://github.com/Corvus-Malus/XKeen
