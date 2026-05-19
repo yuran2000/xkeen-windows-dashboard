@@ -1,0 +1,20 @@
+name: ❓ Вопрос
+description: Не уверен как что-то сделать
+labels: ["question"]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: В чём вопрос?
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: Что уже пробовал?
+      description: Какие разделы Help прочитал, какие команды запускал
+  - type: input
+    id: version
+    attributes:
+      label: Версия панели
+      placeholder: v1.7.30

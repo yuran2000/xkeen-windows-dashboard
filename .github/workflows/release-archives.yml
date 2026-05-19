@@ -1,0 +1,69 @@
+name: Attach source archives to release
+
+# Зачем этот workflow:
+# GitHub автоматически генерит «Source code (zip)» и «Source code (tar.gz)» для
+# каждого тэга, НО эти автоматические assets НЕ имеют downloads-counter в API
+# (известное ограничение GitHub). Чтобы видеть точную статистику скачиваний
+# через https://github.com/yuran2000/xray-dashboard/releases — нужно attach
+# зеркала этих архивов как реальные release-assets.
+#
+# Триггер: при создании (или редактировании) релиза → workflow генерит
+# два архива через `git archive` (уважает .gitignore, без .venv/backups/config_local.py)
+# и upload'ит их к релизу.
+#
+# Permissions: contents:write — нужно для upload assets к существующему release.
+
+on:
+  release:
+    types: [created, edited]
+  # Для backfill старых релизов вручную: Actions → Run workflow → tag name
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name (например v1.7.30) для backfill старого релиза'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code at the release tag
+        uses: actions/checkout@v4
+        with:
+          # Берём именно тег релиза (для release-trigger), или ручной input (для backfill)
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          fetch-depth: 1
+
+      - name: Determine tag name
+        id: tagname
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Имя архива — xray-dashboard-vX.Y.Z (без слешей)
+          NAME="xray-dashboard-$TAG"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Create source archives via git archive
+        run: |
+          TAG="${{ steps.tagname.outputs.tag }}"
+          NAME="${{ steps.tagname.outputs.name }}"
+          # git archive уважает .gitignore автоматически — config_local.py, .venv, backups/,
+          # *.log, .ssh/ и прочие секретные файлы НЕ попадут в архив.
+          # --prefix создаёт папку внутри архива чтобы при распаковке не засорять CWD.
+          git archive --format=zip    --prefix="$NAME/" --output="$NAME.zip"    "$TAG"
+          git archive --format=tar.gz --prefix="$NAME/" --output="$NAME.tar.gz" "$TAG"
+          ls -lh "$NAME.zip" "$NAME.tar.gz"
+
+      - name: Upload archives to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tagname.outputs.tag }}"
+          NAME="${{ steps.tagname.outputs.name }}"
+          # --clobber: перезаписать если такой asset уже был (для idempotency при edit-trigger)
+          gh release upload "$TAG" "$NAME.zip" "$NAME.tar.gz" --clobber --repo "${{ github.repository }}"
+          echo "✅ Uploaded $NAME.zip and $NAME.tar.gz to release $TAG"

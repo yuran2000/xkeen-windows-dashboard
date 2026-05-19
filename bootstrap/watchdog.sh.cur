@@ -1,0 +1,522 @@
+#!/bin/sh
+# XKeen failover watchdog v10 (2026-05-18, YT GeoIP-категории):
+#   YT_GEOIP_CATEGORIES — список geoip-категорий (telegram, discord, ...) для YT-канала.
+#   Зачем: IP-only приложения вроде Telegram Desktop коннектятся напрямую к датацентрам
+#   минуя DNS — доменные правила их не ловят. Через geoip:NAME (использует geoip.dat) их
+#   трафик попадает на YT_TAG канал, не на default (provider). Применяется тот же
+#   EFFECTIVE_YT_TAG (с kill-switch), что и для доменного YT-правила.
+# v9 (2026-05-18, prevention-фиксы):
+#   1) Defensive default_tag: если PRIMARY_TAG пустой — fallback на 'direct' (если есть в outbounds).
+#      Иначе xray валится с "neither outboundTag nor balancerTag in routing rule".
+#   2) AI rule НЕ генерится если AI_TAG пустой (даже если AI_DOMAINS не пуст).
+#      Раньше: получалось outboundTag="" — xray валился.
+#   3) Валидация JSON через `jq empty` после awk-генерации. Если битый — НЕ применяется,
+#      старый routing.json остаётся → xray продолжает работать. Битый файл сохраняется
+#      как .bad-<timestamp> для диагностики.
+#   4) Semantic-валидация: каждое правило должно иметь outboundTag или balancerTag.
+#      Если хотя бы одно правило без них — НЕ применяется (xray валится в любом случае).
+# v8 (2026-05-17): добавлены AI_EXT_CATEGORIES / YT_EXT_CATEGORIES — v2fly категории через ext:geosite_v2fly.dat:NAME.
+# v7 (2026-05-17): добавлен BLOCK_DOMAINS — outbound `block` для Win Update / Adobe / телеметрии.
+# Каждую минуту через cron:
+#   1) Читает /opt/etc/xray/watchdog.config (PRIMARY_TAG, FAILOVER_TAGS, AI_TAG, AI_DOMAINS, FORCE_MODE, TG_*)
+#   2) Пингует PRIMARY (HTTPS curl если PRIMARY_PROBE_URL задан, иначе TCP-probe через curl)
+#   3) State machine: если primary стабильно down → выбирает первый живой из FAILOVER_TAGS
+#   4) Генерит 05_routing.json из template'а через awk-подмену __DEFAULT_TAG__, __AI_TAG__, __AI_DOMAINS_JSON__
+#   5) md5-сравнение со старым; если файл изменился → restart xkeen + лог + TG-алерт
+#
+# Управление дашбордом: меняет watchdog.config + опционально дёргает скрипт чтобы применить сразу.
+# Старые шаблоны 05_routing.{primary,failover}.json больше не нужны (но сохранены для отката).
+
+CFG=/opt/etc/xray/watchdog.config
+[ -f "$CFG" ] || { echo "$(date '+%F %T') config $CFG not found" >> /opt/var/log/xray/watchdog.log; exit 1; }
+. "$CFG"
+
+CONFIG_DIR=/opt/etc/xray/configs
+TEMPL=/opt/etc/xray/configs.bak/05_routing.template.json
+OUTBOUNDS_JSON=/opt/etc/xray/configs/04_outbounds.json
+STATE_FILE=/opt/etc/xray/watchdog.state
+LOG=/opt/var/log/xray/watchdog.log
+
+mkdir -p "$(dirname "$LOG")"
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+# ---------- Helpers ----------
+
+# Возвращает "host port" для tag из 04_outbounds.json (или пусто если не найдено).
+get_host_port() {
+  jq -r ".outbounds[] | select(.tag==\"$1\") | \"\(.settings.vnext[0].address) \(.settings.vnext[0].port)\"" \
+    "$OUTBOUNDS_JSON" 2>/dev/null
+}
+
+# Пинг outbound по tag. Возвращает 0 если живой, 1 если мёртвый.
+# Для PRIMARY с PRIMARY_PROBE_URL — curl HTTPS. Иначе — curl TCP-probe (через https://host:port/).
+# Busybox nc на Entware слишком урезанный (нет -z/-w), поэтому используем curl exit codes:
+#   7 = couldn't connect, 28 = timeout → порт мёртв
+#   0 / 35 / 51 / 52 / 56 / 60 / 77 (любые SSL/HTTP-ошибки ПОСЛЕ connect) → порт жив
+probe_tag() {
+  local tag="$1" probe_url="$2"
+  if [ -n "$probe_url" ]; then
+    code=$(curl -sk --connect-timeout 5 --max-time 8 -o /dev/null -w '%{http_code}' "$probe_url" 2>/dev/null)
+    [ -n "$code" ] && [ "$code" != "000" ] && return 0
+    return 1
+  fi
+  # TCP-probe через curl (HTTPS-запрос — если connect успешен, любой ответ кроме timeout/refused
+  # это "порт открыт", даже SSL-handshake fail)
+  hp=$(get_host_port "$tag")
+  [ -z "$hp" ] && return 1
+  set -- $hp
+  host="$1"; port="$2"
+  curl -sk --connect-timeout 5 --max-time 8 -o /dev/null "https://${host}:${port}/" 2>/dev/null
+  rc=$?
+  case "$rc" in
+    7|28) return 1 ;;  # 7=couldn't connect, 28=timeout
+    *)    return 0 ;;  # любой другой — TCP-connect был успешен
+  esac
+}
+
+# Telegram-алерт. Молча если TG_BOT_TOKEN или TG_CHAT_ID пусты.
+# Идёт через локальный SOCKS5-прокси xray (127.0.0.1:10808 → выбранный VPN-outbound),
+# чтобы обойти возможную блокировку api.telegram.org в стране роутера.
+# Прямой curl с роутера может не работать там где api.telegram.org заблокирован,
+# а исходящий трафик с самого роутера НЕ перехватывается XKeen redirect/tproxy (только LAN).
+tg_alert() {
+  [ -z "$TG_BOT_TOKEN" ] && return 0
+  [ -z "$TG_CHAT_ID" ] && return 0
+  local text="$1"
+  curl -s --connect-timeout 5 --max-time 10 \
+    --socks5-hostname 127.0.0.1:10808 \
+    -d "chat_id=$TG_CHAT_ID" \
+    --data-urlencode "text=$text" \
+    -d "parse_mode=HTML" \
+    "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1
+}
+
+# Генерит финальный 05_routing.json из template через подмену 2 placeholder'ов:
+#   __DEFAULT_TAG__   — основной outbound (default-маршрут)
+#   __AI_RULE_BLOCK__ — JSON-блок AI-sticky правила (или пусто если AI_DOMAINS пуст)
+# AI_DOMAINS в config через пробел или запятую — например "claude.ai openai.com anthropic.com".
+# Если AI_DOMAINS пуст ИЛИ только из пробелов → AI-sticky выключен: блок заменяется на пустую
+# строку, AI-сайты идут через PRIMARY как обычный трафик.
+generate_routing() {
+  local default_tag="$1" ai_tag="$2" yt_tag="$3"
+  [ -f "$TEMPL" ] || { log "ERROR: template $TEMPL not found"; return 1; }
+
+  # v9 defensive: если default_tag пустой — fallback на 'direct' если есть в outbounds.
+  # Иначе xray валится с "neither outboundTag nor balancerTag in routing rule" — это сегодня
+  # ловил юзер на работе (PRIMARY_TAG="" после subscription sync).
+  if [ -z "$default_tag" ]; then
+    log "WARN: default_tag пустой — пробуем 'direct' как fallback"
+    if [ -f "$OUTBOUNDS_JSON" ] && grep -q '"tag": *"direct"' "$OUTBOUNDS_JSON" 2>/dev/null; then
+      default_tag="direct"
+      log "AUTO-FIX: используем 'direct' как default_tag (PRIMARY_TAG пустой в watchdog.config)"
+    else
+      log "ERROR: 'direct' тоже отсутствует в outbounds — не могу сгенерить routing без default outbound"
+      return 1
+    fi
+  fi
+
+  # ---- AI rule block ----
+  # Source: AI_DOMAINS (ручные) + AI_EXT_CATEGORIES (v2fly категории через ext:geosite_v2fly.dat:NAME).
+  # Если оба пусты — правило не генерится (AI идёт через PRIMARY как обычный трафик).
+  # v9: ДОБАВЛЕНА проверка [ -n "$ai_tag" ] — иначе genrate routing с outboundTag="" → xray валится.
+  local clean_ai_combined
+  clean_ai_combined=$(echo "$AI_DOMAINS$AI_EXT_CATEGORIES" | tr -d ' ,\t\n\r')
+  local ai_rule_block=""
+  if [ -n "$clean_ai_combined" ] && [ -n "$ai_tag" ]; then
+    local ai_domains_json
+    ai_domains_json=$(
+      {
+        echo "$AI_DOMAINS" | tr ' ,' '\n' | grep -v '^$' | sed 's/^/domain:/'
+        echo "$AI_EXT_CATEGORIES" | tr ' ,' '\n' | grep -v '^$' | sed 's|^|ext:geosite_v2fly.dat:|'
+      } | jq -R -s -c 'split("\n") | map(select(length>0))' 2>/dev/null
+    )
+    if [ -n "$ai_domains_json" ] && [ "$ai_domains_json" != "[]" ]; then
+      ai_rule_block='      { "inboundTag": ["redirect","tproxy"], "outboundTag": "'"$ai_tag"'", "type": "field", "domain": '"$ai_domains_json"' },'
+    fi
+  elif [ -n "$clean_ai_combined" ] && [ -z "$ai_tag" ]; then
+    log "WARN: AI_DOMAINS/AI_EXT_CATEGORIES заданы, но AI_TAG пустой — AI правило не генерируем (вместо генерации с битым outboundTag='')"
+  fi
+
+  # ---- DIRECT rule block ----
+  # DIRECT_DOMAINS — список сайтов которые НЕ идут через VPN (mail.ru, okko, etc).
+  # Регулярки .ru/.su/.рф + geosite (yandex/vk) — отдельные правила в template, остаются.
+  local clean_direct_domains
+  clean_direct_domains=$(echo "$DIRECT_DOMAINS" | tr -d ' ,\t\n\r')
+  local direct_rule_block=""
+  if [ -n "$clean_direct_domains" ]; then
+    local direct_domains_json
+    direct_domains_json=$(echo "$DIRECT_DOMAINS" | tr ' ,' '\n' | grep -v '^$' | \
+      jq -R -s -c 'split("\n") | map(select(length>0)) | map("domain:" + .)' 2>/dev/null)
+    if [ -n "$direct_domains_json" ] && [ "$direct_domains_json" != "[]" ]; then
+      direct_rule_block='      { "inboundTag": ["redirect","tproxy"], "outboundTag": "direct", "type": "field", "domain": '"$direct_domains_json"' },'
+    fi
+  fi
+
+  # ---- YT rule block ----
+  # YT_DOMAINS — список сайтов через YT_TAG (sticky outbound для YouTube/Instagram/Discord).
+  # YT_EXT_CATEGORIES — v2fly категории (youtube, tiktok, ...). Приклеиваются к доменам.
+  # Кейс: YT_TAG = RU-exit с DPI-обходом → YouTube не показывает рекламу + работает.
+  # Без kill-switch — если YT_TAG упал, домены идут через PRIMARY (с рекламой, но не критично).
+  local clean_yt_combined
+  clean_yt_combined=$(echo "$YT_DOMAINS$YT_EXT_CATEGORIES" | tr -d ' ,\t\n\r')
+  local yt_rule_block=""
+  if [ -n "$clean_yt_combined" ] && [ -n "$yt_tag" ]; then
+    local yt_domains_json
+    yt_domains_json=$(
+      {
+        echo "$YT_DOMAINS" | tr ' ,' '\n' | grep -v '^$' | sed 's/^/domain:/'
+        echo "$YT_EXT_CATEGORIES" | tr ' ,' '\n' | grep -v '^$' | sed 's|^|ext:geosite_v2fly.dat:|'
+      } | jq -R -s -c 'split("\n") | map(select(length>0))' 2>/dev/null
+    )
+    if [ -n "$yt_domains_json" ] && [ "$yt_domains_json" != "[]" ]; then
+      yt_rule_block='      { "inboundTag": ["redirect","tproxy"], "outboundTag": "'"$yt_tag"'", "type": "field", "domain": '"$yt_domains_json"' },'
+    fi
+  fi
+
+  # ---- YT GeoIP rule block (v10) ----
+  # YT_GEOIP_CATEGORIES — список geoip-категорий (telegram, discord) для YT-канала.
+  # Генерится как ОТДЕЛЬНОЕ правило с "ip": ["geoip:..."] (не объединяется с domain — xray
+  # трактует поля внутри одного rule как AND, объединение не сработало бы для IP-only).
+  # outboundTag = $yt_tag (тот же что и для domain rule, с тем же kill-switch).
+  local clean_yt_geoip
+  clean_yt_geoip=$(echo "$YT_GEOIP_CATEGORIES" | tr -d ' ,\t\n\r')
+  local yt_geoip_rule_block=""
+  if [ -n "$clean_yt_geoip" ] && [ -n "$yt_tag" ]; then
+    local yt_geoip_json
+    yt_geoip_json=$(echo "$YT_GEOIP_CATEGORIES" | tr ' ,' '\n' | grep -v '^$' | \
+      jq -R -s -c 'split("\n") | map(select(length>0)) | map("geoip:" + .)' 2>/dev/null)
+    if [ -n "$yt_geoip_json" ] && [ "$yt_geoip_json" != "[]" ]; then
+      yt_geoip_rule_block='      { "inboundTag": ["redirect","tproxy"], "outboundTag": "'"$yt_tag"'", "type": "field", "ip": '"$yt_geoip_json"' },'
+    fi
+  elif [ -n "$clean_yt_geoip" ] && [ -z "$yt_tag" ]; then
+    log "WARN: YT_GEOIP_CATEGORIES задан, но YT_TAG пуст — GeoIP правило не генерируем"
+  fi
+
+  # ---- BLOCK rule block ----
+  # BLOCK_DOMAINS — список сайтов которые ПОЛНОСТЬЮ заблокированы (outbound `block`/blackhole).
+  # Кейс: Windows Update, Adobe Genuine, телеметрия — отрезка на уровне роутера.
+  # Идёт ПЕРЕД DIRECT и AI/YT правилами в template — приоритет блока выше.
+  local clean_block_domains
+  clean_block_domains=$(echo "$BLOCK_DOMAINS" | tr -d ' ,\t\n\r')
+  local block_rule_block=""
+  if [ -n "$clean_block_domains" ]; then
+    local block_domains_json
+    block_domains_json=$(echo "$BLOCK_DOMAINS" | tr ' ,' '\n' | grep -v '^$' | \
+      jq -R -s -c 'split("\n") | map(select(length>0)) | map("domain:" + .)' 2>/dev/null)
+    if [ -n "$block_domains_json" ] && [ "$block_domains_json" != "[]" ]; then
+      block_rule_block='      { "inboundTag": ["redirect","tproxy"], "outboundTag": "block", "type": "field", "domain": '"$block_domains_json"' },'
+    fi
+  fi
+
+  awk -v dt="$default_tag" -v ai_rule="$ai_rule_block" -v direct_rule="$direct_rule_block" -v yt_rule="$yt_rule_block" -v yt_geoip_rule="$yt_geoip_rule_block" -v block_rule="$block_rule_block" '
+    /__AI_RULE_BLOCK__/ {
+      if (ai_rule == "") next
+      else { gsub(/__AI_RULE_BLOCK__/, ai_rule); print; next }
+    }
+    /__YT_RULE_BLOCK__/ {
+      if (yt_rule == "") next
+      else { gsub(/__YT_RULE_BLOCK__/, yt_rule); print; next }
+    }
+    /__YT_RULE_GEOIP__/ {
+      if (yt_geoip_rule == "") next
+      else { gsub(/__YT_RULE_GEOIP__/, yt_geoip_rule); print; next }
+    }
+    /__DIRECT_RULE_BLOCK__/ {
+      if (direct_rule == "") next
+      else { gsub(/__DIRECT_RULE_BLOCK__/, direct_rule); print; next }
+    }
+    /__BLOCK_RULE_BLOCK__/ {
+      if (block_rule == "") next
+      else { gsub(/__BLOCK_RULE_BLOCK__/, block_rule); print; next }
+    }
+    { gsub(/__DEFAULT_TAG__/, dt); print }
+  ' "$TEMPL" > "$CONFIG_DIR/05_routing.json.new"
+
+  # v9: валидация JSON перед возвратом. Если awk/template/sed где-то сгенерили
+  # битый JSON (например trailing comma, пустой outboundTag) — не применять.
+  # Сегодня юзер ловил оба этих кейса.
+  #
+  # Template содержит // комментарии (header) — стандартный jq на них падает.
+  # Поэтому делаем strip комментариев во временный файл, валидируем уже его.
+  if command -v jq >/dev/null 2>&1; then
+    local _stripped="$CONFIG_DIR/05_routing.json.new.stripped"
+    sed 's|^[[:space:]]*//.*$||' "$CONFIG_DIR/05_routing.json.new" > "$_stripped"
+
+    if ! jq empty "$_stripped" 2>/dev/null; then
+      local ts="$(date +%Y%m%d-%H%M%S)"
+      log "ERROR: сгенерированный 05_routing.json.new — НЕВАЛИДНЫЙ JSON"
+      log "       Битый файл сохраняем как .bad-${ts} для диагностики"
+      mv "$CONFIG_DIR/05_routing.json.new" "$CONFIG_DIR/05_routing.json.new.bad-${ts}" 2>/dev/null
+      rm -f "$_stripped" 2>/dev/null
+      log "       routing.json остаётся прежним — xray продолжит работать со старой конфигурацией"
+      return 1
+    fi
+    # Semantic: каждое правило должно иметь outboundTag или balancerTag
+    if jq -e '[.routing.rules[] | select((.outboundTag // .balancerTag) | not)] | length > 0' "$_stripped" >/dev/null 2>&1; then
+      local ts="$(date +%Y%m%d-%H%M%S)"
+      log "ERROR: в 05_routing.json.new есть правило БЕЗ outboundTag/balancerTag"
+      log "       Битый файл: $CONFIG_DIR/05_routing.json.new.bad-${ts}"
+      mv "$CONFIG_DIR/05_routing.json.new" "$CONFIG_DIR/05_routing.json.new.bad-${ts}" 2>/dev/null
+      rm -f "$_stripped" 2>/dev/null
+      return 1
+    fi
+    rm -f "$_stripped" 2>/dev/null
+  fi
+  return 0
+}
+
+# Сравнение нового и текущего routing.json через md5sum. Возвращает 0 если отличается.
+routing_changed() {
+  [ ! -f "$CONFIG_DIR/05_routing.json" ] && return 0
+  local md5_old md5_new
+  md5_old=$(md5sum < "$CONFIG_DIR/05_routing.json" 2>/dev/null | awk '{print $1}')
+  md5_new=$(md5sum < "$CONFIG_DIR/05_routing.json.new" 2>/dev/null | awk '{print $1}')
+  [ "$md5_old" != "$md5_new" ]
+}
+
+# ---------- State ----------
+# Формат state: "<current_state> <counter> <current_default_tag>"
+# current_state: primary | failover
+# counter: счётчик стабильных проверок (fail для primary, pass для failover-возврата)
+# current_default_tag: какой tag сейчас в default-правиле (для определения нужно ли менять файл)
+
+if [ -f "$STATE_FILE" ]; then
+  # 4-арг read: REST поглощает все поля после 3-го (EFFECTIVE_AI/EFFECTIVE_YT/LAST_FULL_PROBE/PREV_ALIVE).
+  # Без REST bash засасывает всё остальное в CUR_DEFAULT — TG-сообщения становятся нечитаемой кашей.
+  read CUR CTR CUR_DEFAULT REST < "$STATE_FILE"
+fi
+[ -z "$CUR" ] && CUR=primary
+[ -z "$CTR" ] && CTR=0
+[ -z "$CUR_DEFAULT" ] && CUR_DEFAULT="$PRIMARY_TAG"
+
+# ---------- Force-mode override ----------
+case "$FORCE_MODE" in
+  primary)
+    NEW_STATE=primary
+    NEW_DEFAULT="$PRIMARY_TAG"
+    PROBE_CODE="FORCE"
+    ;;
+  failover)
+    NEW_STATE=failover
+    # Берём первый живой из FAILOVER_TAGS
+    NEW_DEFAULT=""
+    for t in $(echo "$FAILOVER_TAGS" | tr ',' ' '); do
+      if probe_tag "$t" ""; then
+        NEW_DEFAULT="$t"; break
+      fi
+    done
+    [ -z "$NEW_DEFAULT" ] && NEW_DEFAULT=$(echo "$FAILOVER_TAGS" | tr ',' ' ' | awk '{print $1}')
+    PROBE_CODE="FORCE"
+    ;;
+  *)
+    # Auto-mode (нормальная работа)
+    if probe_tag "$PRIMARY_TAG" "$PRIMARY_PROBE_URL"; then
+      PRIMARY_ALIVE=1
+      PROBE_CODE="up"
+    else
+      PRIMARY_ALIVE=0
+      PROBE_CODE="down"
+    fi
+
+    case "$CUR/$PROBE_CODE" in
+      primary/up)
+        CTR=0
+        NEW_STATE=primary
+        NEW_DEFAULT="$PRIMARY_TAG"
+        ;;
+      primary/down)
+        CTR=$((CTR+1))
+        if [ "$CTR" -ge "$FAIL_THRESHOLD" ]; then
+          # Переход в failover — ищем первый живой из FAILOVER_TAGS
+          NEW_STATE=failover
+          NEW_DEFAULT=""
+          for t in $(echo "$FAILOVER_TAGS" | tr ',' ' '); do
+            if probe_tag "$t" ""; then
+              NEW_DEFAULT="$t"; break
+            fi
+          done
+          if [ -z "$NEW_DEFAULT" ]; then
+            # Все failover-каналы мёртвы — оставляем primary (хуже не сделаем)
+            NEW_STATE=primary
+            NEW_DEFAULT="$PRIMARY_TAG"
+            log "WARN: PRIMARY down AND все failover-каналы недоступны — оставляю default=$PRIMARY_TAG"
+            tg_alert "🚨 <b>XKeen watchdog</b>: PRIMARY ($PRIMARY_TAG) и ВСЕ failover каналы недоступны! Default остаётся $PRIMARY_TAG. Проверь интернет."
+          fi
+          CTR=0
+        else
+          NEW_STATE=primary
+          NEW_DEFAULT="$PRIMARY_TAG"
+        fi
+        ;;
+      failover/up)
+        # Primary вернулся к жизни. Считаем подряд успехи.
+        CTR=$((CTR+1))
+        if [ "$CTR" -ge "$PASS_THRESHOLD" ]; then
+          NEW_STATE=primary
+          NEW_DEFAULT="$PRIMARY_TAG"
+          CTR=0
+        else
+          # Пока остаёмся в failover, но обновим если текущий default умер
+          NEW_STATE=failover
+          if probe_tag "$CUR_DEFAULT" ""; then
+            NEW_DEFAULT="$CUR_DEFAULT"
+          else
+            # Текущий failover-канал умер — перевыбираем
+            NEW_DEFAULT=""
+            for t in $(echo "$FAILOVER_TAGS" | tr ',' ' '); do
+              if probe_tag "$t" ""; then
+                NEW_DEFAULT="$t"; break
+              fi
+            done
+            [ -z "$NEW_DEFAULT" ] && NEW_DEFAULT="$CUR_DEFAULT"
+          fi
+        fi
+        ;;
+      failover/down)
+        CTR=0
+        # Primary всё ещё мёртв. Проверяем что текущий failover жив, иначе перевыбираем.
+        NEW_STATE=failover
+        if probe_tag "$CUR_DEFAULT" ""; then
+          NEW_DEFAULT="$CUR_DEFAULT"
+        else
+          NEW_DEFAULT=""
+          for t in $(echo "$FAILOVER_TAGS" | tr ',' ' '); do
+            if probe_tag "$t" ""; then
+              NEW_DEFAULT="$t"; break
+            fi
+          done
+          if [ -z "$NEW_DEFAULT" ]; then
+            NEW_DEFAULT="$CUR_DEFAULT"  # все мертвы, не меняем
+            log "WARN: все failover-каналы мертвы, default остаётся $CUR_DEFAULT"
+            tg_alert "🚨 <b>XKeen watchdog</b>: все failover каналы недоступны! Default = $CUR_DEFAULT (не работает). Проверь интернет."
+          fi
+        fi
+        ;;
+    esac
+    ;;
+esac
+
+# ---------- AI kill-switch ----------
+# Если AI_TAG канал мёртв И AI_FAIL_BLOCK=1 → подменяем effective AI на 'block' (kill-switch).
+# Зачем: если AI-канал упал и трафик пойдёт через PRIMARY с «неподходящим» IP
+# (например, российский для Anthropic/OpenAI), сервис может заблокировать аккаунт по geo.
+# Лучше вообще не ходить туда до восстановления AI-канала, чем рискнуть.
+# Логируем переключение чтобы юзер знал.
+EFFECTIVE_AI_TAG="$AI_TAG"
+AI_PROBE_CODE=""
+if [ -n "$AI_DOMAINS" ] && [ -n "$AI_TAG" ] && [ "$AI_TAG" != "block" ]; then
+  if [ "${AI_FAIL_BLOCK:-1}" = "1" ]; then
+    # Пингуем AI_TAG (TCP-probe, без HTTPS — у VETRYX нет HTTP endpoint)
+    if probe_tag "$AI_TAG" ""; then
+      AI_PROBE_CODE="up"
+    else
+      AI_PROBE_CODE="down"
+      EFFECTIVE_AI_TAG="block"
+    fi
+  fi
+fi
+
+# ---------- YT kill-switch (по умолчанию ВЫКЛЮЧЕН — YT_FAIL_BLOCK=0) ----------
+# Если YT_TAG канал мёртв И YT_FAIL_BLOCK=1 → подменяем effective YT на 'block'.
+# Зачем: для YouTube это редко нужно — если YT-канал упал, страшнее показ рекламы,
+# чем «засветка» страны. Поэтому дефолт = 0 (kill-switch выключен): при падении
+# YT_TAG → YouTube идёт через PRIMARY (с рекламой, но работает).
+# Включи YT_FAIL_BLOCK=1 если хочешь вообще не пускать YT в обход выбранного канала.
+EFFECTIVE_YT_TAG="$YT_TAG"
+YT_PROBE_CODE=""
+if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ]; then
+  if [ "${YT_FAIL_BLOCK:-0}" = "1" ]; then
+    if probe_tag "$YT_TAG" ""; then
+      YT_PROBE_CODE="up"
+    else
+      YT_PROBE_CODE="down"
+      EFFECTIVE_YT_TAG="block"
+    fi
+  fi
+fi
+
+# Запомнить предыдущий effective_ai/effective_yt чтобы логировать смену
+PREV_AI=$(grep -o 'EFFECTIVE_AI=\S*' "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+[ -z "$PREV_AI" ] && PREV_AI="$AI_TAG"
+PREV_YT=$(grep -o 'EFFECTIVE_YT=\S*' "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+[ -z "$PREV_YT" ] && PREV_YT="$YT_TAG"
+
+# ---------- Apply changes ----------
+# Всегда генерим новый routing.json и сравниваем с текущим через md5.
+# Это позволяет триггерить пересборку не только при смене default_tag, но и при изменении
+# AI_DOMAINS / AI_TAG / YT_DOMAINS / YT_TAG / шаблона (юзер правит из дашборда).
+if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG"; then
+  if routing_changed; then
+    if mv "$CONFIG_DIR/05_routing.json.new" "$CONFIG_DIR/05_routing.json"; then
+      /opt/sbin/xkeen -restart >/dev/null 2>&1
+      if [ "$NEW_DEFAULT" != "$CUR_DEFAULT" ]; then
+        log "SWITCH default $CUR_DEFAULT -> $NEW_DEFAULT (state=$CUR/$NEW_STATE probe=$PROBE_CODE)"
+        tg_alert "🚦 <b>XKeen watchdog</b>: default переключён <code>$CUR_DEFAULT</code> → <code>$NEW_DEFAULT</code>${PROBE_CODE:+ (probe=$PROBE_CODE)}"
+      else
+        log "UPDATE routing config changed (AI_DOMAINS / AI_TAG / kill-switch state) — default остаётся $NEW_DEFAULT"
+      fi
+      # AI kill-switch event log
+      if [ "$EFFECTIVE_AI_TAG" != "$PREV_AI" ]; then
+        if [ "$EFFECTIVE_AI_TAG" = "block" ]; then
+          log "AI-KILL-SWITCH: AI_TAG=$AI_TAG мёртв — AI-трафик заблокирован"
+          tg_alert "🛡️ <b>XKeen AI kill-switch</b>: канал <code>$AI_TAG</code> недоступен → AI-сайты ВРЕМЕННО заблокированы (чтобы не светить RU IP). Восстановится автоматически когда $AI_TAG оживёт."
+        else
+          log "AI-KILL-SWITCH-CLEAR: $AI_TAG восстановился — AI-трафик пошёл через него"
+          tg_alert "✅ <b>XKeen AI kill-switch</b>: канал <code>$AI_TAG</code> восстановился, AI-сайты снова работают через него."
+        fi
+      fi
+      # YT kill-switch event log + TG-уведомление (с 2026-05-15)
+      if [ "$EFFECTIVE_YT_TAG" != "$PREV_YT" ]; then
+        if [ "$EFFECTIVE_YT_TAG" = "block" ]; then
+          log "YT-KILL-SWITCH: YT_TAG=$YT_TAG мёртв — YouTube-трафик заблокирован (YT_FAIL_BLOCK=1)"
+          tg_alert "📺 <b>XKeen YT kill-switch</b>: канал <code>$YT_TAG</code> недоступен → YouTube/IG/Discord ВРЕМЕННО заблокированы. Восстановится автоматически когда $YT_TAG оживёт."
+        else
+          log "YT-KILL-SWITCH-CLEAR: $YT_TAG восстановился — YouTube-трафик пошёл через него"
+          tg_alert "✅ <b>XKeen YT kill-switch</b>: канал <code>$YT_TAG</code> восстановился, YouTube/IG/Discord снова работают через него."
+        fi
+      fi
+    else
+      log "ERROR: не удалось применить новый routing.json"
+    fi
+  else
+    rm -f "$CONFIG_DIR/05_routing.json.new"
+  fi
+else
+  log "ERROR: generate_routing failed"
+fi
+
+# ---------- Failover health check (с 2026-05-15) ----------
+# Раз в 5 минут пробит ВСЕ failover-каналы и считает живых. Если число снизилось до
+# критичного уровня (≤2 живых) — TG-алерт. При восстановлении (>2 живых) — снять тревогу.
+# Probe только когда PRIMARY жив — иначе watchdog уже занят перебором failover'ов в state machine.
+NOW_EPOCH=$(date +%s)
+LAST_FULL_PROBE=$(grep -o 'LAST_FULL_PROBE=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+[ -z "$LAST_FULL_PROBE" ] && LAST_FULL_PROBE=0
+PREV_ALIVE_FAILOVER=$(grep -o 'PREV_ALIVE=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+[ -z "$PREV_ALIVE_FAILOVER" ] && PREV_ALIVE_FAILOVER=999  # 999 = не считали ещё, не алертить при первом запуске
+
+ALIVE_FAILOVER="$PREV_ALIVE_FAILOVER"  # default: считаем что не менялось
+if [ "$NEW_STATE" = "primary" ] && [ $((NOW_EPOCH - LAST_FULL_PROBE)) -ge 300 ]; then
+  ALIVE_FAILOVER=0
+  TOTAL_FAILOVER=0
+  for t in $(echo "$FAILOVER_TAGS" | tr ',' ' '); do
+    TOTAL_FAILOVER=$((TOTAL_FAILOVER+1))
+    if probe_tag "$t" ""; then
+      ALIVE_FAILOVER=$((ALIVE_FAILOVER+1))
+    fi
+  done
+  LAST_FULL_PROBE=$NOW_EPOCH
+  log "FAILOVER-HEALTH: $ALIVE_FAILOVER/$TOTAL_FAILOVER каналов живы"
+  # Алерты при пересечении threshold=2
+  if [ "$PREV_ALIVE_FAILOVER" != "999" ]; then
+    if [ "$ALIVE_FAILOVER" -le 2 ] && [ "$PREV_ALIVE_FAILOVER" -gt 2 ]; then
+      tg_alert "⚠️ <b>XKeen watchdog</b>: failover-каналов осталось <b>$ALIVE_FAILOVER из $TOTAL_FAILOVER</b>. Если PRIMARY (<code>$PRIMARY_TAG</code>) упадёт — резерв уже под угрозой."
+    elif [ "$ALIVE_FAILOVER" -gt 2 ] && [ "$PREV_ALIVE_FAILOVER" -le 2 ]; then
+      tg_alert "✅ <b>XKeen watchdog</b>: failover-каналы восстановились — живых <b>$ALIVE_FAILOVER из $TOTAL_FAILOVER</b>."
+    fi
+  fi
+fi
+
+# ---------- Save state ----------
+# Формат: "<state> <counter> <default_tag> EFFECTIVE_AI=<tag> EFFECTIVE_YT=<tag> LAST_FULL_PROBE=<epoch> PREV_ALIVE=<n>"
+echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER" > "$STATE_FILE"

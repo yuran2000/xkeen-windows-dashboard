@@ -1,0 +1,13082 @@
+r"""
+xray dashboard — локальная веб-панель для мониторинга домашнего xray.
+
+Запуск:
+    .\.venv\Scripts\python.exe dashboard.py
+
+Открывается на http://localhost:5000 (или http://<your-pc-lan-ip>:5000 из локалки).
+Логин/пароль — в config_local.py.
+"""
+from flask import Flask, render_template_string, request, Response, jsonify, session, redirect, url_for, send_from_directory
+from functools import wraps
+from datetime import datetime, timedelta
+import psutil
+import json
+import re
+import io
+import base64
+import os
+import subprocess
+import tempfile
+
+import qrcode
+import socket
+import time as _time_mod
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import config_local as cfg
+import threading as _threading
+
+# ============== ВЕРСИЯ ПАНЕЛИ ==============
+# Hardcoded fallback. Обновляется руками при каждом release (см. CONTRIBUTING.md).
+# Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
+# если в репо есть свежий tag (например юзер на main после моего push), увидит его.
+# Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
+_VERSION_FALLBACK = "1.0.0"
+
+
+def get_dashboard_version():
+    """Версия панели. Сначала git describe (свежее), потом fallback на константу.
+    Кэшируется на 60 сек — git вызов недешёвый."""
+    now = _time_mod.time()
+    cached = getattr(get_dashboard_version, "_cache", None)
+    if cached and now - cached[1] < 60:
+        return cached[0]
+    version = _VERSION_FALLBACK
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--abbrev=0"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # git describe возвращает напр. "v1.4.3" — снимаем "v" префикс
+            version = result.stdout.strip().lstrip("v")
+    except Exception:
+        pass
+    get_dashboard_version._cache = (version, now)
+    return version
+
+# ============== RUNTIME SETTINGS (overrides поверх config_local.py) ==============
+# Хранятся отдельным JSON чтобы при обновлении dashboard.py не сбрасывались.
+# Перезаписывают атрибуты cfg-модуля → существующий код cfg.KEENETIC_* работает без правок.
+RUNTIME_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_settings.json")
+_RUNTIME_LOCK = _threading.Lock()
+
+# key в runtime.keenetic → attr в cfg-модуле. KEENETIC_PORT — int, остальные str.
+KEENETIC_RUNTIME_KEYS = [
+    ("host",           "KEENETIC_HOST",           "str"),
+    ("port",           "KEENETIC_PORT",           "int"),
+    ("user",           "KEENETIC_USER",           "str"),
+    ("ssh_key",        "KEENETIC_SSH_KEY",        "str"),
+    ("xray_configs",   "KEENETIC_XRAY_CONFIGS",   "str"),
+    ("xray_bak_dir",   "KEENETIC_XRAY_BAK_DIR",   "str"),
+    ("watchdog_state", "KEENETIC_WATCHDOG_STATE", "str"),
+    ("watchdog_log",   "KEENETIC_WATCHDOG_LOG",   "str"),
+]
+
+def load_runtime_settings():
+    with _RUNTIME_LOCK:
+        if not os.path.exists(RUNTIME_SETTINGS_FILE):
+            return {}
+        try:
+            with open(RUNTIME_SETTINGS_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+def save_runtime_settings(data):
+    with _RUNTIME_LOCK:
+        with open(RUNTIME_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+def apply_runtime_overrides():
+    """Перезаписать атрибуты cfg значениями из runtime_settings.json."""
+    rt = load_runtime_settings()
+    kn = rt.get("keenetic", {}) if isinstance(rt.get("keenetic"), dict) else {}
+    for rt_key, cfg_attr, typ in KEENETIC_RUNTIME_KEYS:
+        if rt_key in kn and kn[rt_key] not in ("", None):
+            try:
+                val = int(kn[rt_key]) if typ == "int" else str(kn[rt_key])
+                setattr(cfg, cfg_attr, val)
+            except (ValueError, TypeError):
+                pass
+
+def get_keenetic_settings_merged():
+    """Текущее эффективное состояние SSH-настроек роутера для UI.
+    Возвращает {current: {...}, overridden: {key: bool}}.
+    Если overridden[key]=False — значение пришло из config_local.py (показать как «по умолчанию»).
+    """
+    rt = load_runtime_settings().get("keenetic", {}) or {}
+    out = {"current": {}, "overridden": {}}
+    for rt_key, cfg_attr, _typ in KEENETIC_RUNTIME_KEYS:
+        out["current"][rt_key] = getattr(cfg, cfg_attr, None)
+        out["overridden"][rt_key] = rt_key in rt and rt[rt_key] not in ("", None)
+    return out
+
+# Применить overrides при импорте, до создания Flask-приложения
+apply_runtime_overrides()
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = cfg.SECRET_KEY
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=getattr(cfg, "SESSION_DAYS", 30))
+
+# Лог запросов подписки (in-memory, последние N)
+SUBS_LOG = []  # list of dicts: {time, ip, user_agent, app, app_version, platform, platform_version}
+
+
+# ============== AUTH (session-based) ==============
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*a, **kw):
+        if not session.get("logged_in"):
+            return redirect(url_for("login", next=request.path))
+        return f(*a, **kw)
+    return decorated
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        u = request.form.get("username", "").strip()
+        p = request.form.get("password", "")
+        if u == cfg.USERNAME and p == cfg.PASSWORD:
+            session["logged_in"] = True
+            session["username"] = u
+            if request.form.get("remember"):
+                session.permanent = True
+            else:
+                session.permanent = False
+            nxt = request.args.get("next") or url_for("index")
+            return redirect(nxt)
+        else:
+            error = "Неверный логин или пароль"
+    return render_template_string(LOGIN_TEMPLATE, error=error)
+
+
+# ============== DATA COLLECTORS ==============
+def humanize_uptime(seconds):
+    d, r = divmod(int(seconds), 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    parts = []
+    if d: parts.append(f"{d}д")
+    if h: parts.append(f"{h}ч")
+    if m: parts.append(f"{m}м")
+    if not parts: parts.append(f"{s}с")
+    return " ".join(parts)
+
+
+def get_process_info(name):
+    """Найти процесс по имени (без .exe)."""
+    target = name.lower()
+    if not target.endswith(".exe"):
+        target += ".exe"
+    for proc in psutil.process_iter(["pid", "name", "create_time"]):
+        try:
+            if (proc.info["name"] or "").lower() == target:
+                p = psutil.Process(proc.info["pid"])
+                with p.oneshot():
+                    mem = p.memory_info().rss / 1024 / 1024
+                    cpu = p.cpu_percent(interval=0.1)
+                    create = proc.info["create_time"]
+                return {
+                    "alive": True,
+                    "pid": proc.info["pid"],
+                    "start": datetime.fromtimestamp(create).strftime("%Y-%m-%d %H:%M:%S"),
+                    "uptime": humanize_uptime(datetime.now().timestamp() - create),
+                    "cpu": round(cpu, 1),
+                    "mem_mb": round(mem, 1),
+                }
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return {"alive": False}
+
+
+def get_port_status(ports):
+    """Кто слушает каждый порт + сколько активных подключений (через netstat -an, не требует админа)."""
+    import subprocess
+    info = {p: {"listening": False, "established": [], "established_count": 0, "clients": []} for p in ports}
+
+    try:
+        # netstat -an на Windows: TCP <local> <remote> <state>
+        result = subprocess.run(
+            ["netstat", "-an", "-p", "TCP"],
+            capture_output=True, timeout=5,
+        )
+        # Декодируем как cp866 (русская Windows console) — данные ASCII, заголовки могут быть в кириллице
+        out = result.stdout.decode("cp866", errors="ignore")
+    except Exception:
+        return info
+
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[0] != "TCP":
+            continue
+        local, remote, state = parts[1], parts[2], parts[3]
+        # local может быть 0.0.0.0:443, [::]:443, <your-pc-lan-ip>:443
+        try:
+            local_port = int(local.rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        if local_port not in info:
+            continue
+
+        if state == "LISTENING":
+            info[local_port]["listening"] = True
+        elif state == "ESTABLISHED":
+            try:
+                remote_ip = remote.rsplit(":", 1)[0].strip("[]")
+            except IndexError:
+                continue
+            # Не отфильтровываем — Keenetic делает source NAT на свой IP 192.168.1.1
+            # для всех external-форвардов, реальные external IP так не видны
+            if remote_ip.startswith(("127.", "::1", "0.0.0.0")):
+                continue  # это сам себя
+            info[local_port]["established"].append(remote_ip)
+            info[local_port]["established_count"] += 1
+
+    # IP-адреса которые не считаются "реальными клиентами" (служебные)
+    SERVICE_IPS = {cfg.KEENETIC_HOST}  # Keenetic делает connectivity-checks через xray
+
+    # Группируем IP с count
+    for p in info:
+        grouped = {}
+        for ip in info[p]["established"]:
+            grouped[ip] = grouped.get(ip, 0) + 1
+        info[p]["clients"] = sorted(
+            [{"ip": k, "count": v} for k, v in grouped.items()],
+            key=lambda x: -x["count"],
+        )
+        info[p]["unique_ips"] = len(grouped)
+        # Реальные клиенты = всё кроме служебных
+        info[p]["real_unique_ips"] = sum(1 for ip in grouped if ip not in SERVICE_IPS)
+        info[p]["real_tcp_count"] = sum(v for ip, v in grouped.items() if ip not in SERVICE_IPS)
+    return info
+
+
+def parse_active_per_port(access_log_path, window_sec=30, lines_limit=10000):
+    """
+    Из access.log: уникальные external IP за последние N секунд, сгруппированные по inbound port.
+    Это точнее чем netstat для xhttp (которая использует короткоживущие TCP).
+    Возвращает dict: {port: [{ip, count, last}, ...]}
+    """
+    from datetime import timedelta
+    cutoff = datetime.now() - timedelta(seconds=window_sec)
+
+    # Map inbound tag -> port (читаем из config.json)
+    tag_to_port = {}
+    try:
+        with open(cfg.XRAY_CONFIG, "r", encoding="utf-8") as f:
+            conf = json.load(f)
+        for ib in conf.get("inbounds", []):
+            tag = ib.get("tag", "")
+            if tag:
+                tag_to_port[tag] = ib.get("port")
+    except Exception:
+        pass
+
+    by_port = {}  # port -> dict of ip -> {count, last}
+    try:
+        with open(access_log_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()[-lines_limit:]
+    except Exception:
+        return by_port
+
+    for line in lines:
+        # Формат: 2026/05/07 19:35:39.292373 from 5.142.45.177:10938 accepted tcp:216.58.198.170:443 [in-xhttp >> direct]
+        m = re.match(
+            r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+ from ([\d.]+):\d+ accepted .+?\[(\S+) >> .+\]",
+            line,
+        )
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group(1), "%Y/%m/%d %H:%M:%S")
+        except ValueError:
+            continue
+        if ts < cutoff:
+            continue
+        ip = m.group(2)
+        tag = m.group(3)
+        # Skip только сам Keenetic (его connectivity-checks) и loopback.
+        # LAN-клиентов НЕ фильтруем — это твой телефон/ноут на Wi-Fi.
+        if ip == cfg.KEENETIC_HOST or ip.startswith("127."):
+            continue
+        port = tag_to_port.get(tag)
+        if not port:
+            continue
+        by_port.setdefault(port, {})
+        cur = by_port[port].setdefault(ip, {"count": 0, "last": ts, "first": ts})
+        cur["count"] += 1
+        cur["last"] = max(cur["last"], ts)
+        cur["first"] = min(cur["first"], ts)
+
+    now = datetime.now()
+    result = {}
+    for port, ips in by_port.items():
+        result[port] = sorted(
+            [
+                {
+                    "ip": ip,
+                    "count": v["count"],
+                    "last": v["last"].strftime("%H:%M:%S"),
+                    "first": v["first"].strftime("%H:%M:%S"),
+                    "ago_sec": int((now - v["last"]).total_seconds()),
+                    "is_lan": ip.startswith(("192.168.", "10.")),
+                }
+                for ip, v in ips.items()
+            ],
+            key=lambda x: -x["count"],
+        )
+    return result
+
+
+def parse_recent_external_clients(error_log_path, minutes=5, lines_limit=5000):
+    """Из error.log собрать реальные external IP клиентов за последние N минут.
+    Источники: REALITY-ошибки (там IP виден явно)."""
+    from datetime import timedelta
+    cutoff = datetime.now() - timedelta(minutes=minutes)
+    clients = {}  # ip -> {first, last, attempts, errors}
+    try:
+        with open(error_log_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()[-lines_limit:]
+    except Exception:
+        return []
+
+    for line in lines:
+        # Достаём timestamp + IP из REALITY-строки
+        m = re.search(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}).*from ([\d.]+):\d+", line)
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group(1), "%Y/%m/%d %H:%M:%S")
+        except ValueError:
+            continue
+        if ts < cutoff:
+            continue
+        ip = m.group(2)
+        # Skip только Keenetic и loopback — LAN-клиенты (Wi-Fi) показываем
+        if ip == cfg.KEENETIC_HOST or ip.startswith("127."):
+            continue
+        c = clients.setdefault(ip, {"ip": ip, "first": ts, "last": ts, "events": 0, "errors": 0})
+        c["last"] = max(c["last"], ts)
+        c["first"] = min(c["first"], ts)
+        c["events"] += 1
+        if "REALITY: processed invalid" in line:
+            c["errors"] += 1
+
+    # Список, отсортированный по last desc
+    out = []
+    for c in clients.values():
+        out.append({
+            "ip": c["ip"],
+            "first": c["first"].strftime("%H:%M:%S"),
+            "last": c["last"].strftime("%H:%M:%S"),
+            "events": c["events"],
+            "errors": c["errors"],
+        })
+    out.sort(key=lambda x: x["last"], reverse=True)
+    return out
+
+
+def parse_error_log(path, lines_limit=3000):
+    """Парсим error.log: VLESS-сессии (с sniffed domain) + Reality-ошибки."""
+    sessions = []          # успешные VLESS-сессии
+    reality_errors = []    # неудачные handshake'и
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()[-lines_limit:]
+    except Exception:
+        return sessions, reality_errors
+
+    # Группируем по request_id чтобы собрать целую сессию
+    cur = {}
+    for line in lines:
+        # Извлечь время + (опционально) request_id + сообщение
+        m_meta = re.match(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+ \[(\w+)\] (?:\[(\d+)\] )?(.*)", line)
+        if not m_meta:
+            continue
+        ts, level, rid, msg = m_meta.groups()
+
+        # === Reality ошибки ===
+        m_err = re.search(r"REALITY: processed invalid connection from ([\d.]+):(\d+): (.+)", msg)
+        if m_err:
+            reality_errors.append({
+                "time": ts,
+                "ip": m_err.group(1),
+                "port": m_err.group(2),
+                "reason": m_err.group(3).strip(),
+            })
+            continue
+
+        if not rid:
+            continue
+
+        # === Открытие VLESS-сессии (firstLen) ===
+        if "proxy/vless/inbound: firstLen" in msg:
+            cur[rid] = {"time": ts, "rid": rid, "domain": "", "target": "", "remote": ""}
+            continue
+
+        # === Sniffing ===
+        m_dom = re.search(r"sniffed domain: (.+)$", msg)
+        if m_dom and rid in cur:
+            cur[rid]["domain"] = m_dom.group(1).strip()
+            continue
+
+        # === Куда клиент хотел пойти ===
+        m_target = re.search(r"received request for (.+)$", msg)
+        if m_target and rid in cur:
+            cur[rid]["target"] = m_target.group(1).strip()
+            continue
+
+        # === Outbound открыт — фиксируем сессию ===
+        m_open = re.search(r"connection opened to.+remote endpoint ([\d\.:]+)", msg)
+        if m_open and rid in cur:
+            cur[rid]["remote"] = m_open.group(1).strip()
+            sess = cur.pop(rid)
+            # Если sniffing определил домен — показываем его, иначе target
+            sess["dest"] = sess["domain"] or sess["target"]
+            sessions.append(sess)
+
+    return sessions, reality_errors
+
+
+def make_qr_data_url(data):
+    img = qrcode.make(data, box_size=4, border=2)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def parse_xray_config():
+    """Считать список inbound из config.json для отображения."""
+    try:
+        with open(cfg.XRAY_CONFIG, "r", encoding="utf-8") as f:
+            conf = json.load(f)
+    except Exception:
+        return []
+    inbounds = []
+    for ib in conf.get("inbounds", []):
+        ss = ib.get("streamSettings", {})
+        rs = ss.get("realitySettings", {})
+        inbounds.append({
+            "tag": ib.get("tag", "?"),
+            "port": ib.get("port"),
+            "protocol": ib.get("protocol"),
+            "network": ss.get("network"),
+            "security": ss.get("security"),
+            "dest": rs.get("dest"),
+            "serverNames": rs.get("serverNames", []),
+            "shortIds": rs.get("shortIds", []),
+            "clients_count": len(ib.get("settings", {}).get("clients", [])),
+        })
+    return inbounds
+
+
+def collect_dynamic_data():
+    """Собрать всё что меняется (для AJAX-обновления)."""
+    xray_proc = get_process_info("xray")
+    caddy_proc = get_process_info("caddy")
+    ports = get_port_status(cfg.MONITORED_PORTS)
+    sessions, reality_errors = parse_error_log(cfg.XRAY_ERROR_LOG)
+    recent_clients = parse_recent_external_clients(cfg.XRAY_ERROR_LOG, minutes=5)
+    active_30s = parse_active_per_port(cfg.XRAY_ACCESS_LOG, window_sec=30)
+
+    # Реверс — новые сверху, ограничим
+    sessions = list(reversed(sessions))[:50]
+    reality_errors = list(reversed(reality_errors))[:30]
+
+    # Разбить порты по owner для отдельных таблиц
+    ports_info = getattr(cfg, "MONITORED_PORTS_INFO", [{"port": p, "owner": "?", "purpose": ""} for p in cfg.MONITORED_PORTS])
+    ports_by_owner = {}
+    for pi in ports_info:
+        port = pi["port"]
+        port_data = dict(ports.get(port, {"listening": False, "established_count": 0, "unique_ips": 0, "real_unique_ips": 0, "real_tcp_count": 0, "clients": []}))
+
+        # Фильтрация stale TCP: оставляем только тех клиентов которые активны
+        # в access.log за последние 30 секунд. Keenetic (cfg.KEENETIC_HOST) оставляем всегда.
+        active_ips = {c["ip"] for c in active_30s.get(port, [])}
+        active_ips.add(cfg.KEENETIC_HOST)  # Keenetic-самопроверки всегда показываем
+        all_clients = port_data.get("clients", [])
+        active_clients = [c for c in all_clients if c["ip"] in active_ips]
+        stale_count = len(all_clients) - len(active_clients)
+
+        port_data["clients"] = active_clients
+        port_data["stale_count"] = stale_count
+        port_data["real_unique_ips"] = sum(1 for c in active_clients if c["ip"] != cfg.KEENETIC_HOST)
+        port_data["real_tcp_count"] = sum(c["count"] for c in active_clients if c["ip"] != cfg.KEENETIC_HOST)
+
+        ports_by_owner.setdefault(pi["owner"], []).append({**pi, **port_data})
+
+    # Группируем подписочные запросы по IP (последние)
+    subs_by_ip = {}
+    for e in SUBS_LOG:
+        key = e["ip"]
+        if key not in subs_by_ip or subs_by_ip[key]["time"] < e["time"]:
+            subs_by_ip[key] = e
+    subs_recent = sorted(subs_by_ip.values(), key=lambda x: x["time"], reverse=True)
+    subs_view = [
+        {
+            "ip": e["ip"],
+            "app": e["app"],
+            "app_version": e["app_version"],
+            "platform": e["platform"],
+            "user_agent": e["user_agent"],
+            "last": e["time"].strftime("%Y-%m-%d %H:%M:%S"),
+            "ago_min": int((datetime.now() - e["time"]).total_seconds() / 60),
+        }
+        for e in subs_recent[:20]
+    ]
+    subs_total = len(SUBS_LOG)
+
+    return dict(
+        xray=xray_proc,
+        caddy=caddy_proc,
+        ports=ports,
+        ports_by_owner=ports_by_owner,
+        active_30s=active_30s,
+        nat_forwards=getattr(cfg, "NAT_FORWARDS", []),
+        recent_clients=recent_clients,
+        sessions=sessions,
+        reality_errors=reality_errors,
+        subs_view=subs_view,
+        subs_total=subs_total,
+        now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        keenetic_host=cfg.KEENETIC_HOST,
+    )
+
+
+# ============== XKEEN MANAGEMENT (Phase 1) ==============
+# Управление xray на Кинетике (192.168.1.1) через SSH.
+# Помощь PowerShell-скриптов из <scripts-path>\:
+#   - Add-XKeenOutbound.ps1 — добавить outbound в существующий 04_outbounds.json
+
+def _ssh_args(extra_cmd=None):
+    """Базовые SSH-аргументы для роутера.
+    UserKnownHostsFile=NUL — SYSTEM-аккаунт не имеет .ssh/known_hosts в
+    C:\\Windows\\System32\\config\\systemprofile\\.ssh\\, без NUL ssh пытается туда
+    писать и может зависнуть/упасть."""
+    args = [
+        "ssh",
+        "-i", cfg.KEENETIC_SSH_KEY,
+        "-p", str(cfg.KEENETIC_PORT),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=NUL",
+        "-o", "ConnectTimeout=10",
+        "-o", "BatchMode=yes",
+        "-o", "LogLevel=ERROR",  # подавить "Warning: Permanently added..."
+        f"{cfg.KEENETIC_USER}@{cfg.KEENETIC_HOST}",
+    ]
+    if extra_cmd:
+        args.append(extra_cmd)
+    return args
+
+
+def is_keenetic_reachable(timeout=1.5):
+    """Быстрая TCP-проверка SSH-порта роутера. Не делает SSH-handshake.
+    Возвращает True/False за ≤ timeout секунд. Используется на /xkeen чтобы
+    не висеть 30+ секунд на каждом SSH-вызове когда роутер недоступен.
+    """
+    try:
+        with socket.create_connection((cfg.KEENETIC_HOST, cfg.KEENETIC_PORT), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        return False
+
+
+def keenetic_ssh(cmd, timeout=15, stdin_data=None):
+    """Выполнить команду на Кинетике через SSH.
+    Возвращает dict {ok, stdout, stderr, code}.
+    text=False + ручное декодирование UTF-8 с errors='replace' — иначе на SYSTEM
+    locale (cp1251) теряются строки с UTF-8 кириллицей (например watchdog.config с комментариями)."""
+    try:
+        stdin_bytes = stdin_data.encode("utf-8") if isinstance(stdin_data, str) else stdin_data
+        result = subprocess.run(
+            _ssh_args(cmd),
+            capture_output=True, timeout=timeout,
+            input=stdin_bytes,
+        )
+        return {
+            "ok": result.returncode == 0,
+            "stdout": result.stdout.decode("utf-8", errors="replace"),
+            "stderr": result.stderr.decode("utf-8", errors="replace"),
+            "code": result.returncode,
+        }
+    except subprocess.TimeoutExpired as e:
+        # Сохраняем partial output (что успело прилететь до timeout) — иначе юзер видит
+        # пустую textarea и не понимает что произошло. Команда могла фактически выполниться,
+        # просто SSH-канал не успел закрыться за timeout.
+        partial_out = ""
+        partial_err = ""
+        try:
+            if e.stdout:
+                partial_out = (e.stdout.decode("utf-8", errors="replace") if isinstance(e.stdout, bytes) else str(e.stdout))[-4000:]
+            if e.stderr:
+                partial_err = (e.stderr.decode("utf-8", errors="replace") if isinstance(e.stderr, bytes) else str(e.stderr))[-2000:]
+        except Exception:
+            pass
+        hint = f"⏱ timeout {timeout}s — команда могла фактически выполниться, проверь статус кнопкой '📊 Статус'."
+        return {
+            "ok": False,
+            "stdout": partial_out,
+            "stderr": (hint + ("\n\n" + partial_err if partial_err else "")),
+            "code": -1,
+        }
+    except Exception as ex:
+        return {"ok": False, "stdout": "", "stderr": str(ex), "code": -2}
+
+
+def keenetic_read_file(remote_path, timeout=10):
+    """Прочитать файл с роутера через cat. Вернёт str или None при ошибке."""
+    r = keenetic_ssh(f"cat {remote_path}", timeout=timeout)
+    return r["stdout"] if r["ok"] else None
+
+
+_JSON_LINE_COMMENT_RE = re.compile(r'^\s*//.*$', re.MULTILINE)
+
+
+def _strip_json_comments(text):
+    """Удалить //-комментарии из JSON-текста. XKeen в свежих 04_outbounds.json /
+    05_routing.json кладёт `// ...` строки — стандартный json.loads падает на них:
+    «Expecting property name enclosed in double quotes». Поддерживается только
+    line-comments (// в начале строки), не /* ... */ блочные."""
+    if not text:
+        return text
+    return _JSON_LINE_COMMENT_RE.sub('', text)
+
+
+def keenetic_load_json(remote_path, timeout=10):
+    """Прочитать и распарсить JSON-файл с роутера. Автоматически чистит //-комментарии.
+    Возвращает dict/list или None при ошибке (read fail или parse error)."""
+    raw = keenetic_read_file(remote_path, timeout=timeout)
+    if not raw:
+        return None
+    try:
+        return json.loads(_strip_json_comments(raw))
+    except Exception:
+        return None
+
+
+def keenetic_tail_log(remote_path, n=30, timeout=10):
+    """Tail последних N строк лога с роутера. Возвращает list строк (пустой если файл/ошибка)."""
+    r = keenetic_ssh(f"tail -n {n} {remote_path} 2>/dev/null || true", timeout=timeout)
+    return (r.get("stdout") or "").splitlines()
+
+
+KEENETIC_META_FILE = "/opt/etc/xray/outbound_meta.json"
+KEENETIC_SUB_META_FILE = "/opt/etc/xray/subscription_meta.json"
+# Sidecar JSON для примечаний к доменам (v1.7.0). watchdog.config хранит только
+# домены через пробел (shell-format), а здесь — namespaced {section: {domain: note}}.
+# Notes отображаются в textarea как `domain  # note`, парсятся обратно при save.
+# Backward-compat: если файла нет — UI работает как раньше (notes пустые).
+KEENETIC_DOMAIN_NOTES_FILE = "/opt/etc/xray/domain_notes.json"
+
+
+def keenetic_read_domain_notes():
+    """Читает sidecar /opt/etc/xray/domain_notes.json (v1.7.0).
+    Формат: {"ai": {"claude.ai": "📦 claude"}, "yt": {...}, "direct": {...}, "block": {...}}
+    Если файла нет — возвращает пустую структуру (4 пустых namespace).
+    """
+    empty = {"ai": {}, "yt": {}, "direct": {}, "block": {}}
+    raw = keenetic_read_file(KEENETIC_DOMAIN_NOTES_FILE)
+    if not raw:
+        return empty
+    try:
+        d = json.loads(raw)
+        if not isinstance(d, dict):
+            return empty
+        # Гарантируем что все 4 ключа есть
+        for k in empty:
+            if k not in d or not isinstance(d[k], dict):
+                d[k] = {}
+        return d
+    except Exception:
+        return empty
+
+
+def keenetic_write_domain_notes(notes_dict):
+    """Записывает sidecar /opt/etc/xray/domain_notes.json.
+    Делает .bak-pre-<ts> бэкап перед перезаписью.
+    """
+    import time as _time
+    # Нормализуем
+    safe = {"ai": {}, "yt": {}, "direct": {}, "block": {}}
+    for k in safe:
+        v = notes_dict.get(k, {}) if isinstance(notes_dict, dict) else {}
+        if isinstance(v, dict):
+            # Только non-empty notes — пустые не пишем для компактности
+            safe[k] = {dom: note for dom, note in v.items() if dom and note}
+    text = json.dumps(safe, indent=2, ensure_ascii=False)
+    ts = _time.strftime('%Y%m%d-%H%M%S')
+    bak = f"{KEENETIC_DOMAIN_NOTES_FILE}.bak-{ts}"
+    # Бэкап перед записью (если файл уже есть) + запись через heredoc.
+    # busybox cp может не сработать если файла нет — || true.
+    bak_cmd = f"[ -f {KEENETIC_DOMAIN_NOTES_FILE} ] && cp {KEENETIC_DOMAIN_NOTES_FILE} {bak} || true"
+    write_cmd = (
+        f"{bak_cmd} && "
+        f"cat > {KEENETIC_DOMAIN_NOTES_FILE} <<'XKEEN_NOTES_EOF'\n"
+        f"{text}\n"
+        f"XKEEN_NOTES_EOF\n"
+    )
+    return keenetic_ssh(write_cmd, timeout=10)
+
+
+def keenetic_read_sub_meta():
+    """Читает sidecar /opt/etc/xray/subscription_meta.json.
+    Ключи = pbk (Reality publicKey, уникальный идентификатор провайдера).
+    Значения: {note, expires_at (YYYY-MM-DD), updated_at}."""
+    raw = keenetic_read_file(KEENETIC_SUB_META_FILE)
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+        return d.get("subs", {}) if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def keenetic_write_sub_meta(subs):
+    payload = {"version": 1, "subs": subs}
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    r = keenetic_ssh(f"cat > {KEENETIC_SUB_META_FILE}", stdin_data=text, timeout=10)
+    return r["ok"]
+
+
+def keenetic_set_sub_meta(pbk, **fields):
+    """Merge не-None полей для подписки с этим pbk."""
+    if not pbk:
+        return False
+    subs = keenetic_read_sub_meta()
+    entry = dict(subs.get(pbk, {}))
+    changed = False
+    for k, v in fields.items():
+        if v is None:
+            continue
+        v = v.strip() if isinstance(v, str) else v
+        if v:
+            if entry.get(k) != v:
+                entry[k] = v
+                changed = True
+        else:
+            if k in entry:
+                entry.pop(k, None)
+                changed = True
+    if not changed and pbk in subs:
+        return True
+    entry["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    subs[pbk] = entry
+    return keenetic_write_sub_meta(subs)
+
+# ============== OUTBOUND LIVENESS PROBES ==============
+# Кэш статусов outbound'ов: {tag: {"ok": bool, "ts": epoch, "host": str, "port": int, "ms": int}}
+# Probe TCP-connect с PC дашборда (<your-pc-lan-ip>) — это НЕ то же что роутер видит,
+# но даёт хороший индикатор «жив ли сервер вообще». Для accuracy от лица роутера
+# нужно было бы ходить через ssh, что медленнее и шумнее.
+_OUTBOUND_STATUS_CACHE = {}
+_OUTBOUND_STATUS_TTL = 60  # секунд — за этот период не probим повторно
+
+
+def _probe_via_router(targets, connect_timeout=4, max_time=7):
+    """TCP+TLS-handshake probe ЧЕРЕЗ РОУТЕР по SSH.
+    targets: list of (tag, host, port).
+    Возвращает {tag: (ok, ms)}.
+
+    Мерим `time_appconnect` (TCP+TLS = 2 RTT), а не `time_connect` (TCP = 1 RTT),
+    чтобы числа были ближе к тому что Happ показывает в режиме «via Proxy».
+    Happ делает 3-5 RTT (TCP + VLESS-Reality + туннелированный HTTP до gstatic),
+    мы делаем 2 RTT — числа меньше Happ примерно в 1.5-2 раза, но порядки совпадают.
+
+    Если TLS не отвечает (time_appconnect = 0), fallback на time_connect и
+    помечаем `tcp_only=1` — лучше показать TCP-only, чем FAIL.
+
+    Зачем через роутер, а не с PC: XKeen на роутере перехватывает TCP-трафик с
+    PC через redirect+tproxy iptables → handshake завершается локально на
+    роутере за ~1ms. С роутера же curl от его собственного egress, не подпадает
+    под собственные redirect правила (они для PREROUTING/forwarded traffic).
+    Получаем настоящий handshake до VPN-порта.
+
+    Все probes параллельно через `&` + `wait`. -k = ignore TLS cert (Reality
+    серверы серверы часто отвечают через fallback на nginx с обычным cert домена
+    провайдера, поэтому валидация бесполезна).
+    """
+    if not targets:
+        return {}
+    lines = ['set +e']
+    idx_to_tag = {}  # numeric index → original tag для маппинга ответа обратно
+    for i, (tag, host, port) in enumerate(targets):
+        key = str(i)  # безопасный ключ — только цифры, нет риска shell-injection
+        idx_to_tag[key] = tag
+        # Жёсткая валидация host/port чтобы не было shell injection через битый xray-config:
+        # host = только буквы/цифры/.-_  (хватает для FQDN и IPv4; IPv6 не поддержим)
+        # port = только число
+        if not re.match(r'^[A-Za-z0-9._\-]+$', str(host) or ''):
+            continue
+        try:
+            safe_port = int(port)
+            if not (1 <= safe_port <= 65535):
+                continue
+        except (TypeError, ValueError):
+            continue
+        ct = str(connect_timeout)
+        mt = str(max_time)
+        h = host
+        p = str(safe_port)
+        # Вывод: key|appconnect|connect|code
+        # Ключ — числовой индекс (не tag!): emoji/кириллика в теге ломала re.sub → все теги
+        # становились "_", Python не мог сопоставить ответ с оригинальным тегом.
+        lines.append(
+            f'( m=$(curl -ks -o /dev/null --connect-timeout {ct} --max-time {mt}'
+            f' -w "%{{time_appconnect}}|%{{time_connect}}|%{{http_code}}"'
+            f' "https://{h}:{p}/" 2>/dev/null);'
+            f' echo "{key}|$m" ) &'
+        )
+    lines.append('wait')
+    script = '\n'.join(lines)
+    r = keenetic_ssh(script, timeout=max_time + 5)
+    if not r["ok"]:
+        # SSH сам упал (LAN-разрыв, ключ, роутер ребутится) — НЕ кэшируем все как мёртвые,
+        # иначе на 60 сек UI будет врать что всё лежит. Возвращаем спец. маркер,
+        # вызывающий код оставит старые значения в кэше нетронутыми.
+        return {"__ssh_failed__": (False, None, r.get("stderr", "")[:200])}
+    out = r["stdout"]
+    parsed = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or '|' not in line:
+            continue
+        parts = line.split('|')
+        if len(parts) < 2:
+            continue
+        key = parts[0]
+        tag = idx_to_tag.get(key)
+        if tag is None:
+            continue  # неизвестный ключ — пропускаем
+        # appconnect|connect|code[|nc] (могут быть пустые если curl/nc упал)
+        try:
+            t_app = float(parts[1]) if len(parts) > 1 and parts[1] else 0.0
+            t_conn = float(parts[2]) if len(parts) > 2 and parts[2] else 0.0
+        except ValueError:
+            t_app, t_conn = 0.0, 0.0
+        is_nc = len(parts) > 4 and parts[4].strip() == 'nc'
+        if t_app > 0:
+            # Успех: TCP+TLS handshake
+            parsed[tag] = (True, int(t_app * 1000))
+        elif t_conn > 0:
+            # Только TCP (TLS не прошёл — fallback не настроен на сервере).
+            parsed[tag] = (True, int(t_conn * 1000))
+        elif is_nc:
+            # nc -z успешен: TCP-порт открыт, но TLS не отвечает (Reality без фолбэка — норма).
+            # Показываем как отдельный "tcp_nc" статус, не как ошибку.
+            parsed[tag] = ("nc", None)
+        else:
+            parsed[tag] = (False, None)
+    for tag, _, _ in targets:
+        if tag not in parsed:
+            parsed[tag] = (False, None)
+    return parsed
+
+
+def probe_outbounds(outbounds, force=False, max_workers=8):
+    """Для каждого vless-outbound делает TCP-connect параллельно. Возвращает
+    dict {tag: {ok, ms, ts}}. Использует in-memory кэш с TTL — если запись свежая,
+    не probим заново (force=True заставляет).
+
+    direct/block/freedom/blackhole — статус всегда «ok» (это локальные, не сетевые).
+    """
+    now = _time_mod.time()
+    result = {}
+    to_probe = []  # [(tag, host, port), ...]
+
+    for o in outbounds:
+        tag = o.get("tag")
+        proto = o.get("protocol")
+        if not tag:
+            continue
+        if proto in ("freedom", "blackhole"):
+            result[tag] = {"ok": True, "ms": 0, "ts": now, "kind": "local"}
+            continue
+        # Кэш свежий?
+        cached = _OUTBOUND_STATUS_CACHE.get(tag)
+        if cached and not force and (now - cached["ts"]) < _OUTBOUND_STATUS_TTL:
+            result[tag] = cached
+            continue
+        host = o.get("host")
+        port = o.get("port")
+        if not host or host in ("?", ""):
+            result[tag] = {"ok": False, "ms": None, "ts": now, "kind": "noaddr"}
+            continue
+        to_probe.append((tag, host, port))
+
+    if to_probe:
+        # Один batched SSH-вызов на роутер — все probes параллельно через bash &/wait
+        batched = _probe_via_router(to_probe)
+        # SSH сам упал — не трогаем кэш, возвращаем что было (с маркером stale если совсем нет)
+        if "__ssh_failed__" in batched:
+            err_msg = batched["__ssh_failed__"][2] if len(batched["__ssh_failed__"]) >= 3 else ""
+            for tag, host, port in to_probe:
+                stale = _OUTBOUND_STATUS_CACHE.get(tag)
+                if stale:
+                    # Помечаем что данные stale, но не перетираем как dead
+                    entry = dict(stale)
+                    entry["stale"] = True
+                    entry["ssh_error"] = err_msg
+                    result[tag] = entry
+                else:
+                    result[tag] = {"ok": None, "ms": None, "ts": now, "kind": "ssh_fail",
+                                   "host": host, "port": port, "ssh_error": err_msg}
+        else:
+            for tag, host, port in to_probe:
+                ok, ms = batched.get(tag, (False, None))
+                if ok == "nc":
+                    kind = "tcp_nc"
+                    ok = True
+                else:
+                    kind = "probe"
+                entry = {"ok": ok, "ms": ms, "ts": now, "kind": kind, "host": host, "port": port}
+                _OUTBOUND_STATUS_CACHE[tag] = entry
+                result[tag] = entry
+
+    return result
+
+
+
+def keenetic_read_meta():
+    """Читает sidecar /opt/etc/xray/outbound_meta.json.
+    Возвращает dict {tag: {provider, sub_name, sub_url, updated_at}}.
+    Файл хранит дружелюбные имена провайдера/подписки для UI — xray его не читает."""
+    raw = keenetic_read_file(KEENETIC_META_FILE)
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+        return d.get("tags", {}) if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def keenetic_write_meta(meta_tags):
+    """Сериализует и заливает meta-файл на роутер."""
+    payload = {"version": 1, "tags": meta_tags}
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    r = keenetic_ssh(f"cat > {KEENETIC_META_FILE}", stdin_data=text, timeout=10)
+    return r["ok"]
+
+
+def keenetic_set_meta(tag, **fields):
+    """Merge не-None полей для tag. Пустая строка очищает поле, None — оставляет как было."""
+    if not tag:
+        return False
+    meta = keenetic_read_meta()
+    entry = dict(meta.get(tag, {}))
+    changed = False
+    for k, v in fields.items():
+        if v is None:
+            continue
+        v = v.strip() if isinstance(v, str) else v
+        if v:
+            if entry.get(k) != v:
+                entry[k] = v
+                changed = True
+        else:
+            if k in entry:
+                entry.pop(k, None)
+                changed = True
+    if not changed and tag in meta:
+        return True
+    entry["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    meta[tag] = entry
+    return keenetic_write_meta(meta)
+
+
+def keenetic_remove_meta_entry(tag):
+    """Удалить запись meta для tag (вызывать после remove outbound)."""
+    meta = keenetic_read_meta()
+    if tag in meta:
+        meta.pop(tag, None)
+        return keenetic_write_meta(meta)
+    return True
+
+
+def keenetic_get_outbounds():
+    """Парсит 04_outbounds.json на роутере. Возвращает list[dict] или None.
+    Каждому outbound прицепляются meta-поля (provider/sub_name/sub_url) из
+    outbound_meta.json — дружелюбные имена для UI."""
+    raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
+    if not raw:
+        return None
+    try:
+        cfg_json = json.loads(_strip_json_comments(raw))
+    except Exception:
+        return None
+    outbounds = cfg_json.get("outbounds", [])
+    meta = keenetic_read_meta()
+    # Аугментируем краткой инфо для UI
+    enriched = []
+    for o in outbounds:
+        tag = o.get("tag", "?")
+        protocol = o.get("protocol", "?")
+        info = {"tag": tag, "protocol": protocol}
+        if protocol == "vless":
+            vnext = (o.get("settings", {}) or {}).get("vnext", []) or [{}]
+            v = vnext[0] if vnext else {}
+            info["host"] = v.get("address", "?")
+            info["port"] = v.get("port", 0)
+            users = v.get("users", []) or [{}]
+            user0 = users[0] if users else {}
+            info["uuid"] = user0.get("id", "")
+            info["flow"] = user0.get("flow", "")
+            ss = o.get("streamSettings", {}) or {}
+            info["network"] = ss.get("network", "?")
+            info["security"] = ss.get("security", "?")
+            rs = ss.get("realitySettings", {}) or {}
+            info["sni"] = rs.get("serverName", "")
+            info["pbk"] = rs.get("publicKey", "")
+            info["sid"] = rs.get("shortId", "")
+            info["fp"]  = rs.get("fingerprint", "")
+            # xhttp-specific
+            xs = ss.get("xhttpSettings", {}) or {}
+            info["path"] = xs.get("path", "") or (ss.get("wsSettings", {}) or {}).get("path", "")
+            info["mode"] = xs.get("mode", "")
+            info["host_hdr"] = xs.get("host", "")
+        elif protocol == "freedom":
+            info["host"] = "(direct — без VPN)"
+        elif protocol == "blackhole":
+            info["host"] = "(block — чёрная дыра)"
+        m = meta.get(tag) or {}
+        info["provider"] = m.get("provider", "")
+        info["sub_name"] = m.get("sub_name", "")
+        info["sub_url"]  = m.get("sub_url", "")
+        info["note"]     = m.get("note", "")
+        info["meta_updated_at"] = m.get("updated_at", "")
+        enriched.append(info)
+    return enriched
+
+
+def keenetic_get_routing_active():
+    """Парсит активный 05_routing.json. Возвращает dict с key default_outbound."""
+    raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/05_routing.json")
+    if not raw:
+        return None
+    # В шаблонах есть // комментарии — нужно их выкинуть для парсинга
+    cleaned = re.sub(r"^\s*//.*$", "", raw, flags=re.MULTILINE)
+    try:
+        cfg_json = json.loads(cleaned)
+    except Exception:
+        return None
+    rules = (cfg_json.get("routing", {}) or {}).get("rules", []) or []
+    # Default outbound — последнее правило без особого фильтра (обычно с inboundTag=[redirect,tproxy])
+    default_outbound = None
+    for r in rules:
+        if r.get("inboundTag") and "tproxy" in r["inboundTag"] and not r.get("domain") and not r.get("ip"):
+            default_outbound = r.get("outboundTag")
+    return {"default_outbound": default_outbound, "rules_count": len(rules)}
+
+
+def keenetic_get_watchdog():
+    """Читает watchdog.state (формат: 'primary|failover counter default_tag EFFECTIVE_AI=<tag> EFFECTIVE_YT=<tag>')
+    + последние строки watchdog.log."""
+    state_raw = keenetic_read_file(cfg.KEENETIC_WATCHDOG_STATE)
+    state = "unknown"
+    counter = 0
+    current_default = None
+    effective_ai = None
+    effective_yt = None
+    if state_raw:
+        parts = state_raw.strip().split()
+        if len(parts) >= 1:
+            state = parts[0]
+            try:
+                counter = int(parts[1]) if len(parts) >= 2 else 0
+            except ValueError:
+                counter = 0
+            if len(parts) >= 3:
+                current_default = parts[2]
+            # Парсим EFFECTIVE_AI=<tag> и EFFECTIVE_YT=<tag> из любой позиции
+            for p in parts[3:]:
+                if p.startswith("EFFECTIVE_AI="):
+                    effective_ai = p.split("=", 1)[1]
+                elif p.startswith("EFFECTIVE_YT="):
+                    effective_yt = p.split("=", 1)[1]
+    log_lines = keenetic_tail_log(cfg.KEENETIC_WATCHDOG_LOG, n=30)
+    return {
+        "state": state, "counter": counter,
+        "current_default": current_default,
+        "effective_ai": effective_ai,
+        "effective_yt": effective_yt,
+        "log": log_lines,
+    }
+
+
+def _parse_watchdog_config(raw):
+    """Парсит /opt/etc/xray/watchdog.config (shell-style KEY="value") в dict."""
+    out = {}
+    if not raw:
+        return out
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r'^(\w+)\s*=\s*"?([^"]*)"?\s*$', line)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def keenetic_read_watchdog_config():
+    """Читает /opt/etc/xray/watchdog.config с роутера."""
+    raw = keenetic_read_file("/opt/etc/xray/watchdog.config")
+    return _parse_watchdog_config(raw)
+
+
+def keenetic_get_watchdog_targets():
+    """Возвращает все поля из watchdog.config для UI: PRIMARY/FAILOVER/AI/DIRECT."""
+    cfg_d = keenetic_read_watchdog_config()
+    failover_str = cfg_d.get("FAILOVER_TAGS", "")
+    failover_list = [t.strip() for t in re.split(r"[,\s]+", failover_str) if t.strip()]
+    ai_domains_str = cfg_d.get("AI_DOMAINS", "")
+    ai_domains_list = [d.strip() for d in re.split(r"[\s,]+", ai_domains_str) if d.strip()]
+    yt_domains_str = cfg_d.get("YT_DOMAINS", "")
+    yt_domains_list = [d.strip() for d in re.split(r"[\s,]+", yt_domains_str) if d.strip()]
+    direct_domains_str = cfg_d.get("DIRECT_DOMAINS", "")
+    direct_domains_list = [d.strip() for d in re.split(r"[\s,]+", direct_domains_str) if d.strip()]
+    block_domains_str = cfg_d.get("BLOCK_DOMAINS", "")
+    block_domains_list = [d.strip() for d in re.split(r"[\s,]+", block_domains_str) if d.strip()]
+    return {
+        "primary_tag":  cfg_d.get("PRIMARY_TAG"),
+        "failover_tag": failover_list[0] if failover_list else None,
+        "failover_tags": failover_list,
+        "ai_tag":       cfg_d.get("AI_TAG"),
+        "ai_domains":   ai_domains_list,
+        "ai_ext_categories": cfg_d.get("AI_EXT_CATEGORIES", "").strip(),
+        "ai_fail_block": cfg_d.get("AI_FAIL_BLOCK", "1") == "1",
+        "yt_tag":       cfg_d.get("YT_TAG"),
+        "yt_domains":   yt_domains_list,
+        "yt_ext_categories": cfg_d.get("YT_EXT_CATEGORIES", "").strip(),
+        "yt_geoip_categories": cfg_d.get("YT_GEOIP_CATEGORIES", "").strip(),
+        "yt_fail_block": cfg_d.get("YT_FAIL_BLOCK", "1") == "1",
+        "direct_domains": direct_domains_list,
+        "block_domains":  block_domains_list,
+        "force_mode":   cfg_d.get("FORCE_MODE", "auto"),
+    }
+
+
+def _build_watchdog_config(d):
+    """Сериализует dict обратно в shell config-формат.
+    Все поля из d сохраняются (даже неизвестные) — иначе любое изменение
+    через дашборд стирает AI_DOMAINS / DIRECT_DOMAINS / etc."""
+    keys_order = [
+        "PRIMARY_TAG", "FAILOVER_TAGS",
+        "AI_TAG", "AI_DOMAINS", "AI_EXT_CATEGORIES", "AI_FAIL_BLOCK",
+        "YT_TAG", "YT_DOMAINS", "YT_EXT_CATEGORIES", "YT_GEOIP_CATEGORIES", "YT_FAIL_BLOCK",
+        "DIRECT_DOMAINS",
+        "BLOCK_DOMAINS",
+        "PRIMARY_PROBE_URL", "FAIL_THRESHOLD", "PASS_THRESHOLD",
+        "TG_BOT_TOKEN", "TG_CHAT_ID",
+        "FORCE_MODE",
+    ]
+    lines = ["# /opt/etc/xray/watchdog.config — управляется дашбордом xray-dashboard"]
+    written = set()
+    for k in keys_order:
+        v = d.get(k, "")
+        lines.append(f'{k}="{v}"')
+        written.add(k)
+    # Дописываем любые поля что были в config но не в keys_order — чтобы ничего не потерять
+    for k, v in d.items():
+        if k not in written:
+            lines.append(f'{k}="{v}"')
+    return "\n".join(lines) + "\n"
+
+
+def keenetic_write_watchdog_config(updates):
+    """Прочитать текущий watchdog.config, применить updates, залить обратно.
+    После заливки запускаем watchdog.sh — он применит изменения."""
+    cur = keenetic_read_watchdog_config()
+    # Defaults если первый раз
+    if "PRIMARY_TAG" not in cur: cur["PRIMARY_TAG"] = "vless-reality"
+    if "FAILOVER_TAGS" not in cur: cur["FAILOVER_TAGS"] = "provider-a-nl"
+    if "AI_TAG" not in cur: cur["AI_TAG"] = "provider-a-nl"
+    if "YT_TAG" not in cur: cur["YT_TAG"] = ""
+    if "YT_DOMAINS" not in cur: cur["YT_DOMAINS"] = ""
+    if "YT_FAIL_BLOCK" not in cur: cur["YT_FAIL_BLOCK"] = "0"
+    # v8 (2026-05-17): ext-категории v2fly для AI/YT — необязательны, пустые по умолчанию.
+    # Когда юзер добавляет напр. "openai anthropic" — watchdog подставит ext:geosite_v2fly.dat:openai
+    # в AI-правило 05_routing.json (вместе с ручными доменами из AI_DOMAINS).
+    if "AI_EXT_CATEGORIES" not in cur: cur["AI_EXT_CATEGORIES"] = ""
+    if "YT_EXT_CATEGORIES" not in cur: cur["YT_EXT_CATEGORIES"] = ""
+    # v1.6.0 (2026-05-18): YT_GEOIP_CATEGORIES — для IP-only приложений (Telegram Desktop, Discord).
+    # Когда юзер добавляет "telegram" — watchdog v10 сгенерит отдельное правило
+    # {"ip": ["geoip:telegram"], "outboundTag": YT_TAG} в 05_routing.json.
+    if "YT_GEOIP_CATEGORIES" not in cur: cur["YT_GEOIP_CATEGORIES"] = ""
+    if "PRIMARY_PROBE_URL" not in cur: cur["PRIMARY_PROBE_URL"] = f"https://{getattr(cfg, 'EXTERNAL_DOMAIN', None) or 'your-vpn-domain.example'}:8444/"
+    if "FAIL_THRESHOLD" not in cur: cur["FAIL_THRESHOLD"] = "2"
+    if "PASS_THRESHOLD" not in cur: cur["PASS_THRESHOLD"] = "3"
+    if "FORCE_MODE" not in cur: cur["FORCE_MODE"] = "auto"
+    cur.update(updates)
+    new_text = _build_watchdog_config(cur)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    keenetic_ssh(f"cp /opt/etc/xray/watchdog.config /opt/etc/xray/watchdog.config.bak-{ts}")
+    r = keenetic_ssh("cat > /opt/etc/xray/watchdog.config", stdin_data=new_text, timeout=10)
+    if not r["ok"]:
+        return {"ok": False, "stderr": f"write config failed: {r['stderr']}"}
+    # Сразу применяем — запускаем watchdog.sh
+    apply = keenetic_ssh("/opt/etc/xray/watchdog.sh", timeout=30)
+    return {
+        "ok": True,
+        "stdout": f"watchdog.config обновлён, watchdog.sh запущен (см. /opt/var/log/xray/watchdog.log).",
+        "apply_stderr": apply.get("stderr", "")[:500],
+    }
+
+
+def keenetic_set_watchdog_target(role, new_tag):
+    """Меняет PRIMARY_TAG / failover-головной-tag / AI_TAG в watchdog.config.
+    role: 'primary' | 'failover' | 'ai'.
+
+    При смене PRIMARY автоматически:
+    - Старый PRIMARY попадает на первую позицию FAILOVER_TAGS (как приоритетный резерв)
+    - Новый PRIMARY убирается из FAILOVER_TAGS (если был)
+    - PRIMARY_PROBE_URL переключается: vless-reality → HTTPS curl, остальные → TCP-probe (пусто)
+    """
+    if role not in ("primary", "failover", "ai", "yt"):
+        return {"ok": False, "stderr": "invalid role"}
+    cur = keenetic_read_watchdog_config()
+    failover_str = cur.get("FAILOVER_TAGS", "")
+    failover_list = [t.strip() for t in re.split(r"[,\s]+", failover_str) if t.strip()]
+
+    if role == "primary":
+        old_primary = cur.get("PRIMARY_TAG")
+        # Убираем new_tag из failover-цепочки (если он там был — он теперь PRIMARY)
+        failover_list = [t for t in failover_list if t != new_tag]
+        # Старый PRIMARY (если был и не совпадает с новым) — в начало failover
+        if old_primary and old_primary != new_tag and old_primary not in failover_list:
+            failover_list.insert(0, old_primary)
+        updates = {
+            "PRIMARY_TAG": new_tag,
+            "FAILOVER_TAGS": " ".join(failover_list),
+            "PRIMARY_PROBE_URL": f"https://{getattr(cfg, 'EXTERNAL_DOMAIN', None) or 'your-vpn-domain.example'}:8444/" if new_tag == "vless-reality" else "",
+        }
+        return keenetic_write_watchdog_config(updates)
+
+    if role == "ai":
+        # AI_TAG — sticky outbound для claude/openai (отдельно от default).
+        return keenetic_write_watchdog_config({"AI_TAG": new_tag})
+
+    if role == "yt":
+        # YT_TAG — sticky outbound для YouTube/Instagram/Discord (RU exit без рекламы).
+        return keenetic_write_watchdog_config({"YT_TAG": new_tag})
+
+    # role == "failover": ставим new_tag первым в FAILOVER_TAGS, остальные сохраняем
+    failover_list = [t for t in failover_list if t != new_tag]
+    failover_list.insert(0, new_tag)
+    return keenetic_write_watchdog_config({"FAILOVER_TAGS": " ".join(failover_list)})
+
+
+def keenetic_force_mode(mode):
+    """Принудительно поставить primary/failover/auto через watchdog.config FORCE_MODE."""
+    if mode not in ("primary", "failover", "auto"):
+        return {"ok": False, "stderr": "invalid mode"}
+    return keenetic_write_watchdog_config({"FORCE_MODE": mode})
+
+
+def keenetic_remove_outbound(tag):
+    """Удалить outbound по tag из 04_outbounds.json.
+    Защита: direct/block, и outbound который сейчас в watchdog.config (PRIMARY/FAILOVER/AI).
+    Удаление активного outbound сломало бы routing — xray не стартанул бы."""
+    if tag in ("direct", "block"):
+        return {"ok": False, "stderr": f"tag '{tag}' — служебный, не удаляется"}
+    # Проверяем активные роли
+    targets = keenetic_get_watchdog_targets()
+    if tag == targets.get("primary_tag"):
+        return {"ok": False, "stderr": f"tag '{tag}' сейчас PRIMARY. Сначала смени PRIMARY на другой outbound."}
+    if tag == targets.get("ai_tag"):
+        return {"ok": False, "stderr": f"tag '{tag}' сейчас AI-sticky. Сначала смени AI на другой outbound."}
+    if tag == targets.get("yt_tag"):
+        return {"ok": False, "stderr": f"tag '{tag}' сейчас YouTube-sticky. Сначала смени YouTube на другой outbound."}
+    if tag in (targets.get("failover_tags") or []):
+        return {"ok": False, "stderr": f"tag '{tag}' в списке FAILOVER. Сначала убери его оттуда (смени FAILOVER на другой)."}
+    raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
+    if not raw:
+        return {"ok": False, "stderr": "не смог прочитать 04_outbounds.json"}
+    try:
+        cfg_json = json.loads(_strip_json_comments(raw))
+    except Exception as ex:
+        return {"ok": False, "stderr": f"json parse: {ex}"}
+    before = len(cfg_json.get("outbounds", []))
+    cfg_json["outbounds"] = [o for o in cfg_json.get("outbounds", []) if o.get("tag") != tag]
+    after = len(cfg_json["outbounds"])
+    if after == before:
+        return {"ok": False, "stderr": f"outbound с tag='{tag}' не найден"}
+    # Бэкап на роутере + заливка через ssh+cat (entware без sftp)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    bak_cmd = f"cp {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.bak-{ts}"
+    bak = keenetic_ssh(bak_cmd)
+    if not bak["ok"]:
+        return {"ok": False, "stderr": f"backup failed: {bak['stderr']}"}
+    new_json = json.dumps(cfg_json, indent=4, ensure_ascii=False)
+    r = keenetic_ssh(f"cat > {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json",
+                     stdin_data=new_json, timeout=15)
+    if not r["ok"]:
+        # Откат
+        keenetic_ssh(f"cp {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.bak-{ts} {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
+        return {"ok": False, "stderr": f"write failed: {r['stderr']}"}
+    restart = keenetic_ssh("xkeen -restart", timeout=20)
+    if not restart["ok"]:
+        keenetic_ssh(f"cp {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.bak-{ts} {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json && xkeen -restart")
+        return {"ok": False, "stderr": f"xkeen restart failed: {restart['stderr']}"}
+    return {"ok": True, "stdout": f"Удалён outbound '{tag}'. Осталось {after}. Бэкап: 04_outbounds.json.bak-{ts}"}
+
+
+def keenetic_remove_outbounds_bulk(tags):
+    """Удалить несколько outbound'ов за одну транзакцию: один read+write+restart.
+    Защита: те же правила что и одиночное remove — direct/block нельзя, активные в watchdog нельзя.
+    Возвращает {ok, removed: [tags], skipped: {tag: reason}, stdout, stderr}."""
+    tags = [t for t in (tags or []) if t]
+    if not tags:
+        return {"ok": False, "stderr": "пустой список tags"}
+    targets = keenetic_get_watchdog_targets()
+    primary = targets.get("primary_tag")
+    ai = targets.get("ai_tag")
+    yt = targets.get("yt_tag")
+    failover_set = set(targets.get("failover_tags") or [])
+    skipped = {}
+    to_remove = []
+    for t in tags:
+        if t in ("direct", "block"):
+            skipped[t] = "служебный"
+        elif t == primary:
+            skipped[t] = "сейчас PRIMARY"
+        elif t == ai:
+            skipped[t] = "сейчас AI-sticky"
+        elif t == yt:
+            skipped[t] = "сейчас YouTube-sticky"
+        elif t in failover_set:
+            skipped[t] = "в списке FAILOVER"
+        else:
+            to_remove.append(t)
+    if not to_remove:
+        return {"ok": False, "stderr": "все теги защищены: " + "; ".join(f"{t}={r}" for t, r in skipped.items()), "skipped": skipped}
+    raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
+    if not raw:
+        return {"ok": False, "stderr": "не смог прочитать 04_outbounds.json"}
+    try:
+        cfg_json = json.loads(_strip_json_comments(raw))
+    except Exception as ex:
+        return {"ok": False, "stderr": f"json parse: {ex}"}
+    remove_set = set(to_remove)
+    before_tags = {o.get("tag") for o in cfg_json.get("outbounds", [])}
+    cfg_json["outbounds"] = [o for o in cfg_json.get("outbounds", []) if o.get("tag") not in remove_set]
+    removed_actual = [t for t in to_remove if t in before_tags]
+    for t in to_remove:
+        if t not in before_tags:
+            skipped[t] = "не найден"
+    if not removed_actual:
+        return {"ok": False, "stderr": "ни один tag не найден в 04_outbounds.json", "skipped": skipped}
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    bak_cmd = f"cp {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.bak-{ts}"
+    bak = keenetic_ssh(bak_cmd)
+    if not bak["ok"]:
+        return {"ok": False, "stderr": f"backup failed: {bak['stderr']}"}
+    new_json = json.dumps(cfg_json, indent=4, ensure_ascii=False)
+    r = keenetic_ssh(f"cat > {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json",
+                     stdin_data=new_json, timeout=15)
+    if not r["ok"]:
+        keenetic_ssh(f"cp {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.bak-{ts} {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
+        return {"ok": False, "stderr": f"write failed: {r['stderr']}", "removed": [], "skipped": skipped}
+    restart = keenetic_ssh("xkeen -restart", timeout=25)
+    if not restart["ok"]:
+        keenetic_ssh(f"cp {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.bak-{ts} {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json && xkeen -restart")
+        return {"ok": False, "stderr": f"xkeen restart failed: {restart['stderr']}", "removed": [], "skipped": skipped}
+    return {
+        "ok": True,
+        "stdout": f"Удалено {len(removed_actual)} outbound'ов. Бэкап: 04_outbounds.json.bak-{ts}",
+        "removed": removed_actual,
+        "skipped": skipped,
+    }
+
+
+def keenetic_add_outbound(payload, tag_override=None, overwrite=False):
+    """Добавить outbound через PowerShell-скрипт Add-XKeenOutbound.ps1.
+    payload — string: vless:// URL или JSON-text.
+    Возвращает {ok, stdout, stderr}."""
+    if not payload or not payload.strip():
+        return {"ok": False, "stderr": "пустой payload"}
+    # Если JSON — сохраняем в temp-файл и передаём через -JsonPath (URL может быть длиннее cmdline лимита)
+    payload = payload.strip()
+    tmp_path = None
+    args = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", cfg.ADD_XKEEN_PS1,
+    ]
+    if payload.startswith("{"):
+        # JSON — через файл
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="xkeen-add-")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            args += ["-JsonPath", tmp_path]
+        except Exception as ex:
+            return {"ok": False, "stderr": f"temp file: {ex}"}
+    elif payload.lower().startswith("vless://"):
+        args += ["-Url", payload]
+    else:
+        return {"ok": False, "stderr": "Не похоже ни на vless://, ни на JSON"}
+    if tag_override:
+        args += ["-Tag", tag_override]
+    if overwrite:
+        args += ["-OverwriteExisting"]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        return {
+            "ok": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "code": result.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "stdout": "", "stderr": "PowerShell timeout (60s)", "code": -1}
+    except Exception as ex:
+        return {"ok": False, "stdout": "", "stderr": str(ex), "code": -2}
+    finally:
+        if tmp_path:
+            try: os.unlink(tmp_path)
+            except OSError: pass
+
+
+# ============== ROUTES ==============
+@app.route("/")
+@requires_auth
+def index():
+    # "Client-only" режим: если нет локального xray (пустые MONITORED_PORTS_INFO и PROFILES) —
+    # главная страница про статусы xray/caddy бесполезна. Сразу редиректим на /xkeen.
+    # Юзеру с локальным xray (home VPN сервер) — главная показывается как раньше.
+    if not getattr(cfg, "MONITORED_PORTS_INFO", None) and not getattr(cfg, "PROFILES", None):
+        return redirect(url_for("xkeen_page"))
+    inbounds = parse_xray_config()
+    profiles = [{**p, "qr": make_qr_data_url(p["url"])} for p in cfg.PROFILES]
+    # Subscription URL — HTTPS через Caddy (на 8443) с настоящим сертом <your-home-domain>.
+    # Caddy проксирует /sub/* → 127.0.0.1:5000. Happ требует HTTPS, иначе ругается
+    # «небезопасная схема HTTP запрещена».
+    sub_url = f"https://{getattr(cfg, 'HOME_DOMAIN', None) or 'your-home-domain.example'}:8443/sub/{cfg.SUBSCRIPTION_TOKEN}"
+    sub_qr = make_qr_data_url(sub_url)
+    data = collect_dynamic_data()
+    dynamic_html = render_template_string(DYNAMIC_TEMPLATE, **data)
+    return render_template_string(
+        TEMPLATE,
+        inbounds=inbounds,
+        profiles=profiles,
+        external_ip=cfg.EXTERNAL_IP,
+        username=session.get("username", "?"),
+        dynamic_html=dynamic_html,
+        ports=data["ports"],
+        nat_forwards=data["nat_forwards"],
+        subscription_url=sub_url,
+        sub_qr=sub_qr,
+    )
+
+
+@app.route("/api/state")
+@requires_auth
+def api_state():
+    """AJAX-endpoint: возвращает HTML для блока #dynamic."""
+    data = collect_dynamic_data()
+    return render_template_string(DYNAMIC_TEMPLATE, **data)
+
+
+# ============== XKEEN ROUTES ==============
+@app.after_request
+def _xkeen_no_cache(response):
+    """Запрет кеширования для /xkeen и /api/xkeen/* — иначе браузер кеширует HTML
+    и JSON, и после рестарта дашборда юзер видит старые данные."""
+    if request.path.startswith("/xkeen") or request.path.startswith("/api/xkeen"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
+@app.errorhandler(Exception)
+def _xkeen_error_handler(ex):
+    """Catch-all для exception'ов на /xkeen и /api/xkeen/* — вместо 'Internal Server Error'
+    показываем юзеру конкретный traceback (он диагностирует или присылает разработчику)."""
+    import traceback
+    if request.path.startswith("/xkeen") or request.path.startswith("/api/xkeen"):
+        tb = traceback.format_exc()
+        # Также печатаем в stderr (попадёт в dashboard.log через Tee-Object)
+        print(f"[xkeen-error] {request.path}: {ex}\n{tb}", flush=True)
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": str(ex), "traceback": tb}), 500
+        return f"""<!doctype html><html><head><meta charset="utf-8"><title>Ошибка</title></head><body style="font-family: -apple-system, Segoe UI, sans-serif; padding: 20px; max-width: 1000px;">
+<h2>❌ Ошибка при рендеринге /xkeen</h2>
+<p><strong>Что произошло:</strong> {str(ex).replace('<','&lt;')}</p>
+<p>Скопируй traceback ниже и пришли в чат:</p>
+<pre style="background:#1e1e1e; color:#ddd; padding:14px; border-radius:6px; overflow-x:auto; font-size:0.85em; line-height:1.4;">{tb.replace('<','&lt;')}</pre>
+<p><a href="/login">← на login</a> · <a href="/xkeen">обновить</a></p>
+</body></html>""", 500
+    raise ex  # для остальных путей — поведение по умолчанию
+
+
+@app.route("/xkeen")
+@requires_auth
+def xkeen_page():
+    """Полноэкранный UI для управления xray на Кинетике."""
+    # Quick-fail: если SSH-порт роутера недоступен (роутер выключен / не настроен /
+    # вне сети), пропускаем все SSH-вызовы — иначе страница висит 30+ секунд на
+    # таймаутах. Welcome-баннер подскажет юзеру что делать.
+    # Все поля должны быть заполнены дефолтами т.к. в шаблоне есть `|tojson` filter
+    # который падает на jinja Undefined.
+    if not is_keenetic_reachable():
+        outbounds = []
+        routing = {"default_outbound": None}
+        watchdog = {
+            "state": "unknown",
+            "counter": 0,
+            "current_default": None,
+            "effective_ai": None,
+            "effective_yt": None,
+        }
+        targets = {
+            "primary_tag": None,
+            "failover_tag": None,
+            "ai_tag": None,
+            "yt_tag": None,
+            "failover_tags": [],
+            "ai_fail_block": None,
+            "yt_fail_block": None,
+            "ai_domains": [],
+            "ai_ext_categories": "",
+            "yt_domains": [],
+            "yt_ext_categories": "",
+            "yt_geoip_categories": "",
+            "direct_domains": [],
+            "block_domains": [],
+            "force_mode": "auto",
+        }
+    else:
+        outbounds = keenetic_get_outbounds() or []
+        routing = keenetic_get_routing_active() or {}
+        watchdog = keenetic_get_watchdog() or {}
+        targets = keenetic_get_watchdog_targets() or {}
+    active_outbound = routing.get("default_outbound")
+    primary_tag = targets.get("primary_tag")
+    failover_tag = targets.get("failover_tag")
+    ai_tag = targets.get("ai_tag")
+    yt_tag = targets.get("yt_tag")
+    failover_tags = targets.get("failover_tags") or []
+    # Статусы outbound'ов — НЕ probим автоматически (это шум на серверах
+    # провайдеров + лаг рендера ~3 сек). Берём только из кэша. Если кэш пуст
+    # (свежий рестарт дашборда или 60s TTL истёк) — UI покажет «⚪ нажми кнопку».
+    # Force-probe только по кнопке «🔄 Проверить статус» (api_xkeen_probe_status).
+    now_epoch = _time_mod.time()
+    statuses = {}
+    for o in outbounds:
+        tag = o.get("tag")
+        proto = o.get("protocol")
+        if proto in ("freedom", "blackhole"):
+            statuses[tag] = {"ok": True, "ms": 0, "kind": "local"}
+            continue
+        cached = _OUTBOUND_STATUS_CACHE.get(tag)
+        if cached and (now_epoch - cached["ts"]) < _OUTBOUND_STATUS_TTL:
+            statuses[tag] = cached
+    # Ключевые слова для эвристики «anti-DPI / DPI-обход маскировкой».
+    # ВАЖНО: чисто-RU keyword'ы (🇷🇺, россия, ростелеком/мтс/билайн/мегафон/теле2) НЕ относятся
+    # к anti-DPI — это просто RU-exit, помечается отдельным is_ru. Обход = либо SNI≠host
+    # (реальная маскировка), либо явные «обход / антиглушилк / whitelist / тспу / ркн».
+    # Синхронизировано с api_xkeen_subscription_preview() — при добавлении правь оба места.
+    _ANTI_DPI_KW = (
+        "обход", "антиглушилк", "анти-глушилк", "antidpi", "anti-dpi",
+        "белые списки", "белый список", "whitelist",
+        "тспу", "tspu", "ркн",
+    )
+    for o in outbounds:
+        o["is_default"] = (o["tag"] == active_outbound)
+        o["is_primary"]  = (o["tag"] == primary_tag)
+        o["is_failover"] = (o["tag"] == failover_tag)
+        o["is_ai"]       = (o["tag"] == ai_tag)
+        o["is_yt"]       = (o["tag"] == yt_tag)
+        o["in_failover_chain"] = (o["tag"] in failover_tags)
+        st = statuses.get(o["tag"], {})
+        o["status_ok"]   = st.get("ok")
+        o["status_ms"]   = st.get("ms")
+        o["status_kind"] = st.get("kind", "")
+        # is_anti_dpi: эвристика для UI-предупреждения при назначении AI/PRIMARY ролей.
+        # См. memory/vpn_provider_device_limits.md раздел про RU-exit + AI блокировки.
+        host = ""
+        sni = ""
+        if o.get("protocol") == "vless":
+            vn = (o.get("settings", {}) or {}).get("vnext", [{}])
+            if vn:
+                host = (vn[0] or {}).get("address", "") or ""
+            ss = o.get("streamSettings", {}) or {}
+            if ss.get("security") == "reality":
+                sni = (ss.get("realitySettings", {}) or {}).get("serverName", "") or ""
+            elif ss.get("security") == "tls":
+                sni = (ss.get("tlsSettings", {}) or {}).get("serverName", "") or ""
+        sni_cam = bool(sni and host and sni != host and not host.endswith("." + sni) and not sni.endswith("." + host))
+        tag_lower = (o.get("tag") or "").lower()
+        kw_hit = any(kw in tag_lower for kw in _ANTI_DPI_KW)
+        o["is_anti_dpi"] = sni_cam or kw_hit
+        # is_inactive: vless-outbound который никуда не маршрутизируется (свободный).
+        # Используется в UI для тусклой подсветки строки в таблице outbound'ов.
+        o["is_inactive"] = (
+            o["protocol"] == "vless"
+            and not o["is_default"]
+            and not o["is_primary"]
+            and not o["is_failover"]
+            and not o["is_ai"]
+            and not o["is_yt"]
+            and not o["in_failover_chain"]
+        )
+    # Только vless-outbounds можно выбрать как primary/failover
+    vless_tags = [o["tag"] for o in outbounds if o["protocol"] == "vless"]
+    # «direct» (freedom-outbound) — валидный target для PRIMARY/FAILOVER/AI/YT ролей
+    # (режим «всё напрямую без VPN, только sticky-каналы через VPN»).
+    if any(o.get("tag") == "direct" and o.get("protocol") == "freedom" for o in outbounds):
+        vless_tags.append("direct")
+    # Множество anti-DPI tag'ов для JS-предупреждения при назначении AI-роли через dropdown.
+    # Передаётся в шаблон отдельным списком.
+    anti_dpi_tags = [o["tag"] for o in outbounds if o.get("is_anti_dpi")]
+    # Метаинформация для подсказок под dropdown'ами (host:port/network/security)
+    def _short(s, n=8):
+        s = s or ""
+        return s if len(s) <= n + 2 else s[:n] + "…"
+    import socket as _socket
+    _ip_cache = {}
+    def _resolve(host):
+        if not host or host in ("?", ""): return ""
+        # Уже IP?
+        try:
+            _socket.inet_aton(host)
+            return host
+        except OSError:
+            pass
+        if host in _ip_cache: return _ip_cache[host]
+        try:
+            _socket.setdefaulttimeout(1.5)
+            ip = _socket.gethostbyname(host)
+        except Exception:
+            ip = ""
+        _ip_cache[host] = ip
+        return ip
+    vless_meta = {
+        o["tag"]: {
+            "protocol": o.get("protocol") or "",
+            "host": o.get("host") or "",
+            "port": o.get("port") or "",
+            "target_ip": _resolve(o.get("host")),
+            "network": o.get("network") or "",
+            "security": o.get("security") or "",
+            "sni": o.get("sni") or "",
+            "flow": o.get("flow") or "",
+            "uuid_short": _short(o.get("uuid"), 8),
+            "uuid": o.get("uuid") or "",
+            "pbk_short": _short(o.get("pbk"), 10),
+            "pbk": o.get("pbk") or "",
+            "sid": o.get("sid") or "",
+            "fp": o.get("fp") or "",
+            "path": o.get("path") or "",
+            "mode": o.get("mode") or "",
+            "host_hdr": o.get("host_hdr") or "",
+            "status_ok": o.get("status_ok"),
+            "status_ms": o.get("status_ms"),
+            "status_kind": o.get("status_kind") or "",
+        }
+        for o in outbounds if o["protocol"] == "vless"
+    }
+    # Сортировка для секции «Цепочка FAILOVER»:
+    # 1. PRIMARY — первой строкой как read-only (видно что есть, но изменить нельзя)
+    # 2. Отмеченные в цепочке — в порядке как в FAILOVER_TAGS
+    # 3. Не отмеченные — в конце, в порядке как в 04_outbounds.json
+    primary_row = [o for o in outbounds if o["protocol"] == "vless" and o["tag"] == primary_tag]
+    in_chain = [o for o in outbounds if o["protocol"] == "vless" and o["tag"] != primary_tag and o["tag"] in failover_tags]
+    in_chain.sort(key=lambda o: failover_tags.index(o["tag"]))
+    not_in_chain = [o for o in outbounds if o["protocol"] == "vless" and o["tag"] != primary_tag and o["tag"] not in failover_tags]
+    chain_outbounds = primary_row + in_chain + not_in_chain
+
+    # === Автогруппировка outbound'ов ===
+    # ПРИОРИТЕТ 1: общий `sub_url` в outbound_meta (если sync через подписку прописал).
+    #   Это покрывает провайдеров типа Provider B с разными pbk/SNI на каждом сервере.
+    # ПРИОРИТЕТ 2 (fallback): `(pbk, sni)` Reality identity.
+    #   Это покрывает провайдеров типа Provider A где все серверы делят один pbk + SNI.
+    # ПРИОРИТЕТ 3: orphan-<tag> если ни sub_url ни pbk нет.
+    groups_dict = {}
+    SERVICE_GROUP = "__service__"
+    for o in outbounds:
+        if o["protocol"] != "vless":
+            key = SERVICE_GROUP
+        else:
+            sub_url = (o.get("sub_url") or "").strip()
+            pbk = o.get("pbk", "") or ""
+            sni = o.get("sni", "") or ""
+            if sub_url:
+                key = ("sub_url", sub_url)
+            elif pbk:
+                key = ("pbk_sni", pbk, sni)
+            else:
+                key = ("orphan", o["tag"])
+        groups_dict.setdefault(key, []).append(o)
+
+    def _group_name(items, key):
+        """Подобрать имя группы по приоритету:
+        provider из meta (legacy) → host из sub_url (если группа sub_url-based)
+        → общий префикс tag → pbk[:8]."""
+        # 1. Provider из meta legacy (для back-compat)
+        for it in items:
+            p = it.get("provider", "").strip()
+            if p:
+                return p
+        # 2. Если группа по sub_url — выводим host из URL
+        if isinstance(key, tuple) and len(key) >= 2 and key[0] == "sub_url":
+            try:
+                from urllib.parse import urlparse
+                host = urlparse(key[1]).netloc
+                if host:
+                    # provider-b.ru → Provider B; sub.provider-b.ru → Sub.provider-b
+                    parts = host.split(".")
+                    base = parts[-2] if len(parts) >= 2 else parts[0]
+                    return base.capitalize()
+            except Exception:
+                pass
+        # 3. Общий префикс tag до '-'
+        tags = [it["tag"] for it in items if it.get("protocol") == "vless"]
+        if tags:
+            prefixes = [t.split("-")[0] for t in tags if "-" in t]
+            if prefixes and len(set(prefixes)) == 1:
+                return prefixes[0].upper()
+        # 4. pbk[:8]
+        pbk = items[0].get("pbk", "") if items else ""
+        if pbk:
+            return f"Reality {pbk[:8]}…"
+        return "Без имени"
+
+    sub_meta_all = keenetic_read_sub_meta()
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    def _days_until(date_str):
+        try:
+            d_target = datetime.strptime(date_str, "%Y-%m-%d")
+            d_now = datetime.strptime(today_iso, "%Y-%m-%d")
+            return (d_target - d_now).days
+        except Exception:
+            return None
+
+    outbound_groups = []
+    for key, items in groups_dict.items():
+        if key == SERVICE_GROUP:
+            outbound_groups.append({
+                "name": "Служебные (без VPN)",
+                "key": "service",
+                "pbk": "",
+                "pbk_short": "",
+                "sni": "",
+                "count": len(items),
+                "outbounds": items,
+                "any_active": False,
+                "sub_note": "",
+                "sub_expires_at": "",
+                "sub_days_left": None,
+                "sub_url": "",
+            })
+        else:
+            # Определяем "canonical key" группы — используется как ключ в subscription_meta
+            # и передаётся в JS как data-pbk (поле сохранило старое имя для back-compat)
+            if isinstance(key, tuple):
+                if key[0] == "sub_url":
+                    canonical_key = key[1]  # сам URL
+                    pbk_display = items[0].get("pbk", "") or ""  # для tooltip берём первый pbk
+                    sni_display = items[0].get("sni", "") or ""
+                elif key[0] == "pbk_sni":
+                    canonical_key = key[1]  # сам pbk
+                    pbk_display = key[1]
+                    sni_display = key[2] if len(key) > 2 else ""
+                else:  # orphan
+                    canonical_key = key[1]
+                    pbk_display = ""
+                    sni_display = ""
+            else:
+                canonical_key = str(key)
+                pbk_display = ""
+                sni_display = ""
+
+            any_active = any(it.get("is_primary") or it.get("is_failover") or it.get("is_ai") or it.get("in_failover_chain") for it in items)
+            sub_m = sub_meta_all.get(canonical_key, {}) if canonical_key else {}
+            # Ручное имя группы из subscription_meta.json имеет приоритет над автоопределением.
+            # Пример: автоимя по hostname `sub.provider-d.com` → "Routerwb", но провайдер себя
+            # называет "Provider C" — юзер вбивает кастом через модалку ✏️ Подписка.
+            custom_name = (sub_m.get("name") or "").strip()
+            name = custom_name if custom_name else _group_name(items, key)
+            expires = sub_m.get("expires_at", "")
+            days_left = _days_until(expires) if expires else None
+            # Прокидываем expires per-outbound в группе — нужно для badge «⏳ истекла» в таблице
+            # outbound'ов (иначе видно только в шапке группы и теряется в длинном списке).
+            for _it in items:
+                _it["sub_expires_at"] = expires
+                _it["sub_days_left"] = days_left
+                _it["sub_expired"] = (days_left is not None and days_left < 0)
+                _it["sub_expires_soon"] = (days_left is not None and 0 <= days_left <= 3)
+            # Если sub_url не в sub_meta, но группа sub_url-based — берём из ключа
+            group_sub_url = sub_m.get("sub_url", "")
+            if not group_sub_url and isinstance(key, tuple) and key[0] == "sub_url":
+                group_sub_url = key[1]
+            inactive_tags = [it["tag"] for it in items if it.get("is_inactive")]
+            outbound_groups.append({
+                "name": name,
+                "custom_name": custom_name,  # пусто = используется auto-имя; иначе override
+                "key": f"grp-{abs(hash(canonical_key)) % 10**8}",
+                "pbk": canonical_key,  # canonical key для sub_meta API (sub_url ИЛИ pbk)
+                "pbk_short": (pbk_display[:10] + "…") if pbk_display else (canonical_key[:30] + "…" if len(canonical_key) > 30 else canonical_key),
+                "sni": sni_display,
+                "count": len(items),
+                "outbounds": items,
+                "any_active": any_active,
+                "sub_note": sub_m.get("note", ""),
+                "sub_expires_at": expires,
+                "sub_days_left": days_left,
+                "sub_url": group_sub_url,
+                "inactive_tags": inactive_tags,
+                "inactive_count": len(inactive_tags),
+            })
+    # Сортируем: vless-группы по убыванию any_active+count, служебные в конец
+    outbound_groups.sort(key=lambda g: (g["name"] == "Служебные (без VPN)", -int(g["any_active"]), -g["count"], g["name"]))
+
+    # Прикрепляем group_name + color_idx к каждому outbound dict — chain_outbounds
+    # содержит те же объекты, поэтому изменения видны и там
+    for idx, _g in enumerate(outbound_groups):
+        for o in _g["outbounds"]:
+            o["group_name"] = _g["name"]
+            o["group_color_idx"] = idx % 6  # ротация 6 цветов
+            o["group_pbk_short"] = _g.get("pbk_short", "")
+
+    # Дополняем vless_meta информацией о группе/цвете подписки —
+    # для рендера заголовка info-блока (имя канала + бейдж подписки) и для
+    # подсветки фона <select> цветом группы выбранной опции (через JS).
+    _GROUP_BG = ["#ecf6ed", "#e8eef8", "#f8efe5", "#f3ebdf", "#f0e8f5", "#f7e9e9"]
+    for o in outbounds:
+        if o.get("protocol") == "vless" and o["tag"] in vless_meta:
+            vless_meta[o["tag"]]["group_name"] = o.get("group_name", "")
+            vless_meta[o["tag"]]["group_bg"] = _GROUP_BG[(o.get("group_color_idx", 0)) % 6]
+            vless_meta[o["tag"]]["is_anti_dpi"] = bool(o.get("is_anti_dpi"))
+            # Дата истечения подписки + дни (для бейджа в info-header)
+            vless_meta[o["tag"]]["sub_expires_at"] = o.get("sub_expires_at", "") or ""
+            vless_meta[o["tag"]]["sub_days_left"] = o.get("sub_days_left")
+
+    # vless_options — единый список для всех 4 dropdown'ов (PRIMARY/FAILOVER/AI/YT).
+    # Каждая опция несёт: tag, group_name (имя подписки), is_anti_dpi (DPI-обход маскировкой),
+    # is_ru (RU-exit по флагу/префиксу/RU-оператору в имени). Используется в макросе шаблона.
+    # is_ru: явный RU-exit — флаг 🇷🇺, префикс ru_/ru-, _ru_ в середине, или RU-оператор/слово
+    # в имени (россия/russia/ростелеком/мтс/билайн/мегафон/теле2). Это НЕ anti-DPI само по себе —
+    # просто RU exit-IP, важно для YT (без рекламы) и опасно для AI (геоблокировка).
+    _RU_KW = (
+        "россия", "russia",
+        "ростелеком", "rostelecom",
+        "мтс", "билайн", "beeline", "мегафон", "megafon", "теле2", "tele2",
+    )
+    vless_options = []
+    # Виртуальная опция «🌐 Напрямую без VPN» — выбирает встроенный freedom-outbound
+    # (tag="direct" в 04_outbounds.json, стандарт XKeen). При назначении в PRIMARY весь
+    # трафик идёт через провайдера минуя VPN — режим «работа/гость, разблокируем только AI/YT».
+    # Watchdog probe против direct всегда успешен (это локальный freedom, не падает).
+    _has_direct_outbound = any(o.get("tag") == "direct" and o.get("protocol") == "freedom" for o in outbounds)
+    if _has_direct_outbound:
+        vless_options.append({
+            "tag": "direct",
+            "group_name": "🌐 Системные (не VPN)",
+            "group_color_idx": 99,
+            "is_anti_dpi": False,
+            "is_ru": False,
+            "is_direct": True,  # пометка для UI чтобы показать особый стиль/предупреждения
+        })
+    for o in outbounds:
+        if o["protocol"] != "vless":
+            continue
+        tag = o["tag"]
+        tag_lower = tag.lower()
+        is_ru = (
+            "🇷🇺" in tag
+            or tag_lower.startswith("ru_")
+            or tag_lower.startswith("ru-")
+            or "_ru_" in tag_lower
+            or any(kw in tag_lower for kw in _RU_KW)
+        )
+        vless_options.append({
+            "tag": tag,
+            "group_name": o.get("group_name", "") or "",
+            "group_color_idx": o.get("group_color_idx", 0),
+            "is_anti_dpi": bool(o.get("is_anti_dpi")),
+            "is_ru": is_ru,
+            "is_direct": False,
+        })
+
+    # vless_option_groups — vless_options сгруппированы по подписке для рендера optgroup'ами.
+    # Порядок групп = такой же как в outbound_groups (отсортирован по any_active+count).
+    # Цвет — лёгкий фон под каждой опцией (те же 6 цветов что в Цепочке FAILOVER).
+    GROUP_BG_COLORS = ["#ecf6ed", "#e8eef8", "#f8efe5", "#f3ebdf", "#f0e8f5", "#f7e9e9"]
+    DIRECT_GROUP_NAME = "🌐 Системные (не VPN)"
+    _by_name = {}
+    for opt in vless_options:
+        _by_name.setdefault(opt["group_name"] or "Без подписки", []).append(opt)
+    vless_option_groups = []
+    _seen = set()
+    # «🌐 Системные» — всегда первой в списке (чтобы direct был наверху dropdown'а)
+    if DIRECT_GROUP_NAME in _by_name:
+        vless_option_groups.append({
+            "name": DIRECT_GROUP_NAME,
+            "color_idx": 99,
+            "bg": "#fff5e6",  # пастельный оранжевый — отличается от VPN-групп
+            "options": _by_name[DIRECT_GROUP_NAME],
+        })
+        _seen.add(DIRECT_GROUP_NAME)
+    for _g in outbound_groups:
+        gname = _g["name"]
+        if gname in _by_name and gname not in _seen:
+            vless_option_groups.append({
+                "name": gname,
+                "color_idx": _g.get("outbounds", [{}])[0].get("group_color_idx", 0) if _g.get("outbounds") else 0,
+                "bg": GROUP_BG_COLORS[(_g.get("outbounds", [{}])[0].get("group_color_idx", 0) if _g.get("outbounds") else 0) % 6],
+                "options": _by_name[gname],
+            })
+            _seen.add(gname)
+    # Хвост — группы которые не попали (теоретически не должно быть, но safety)
+    for gname, opts in _by_name.items():
+        if gname not in _seen:
+            vless_option_groups.append({
+                "name": gname, "color_idx": 0,
+                "bg": GROUP_BG_COLORS[0],
+                "options": opts,
+            })
+
+    # Уникальные subscription URLs из sub_meta (group-level) для dropdown «Сохранённый URL»
+    # Берём из subscription_meta — там URL хранится один на подписку (по pbk), без дублей
+    sub_urls_to_groups = {}  # url → список (group_name, count)
+    for g in outbound_groups:
+        u = (g.get("sub_url") or "").strip()
+        if not u:
+            continue
+        sub_urls_to_groups.setdefault(u, []).append({"name": g["name"], "count": g["count"]})
+
+    def _url_short_label(url):
+        try:
+            from urllib.parse import urlparse
+            return urlparse(url).netloc or url[:40]
+        except Exception:
+            return url[:40]
+
+    saved_sub_urls = [
+        {"url": u, "label": _url_short_label(u),
+         "groups": [grp["name"] for grp in groups],
+         "tags": []}  # tags оставлено для back-compat шаблона
+        for u, groups in sub_urls_to_groups.items()
+    ]
+    # Первый запуск / роутер недоступен — outbounds пуст, показываем welcome-баннер
+    is_first_run = (len(outbounds) == 0)
+    # Client-only режим — главная страница про локальный xray бесполезна (редиректит на /xkeen).
+    # В этом режиме ссылка «← дашборд» в шапке /xkeen ведёт обратно сюда — скрываем её.
+    is_client_only = (not getattr(cfg, "MONITORED_PORTS_INFO", None)
+                      and not getattr(cfg, "PROFILES", None))
+    # v1.7.0: примечания к доменам из sidecar JSON. Если роутер недоступен или файла нет —
+    # возвращается пустая структура (4 пустых namespace), UI работает как раньше.
+    try:
+        domain_notes = keenetic_read_domain_notes()
+    except Exception:
+        domain_notes = {"ai": {}, "yt": {}, "direct": {}, "block": {}}
+    return render_template_string(
+        XKEEN_TEMPLATE,
+        outbounds=outbounds,
+        chain_outbounds=chain_outbounds,
+        outbound_groups=outbound_groups,
+        routing=routing,
+        watchdog=watchdog,
+        targets=targets,
+        vless_tags=vless_tags,
+        vless_options=vless_options,
+        vless_option_groups=vless_option_groups,
+        anti_dpi_tags_set=set(anti_dpi_tags),
+        anti_dpi_tags_json=json.dumps(anti_dpi_tags, ensure_ascii=False),
+        vless_meta_json=json.dumps(vless_meta),
+        saved_sub_urls=saved_sub_urls,
+        username=session.get("username", "?"),
+        keenetic_settings=get_keenetic_settings_merged(),
+        is_first_run=is_first_run,
+        is_client_only=is_client_only,
+        dashboard_version=get_dashboard_version(),
+        domain_notes_json=json.dumps(domain_notes, ensure_ascii=False),  # v1.7.0
+        cfg=cfg,  # доступ к EXTERNAL_DOMAIN/HOME_DOMAIN/LAN_HOST из config_local в шаблонах
+    )
+
+
+@app.route("/api/xkeen/state")
+@requires_auth
+def api_xkeen_state():
+    """JSON со свежим состоянием Кинетика (для AJAX-refresh)."""
+    outbounds = keenetic_get_outbounds() or []
+    routing = keenetic_get_routing_active() or {}
+    watchdog = keenetic_get_watchdog() or {}
+    return jsonify({
+        "outbounds": outbounds,
+        "routing": routing,
+        "watchdog": watchdog,
+    })
+
+
+@app.route("/api/xkeen/add", methods=["POST"])
+@requires_auth
+def api_xkeen_add():
+    """Добавить outbound. Тело: form-data {payload, tag, overwrite, sub_url, note}.
+    sub_url + note — meta-поля для UI, пишутся в outbound_meta.json (xray их не читает)."""
+    payload = request.form.get("payload", "")
+    tag = request.form.get("tag", "").strip() or None
+    overwrite = request.form.get("overwrite") == "1"
+    sub_url  = request.form.get("sub_url", "").strip()
+    note     = request.form.get("note", "").strip()
+    result = keenetic_add_outbound(payload, tag_override=tag, overwrite=overwrite)
+    if result.get("ok") and (sub_url or note):
+        effective_tag = tag
+        if not effective_tag:
+            mm = re.search(r"tag[:\s=]+([A-Za-z0-9_\-]+)", result.get("stdout", "") or "")
+            if mm:
+                effective_tag = mm.group(1)
+        if effective_tag:
+            keenetic_set_meta(effective_tag, sub_url=sub_url, note=note)
+    return jsonify(result)
+
+
+@app.route("/api/xkeen/remove", methods=["POST"])
+@requires_auth
+def api_xkeen_remove():
+    """Удалить outbound по tag."""
+    tag = request.form.get("tag", "").strip()
+    if not tag:
+        return jsonify({"ok": False, "stderr": "tag не передан"})
+    result = keenetic_remove_outbound(tag)
+    if result.get("ok"):
+        keenetic_remove_meta_entry(tag)
+        # Чистим кэш probe-статуса чтобы не утекала память за месяцы работы
+        _OUTBOUND_STATUS_CACHE.pop(tag, None)
+    return jsonify(result)
+
+
+@app.route("/api/xkeen/remove-bulk", methods=["POST"])
+@requires_auth
+def api_xkeen_remove_bulk():
+    """Удалить несколько outbound'ов одной транзакцией.
+    Body: tags = newline или comma-separated список тегов."""
+    raw_tags = request.form.get("tags", "")
+    tags = [t.strip() for t in raw_tags.replace(",", "\n").splitlines() if t.strip()]
+    if not tags:
+        return jsonify({"ok": False, "stderr": "tags не переданы"})
+    result = keenetic_remove_outbounds_bulk(tags)
+    for t in result.get("removed", []) or []:
+        keenetic_remove_meta_entry(t)
+        _OUTBOUND_STATUS_CACHE.pop(t, None)
+    return jsonify(result)
+
+
+@app.route("/api/xkeen/probe-status", methods=["POST", "GET"])
+@requires_auth
+def api_xkeen_probe_status():
+    """Force-probe всех outbound'ов (игнорирует TTL кэша). Возвращает {tag: {ok, ms, kind}}.
+    Используется кнопкой «🔄 Проверить статус» — пользователь хочет видеть актуальное состояние."""
+    outbounds = keenetic_get_outbounds() or []
+    force = request.args.get("force", "1") == "1"
+    statuses = probe_outbounds(outbounds, force=force)
+    return jsonify({"ok": True, "statuses": statuses})
+
+
+@app.route("/api/xkeen/meta", methods=["POST"])
+@requires_auth
+def api_xkeen_meta():
+    """Сохранить дружелюбные имена для outbound.
+    Body: tag, provider, sub_name, sub_url (любые из последних трёх — опционально).
+    Пустая строка очищает поле. None/отсутствие — оставляет как было."""
+    tag = request.form.get("tag", "").strip()
+    if not tag:
+        return jsonify({"ok": False, "stderr": "tag не передан"})
+    fields = {}
+    for k in ("provider", "sub_name", "sub_url", "note"):
+        if k in request.form:
+            fields[k] = request.form.get(k, "")
+    if not fields:
+        return jsonify({"ok": False, "stderr": "нет полей для сохранения"})
+    ok = keenetic_set_meta(tag, **fields)
+    return jsonify({"ok": ok, "stdout": "Сохранено" if ok else "", "stderr": "" if ok else "write failed"})
+
+
+@app.route("/api/xkeen/sub-meta", methods=["POST"])
+@requires_auth
+def api_xkeen_sub_meta():
+    """Сохранить метаданные подписки (на уровне группы). Ключ = pbk.
+    Body: pbk, note, expires_at (любые опциональные)."""
+    pbk = request.form.get("pbk", "").strip()
+    if not pbk:
+        return jsonify({"ok": False, "stderr": "pbk не передан"})
+    fields = {}
+    for k in ("note", "expires_at", "sub_url", "name"):
+        if k in request.form:
+            fields[k] = request.form.get(k, "")
+    if not fields:
+        return jsonify({"ok": False, "stderr": "нет полей для сохранения"})
+    ok = keenetic_set_sub_meta(pbk, **fields)
+    return jsonify({"ok": ok, "stdout": "Сохранено" if ok else "", "stderr": "" if ok else "write failed"})
+
+
+@app.route("/api/xkeen/watchdog/<mode>", methods=["POST"])
+@requires_auth
+def api_xkeen_watchdog(mode):
+    """Принудительно: primary / failover / auto."""
+    result = keenetic_force_mode(mode)
+    return jsonify(result)
+
+
+@app.route("/api/xkeen/debug")
+@requires_auth
+def api_xkeen_debug():
+    """Debug: SSH + parse результаты + raw watchdog.config + targets dict."""
+    import sys, os
+    info = {
+        "pid": os.getpid(),
+        "user": os.environ.get("USERNAME", "?"),
+        "ssh_key_path": cfg.KEENETIC_SSH_KEY,
+        "ssh_key_exists": os.path.exists(cfg.KEENETIC_SSH_KEY),
+    }
+    r = keenetic_ssh("echo HELLO_FROM_KEENETIC", timeout=10)
+    info["test_echo"] = r
+    raw_cfg = keenetic_read_file("/opt/etc/xray/watchdog.config")
+    info["watchdog_config_raw_len"] = len(raw_cfg) if raw_cfg else 0
+    info["watchdog_config_raw"] = raw_cfg or "(empty/None)"
+    info["watchdog_config_parsed"] = _parse_watchdog_config(raw_cfg)
+    info["targets"] = keenetic_get_watchdog_targets()
+    info["watchdog_state_raw"] = keenetic_read_file(cfg.KEENETIC_WATCHDOG_STATE) or "(empty)"
+    info["watchdog_state_parsed"] = keenetic_get_watchdog()
+    return jsonify(info)
+
+
+# ============== HEADER STATUS (v1.7.19) ==============
+# Лёгкий статус xray для индикатора в шапке. Server-side cache 30 сек —
+# чтобы N открытых вкладок дашборда не давили роутер N запросами в минуту,
+# а делали один SSH на всех. Polling с фронта раз в 60 сек.
+_HEADER_STATUS_CACHE = {"ts": 0, "data": None}
+
+@app.route("/api/xkeen/header-status", methods=["GET"])
+@requires_auth
+def api_xkeen_header_status():
+    """Состояние xray для индикатора в шапке (compact, кэш 30s).
+
+    Возвращает:
+      state: ok|warn|error|stopped|unreachable
+      label: текст для бейджа («xray TPROXY · vless-reality»)
+      tooltip: подробности при hover
+      active_tag: текущий PRIMARY-tag (из watchdog.state)
+      mode: TPROXY|Mixed|Redirect|unknown
+      running: bool
+      has_error: bool — есть свежие ошибки в error.log
+    """
+    import time as _time
+    now = _time.time()
+    if _HEADER_STATUS_CACHE["data"] and (now - _HEADER_STATUS_CACHE["ts"] < 30):
+        return jsonify(_HEADER_STATUS_CACHE["data"])
+
+    ansi_re = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+
+    # Объединённая команда — 1 SSH на 3 проверки (быстрее чем 3 отдельных вызова)
+    r = keenetic_ssh(
+        'echo "===STATUS==="; xkeen -status 2>&1 | head -10; '
+        'echo "===ERROR==="; tail -3 /opt/var/log/xray/error.log 2>/dev/null | tail -3; '
+        'echo "===STATE==="; cat /opt/etc/xray/watchdog.state 2>/dev/null',
+        timeout=8,
+    )
+
+    if not r["ok"]:
+        result = {
+            "ok": False, "state": "unreachable",
+            "label": "роутер недоступен",
+            "tooltip": "SSH timeout. " + (r.get("stderr") or "")[:200],
+            "active_tag": "", "mode": "unknown",
+            "running": False, "has_error": False,
+        }
+        _HEADER_STATUS_CACHE.update({"ts": now, "data": result})
+        return jsonify(result)
+
+    stdout = ansi_re.sub("", r.get("stdout", "") or "")
+    parts = {"status": "", "error": "", "state": ""}
+    cur = None
+    for line in stdout.splitlines():
+        if line.strip() == "===STATUS===": cur = "status"; continue
+        if line.strip() == "===ERROR===":  cur = "error";  continue
+        if line.strip() == "===STATE===":  cur = "state";  continue
+        if cur: parts[cur] += line + "\n"
+
+    status_text = parts["status"].strip()
+    error_text = parts["error"].strip()
+    state_text = parts["state"].strip()
+
+    running = "запущен" in status_text and "не запущен" not in status_text
+    # Mode из status (в порядке приоритета)
+    mode = "unknown"
+    if "TPROXY" in status_text and "Mixed" not in status_text:
+        mode = "TPROXY"
+    elif "Mixed" in status_text:
+        mode = "Mixed"
+    elif "Redirect" in status_text:
+        mode = "Redirect"
+
+    # Active tag из watchdog.state: формат "primary 0 vless-reality EFFECTIVE_AI=..."
+    active_tag = ""
+    if state_text:
+        fields = state_text.split()
+        if len(fields) >= 3:
+            active_tag = fields[2]
+
+    # Ошибки в error.log за последние 3 строки
+    has_error = bool(re.search(r'failed to load|cannot find|panic:|fatal', error_text, re.IGNORECASE))
+
+    # Классификация
+    if not running:
+        result = {
+            "ok": True, "state": "stopped",
+            "label": "xray НЕ запущен",
+            "tooltip": (error_text or "xray-процесс не работает")[:400],
+        }
+    elif has_error:
+        result = {
+            "ok": True, "state": "error",
+            "label": f"xray {mode} · ошибка",
+            "tooltip": error_text[:400],
+        }
+    elif mode == "TPROXY":
+        result = {
+            "ok": True, "state": "ok",
+            "label": f"xray TPROXY · {active_tag}" if active_tag else "xray TPROXY",
+            "tooltip": f"PRIMARY: {active_tag or '(не определён)'}\nРежим TPROXY — оптимальный.",
+        }
+    else:
+        result = {
+            "ok": True, "state": "warn",
+            "label": f"xray {mode} · {active_tag}" if active_tag else f"xray {mode}",
+            "tooltip": f"PRIMARY: {active_tag or '(не определён)'}\nРежим {mode} — валидный, но не оптимальный. VPN работает.",
+        }
+
+    result.update({
+        "active_tag": active_tag,
+        "mode": mode,
+        "running": running,
+        "has_error": has_error,
+    })
+    _HEADER_STATUS_CACHE.update({"ts": now, "data": result})
+    return jsonify(result)
+
+
+@app.route("/api/xkeen/dashboard-health", methods=["GET"])
+@requires_auth
+def api_xkeen_dashboard_health():
+    """Самодиагностика панели: сколько pythonw-процессов слушают :5000.
+    Нормально = ровно 1. На Windows venv pythonw.exe — это launcher,
+    он запускает реальный интерпретатор как ребёнка; считать «pythonw count > 1»
+    как проблему нельзя — это всегда 2 процесса (launcher + interpreter).
+    А вот listening на одном порту может быть только один — это надёжный критерий."""
+    my_pid = os.getpid()
+    listeners = []
+    for c in psutil.net_connections(kind="tcp"):
+        if c.status != psutil.CONN_LISTEN:
+            continue
+        if c.laddr.port != 5000:
+            continue
+        if not c.pid:
+            continue
+        try:
+            p = psutil.Process(c.pid)
+            listeners.append({
+                "pid": c.pid,
+                "name": p.name(),
+                "is_me": c.pid == my_pid,
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            listeners.append({"pid": c.pid, "name": "?", "is_me": c.pid == my_pid})
+    count = len(listeners)
+    if count == 1:
+        status, msg = "ok", "Панель здорова — 1 listener на :5000"
+    elif count == 0:
+        # Если этот endpoint отвечает, listener'ов точно ≥1. Возможен race в psutil.
+        status, msg = "warn", "Listener на :5000 не виден (race?)"
+    else:
+        status, msg = "bad", f"На :5000 слушают {count} процессов — реальный дубликат, нужен чистый рестарт"
+    return jsonify({"ok": True, "status": status, "msg": msg, "count": count, "listeners": listeners})
+
+
+@app.route("/api/xkeen/restart-dashboard", methods=["POST"])
+@requires_auth
+def api_xkeen_restart_dashboard():
+    """Перезапуск самого xray-dashboard через одноразовую Task Scheduler задачу
+    `XrayDashboardRestarter` (без файлов на диске).
+
+    Стратегия:
+    1. Создаём задачу `XrayDashboardRestarter` (от SYSTEM, /RL HIGHEST) с триггером
+       /SC ONCE /ST 23:59 (фиктивное время — никогда не сработает по триггеру)
+    2. Сразу запускаем через `schtasks /Run` — задача стартует немедленно
+    3. Внутри задачи: stop XrayDashboard → wait 3sec → run XrayDashboard → wait 1sec → удалить себя
+    4. После выполнения /Delete сама стирает себя из Task Scheduler — диск чистый
+
+    Раньше создавали .bat в %TEMP% — оставался мусор. Раньше использовали PowerShell +
+    DETACHED_PROCESS — залипало (родитель умирал от schtasks /End до запуска ребёнка)."""
+    try:
+        # Inline-команда задачи. cmd.exe /c "..." нужен потому что schtasks /TR
+        # не понимает && / timeout / piping напрямую — только одну исполняемую строку.
+        tr = (
+            'cmd.exe /c "'
+            'schtasks /End /TN XrayDashboard'
+            ' && timeout /t 3 /nobreak > nul'
+            ' && schtasks /Run /TN XrayDashboard'
+            ' && timeout /t 1 /nobreak > nul'
+            ' && schtasks /Delete /TN XrayDashboardRestarter /F'
+            '"'
+        )
+        # Создание/перезапись (/F) задачи. /SC ONCE /ST = триггерное время, не используется
+        # т.к. запустим вручную через /Run. /RU SYSTEM = от системного пользователя
+        # (нужны права на /End XrayDashboard). /RL HIGHEST = с админ-привилегиями.
+        result = subprocess.run(
+            ["schtasks", "/Create", "/TN", "XrayDashboardRestarter",
+             "/TR", tr, "/SC", "ONCE", "/ST", "23:59",
+             "/RU", "SYSTEM", "/RL", "HIGHEST", "/F"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode != 0:
+            return jsonify({"ok": False, "stderr": f"schtasks /Create failed: {result.stderr or result.stdout}"})
+        # Запускаем задачу немедленно (не ждём триггера 23:59)
+        subprocess.Popen(
+            ["schtasks", "/Run", "/TN", "XrayDashboardRestarter"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return jsonify({
+            "ok": True,
+            "stdout": "Рестарт через одноразовую Task Scheduler задачу (без файлов на диске). Жди ~5 сек → обнови страницу.",
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "stderr": "schtasks /Create timeout (>10 сек)"})
+    except Exception as ex:
+        return jsonify({"ok": False, "stderr": str(ex)})
+
+
+@app.route("/api/xkeen/set-target/<role>", methods=["POST"])
+@requires_auth
+def api_xkeen_set_target(role):
+    """Сменить outboundTag для primary или failover шаблона.
+    Body: tag=<new_outbound_tag>"""
+    tag = request.form.get("tag", "").strip()
+    if not tag:
+        return jsonify({"ok": False, "stderr": "tag не передан"})
+    result = keenetic_set_watchdog_target(role, tag)
+    return jsonify(result)
+
+
+# Список ВСЕХ файлов XKeen-конфигурации которые попадают в backup.
+# Только конкретные пути (whitelist) — для безопасности restore не зальёт что попало.
+XKEEN_BACKUP_FILES = [
+    # Активные xray-конфиги (то что читает xray прямо сейчас)
+    "/opt/etc/xray/configs/01_log.json",
+    "/opt/etc/xray/configs/02_dns.json",
+    "/opt/etc/xray/configs/03_inbounds.json",
+    "/opt/etc/xray/configs/04_outbounds.json",
+    "/opt/etc/xray/configs/05_routing.json",
+    "/opt/etc/xray/configs/06_policy.json",
+    # Шаблоны и backup-конфиги (наш v6 watchdog template + legacy)
+    "/opt/etc/xray/configs.bak/05_routing.template.json",
+    "/opt/etc/xray/configs.bak/05_routing.primary.json",
+    "/opt/etc/xray/configs.bak/05_routing.failover.json",
+    "/opt/etc/xray/configs.bak/05_routing.original-balancer.json",
+    "/opt/etc/xray/configs.bak/07_observatory.disabled.json",
+    # Watchdog
+    "/opt/etc/xray/watchdog.sh",
+    "/opt/etc/xray/watchdog.config",
+    "/opt/etc/xray/watchdog.state",
+    # Sidecar с дружелюбными именами провайдера/подписки (для UI дашборда)
+    "/opt/etc/xray/outbound_meta.json",
+    "/opt/etc/xray/subscription_meta.json",
+    "/opt/etc/xray/domain_notes.json",  # v1.7.0: примечания к доменам AI/YT/DIRECT/BLOCK
+    # Cron-задачи (включая watchdog cron и xkeen autoupdate)
+    "/opt/var/spool/cron/crontabs/root",
+    # SSH authorized keys (на случай если ключ потеряется)
+    "/opt/etc/dropbear/authorized_keys",
+]
+
+
+def _fetch_subscription(sub_url, ua=None, timeout=15):
+    """HTTP GET subscription URL → распарсенный list of vless URLs + headers.
+    Возвращает (vless_lines, error_str, headers_dict).
+    headers_dict содержит relevant заголовки подписки: Subscription-Userinfo, Profile-Title, etc.
+
+    Камуфляж dashboard sync под iPhone 11 Pro Max для разных провайдеров — у них разная логика
+    идентификации устройства:
+
+    Provider A (default ветка):
+      - device key = X-Hwid (UUID). Смена UA/X-Device-* НЕ плодит новых записей.
+      - UA: `Happ/2.7.0 (iPhone12,5; iOS 26.5; ru-RU) CFNetwork/...` — нужен для прохождения
+        JA3 anti-bot (без iOS-UA отдаёт App_not_supported)
+      - X-Device-Model/Os/Name → парсятся Provider A и показывают в кабинете «iPhone 11 Pro Max · iOS»
+
+    Provider B (если sub_url содержит `provider-b`):
+      - device key = User-Agent. Каждая смена UA → новая запись (см. memory/vpn_provider_device_limits.md)
+      - UA в формате `Happ/2.7.0/iOS/<16-hex-serial>` — Happ-специфичный pattern что Provider B
+        парсит как «iPhone X · iOS Y.Z · Happ/2.7.0/iOS/<serial>». Serial фиксирован чтобы
+        обновлять одну и ту же запись, а не плодить.
+      - X-Hwid и X-Device-* — отправляем для совместимости (Provider B их игнорирует, но не мешают)
+    """
+    import urllib.request, base64
+
+    # Выбор UA в зависимости от провайдера
+    if ua is None:
+        if "provider-b" in sub_url.lower():
+            # Provider B парсит UA-format `Happ/<ver>/<Platform>/<serial>` для имени устройства.
+            # Serial 16-hex — стабильный (часть нашего UUID без дефисов).
+            ua = "Happ/2.7.0/iOS/F7A2D3419C5E18A7"
+        else:
+            ua = "Happ/2.7.0 (iPhone12,5; iOS 26.5; ru-RU) CFNetwork/1568.300.101 Darwin/24.2.0"
+
+    try:
+        req = urllib.request.Request(sub_url, headers={
+            "User-Agent": ua,
+            "Accept": "*/*",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "X-Hwid": "f7a2d341-9c5e-4b18-a703-e1c8d6f20935",
+            # Камуфляж под iPhone 11 Pro Max — Provider A парсит эти headers для отображения имени устройства.
+            # Без них (даже с iOS-UA) показывается генерическое «Устройство». Provider B их игнорирует.
+            "X-Device-Model": "iPhone 11 Pro Max",
+            "X-Device-Os": "iOS",
+            "X-Device-Os-Version": "26.5",
+            "X-Device-Name": "iPhone 11 Pro Max",
+            "X-Platform": "ios",
+            "X-App-Version": "2.7.0",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", "replace").strip()
+            # Извлекаем headers — некоторые провайдеры (Provider B) шлют expire timestamp в Subscription-Userinfo
+            resp_headers = {k: v for k, v in resp.headers.items()}
+    except Exception as ex:
+        return [], f"HTTP fetch failed: {ex}", {}
+    if body.startswith("vless://"):
+        lines = body.splitlines()
+    elif body.startswith("[") or body.startswith("{"):
+        # Happ multi-profile JSON формат (например Provider C / Provider D) — массив полных xray-конфигов,
+        # каждый со своим набором outbound'ов. Извлекаем все уникальные vless-серверы.
+        try:
+            lines = _parse_happ_multiprofile_json(body)
+        except Exception as ex:
+            return [], f"Тело подписки похоже на JSON, но парсинг сломался: {ex}", {}
+        if not lines:
+            return [], "JSON подписки не содержит vless-outbound'ов", {}
+    else:
+        try:
+            decoded = base64.b64decode(body + "==", validate=False).decode("utf-8", "replace")
+            lines = [ln for ln in decoded.splitlines() if ln.startswith("vless://")]
+        except Exception:
+            return [], "Тело подписки не похоже на base64-список vless URLs", {}
+    if not lines:
+        return [], "В ответе подписки нет vless:// URL", {}
+    return lines, None, resp_headers
+
+
+def _parse_happ_multiprofile_json(body):
+    """Парсит Happ multi-profile JSON формат подписки (массив xray-конфигов).
+
+    Используется провайдерами типа Provider C / Provider D, которые шлют не base64-encoded
+    список vless:// URL, а массив полных xray client config'ов — по одному на каждый
+    «профиль» в Happ (страна / анти-DPI / комбо).
+
+    Извлекает все уникальные vless-outbound'ы (по ключу `addr:port+pbk`), и для каждого
+    конструирует vless:// URL. Имя тега берётся из `remarks` профиля + outbound's `tag`
+    (если в профиле несколько vless-outbound'ов).
+
+    Возвращает список vless:// URL или [] если ничего не нашлось.
+    """
+    import json as _json
+    from urllib.parse import quote
+    try:
+        data = _json.loads(body)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+
+    # Сортируем профили: с минимумом vless-outbound'ов (dedicated single-country) идут первыми,
+    # чтобы их remark (типа "🇫🇮 Финляндия") выиграл у remark из multi-server профиля
+    # ("🇪🇺 Европа | Авто-выбор") когда сервер используется в обоих.
+    def _vless_count(p):
+        if not isinstance(p, dict):
+            return 9999
+        return sum(1 for ob in p.get("outbounds", []) if ob.get("protocol") == "vless")
+    sorted_profiles = sorted(data, key=_vless_count)
+
+    seen = {}  # (addr, port, pbk) -> vless URL
+    for profile in sorted_profiles:
+        if not isinstance(profile, dict):
+            continue
+        remark = (profile.get("remarks") or "").strip() or "?"
+        for ob in profile.get("outbounds", []):
+            if ob.get("protocol") != "vless":
+                continue
+            s = (ob.get("settings", {}) or {}).get("vnext", [{}])
+            if not s:
+                continue
+            s = s[0] or {}
+            addr = s.get("address", "")
+            port = s.get("port", 443)
+            users = s.get("users") or [{}]
+            user = users[0] or {}
+            uid = user.get("id", "")
+            flow = user.get("flow", "")
+            ss = ob.get("streamSettings", {}) or {}
+            net = ss.get("network", "tcp")
+            sec = ss.get("security", "")
+            sni = ""
+            pbk = ""
+            sid = ""
+            fp = "chrome"
+            if sec == "reality":
+                rs = ss.get("realitySettings", {}) or {}
+                sni = rs.get("serverName", "")
+                pbk = rs.get("publicKey", "")
+                sid = rs.get("shortId", "")
+                fp = rs.get("fingerprint", "chrome")
+            elif sec == "tls":
+                ts = ss.get("tlsSettings", {}) or {}
+                sni = ts.get("serverName", "")
+                fp = ts.get("fingerprint", "")
+            key = (addr, port, pbk or sni)
+            if key in seen:
+                continue
+            ob_tag = (ob.get("tag") or "").strip()
+            # Имя: remark + (ob_tag если не 'proxy' — bo proxy = default outbound, имя самого профиля важнее)
+            if ob_tag and ob_tag != "proxy":
+                tag = f"{remark}_{ob_tag}"
+            else:
+                tag = remark
+            params = [
+                "encryption=none",
+                f"type={net}",
+            ]
+            if flow:
+                params.append(f"flow={flow}")
+            if sec:
+                params.append(f"security={sec}")
+            if sni:
+                params.append(f"sni={sni}")
+            if fp:
+                params.append(f"fp={fp}")
+            if pbk:
+                params.append(f"pbk={pbk}")
+            if sid:
+                params.append(f"sid={sid}")
+            url = f"vless://{uid}@{addr}:{port}?{'&'.join(params)}#{quote(tag, safe='')}"
+            seen[key] = url
+    return list(seen.values())
+
+
+def _parse_sub_userinfo(headers):
+    """Парсит Subscription-Userinfo header (стандарт sub-providers).
+    Формат: upload=X; download=Y; total=Z; expire=UNIX_TIMESTAMP
+    Возвращает {'expire_at': 'YYYY-MM-DD' или '', 'expire_ts': int|None, 'days_left': int|None}."""
+    if not headers:
+        return {"expire_at": "", "expire_ts": None, "days_left": None}
+    raw = headers.get("Subscription-Userinfo") or headers.get("subscription-userinfo") or ""
+    if not raw:
+        return {"expire_at": "", "expire_ts": None, "days_left": None}
+    m = re.search(r"expire\s*=\s*(\d+)", raw)
+    if not m:
+        return {"expire_at": "", "expire_ts": None, "days_left": None}
+    ts = int(m.group(1))
+    if ts <= 0:
+        return {"expire_at": "", "expire_ts": None, "days_left": None}
+    try:
+        dt = datetime.fromtimestamp(ts)
+        expire_at = dt.strftime("%Y-%m-%d")
+        days_left = (dt.date() - datetime.now().date()).days
+        return {"expire_at": expire_at, "expire_ts": ts, "days_left": days_left}
+    except Exception:
+        return {"expire_at": "", "expire_ts": None, "days_left": None}
+
+
+def _parse_profile_title(headers):
+    """Извлекает имя подписки из HTTP header `Profile-Title` (стандарт sub-providers).
+    Значение может быть plain text ("Provider C") или `base64:<encoded>` для UTF-8.
+    Используется чтобы автоматически назвать группу при первом импорте подписки.
+    Возвращает строку или ''."""
+    if not headers:
+        return ""
+    raw = (headers.get("Profile-Title") or headers.get("profile-title") or "").strip()
+    if not raw:
+        return ""
+    if raw.lower().startswith("base64:"):
+        import base64 as _b
+        try:
+            return _b.b64decode(raw.split(":", 1)[1] + "==", validate=False).decode("utf-8", "replace").strip()
+        except Exception:
+            return ""
+    return raw
+
+
+_SHELL_UNSAFE_RE = re.compile(r"""[\s()\[\]{}*?+|&;,<>$`"'\\!]+""")
+
+
+def _normalize_outbound_tag(t):
+    """Подгоняет имя outbound-тега под формат пригодный для shell-storage в watchdog.config.
+
+    Why: FAILOVER_TAGS — это POSIX-shell строка которую и watchdog.sh, и dashboard
+    парсят через split-by-whitespace. Теги с пробелами и круглыми скобками
+    (Provider B шлёт "🇯🇵 Токио⚡️", "🎮Игровой (Германия)") при split разваливаются
+    на куски и in_failover_chain становится False — UI показывает «не задействован»
+    даже если юзер их выбрал. Эмодзи и кириллица сохраняются — только spaces/brackets
+    и shell-метасимволы конвертим в `_`. Trailing/leading `_` удаляются.
+    """
+    if not t:
+        return t
+    n = _SHELL_UNSAFE_RE.sub("_", t.strip())
+    return n.strip("_")
+
+
+def _parse_vless_url_dict(url):
+    """vless URL → dict с полями. None если не парсится."""
+    from urllib.parse import urlparse, parse_qs, unquote
+    try:
+        u = urlparse(url.strip())
+        if "@" not in u.netloc:
+            return None
+        uuid_part, host_part = u.netloc.split("@", 1)
+        if ":" in host_part:
+            host, port_str = host_part.rsplit(":", 1)
+            port = int(port_str)
+        else:
+            host, port = host_part, 443
+        q = parse_qs(u.query)
+        def g(k, d=None):
+            v = q.get(k, [d])
+            return v[0] if v else d
+        return {
+            "tag": _normalize_outbound_tag(unquote(u.fragment)) if u.fragment else None,
+            "uuid": uuid_part, "host": host, "port": port,
+            "network": g("type", "tcp"),
+            "security": g("security", "none"),
+            "sni": g("sni") or g("host"),
+            "pbk": g("pbk"), "sid": g("sid", ""), "fp": g("fp", "chrome"),
+            "flow": g("flow", ""), "spx": g("spx", ""),
+            "path": g("path", "/"), "host_hdr": g("host", ""),
+            "mode": g("mode", "auto"),
+            "service_name": g("serviceName", ""),
+        }
+    except Exception:
+        return None
+
+
+@app.route("/api/xkeen/subscription-preview", methods=["POST"])
+@requires_auth
+def api_xkeen_subscription_preview():
+    """Скачать подписку и показать ЧТО НАЙДЕНО + matching с outbound'ами на роутере.
+    БЕЗ применения. Возвращает {found: [...], matches: [...], orphans_in_sub: [...], orphans_local: [...]}"""
+    sub_url = request.form.get("url", "").strip()
+    if not sub_url or not sub_url.startswith(("http://", "https://")):
+        return jsonify({"ok": False, "stderr": "Невалидный URL"})
+    vless_lines, err, headers = _fetch_subscription(sub_url)
+    if err:
+        return jsonify({"ok": False, "stderr": err})
+
+    # Извлекаем expire timestamp из Subscription-Userinfo header
+    sub_info = _parse_sub_userinfo(headers)
+
+    parsed = []
+    for url in vless_lines:
+        p = _parse_vless_url_dict(url)
+        if p and p.get("tag"):
+            parsed.append(p)
+
+    # Текущие outbound'ы на роутере (strip //-комментариев — XKeen в свежем файле их кладёт)
+    raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
+    cur_outbounds = []
+    if raw:
+        try:
+            cur_outbounds = json.loads(_strip_json_comments(raw)).get("outbounds", [])
+        except Exception:
+            pass
+    local_tags = {o.get("tag") for o in cur_outbounds if o.get("protocol") == "vless"}
+    def _extract_full(o):
+        v = (o.get("settings", {}).get("vnext", [{}])[0] or {})
+        ss = o.get("streamSettings", {}) or {}
+        rs = ss.get("realitySettings", {}) or {}
+        return {
+            "host": v.get("address", "?"),
+            "port": v.get("port", 0),
+            "pbk":  rs.get("publicKey", ""),
+            "sni":  rs.get("serverName", ""),
+        }
+    local_by_tag = {o.get("tag"): _extract_full(o)
+                    for o in cur_outbounds if o.get("protocol") == "vless"}
+
+    sub_tags = {p["tag"] for p in parsed}
+    matches = []
+    for p in parsed:
+        if p["tag"] in local_tags:
+            local = local_by_tag.get(p["tag"], {})
+            new_pbk = (p.get("pbk") or "").strip()
+            new_sni = (p.get("sni") or "").strip()
+            old_pbk = (local.get("pbk") or "").strip()
+            old_sni = (local.get("sni") or "").strip()
+            # Если pbk или SNI меняются — это похоже на другого провайдера, не просто обновление
+            pbk_change = bool(new_pbk and old_pbk and new_pbk != old_pbk)
+            sni_change = bool(new_sni and old_sni and new_sni != old_sni)
+            different_provider = pbk_change  # pbk = Reality identity провайдера, главный сигнал
+            matches.append({
+                "tag": p["tag"],
+                "sub_host": f"{p['host']}:{p['port']}",
+                "sub_uuid": p["uuid"][:8] + "…",
+                "local_host": f"{local.get('host','?')}:{local.get('port','?')}",
+                "changed": (p["host"], p["port"]) != (local.get("host"), local.get("port")),
+                "pbk_change": pbk_change,
+                "sni_change": sni_change,
+                "different_provider": different_provider,
+                "old_pbk_short": (old_pbk[:10] + "…") if old_pbk else "",
+                "new_pbk_short": (new_pbk[:10] + "…") if new_pbk else "",
+                "old_sni": old_sni,
+                "new_sni": new_sni,
+            })
+    orphans_in_sub = []
+    # Эвристика «anti-DPI / антиглушилка / обход / белые списки» — для подсветки в UI:
+    #   (1) SNI ≠ host — сервер маскируется под чужой домен (yandex/x5/google и т.д.), типичный
+    #       признак anti-DPI у RU-провайдеров с reality.
+    #   ИЛИ (2) tag содержит характерные слова. Список keywords пополняется по мере обнаружения
+    #   новых вариантов именования у разных провайдеров (пользователь подкидывает примеры).
+    _ANTI_DPI_KEYWORDS = (
+        "обход",          # Provider C «Обход №1..5», Provider A «обход глушилок»
+        "антиглушилк",    # «анти-глушилка», «антиглушилки»
+        "анти-глушилк",
+        "lte",            # Provider C «LTE»
+        "antidpi",        # generic
+        "anti-dpi",
+        "белые списки",   # VPN-режим «whitelist» — exit-точка маскируется через whitelisted RU-домены
+        "белый список",
+        "whitelist",
+        "ростелеком",     # некоторые провайдеры дают exit через корпоративные сети крупных RU-операторов
+        "мтс",
+        "билайн",
+        "мегафон",
+        "теле2",
+        "тспу",           # ТСПУ — российская система DPI; «обход ТСПУ» = anti-DPI
+        "tspu",
+        "ркн",            # Роскомнадзор
+        # RU-exit маркеры (2026-05-15): профили которые в имени указывают на Россию —
+        # exit-IP внутри РФ → AI/streaming геоблокируют. Например Provider C «🇷🇺 Россия YouTube».
+        "россия",          # Cyrillic
+        "russia",          # Latin
+        "🇷🇺",              # Russian flag emoji
+    )
+    for p in parsed:
+        if p["tag"] in local_tags:
+            continue
+        host = p["host"]
+        sni = (p.get("sni") or "").strip()
+        sni_camouflage = bool(sni and sni != host and not host.endswith("." + sni) and not sni.endswith("." + host))
+        tag_lower = (p["tag"] or "").lower()
+        tag_keyword = any(kw in tag_lower for kw in _ANTI_DPI_KEYWORDS)
+        is_anti_dpi = sni_camouflage or tag_keyword
+        orphans_in_sub.append({
+            "tag": p["tag"],
+            "host": f"{host}:{p['port']}",
+            "sni": sni,
+            "is_anti_dpi": is_anti_dpi,
+        })
+    orphans_local = [
+        {"tag": t, "host": f"{local_by_tag[t]['host']}:{local_by_tag[t]['port']}"}
+        for t in (local_tags - sub_tags)
+    ]
+
+    # Детект конфликта: если в подписке есть expire, и у группы уже задана другая
+    # дата — собираем предупреждение. Ключ subscription_meta: sub_url (если выгрузка
+    # из подписки) ИЛИ pbk (для legacy не-sync импортов).
+    expire_conflicts = []
+    new_expire = sub_info.get("expire_at", "")
+    if new_expire:
+        existing_sub_meta = keenetic_read_sub_meta()
+        # Этот sync будет писать в sub_meta по ключу sub_url, поэтому проверяем
+        # сначала его, а потом fallback по pbk (если у старых записей он ключ).
+        candidate_keys = {sub_url}
+        for o in cur_outbounds:
+            if o.get("protocol") != "vless" or o.get("tag") not in local_tags:
+                continue
+            if o.get("tag") not in {p["tag"] for p in parsed}:
+                continue
+            rs = (o.get("streamSettings", {}) or {}).get("realitySettings", {}) or {}
+            pbk = rs.get("publicKey", "")
+            if pbk:
+                candidate_keys.add(pbk)
+        for k in candidate_keys:
+            ex_entry = existing_sub_meta.get(k, {})
+            old_expire = (ex_entry.get("expires_at") or "").strip()
+            if old_expire and old_expire != new_expire:
+                expire_conflicts.append({
+                    "pbk_short": k[:30] + "…" if len(k) > 30 else k,
+                    "old_expire": old_expire,
+                    "new_expire": new_expire,
+                })
+
+    # Имя подписки из Profile-Title header (Provider D шлёт "Provider C" в base64).
+    # Покажем юзеру в preview какое имя автоматически подтянется при sync.
+    profile_title = _parse_profile_title(headers)
+    # Старое имя для сравнения — лежит в sub_meta под ключом sub_url
+    existing_name = ""
+    try:
+        existing_sub_meta = keenetic_read_sub_meta()
+        existing_name = (existing_sub_meta.get(sub_url, {}).get("name") or "").strip()
+    except Exception:
+        pass
+
+    return jsonify({
+        "ok": True,
+        "found_in_sub": len(parsed),
+        "matches": matches,
+        "orphans_in_sub": orphans_in_sub,
+        "orphans_local": orphans_local,
+        "sub_expire_at": sub_info.get("expire_at", ""),
+        "sub_expire_days_left": sub_info.get("days_left"),
+        "expire_conflicts": expire_conflicts,
+        "profile_title": profile_title,
+        "existing_name": existing_name,
+    })
+
+
+def _build_vless_outbound_dict(parsed, tag):
+    """Из parsed dict (от _parse_vless_url_dict) строит outbound JSON для 04_outbounds.json."""
+    user = {"id": parsed["uuid"], "encryption": "none", "level": 0}
+    if parsed.get("flow"):
+        user["flow"] = parsed["flow"]
+    stream = {"network": parsed["network"], "security": parsed["security"]}
+    if parsed["security"] == "reality":
+        rs = {"fingerprint": parsed["fp"]}
+        if parsed.get("pbk"): rs["publicKey"] = parsed["pbk"]
+        if parsed.get("sni"): rs["serverName"] = parsed["sni"]
+        if parsed.get("sid") is not None: rs["shortId"] = parsed["sid"]
+        if parsed.get("spx"): rs["spiderX"] = parsed["spx"]
+        stream["realitySettings"] = rs
+    elif parsed["security"] == "tls":
+        ts = {"fingerprint": parsed["fp"]}
+        if parsed.get("sni"): ts["serverName"] = parsed["sni"]
+        stream["tlsSettings"] = ts
+    net = parsed["network"]
+    if net == "xhttp":
+        xs = {"path": parsed["path"], "mode": parsed["mode"]}
+        if parsed.get("host_hdr"): xs["host"] = parsed["host_hdr"]
+        stream["xhttpSettings"] = xs
+    elif net == "ws":
+        ws = {"path": parsed["path"]}
+        if parsed.get("host_hdr"): ws["headers"] = {"Host": parsed["host_hdr"]}
+        stream["wsSettings"] = ws
+    elif net == "grpc":
+        stream["grpcSettings"] = {"serviceName": parsed.get("service_name", "")}
+    return {
+        "tag": tag,
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": parsed["host"],
+                "port": parsed["port"],
+                "users": [user],
+            }]
+        },
+        "streamSettings": stream,
+    }
+
+
+@app.route("/api/xkeen/subscription-sync", methods=["POST"])
+@requires_auth
+def api_xkeen_subscription_sync():
+    """Скачать subscription URL → распарсить → синхронизировать с outbound'ами на роутере.
+    Body:
+      url=<subscription URL>
+      add_new=1  — добавить outbound'ы которые есть в подписке но нет у тебя
+      remove_orphans=1 — удалить outbound'ы которые есть у тебя но НЕТ в подписке
+                         (только если они НЕ в активной роли watchdog)
+    """
+    sub_url = request.form.get("url", "").strip()
+    if not sub_url or not sub_url.startswith(("http://", "https://")):
+        return jsonify({"ok": False, "stderr": "Невалидный URL"})
+    add_new = request.form.get("add_new") == "1"
+    remove_orphans = request.form.get("remove_orphans") == "1"
+    update_expires = request.form.get("update_expires", "1") == "1"  # default ON
+    overwrite_expires = request.form.get("overwrite_expires") == "1"  # явная галка для перетирания существующей даты
+    # add_tags="tag1\ntag2\ntag3" (newline-separated) — выборочный импорт ТОЛЬКО этих tags
+    # из подписки. Перекрывает add_new=1: если add_tags задан непустой — add_new игнорируется,
+    # и добавляются только указанные tags. Используется для выборочного импорта anti-DPI и т.д.
+    add_tags_raw = request.form.get("add_tags", "").strip()
+    add_tags_filter = None
+    if add_tags_raw:
+        add_tags_filter = {t.strip() for t in add_tags_raw.replace(",", "\n").splitlines() if t.strip()}
+    # (старые поля provider/sub_name удалены из UI с 2026-05-14 — больше не записываются)
+
+    vless_lines, err, headers = _fetch_subscription(sub_url)
+    if err:
+        return jsonify({"ok": False, "stderr": err})
+    sub_info = _parse_sub_userinfo(headers)
+    new_expire_at = sub_info.get("expire_at", "") if update_expires else ""
+    # Имя подписки из header Profile-Title (Provider D: "Provider C", Provider B: "Provider B", и т.д.).
+    # Заполняем поле `name` в sub_meta только если у группы его ещё нет — не затираем юзерский custom.
+    profile_title = _parse_profile_title(headers)
+
+    parsed_by_tag = {}
+    for url in vless_lines:
+        p = _parse_vless_url_dict(url)
+        if p and p.get("tag"):
+            parsed_by_tag[p["tag"]] = p
+
+    if not parsed_by_tag:
+        return jsonify({"ok": False, "stderr": "Не удалось распарсить ни один vless URL"})
+
+    # Читаем текущий 04_outbounds.json. XKeen в свежей установке кладёт файл
+    # с //-комментариями (ссылками на генераторы) — strip их перед json.loads.
+    raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
+    if not raw:
+        return jsonify({"ok": False, "stderr": "Не прочитать 04_outbounds.json"})
+    try:
+        cfg_json = json.loads(_strip_json_comments(raw))
+    except Exception as ex:
+        return jsonify({"ok": False, "stderr": f"04_outbounds.json не парсится: {ex}"})
+
+    outbounds = cfg_json.get("outbounds", [])
+    sub_tags = set(parsed_by_tag.keys())
+    local_tags = {o.get("tag") for o in outbounds if o.get("protocol") == "vless"}
+
+    # Для защиты при remove_orphans — список активных tags из watchdog.config
+    targets = keenetic_get_watchdog_targets()
+    active_tags = set()
+    if targets.get("primary_tag"): active_tags.add(targets["primary_tag"])
+    if targets.get("ai_tag"): active_tags.add(targets["ai_tag"])
+    active_tags.update(targets.get("failover_tags") or [])
+
+    updated_tags = []
+    added_tags = []
+    removed_tags = []
+    skipped_removal = []
+
+    # 0. PRE-CHECK: если remove_orphans=1, есть ли среди orphans активные в watchdog?
+    #    Если да — ничего не делаем, чтобы не получить частично-применённое состояние.
+    if remove_orphans:
+        orphans = local_tags - sub_tags - {"direct", "block"}
+        conflicts = orphans & active_tags
+        if conflicts:
+            roles_msg = []
+            for t in conflicts:
+                roles = []
+                if t == targets.get("primary_tag"):  roles.append("PRIMARY")
+                if t == targets.get("ai_tag"):       roles.append("AI-sticky")
+                if t in (targets.get("failover_tags") or []):
+                    pos = (targets.get("failover_tags") or []).index(t) + 1
+                    roles.append(f"FAILOVER цепочка #{pos}")
+                roles_msg.append(f"  • {t} → {', '.join(roles)}")
+            return jsonify({
+                "ok": False,
+                "stderr": (
+                    "⛔ Удаление отменено: эти outbound'ы используются в активных ролях watchdog. "
+                    "Sync вообще не выполнен — сначала сними роли через dropdown'ы выше:\n\n"
+                    + "\n".join(roles_msg) +
+                    "\n\nКонкретно нужно: для каждого выбрать ДРУГОЙ outbound в PRIMARY / FAILOVER / AI / "
+                    "цепочке резерва. Потом снова запустить sync."
+                ),
+            })
+
+    # 1. UPDATE: совпадающие по tag — обновить
+    for ob in outbounds:
+        tag = ob.get("tag")
+        if not tag or tag not in parsed_by_tag:
+            continue
+        new_ob = _build_vless_outbound_dict(parsed_by_tag[tag], tag)
+        # Заменяем in-place поля
+        ob["settings"] = new_ob["settings"]
+        ob["streamSettings"] = new_ob["streamSettings"]
+        updated_tags.append(tag)
+
+    # 2. ADD NEW: добавляем outbound'ы которые есть в подписке, но нет локально.
+    # Поведение зависит от двух параметров:
+    #   - add_tags_filter (множество тегов): добавить ТОЛЬКО эти теги (если они есть в подписке и нет локально)
+    #   - add_new=1: добавить ВСЕ orphans_in_sub
+    # Если задан add_tags_filter — он приоритетнее add_new (выборочный режим).
+    to_add = set()
+    if add_tags_filter:
+        to_add = (sub_tags & add_tags_filter) - local_tags
+    elif add_new:
+        to_add = sub_tags - local_tags
+    if to_add:
+        # Находим где direct/block и вставляем перед direct
+        insert_idx = len(outbounds)
+        for i, ob in enumerate(outbounds):
+            if ob.get("tag") == "direct":
+                insert_idx = i
+                break
+        for tag in to_add:
+            new_ob = _build_vless_outbound_dict(parsed_by_tag[tag], tag)
+            outbounds.insert(insert_idx, new_ob)
+            added_tags.append(tag)
+            insert_idx += 1
+        cfg_json["outbounds"] = outbounds
+
+    # 3. REMOVE ORPHANS: если remove_orphans=1 — удаляем outbound'ы которых нет в подписке.
+    # Pre-check выше уже гарантировал что в orphans нет active_tags, так что удаляем без проверок.
+    if remove_orphans:
+        orphans = local_tags - sub_tags - {"direct", "block"}
+        keep = []
+        for ob in outbounds:
+            tag = ob.get("tag")
+            if tag in orphans:
+                removed_tags.append(tag)
+            else:
+                keep.append(ob)
+        cfg_json["outbounds"] = keep
+
+    if not (updated_tags or added_tags or removed_tags):
+        return jsonify({"ok": False, "stderr": "Изменений нет."})
+
+    # Бэкап + заливка
+    from datetime import datetime as _dt
+    ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+    keenetic_ssh(f"cp {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.bak-pre-sync-{ts}")
+    new_json = json.dumps(cfg_json, indent=4, ensure_ascii=False)
+    r = keenetic_ssh(f"cat > {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json",
+                     stdin_data=new_json, timeout=15)
+    if not r["ok"]:
+        return jsonify({"ok": False, "stderr": f"write failed: {r['stderr']}"})
+    keenetic_ssh("xkeen -restart", timeout=20)
+
+    # Записываем sub_url в meta для всех обновлённых/добавленных
+    affected = list(updated_tags) + list(added_tags)
+    if affected:
+        meta = keenetic_read_meta()
+        for t in affected:
+            entry = dict(meta.get(t, {}))
+            if sub_url:
+                entry["sub_url"] = sub_url
+            entry["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            meta[t] = entry
+        for t in removed_tags:
+            meta.pop(t, None)
+        keenetic_write_meta(meta)
+    elif removed_tags:
+        meta = keenetic_read_meta()
+        for t in removed_tags:
+            meta.pop(t, None)
+        keenetic_write_meta(meta)
+
+    # Автоматическое обновление expires_at / sub_url в subscription_meta.json (group-level)
+    # Ключ группы — sub_url если есть (объединяет провайдеров типа Provider B с разными pbk),
+    # иначе pbk (для Provider A-подобных где pbk общий).
+    sub_meta_updates = []  # для возврата клиенту: список (pbk_short, old, new, action)
+    if new_expire_at or sub_url or profile_title:
+        sub_meta = keenetic_read_sub_meta()
+        affected_keys = set()
+        # При sync через подписку — canonical key = sub_url (один на все обновлённые)
+        if sub_url:
+            affected_keys.add(sub_url)
+        else:
+            # Иначе fallback на pbk-based группировку
+            cur_after = cfg_json.get("outbounds", [])
+            for ob in cur_after:
+                if ob.get("protocol") != "vless" or ob.get("tag") not in set(affected):
+                    continue
+                rs = (ob.get("streamSettings", {}) or {}).get("realitySettings", {}) or {}
+                pbk = rs.get("publicKey", "")
+                if pbk:
+                    affected_keys.add(pbk)
+
+        for pbk in affected_keys:
+            entry = dict(sub_meta.get(pbk, {}))
+            old_expire = (entry.get("expires_at") or "").strip()
+            changed = False
+            # sub_url — всегда обновляется (он привязан к подписке)
+            if sub_url and entry.get("sub_url") != sub_url:
+                entry["sub_url"] = sub_url
+                changed = True
+            # name — выставляется ТОЛЬКО если у группы ещё нет имени (не затираем юзерский custom)
+            if profile_title and not (entry.get("name") or "").strip():
+                entry["name"] = profile_title
+                sub_meta_updates.append({"pbk_short": pbk[:10] + "…", "action": "name", "old": "", "new": profile_title})
+                changed = True
+            # expires_at — обновляется если: пусто было ИЛИ overwrite_expires=1
+            if new_expire_at:
+                if not old_expire:
+                    entry["expires_at"] = new_expire_at
+                    sub_meta_updates.append({"pbk_short": pbk[:10] + "…", "action": "set", "old": "", "new": new_expire_at})
+                    changed = True
+                elif old_expire != new_expire_at:
+                    if overwrite_expires:
+                        entry["expires_at"] = new_expire_at
+                        sub_meta_updates.append({"pbk_short": pbk[:10] + "…", "action": "overwrite", "old": old_expire, "new": new_expire_at})
+                        changed = True
+                    else:
+                        # Конфликт без явного разрешения — оставляем старое, фиксируем skip
+                        sub_meta_updates.append({"pbk_short": pbk[:10] + "…", "action": "skip", "old": old_expire, "new": new_expire_at})
+            if changed:
+                entry["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                sub_meta[pbk] = entry
+        if sub_meta_updates:
+            keenetic_write_sub_meta(sub_meta)
+
+    parts = []
+    if updated_tags: parts.append(f"🔄 Обновлено {len(updated_tags)}: {', '.join(updated_tags)}")
+    if added_tags:   parts.append(f"➕ Добавлено {len(added_tags)}: {', '.join(added_tags)}")
+    if removed_tags: parts.append(f"🗑 Удалено {len(removed_tags)}: {', '.join(removed_tags)}")
+    # Сообщения о sub_meta-изменениях
+    for u in sub_meta_updates:
+        if u["action"] == "set":
+            parts.append(f"📅 Установлена дата истечения для подписки {u['pbk_short']}: {u['new']}")
+        elif u["action"] == "overwrite":
+            parts.append(f"📅 Дата истечения подписки {u['pbk_short']} обновлена: {u['old']} → {u['new']}")
+        elif u["action"] == "name":
+            parts.append(f"🏷 Название подписки из Profile-Title: «{u['new']}»")
+        elif u["action"] == "skip":
+            parts.append(f"⚠️ У подписки {u['pbk_short']} стояла дата {u['old']}, в URL — {u['new']}. Оставил твою (включи 'Обновить дату истечения' чтобы перетереть)")
+    return jsonify({
+        "ok": True,
+        "stdout": "✅ Sync завершён.\n" + "\n".join(parts) + f"\n\nБэкап: 04_outbounds.json.bak-pre-sync-{ts}",
+        "sub_meta_updates": sub_meta_updates,
+        "added_tags": added_tags,
+        "updated_tags": updated_tags,
+        "removed_tags": removed_tags,
+    })
+
+
+@app.route("/api/xkeen/backup", methods=["GET"])
+@requires_auth
+def api_xkeen_backup():
+    """Скачивает snapshot ВСЕХ конфигов XKeen в JSON-bundle.
+    Содержит 16 файлов: все xray-конфиги (01-06), шаблоны watchdog,
+    сам watchdog.sh + config + state, crontab, authorized_keys."""
+    import time as _time
+    # Собираем bundle через jq на роутере — компактно и читаемо
+    # Для каждого существующего файла строим объект {path, content}
+    cmd_parts = []
+    for p in XKEEN_BACKUP_FILES:
+        # base64 на случай бинарных артефактов (хотя у нас все текстовые)
+        # но raw читабельнее
+        cmd_parts.append(
+            f'[ -f "{p}" ] && jq -n --arg p "{p}" --rawfile c "{p}" '
+            '\'{path: $p, content: $c}\''
+        )
+    cmd = "(" + " ; ".join(cmd_parts) + ") | jq -s --arg ts \"$(date)\" '{version: \"v7\", timestamp: $ts, files: .}'"
+    r = keenetic_ssh(cmd, timeout=30)
+    if not r["ok"]:
+        return jsonify({"ok": False, "stderr": r["stderr"][:500]}), 500
+    fname = f"xkeen-snapshot-{_time.strftime('%Y%m%d-%H%M%S')}.json"
+    return Response(
+        r["stdout"],
+        mimetype="application/json",
+        headers={"Content-Disposition": f"attachment; filename={fname}"}
+    )
+
+
+@app.route("/api/xkeen/backup-to-disk", methods=["POST"])
+@requires_auth
+def api_xkeen_backup_to_disk():
+    """Сохраняет snapshot в стандартную папку C:\\xray-dashboard\\backups\\
+    без всплывающего «Save As» диалога. Бэкап такой же как api_xkeen_backup,
+    просто пишется на сервер а не отдаётся клиенту."""
+    import time as _time
+    cmd_parts = []
+    for p in XKEEN_BACKUP_FILES:
+        cmd_parts.append(
+            f'[ -f "{p}" ] && jq -n --arg p "{p}" --rawfile c "{p}" '
+            '\'{path: $p, content: $c}\''
+        )
+    cmd = "(" + " ; ".join(cmd_parts) + ") | jq -s --arg ts \"$(date)\" '{version: \"v7\", timestamp: $ts, files: .}'"
+    r = keenetic_ssh(cmd, timeout=30)
+    if not r["ok"]:
+        return jsonify({"ok": False, "stderr": r["stderr"][:500]})
+
+    backups_dir = r"C:\xray-dashboard\backups"
+    try:
+        os.makedirs(backups_dir, exist_ok=True)
+    except Exception as ex:
+        return jsonify({"ok": False, "stderr": f"mkdir failed: {ex}"})
+
+    # Имя — с пометкой «manual» чтобы не путать с автоматическими XkeenSnapshotDaily
+    fname = f"xkeen-snapshot-manual-{_time.strftime('%Y%m%d-%H%M%S')}.json"
+    fpath = os.path.join(backups_dir, fname)
+    try:
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(r["stdout"])
+        size = os.path.getsize(fpath)
+    except Exception as ex:
+        return jsonify({"ok": False, "stderr": f"write failed: {ex}"})
+
+    return jsonify({
+        "ok": True,
+        "filename": fname,
+        "path": fpath,
+        "size_kb": round(size / 1024, 1),
+        "stdout": f"✅ Сохранён в {fpath} ({round(size/1024, 1)} КБ)",
+    })
+
+
+@app.route("/api/xkeen/migration-backup", methods=["POST"])
+@requires_auth
+def api_xkeen_migration_backup():
+    """Создаёт /opt/entware_backup.tar.gz на роутере и скачивает на PC.
+
+    Используется для миграции XKeen на новый роутер: архив кладётся на USB
+    в папку install/ рядом с mipsel-installer.tar.gz — при установке Entware
+    через Web UI Keenetic архив автоматически распаковывается, новый роутер
+    получает идентичный setup (Entware + xkeen + наши конфиги + GeoIP-базы).
+
+    Команда из README Corvus-Malus/XKeen («Резервное копирование для быстрого
+    развертывания»):
+        tar czf /opt/entware_backup.tar.gz --exclude=/opt/entware_backup.tar.gz -C /opt .
+
+    Поэтапно:
+    1. tar на роутере (1-2 минуты для /opt ~200MB)
+    2. scp с роутера на PC в C:\\xray-dashboard\\backups\\entware_backup_<ts>.tar.gz
+    3. rm /opt/entware_backup.tar.gz на роутере (не оставляем 50MB+ в /opt/)
+    """
+    import time as _time
+
+    # Pre-check: scp доступен на этом PC?
+    try:
+        v = subprocess.run(["scp", "-V"], capture_output=True, timeout=5)
+        # scp -V пишет в stderr, exit code часто != 0 — нам только важно что бинарник нашёлся
+    except FileNotFoundError:
+        return jsonify({
+            "ok": False, "stage": "scp_check",
+            "error": "Команда scp не найдена в PATH. Установи OpenSSH Client: Settings → Apps → Optional Features → Add 'OpenSSH Client'. Или поставь Git for Windows."
+        }), 500
+    except Exception:
+        pass  # ignore — попробуем напрямую
+
+    # Pre-check: место на /opt/ должно быть в 2x от размера /opt (для tar+оригинал)
+    r_df = keenetic_ssh("df -k /opt | tail -1; echo '---'; du -sk /opt", timeout=10)
+    if not r_df["ok"]:
+        return jsonify({"ok": False, "stage": "precheck", "error": "Не могу проверить размер /opt", "stderr": r_df.get("stderr","")[:200]}), 502
+
+    ts = _time.strftime("%Y%m%d-%H%M%S")
+    remote_tar = "/opt/entware_backup.tar.gz"
+
+    # 1. Создать tar.gz на роутере
+    # Используем czf (compressed) — для GeoIP-баз сжатие минимальное, но для скриптов/конфигов ощутимое
+    tar_cmd = (
+        f'rm -f {remote_tar} 2>/dev/null; '
+        f'tar czf {remote_tar} --exclude={remote_tar} -C /opt . 2>&1 | tail -3; '
+        f'echo "===SIZE==="; '
+        f'wc -c < {remote_tar} 2>&1'
+    )
+    r_tar = keenetic_ssh(tar_cmd, timeout=300)  # tar /opt = до 5 минут на медленных роутерах
+    if not r_tar["ok"]:
+        return jsonify({"ok": False, "stage": "tar",
+                        "error": "Не удалось создать tar.gz на роутере",
+                        "stderr": r_tar.get("stderr","")[:500],
+                        "stdout": r_tar.get("stdout","")[:500]}), 500
+
+    # Парсим размер из вывода
+    out = r_tar.get("stdout","") or ""
+    remote_size = 0
+    if "===SIZE===" in out:
+        try:
+            remote_size = int(out.split("===SIZE===")[1].strip().split()[0])
+        except Exception:
+            pass
+
+    if remote_size < 100 * 1024:  # <100KB — что-то не так
+        # Cleanup
+        keenetic_ssh(f"rm -f {remote_tar}", timeout=10)
+        return jsonify({"ok": False, "stage": "tar",
+                        "error": f"tar получился слишком маленький ({remote_size} байт) — возможно ошибка",
+                        "stdout": out[:1000]}), 500
+
+    # 2. Скачать через scp
+    backups_dir = r"C:\xray-dashboard\backups"
+    try:
+        os.makedirs(backups_dir, exist_ok=True)
+    except Exception as ex:
+        return jsonify({"ok": False, "stage": "mkdir", "error": f"mkdir failed: {ex}"}), 500
+
+    local_fname = f"entware_backup_{ts}.tar.gz"
+    local_path = os.path.join(backups_dir, local_fname)
+
+    scp_args = [
+        "scp",
+        "-i", cfg.KEENETIC_SSH_KEY,
+        "-P", str(cfg.KEENETIC_PORT),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=NUL",
+        "-o", "BatchMode=yes",
+        "-o", "LogLevel=ERROR",
+        f"{cfg.KEENETIC_USER}@{cfg.KEENETIC_HOST}:{remote_tar}",
+        local_path,
+    ]
+    try:
+        scp_r = subprocess.run(scp_args, capture_output=True, timeout=600)  # большой файл — 10 мин max
+    except subprocess.TimeoutExpired:
+        keenetic_ssh(f"rm -f {remote_tar}", timeout=10)
+        return jsonify({"ok": False, "stage": "scp",
+                        "error": "scp timeout 600s — файл слишком большой или медленная сеть"}), 504
+
+    if scp_r.returncode != 0:
+        stderr = scp_r.stderr.decode("utf-8", errors="replace")[:500]
+        keenetic_ssh(f"rm -f {remote_tar}", timeout=10)
+        return jsonify({"ok": False, "stage": "scp",
+                        "error": f"scp failed: rc={scp_r.returncode}",
+                        "stderr": stderr}), 500
+
+    # 3. Cleanup на роутере
+    keenetic_ssh(f"rm -f {remote_tar}", timeout=10)
+
+    try:
+        local_size = os.path.getsize(local_path)
+    except OSError:
+        local_size = 0
+
+    return jsonify({
+        "ok": True,
+        "filename": local_fname,
+        "path": local_path,
+        "size_bytes": local_size,
+        "size_mb": round(local_size / (1024*1024), 1),
+        "remote_size_mb": round(remote_size / (1024*1024), 1),
+        "backups_dir": backups_dir,
+        "msg": f"Архив создан: {local_path} ({round(local_size/(1024*1024), 1)} МБ)",
+    })
+
+
+@app.route("/api/xkeen/restore", methods=["POST"])
+@requires_auth
+def api_xkeen_restore():
+    """Восстанавливает конфиги из загруженного snapshot.json.
+    Поддерживает 2 формата:
+      v7: {"files": [{"path": "/opt/.../file", "content": "..."}, ...]}
+      v6 legacy: {"files": {"04_outbounds.json": "...", ...}}
+    Защита: разрешает писать только в whitelist путей (XKEEN_BACKUP_FILES).
+    Перед записью каждого файла — .bak-pre-restore-<ts> на роутере."""
+    import time as _time
+    if 'snapshot' not in request.files:
+        return jsonify({"ok": False, "stderr": "файл snapshot не приложен"})
+    f = request.files['snapshot']
+    try:
+        data = json.loads(f.read().decode('utf-8'))
+    except Exception as ex:
+        return jsonify({"ok": False, "stderr": f"некорректный JSON: {ex}"})
+
+    raw_files = data.get("files")
+    if not raw_files:
+        return jsonify({"ok": False, "stderr": "в snapshot нет поля files"})
+
+    # Нормализуем оба формата в список (path, content)
+    items = []
+    if isinstance(raw_files, list):
+        # v7 формат
+        for item in raw_files:
+            if isinstance(item, dict) and "path" in item and "content" in item:
+                items.append((item["path"], item["content"]))
+    elif isinstance(raw_files, dict):
+        # v6 legacy формат — словарь {filename: content}
+        legacy_map = {
+            "04_outbounds.json":        "/opt/etc/xray/configs/04_outbounds.json",
+            "05_routing.json":          "/opt/etc/xray/configs/05_routing.json",
+            "05_routing.template.json": "/opt/etc/xray/configs.bak/05_routing.template.json",
+            "watchdog.config":          "/opt/etc/xray/watchdog.config",
+            "watchdog.sh":              "/opt/etc/xray/watchdog.sh",
+            "watchdog.state":           "/opt/etc/xray/watchdog.state",
+        }
+        for name, content in raw_files.items():
+            if name in legacy_map:
+                items.append((legacy_map[name], content))
+
+    if not items:
+        return jsonify({"ok": False, "stderr": "snapshot пустой или невалидный формат"})
+
+    # SECURITY: разрешаем писать только в whitelist путей
+    allowed = set(XKEEN_BACKUP_FILES)
+    ts = _time.strftime('%Y%m%d-%H%M%S')
+    restored = []
+    errors = []
+    skipped = []
+    for path, content in items:
+        if path not in allowed:
+            skipped.append(f"{path} (не в whitelist)")
+            continue
+        # Бэкап текущего
+        keenetic_ssh(f"cp {path} {path}.bak-pre-restore-{ts} 2>/dev/null || true")
+        r = keenetic_ssh(f"cat > {path}", stdin_data=content, timeout=15)
+        if r["ok"]:
+            restored.append(path)
+        else:
+            errors.append(f"{path}: {r['stderr'][:200]}")
+
+    if errors:
+        return jsonify({"ok": False, "stderr": "Ошибки:\n" + "\n".join(errors), "restored": restored})
+
+    # chmod +x для скриптов
+    keenetic_ssh("chmod +x /opt/etc/xray/watchdog.sh")
+    # Перезаливаем crontab если был в bundle
+    if "/opt/var/spool/cron/crontabs/root" in [p for p, _ in items]:
+        keenetic_ssh("crontab /opt/var/spool/cron/crontabs/root 2>/dev/null || true")
+    # Перезапуск xray
+    apply = keenetic_ssh("/opt/etc/xray/watchdog.sh && xkeen -restart", timeout=30)
+
+    msg = f"✅ Восстановлено {len(restored)} файлов. Бэкап текущих: *.bak-pre-restore-{ts}"
+    if skipped:
+        msg += f"\n⚠️ Пропущены (не в whitelist): {len(skipped)} — " + ", ".join(skipped[:3])
+    return jsonify({
+        "ok": True,
+        "stdout": msg,
+        "apply_stderr": apply.get("stderr", "")[:300],
+    })
+
+
+@app.route("/api/xkeen/set-direct-domains", methods=["POST"])
+@requires_auth
+def api_xkeen_set_direct_domains():
+    """Обновить список DIRECT-доменов (идут напрямую без VPN).
+    Body: domains=<строка>"""
+    raw = request.form.get("domains", "").strip()
+    domains = [d.strip() for d in re.split(r"[\s,]+", raw) if d.strip()]
+    # Пустой список разрешён — означает «только базовые .ru regex + geosite работают»
+    return jsonify(keenetic_write_watchdog_config({"DIRECT_DOMAINS": " ".join(domains)}))
+
+
+@app.route("/api/xkeen/get-domain-notes", methods=["GET"])
+@requires_auth
+def api_xkeen_get_domain_notes():
+    """Возвращает sidecar JSON с примечаниями к доменам (v1.7.0).
+    Используется JS на /xkeen при загрузке для рендеринга textarea с inline-комментариями.
+    Если файла нет на роутере — возвращает пустую структуру (4 пустых namespace)."""
+    return jsonify({"ok": True, "notes": keenetic_read_domain_notes()})
+
+
+@app.route("/api/xkeen/set-domain-notes", methods=["POST"])
+@requires_auth
+def api_xkeen_set_domain_notes():
+    """Сохраняет sidecar JSON с примечаниями к доменам (v1.7.0).
+    Body JSON: {"ai": {"claude.ai": "📦 claude", ...}, "yt": {...}, ...}
+    Делает .bak-pre-<ts> на роутере перед перезаписью.
+    Cleanup осиротевших notes (доменов которых нет в watchdog.config) — НЕ делает,
+    это ответственность фронтенда (он отправляет только notes для актуальных доменов)."""
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        return jsonify({"ok": False, "stderr": "invalid json body"}), 400
+    notes = body.get("notes", {})
+    if not isinstance(notes, dict):
+        return jsonify({"ok": False, "stderr": "notes must be a dict"}), 400
+    r = keenetic_write_domain_notes(notes)
+    if r["ok"]:
+        return jsonify({"ok": True, "stdout": "domain_notes.json saved"})
+    return jsonify({"ok": False, "stderr": r.get("stderr", "ssh write failed")})
+
+
+@app.route("/api/xkeen/set-block-domains", methods=["POST"])
+@requires_auth
+def api_xkeen_set_block_domains():
+    """Обновить список BLOCK-доменов (полностью заблокированы через outbound `block`/blackhole).
+    Используется для отсечения Windows Update, Adobe activation, телеметрии и т.п.
+    Body: domains=<строка>"""
+    raw = request.form.get("domains", "").strip()
+    domains = [d.strip() for d in re.split(r"[\s,]+", raw) if d.strip()]
+    return jsonify(keenetic_write_watchdog_config({"BLOCK_DOMAINS": " ".join(domains)}))
+
+
+@app.route("/api/xkeen/set-ai-fail-block", methods=["POST"])
+@requires_auth
+def api_xkeen_set_ai_fail_block():
+    """Включить/выключить AI kill-switch.
+    Body: enabled=1|0"""
+    enabled = request.form.get("enabled", "1") == "1"
+    return jsonify(keenetic_write_watchdog_config({"AI_FAIL_BLOCK": "1" if enabled else "0"}))
+
+
+@app.route("/api/xkeen/set-ai-domains", methods=["POST"])
+@requires_auth
+def api_xkeen_set_ai_domains():
+    """Обновить список AI-доменов в watchdog.config.
+    Body: domains=<строка с доменами через пробел/запятую/перенос строки>"""
+    raw = request.form.get("domains", "").strip()
+    # Нормализация: парсим разделители (запятые/пробелы/переносы), убираем пустые
+    domains = [d.strip() for d in re.split(r"[\s,]+", raw) if d.strip()]
+    if not domains:
+        return jsonify({"ok": False, "stderr": "пустой список доменов"})
+    # Сохраняем как пробел-separated
+    return jsonify(keenetic_write_watchdog_config({"AI_DOMAINS": " ".join(domains)}))
+
+
+@app.route("/api/xkeen/set-yt-domains", methods=["POST"])
+@requires_auth
+def api_xkeen_set_yt_domains():
+    """Обновить список YouTube-доменов в watchdog.config.
+    Пустой список разрешён — означает «YT-sticky правило выключено,
+    YouTube идёт через PRIMARY как обычный трафик»."""
+    raw = request.form.get("domains", "").strip()
+    domains = [d.strip() for d in re.split(r"[\s,]+", raw) if d.strip()]
+    return jsonify(keenetic_write_watchdog_config({"YT_DOMAINS": " ".join(domains)}))
+
+
+@app.route("/api/xkeen/set-yt-fail-block", methods=["POST"])
+@requires_auth
+def api_xkeen_set_yt_fail_block():
+    """Включить/выключить YT kill-switch (по умолчанию выключен).
+    Body: enabled=1|0"""
+    enabled = request.form.get("enabled", "0") == "1"
+    return jsonify(keenetic_write_watchdog_config({"YT_FAIL_BLOCK": "1" if enabled else "0"}))
+
+
+@app.route("/api/xkeen/set-ai-ext-categories", methods=["POST"])
+@requires_auth
+def api_xkeen_set_ai_ext_categories():
+    """Обновить список v2fly geosite-категорий для AI-правила.
+    Watchdog при ребилде routing.json подставит их как ext:geosite_v2fly.dat:NAME
+    рядом с ручными доменами из AI_DOMAINS. Пустой список — категорий нет, остаются только ручные домены.
+    Body: categories=<строка через пробел/запятую>, например "openai anthropic deepseek"."""
+    raw = request.form.get("categories", "").strip()
+    # Нормализация: только [a-z0-9_-]+, остальное игнор. Защита от инъекций.
+    categories = []
+    for c in re.split(r"[\s,]+", raw):
+        c = c.strip().lower()
+        if c and re.match(r"^[a-z0-9_-]+$", c):
+            categories.append(c)
+    return jsonify(keenetic_write_watchdog_config({"AI_EXT_CATEGORIES": " ".join(categories)}))
+
+
+@app.route("/api/xkeen/set-yt-ext-categories", methods=["POST"])
+@requires_auth
+def api_xkeen_set_yt_ext_categories():
+    """Обновить список v2fly geosite-категорий для YT-правила (youtube/tiktok/instagram/...).
+    Body: categories=<строка через пробел/запятую>."""
+    raw = request.form.get("categories", "").strip()
+    categories = []
+    for c in re.split(r"[\s,]+", raw):
+        c = c.strip().lower()
+        if c and re.match(r"^[a-z0-9_-]+$", c):
+            categories.append(c)
+    return jsonify(keenetic_write_watchdog_config({"YT_EXT_CATEGORIES": " ".join(categories)}))
+
+
+@app.route("/api/xkeen/set-yt-geoip-categories", methods=["POST"])
+@requires_auth
+def api_xkeen_set_yt_geoip_categories():
+    """Обновить список geoip-категорий для YT-канала (telegram, discord, ...).
+    Зачем: IP-only приложения (Telegram Desktop) коннектятся напрямую к IP датацентров
+    минуя DNS — доменные правила их не ловят. geoip:NAME матчит по IP-диапазонам из geoip.dat.
+    Watchdog v10 сгенерит ОТДЕЛЬНОЕ правило {"ip": ["geoip:NAME"], "outboundTag": YT_TAG}.
+    Body: categories=<строка через пробел/запятую>, например "telegram discord"."""
+    raw = request.form.get("categories", "").strip()
+    categories = []
+    for c in re.split(r"[\s,]+", raw):
+        c = c.strip().lower()
+        if c and re.match(r"^[a-z0-9_-]+$", c):
+            categories.append(c)
+    return jsonify(keenetic_write_watchdog_config({"YT_GEOIP_CATEGORIES": " ".join(categories)}))
+
+
+@app.route("/api/xkeen/set-failover-chain", methods=["POST"])
+@requires_auth
+def api_xkeen_set_failover_chain():
+    """Установить полный порядок цепочки failover.
+    Body: tags=<comma-separated-список-в-порядке>"""
+    tags_raw = request.form.get("tags", "").strip()
+    if not tags_raw:
+        return jsonify({"ok": False, "stderr": "пустой список — должен быть хотя бы 1 failover"})
+    tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+    if not tags:
+        return jsonify({"ok": False, "stderr": "после фильтрации пусто"})
+    result = keenetic_write_watchdog_config({"FAILOVER_TAGS": " ".join(tags)})
+    return jsonify(result)
+
+
+# ============== POLICY CLIENTS (v1.7.6) ==============
+# Read-only endpoint: список клиентов Keenetic-политики XKeen + сопоставление с
+# всеми LAN-клиентами. Нужен для UI-секции «👥 Клиенты в политике XKeen» — она
+# показывает кто фактически идёт через xray (= кто помечен fwmark'ом политики
+# Policy2 в Keenetic), а кто проходит мимо. Также детектит сюрпризы — например
+# WiFi-камеру случайно попавшую в политику XKeen из-за наследования от AP.
+
+_POLICY_HDR_RE = re.compile(r'policy,\s*name\s*=\s*(Policy\d+),\s*description\s*=\s*([^:\r\n]+?)\s*:', re.IGNORECASE)
+_HOST_POLICY_RE = re.compile(r'^\s*host\s+([0-9a-fA-F:]{17})\s+policy\s+(Policy\d+)\s*$', re.MULTILINE)
+_HOSTSPOT_HOST_BLOCK_RE = re.compile(r'^\s*host:\s*$', re.MULTILINE)
+
+def _parse_ndmc_hosts(text):
+    """Распарсить вывод 'ndmc -c "show ip hotspot"' на список хостов.
+    Возвращает [{mac, ip, name, hostname, active, link, interface, ssid}, ...].
+    """
+    if not text:
+        return []
+    # Разбиваем на блоки по 'host:' (это начало нового хоста)
+    chunks = _HOSTSPOT_HOST_BLOCK_RE.split(text)
+    hosts = []
+    for chunk in chunks[1:]:  # первый chunk до первого 'host:' — мусор
+        # Стопаем по следующему 'host:' либо по концу — но split уже разделил
+        fields = {}
+        for line in chunk.splitlines():
+            line = line.strip()
+            if ':' not in line:
+                continue
+            key, _, val = line.partition(':')
+            key = key.strip().lower()
+            val = val.strip()
+            # Берём только верхнеуровневые поля хоста — не лезем в interface/dhcp/traffic-shape
+            if key in {'mac', 'ip', 'name', 'hostname', 'access', 'active', 'link', 'ssid', 'ap', 'authenticated', 'rxbytes', 'txbytes', 'uptime'}:
+                if key not in fields:  # первое вхождение — оно «настоящее» (потом могут быть вложенные)
+                    fields[key] = val
+        mac = fields.get('mac', '')
+        if not mac or len(mac) != 17:
+            continue
+        # Активность: link=up + active=yes
+        active = (fields.get('active', '') == 'yes') and (fields.get('link', '') == 'up')
+        hosts.append({
+            'mac': mac.lower(),
+            'ip': fields.get('ip', ''),
+            'name': fields.get('name', '') or fields.get('hostname', '') or '(без имени)',
+            'hostname': fields.get('hostname', ''),
+            'active': active,
+            'link': fields.get('link', ''),
+            'ssid': fields.get('ssid', ''),
+            'rxbytes': fields.get('rxbytes', ''),
+            'txbytes': fields.get('txbytes', ''),
+        })
+    return hosts
+
+
+def _parse_ndmc_policies(text):
+    """Распарсить 'show ip policy' в dict {description: internal_name}.
+    Например {'XKeen': 'Policy2', 'Amnezia': 'Policy0', 'hidemy': 'Policy1'}.
+    """
+    if not text:
+        return {}
+    result = {}
+    for m in _POLICY_HDR_RE.finditer(text):
+        internal = m.group(1)
+        desc = m.group(2).strip()
+        result[desc] = internal
+    return result
+
+
+def _parse_host_policies(running_config_text):
+    """Из 'show running-config' выдрать привязки 'host MAC policy PolicyN'.
+    Возвращает dict {mac_lower: internal_policy_name}.
+    """
+    if not running_config_text:
+        return {}
+    result = {}
+    for m in _HOST_POLICY_RE.finditer(running_config_text):
+        mac = m.group(1).lower()
+        policy = m.group(2)
+        result[mac] = policy
+    return result
+
+
+def _parse_lst_file(text):
+    """Парсит файлы /opt/etc/xkeen/*.lst — раскомментированные строки.
+    Игнорирует пустые и закомментированные '#'."""
+    if not text:
+        return []
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith('#'):
+            continue
+        lines.append(s)
+    return lines
+
+
+def _parse_xkeen_ports(text):
+    """xkeen -cp / -cpe возвращает что-то вроде:
+       '  Прокси-клиент работает на портах\n     80\n     443\n'
+       Или '  Нет портов исключенных из проксирования'.
+    """
+    if not text:
+        return []
+    ansi_re = re.compile(r'\x1b?\[[0-9;?]*[a-zA-Z]')
+    clean = ansi_re.sub('', text)
+    ports = []
+    for line in clean.splitlines():
+        s = line.strip()
+        # Берём только строки которые являются числом или диапазоном (например '443' или '50000:50030')
+        if re.match(r'^\d+(:\d+)?$', s):
+            ports.append(s)
+    return ports
+
+
+@app.route("/api/xkeen/policy-clients", methods=["GET"])
+@requires_auth
+def api_xkeen_policy_clients():
+    """Получить состав политики XKeen в Keenetic + список всех LAN-клиентов с сопоставлением.
+
+    Архитектура (см. https://github.com/Corvus-Malus/XKeen + ndmc -c "show ip policy"):
+      - В Keenetic политика существует под автогенерируемым именем (Policy0/1/2/...).
+      - 'Человеческое' имя хранится в description политики.
+      - XKeen-installer ищет политику по description РОВНО 'XKeen' (case-sensitive).
+      - Привязка клиента: 'host <MAC> policy PolicyN' в running-config.
+      - У политики есть fwmark (например 0xffffaac), Keenetic'ом проставляется на пакеты
+        от привязанных MAC, и XKeen-iptables ловит этот fwmark → TPROXY → xray.
+
+    Возвращает:
+      {
+        ok: True,
+        policy_name: "XKeen",
+        policy_id_internal: "Policy2",       // как Keenetic его внутренне зовёт
+        policy_found: True,                  // False если description="XKeen" не нашлось
+        policy_fwmark: "ffffaac",            // hex значение mark (см. ниже warning об извлечении)
+        all_policies: {"XKeen": "Policy2", ...},
+        hosts: [
+          { mac, ip, name, hostname, active, in_xkeen, in_other_policy, other_policy_desc, ssid, rxbytes, txbytes }
+        ],
+        stats: { total_hosts, in_xkeen, in_other_policy, in_no_policy },
+        xkeen_ports: { proxy: ["80","443"], exclude: [] },
+        config_lists: { ip_exclude: [...], port_proxying: [...], port_exclude: [...] },
+      }
+    """
+    # 1. Политики (для description'ов)
+    r_pol = keenetic_ssh('ndmc -c "show ip policy"', timeout=12)
+    if not r_pol["ok"]:
+        return jsonify({
+            "ok": False,
+            "stage": "show ip policy",
+            "error": "Keenetic CLI недоступен",
+            "stderr": r_pol.get("stderr", "")[:500],
+        })
+
+    # 2. Running-config (для привязок host MAC → policy)
+    r_rc = keenetic_ssh('ndmc -c "show running-config" 2>&1 | grep -E "^[[:space:]]*host [0-9a-fA-F:]+ policy"', timeout=15)
+
+    # 3. Хосты hotspot (для имён + статуса)
+    r_hosts = keenetic_ssh('ndmc -c "show ip hotspot"', timeout=15)
+
+    # 4. XKeen-порты
+    r_ports = keenetic_ssh('echo "===CP==="; xkeen -cp 2>&1; echo "===CPE==="; xkeen -cpe 2>&1', timeout=10)
+
+    # 5. /opt/etc/xkeen/*.lst
+    r_lst = keenetic_ssh(
+        'echo "===IP==="; cat /opt/etc/xkeen/ip_exclude.lst 2>/dev/null; '
+        'echo "===PP==="; cat /opt/etc/xkeen/port_proxying.lst 2>/dev/null; '
+        'echo "===PE==="; cat /opt/etc/xkeen/port_exclude.lst 2>/dev/null',
+        timeout=8)
+
+    # 6. Проверить наличие conntrack-tools (для эффективности 🔄 кнопки)
+    r_ct = keenetic_ssh('test -x /opt/sbin/conntrack && echo INSTALLED || echo NOT_INSTALLED', timeout=5)
+    conntrack_tools_installed = 'INSTALLED' in (r_ct.get("stdout", "") or "")
+
+    # Парсинг
+    policies = _parse_ndmc_policies(r_pol["stdout"])
+    xkeen_internal = policies.get("XKeen")
+    # fwmark — ищем рядом с XKeen в выводе
+    fwmark = None
+    if xkeen_internal:
+        # Поищем "policy, name = Policy2, description = XKeen:" и потом первую mark: строку
+        idx = r_pol["stdout"].find(f"name = {xkeen_internal}")
+        if idx >= 0:
+            tail = r_pol["stdout"][idx:idx + 1500]
+            m = re.search(r'mark:\s*([0-9a-fA-F]+)', tail)
+            if m:
+                fwmark = m.group(1)
+
+    host_policy_mapping = _parse_host_policies(r_rc.get("stdout", ""))
+    hosts = _parse_ndmc_hosts(r_hosts.get("stdout", ""))
+
+    # Маппинг хостов к политикам
+    # v1.7.8: heuristic-детектор «подозрительных» по словам в имени убран — он давал
+    # false positive (IoT/камерам тоже иногда нужен VPN: китайский cloud заблокирован,
+    # удалённый просмотр камеры из-за границы и т.п.). Пусть юзер решает сам.
+    for h in hosts:
+        p = host_policy_mapping.get(h["mac"])
+        h["in_xkeen"] = (p == xkeen_internal) if xkeen_internal else False
+        h["in_other_policy"] = bool(p) and not h["in_xkeen"]
+        if h["in_other_policy"]:
+            # Найти description для этой policy
+            other_desc = next((d for d, i in policies.items() if i == p), p)
+            h["other_policy_desc"] = other_desc
+        else:
+            h["other_policy_desc"] = ""
+
+    # Парсинг портов XKeen
+    cp_text, cpe_text = "", ""
+    if "===CP===" in r_ports.get("stdout", ""):
+        parts = r_ports["stdout"].split("===CPE===")
+        cp_text = parts[0].replace("===CP===", "").strip()
+        cpe_text = (parts[1] if len(parts) > 1 else "").strip()
+
+    proxy_ports = _parse_xkeen_ports(cp_text)
+    exclude_ports = _parse_xkeen_ports(cpe_text)
+
+    # Парсинг .lst файлов
+    lst_out = r_lst.get("stdout", "")
+    ip_excl_text = port_proxy_text = port_excl_text = ""
+    if "===IP===" in lst_out:
+        try:
+            _, rest = lst_out.split("===IP===", 1)
+            ip_excl_text, rest = rest.split("===PP===", 1)
+            port_proxy_text, port_excl_text = rest.split("===PE===", 1)
+        except ValueError:
+            pass
+
+    in_xkeen_count = sum(1 for h in hosts if h["in_xkeen"])
+    in_other_count = sum(1 for h in hosts if h["in_other_policy"])
+
+    return jsonify({
+        "ok": True,
+        "policy_name": "XKeen",
+        "policy_id_internal": xkeen_internal,
+        "policy_found": xkeen_internal is not None,
+        "policy_fwmark": fwmark,
+        "all_policies": policies,
+        "hosts": hosts,
+        "stats": {
+            "total_hosts": len(hosts),
+            "in_xkeen": in_xkeen_count,
+            "in_other_policy": in_other_count,
+            "in_no_policy": len(hosts) - in_xkeen_count - in_other_count,
+        },
+        "xkeen_ports": {
+            "proxy": proxy_ports,
+            "exclude": exclude_ports,
+        },
+        "config_lists": {
+            "ip_exclude": _parse_lst_file(ip_excl_text),
+            "port_proxying": _parse_lst_file(port_proxy_text),
+            "port_exclude": _parse_lst_file(port_excl_text),
+        },
+        "conntrack_tools_installed": conntrack_tools_installed,
+    })
+
+
+_MAC_RE = re.compile(r'^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$')
+_POLICY_NAME_RE = re.compile(r'^Policy\d+$')
+_IPV4_RE = re.compile(r'^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$')
+
+
+@app.route("/api/xkeen/routing-template-rules", methods=["GET"])
+@requires_auth
+def api_xkeen_routing_template_rules():
+    """Прочитать и распарсить базовые правила из 05_routing.template.json на роутере.
+
+    Зачем: пользовательские домены (DIRECT/BLOCK/AI/YT) видны в дашборде в textarea,
+    но **базовые** правила (regex *.ru/*.su/*.рф, geosite-категории, IP-список,
+    bittorrent direct, UDP-блокировка SMB/QUIC) захардкожены в template и
+    невидимы для юзера. Этот endpoint парсит их и возвращает структурированно
+    для отображения в read-only блоке.
+    """
+    raw = keenetic_read_file("/opt/etc/xray/configs.bak/05_routing.template.json", timeout=10)
+    if not raw:
+        return jsonify({"ok": False, "error": "Не удалось прочитать template с роутера"}), 502
+
+    # Strip // comments (template их содержит для документации)
+    clean = _strip_json_comments(raw)
+    try:
+        tmpl = json.loads(clean)
+    except Exception as ex:
+        return jsonify({"ok": False, "error": f"Не удалось распарсить template: {ex}", "raw_head": raw[:500]}), 500
+
+    rules_list = (tmpl.get("routing") or {}).get("rules", [])
+    parsed = []
+    for r in rules_list:
+        if not isinstance(r, dict):
+            continue
+        outbound = r.get("outboundTag") or r.get("balancerTag") or ""
+        # Пропускаем placeholder'ы (`__AI_RULE_BLOCK__` и т.п. — это шаблонные точки подстановки)
+        # и пользовательские domain-списки (они уже видны в DIRECT/BLOCK секциях).
+        # Оставляем только хардкод-правила в template (без placeholder'ов в outbound).
+        if "__" in str(outbound):
+            continue
+        # Network/protocol-based правила (UDP-block, bittorrent)
+        if r.get("network") and r.get("port"):
+            parsed.append({
+                "type": "udp-block" if outbound == "block" else "network",
+                "network": r.get("network"),
+                "ports": [p.strip() for p in str(r.get("port")).split(",")],
+                "outbound": outbound,
+                "description": _describe_network_rule(r.get("network"), r.get("port"), outbound),
+            })
+            continue
+        if r.get("protocol"):
+            parsed.append({
+                "type": "protocol",
+                "protocol": r.get("protocol") if isinstance(r.get("protocol"), list) else [r.get("protocol")],
+                "outbound": outbound,
+                "description": "BitTorrent трафик идёт напрямую через провайдера (через VPN торренты обычно запрещены или режут скорость)" if "bittorrent" in str(r.get("protocol")) else "",
+            })
+            continue
+        # IP-список (только хардкод-IP, без geoip:)
+        if r.get("ip") and isinstance(r["ip"], list):
+            ips = [x for x in r["ip"] if isinstance(x, str) and not x.startswith("geoip:")]
+            geoips = [x.replace("geoip:", "") for x in r["ip"] if isinstance(x, str) and x.startswith("geoip:")]
+            if ips:
+                parsed.append({
+                    "type": "ip-list",
+                    "ips": ips,
+                    "outbound": outbound,
+                    "description": "Жёстко прописанные IP в template (вероятно ваши VPN-эндпоинты которые нельзя через xray роутить — иначе loop)",
+                })
+            if geoips:
+                parsed.append({
+                    "type": "geoip",
+                    "categories": geoips,
+                    "outbound": outbound,
+                    "description": f"Категории geoip → {outbound}",
+                })
+            continue
+        # Domain-правила: разделяем regex / geosite ext / прямые
+        if r.get("domain") and isinstance(r["domain"], list):
+            regexps = [d for d in r["domain"] if isinstance(d, str) and d.startswith("regexp:")]
+            ext_sites = [d for d in r["domain"] if isinstance(d, str) and d.startswith("ext:")]
+            plain = [d for d in r["domain"] if isinstance(d, str) and not d.startswith("regexp:") and not d.startswith("ext:") and not d.startswith("geosite:")]
+            geosites = [d.replace("geosite:", "") for d in r["domain"] if isinstance(d, str) and d.startswith("geosite:")]
+            if regexps:
+                parsed.append({
+                    "type": "domain-regex",
+                    "patterns": [_humanize_regex(p) for p in regexps],
+                    "raw_patterns": regexps,
+                    "outbound": outbound,
+                    "description": f"Доменные regex'ы → {outbound}",
+                })
+            if ext_sites:
+                # ext:geosite_v2fly.dat:category-gov-ru → file=geosite_v2fly.dat, cat=category-gov-ru
+                ext_parsed = []
+                for e in ext_sites:
+                    parts = e.split(":", 2)
+                    if len(parts) >= 3:
+                        ext_parsed.append({"file": parts[1], "category": parts[2]})
+                parsed.append({
+                    "type": "geosite-ext",
+                    "ext_categories": ext_parsed,
+                    "outbound": outbound,
+                    "description": f"Geosite-категории из .dat-файлов → {outbound}",
+                })
+            if plain:
+                parsed.append({
+                    "type": "domain-direct",
+                    "domains": plain,
+                    "outbound": outbound,
+                    "description": f"Жёстко прописанные домены в template → {outbound}",
+                })
+            if geosites:
+                parsed.append({
+                    "type": "geosite-builtin",
+                    "categories": geosites,
+                    "outbound": outbound,
+                    "description": f"Встроенные geosite-категории → {outbound}",
+                })
+            continue
+        # InboundTag-only правила (например socks-local → vless-reality) — last в template
+        if r.get("inboundTag") and not r.get("domain") and not r.get("ip") and not r.get("protocol") and not r.get("network"):
+            parsed.append({
+                "type": "inbound-default",
+                "inboundTag": r.get("inboundTag"),
+                "outbound": outbound,
+                "description": f"Все остальные пакеты с inboundTag {r.get('inboundTag')} → {outbound}",
+            })
+
+    return jsonify({
+        "ok": True,
+        "rules": parsed,
+        "template_path": "/opt/etc/xray/configs.bak/05_routing.template.json",
+        "total_rules": len(rules_list),
+        "shown_rules": len(parsed),
+    })
+
+
+def _humanize_regex(pattern):
+    r"""Преобразовать xray regex-паттерн в человеко-читаемую форму.
+    `regexp:^([\w\-\.]+\.)ru$` → `*.ru`
+    `regexp:^([\w\-\.]+\.)xn--p1ai$` → `*.рф`
+    """
+    # Убрать префикс regexp:
+    p = pattern.replace("regexp:", "")
+    # Стандартная форма для xray: `^([\w\-\.]+\.)TLD$` → `*.TLD`
+    m = re.match(r'^\^\(\[\\w\\-\\\.\]\+\\\.\)(.+?)\$$', p)
+    if m:
+        tld = m.group(1)
+        # IDN decode для xn-- доменов
+        if tld == "xn--p1ai":
+            return "*.рф"
+        return f"*.{tld}"
+    return p  # как есть, если не распознали
+
+
+def _describe_network_rule(network, port, outbound):
+    """Описание network-правила (UDP-блокировки и т.п.)."""
+    p = str(port)
+    if network == "udp":
+        if "135" in p or "137" in p or "138" in p or "139" in p:
+            return "UDP NetBIOS (135-139) — блокировка чтобы Windows-PC не утекали имена через VPN. Иначе можно засветить имя хоста для DNS-сниффинга."
+        if "443" in p:
+            return "UDP 443 (QUIC) — блокировка, потому что QUIC обходит TPROXY-перехват (xray работает поверх TCP). Без блока браузеры пытаются Quic, не идут через VPN."
+        return f"UDP порты {port} → {outbound}"
+    return f"{network} порты {port} → {outbound}"
+
+
+@app.route("/api/xkeen/set-client-policy", methods=["POST"])
+@requires_auth
+def api_xkeen_set_client_policy():
+    """Сменить привязку клиента к политике Keenetic (v1.7.6+).
+    Body:
+      - mac=AA:BB:CC:DD:EE:FF (обязательно, валидируется регексом)
+      - policy=Policy2|none   (none = снять привязку = политика по умолчанию)
+    Команды ndmc:
+      - bind:   ndmc -c "host <MAC> policy <PolicyName>"
+      - unbind: ndmc -c "no host <MAC> policy"
+      - save:   ndmc -c "system configuration save"  (иначе после reboot слетит)
+    Защита:
+      - валидация формата MAC
+      - валидация policy формата (Policy\\d+) или 'none'
+      - проверка что policy реально существует в 'show ip policy'
+        (исключает опечатки типа Policy99 → Keenetic мог бы создать новую)
+      - запрет на отвязку самого host'а с которого панель ходит (yuran-00):
+        панель ходит SSH'ом на роутер минуя политику, но в LAN сторона панели
+        тоже работает — однако это не критично, поэтому ограничения нет (юзер
+        сам себе режиссёр; локальный SSH к роутеру не зависит от политики).
+    """
+    mac = (request.form.get("mac", "") or "").strip().lower()
+    policy = (request.form.get("policy", "") or "").strip()
+
+    if not _MAC_RE.match(mac):
+        return jsonify({"ok": False, "error": f"Невалидный MAC: {mac!r} (ожидаю формат AA:BB:CC:DD:EE:FF)"}), 400
+
+    is_unbind = policy in ("", "none", "default", "0")
+    if not is_unbind:
+        if not _POLICY_NAME_RE.match(policy):
+            return jsonify({"ok": False, "error": f"Невалидное имя политики: {policy!r} (ожидаю PolicyN или 'none')"}), 400
+        # Проверка что такая политика реально существует на роутере (защита от опечаток)
+        r_pol = keenetic_ssh('ndmc -c "show ip policy"', timeout=10)
+        if not r_pol["ok"]:
+            return jsonify({"ok": False, "error": "Keenetic CLI недоступен (не могу проверить существование политики)", "stderr": r_pol.get("stderr", "")[:300]}), 502
+        existing = _parse_ndmc_policies(r_pol["stdout"])
+        if policy not in existing.values():
+            return jsonify({
+                "ok": False,
+                "error": f"Политика {policy} не найдена на роутере. Существующие: {', '.join(existing.values()) or '(нет политик)'}",
+            }), 400
+
+    # Выполняем команду.
+    # Синтаксис: команды host/policy для клиента — это подкоманды `ip hotspot` (видно
+    # из running-config: они идут с indent внутри `ip hotspot` блока). Поэтому правильно
+    # `ip hotspot host MAC policy NAME` (не просто `host MAC policy NAME` — такого
+    # верхнеуровневого command нет, и ndmc вернёт "no such command: host").
+    if is_unbind:
+        cmd = f'ndmc -c "no ip hotspot host {mac} policy" 2>&1; echo "---SAVE---"; ndmc -c "system configuration save" 2>&1'
+        action = "unbind (=политика по умолчанию)"
+    else:
+        cmd = f'ndmc -c "ip hotspot host {mac} policy {policy}" 2>&1; echo "---SAVE---"; ndmc -c "system configuration save" 2>&1'
+        action = f"bind to {policy}"
+
+    r = keenetic_ssh(cmd, timeout=15)
+    # Чистим ANSI escape codes (Keenetic CLI любит [K cursor-erase)
+    ansi_re = re.compile(r'\x1b?\[[0-9;?]*[a-zA-Z]')
+    stdout_clean = ansi_re.sub('', r.get("stdout", "") or "").strip()
+    stderr_clean = ansi_re.sub('', r.get("stderr", "") or "").strip()
+
+    # Парсим — была ли ошибка в выводе ndmc (он часто пишет ошибки в stdout, exit-code = 0)
+    has_error = bool(re.search(r'\berror\[?\d', stdout_clean, re.IGNORECASE)) or not r["ok"]
+
+    return jsonify({
+        "ok": r["ok"] and not has_error,
+        "action": action,
+        "mac": mac,
+        "policy": policy if not is_unbind else None,
+        "stdout": stdout_clean[:2000],
+        "stderr": stderr_clean[:1000],
+        "code": r.get("code", -1),
+    })
+
+
+@app.route("/api/xkeen/flush-conntrack", methods=["POST"])
+@requires_auth
+def api_xkeen_flush_conntrack():
+    """Сбросить conntrack-записи для указанного клиента LAN.
+
+    Зачем: при смене Keenetic-политики через set-client-policy новый fwmark
+    применяется только к НОВЫМ соединениям. Существующие TCP/UDP остаются в
+    conntrack-таблице с старым маршрутом до закрытия (TCP FIN или UDP timeout).
+    Долгоживущие connection'ы (Telegram websocket, игры, ssh) могут «зависнуть»
+    на старой политике до явного reconnect. Этот endpoint мгновенно их сбрасывает.
+
+    Body: ip=192.168.15.X (только IPv4; conntrack по MAC не фильтрует — он работает
+    на L3 по IP-адресам).
+
+    Стратегии:
+      1. /opt/sbin/conntrack -D -s IP — если установлен conntrack-tools (opkg)
+      2. ndmc -c "clear ip conntrack source IP" — нативная Keenetic-команда
+    """
+    ip = (request.form.get("ip", "") or "").strip()
+    if not _IPV4_RE.match(ip):
+        return jsonify({"ok": False, "error": f"Невалидный IPv4: {ip!r}"}), 400
+
+    # Стратегия 1: conntrack-tools (если установлен в Entware)
+    # Стратегия 2: ndmc CLI команда clear ip conntrack source <IP>
+    # Сначала пытаемся conntrack-tools (более выразительный вывод "X flow entries deleted"),
+    # если бинарника нет — fallback на ndmc.
+    cmd = (
+        f'if [ -x /opt/sbin/conntrack ]; then '
+        f'  echo "===METHOD:conntrack==="; '
+        f'  /opt/sbin/conntrack -D -s {ip} 2>&1; '
+        f'else '
+        f'  echo "===METHOD:ndmc==="; '
+        f'  ndmc -c "clear ip conntrack source {ip}" 2>&1; '
+        f'fi'
+    )
+    r = keenetic_ssh(cmd, timeout=15)
+
+    ansi_re = re.compile(r'\x1b?\[[0-9;?]*[a-zA-Z]')
+    stdout_clean = ansi_re.sub('', r.get("stdout", "") or "").strip()
+    stderr_clean = ansi_re.sub('', r.get("stderr", "") or "").strip()
+
+    # Определяем метод и парсим результат
+    used_method = "unknown"
+    if "===METHOD:conntrack===" in stdout_clean:
+        used_method = "conntrack-tools"
+    elif "===METHOD:ndmc===" in stdout_clean:
+        used_method = "ndmc CLI"
+
+    # Извлечь summary (например 'X flow entries have been deleted' от conntrack-tools)
+    summary = ""
+    m = re.search(r'(\d+)\s+flow entries have been deleted', stdout_clean)
+    if m:
+        summary = f"Удалено {m.group(1)} соединений в conntrack-таблице."
+    elif used_method == "ndmc CLI":
+        # ndmc clear обычно тихий — если нет error[NNNN] значит успех
+        if 'error[' not in stdout_clean.lower() and 'no such command' not in stdout_clean.lower():
+            summary = "Команда выполнена (ndmc clear молчит при успехе)."
+
+    # Распознать ошибки
+    has_error = bool(re.search(r'\berror\[\d|no such command|not found|invalid', stdout_clean, re.IGNORECASE)) or not r["ok"]
+
+    # Подсказка если оба метода не сработали + detect can_auto_install
+    hint = ""
+    can_auto_install = False
+    if has_error and used_method == "ndmc CLI":
+        hint = ("conntrack-tools не установлен на роутере, и нативной CLI-команды "
+                "сброса conntrack по фильтру у KeeneticOS нет. Поставь conntrack-tools "
+                "(~50KB + зависимости) — после этого кнопка 🔄 заработает.")
+        can_auto_install = True
+
+    return jsonify({
+        "ok": not has_error,
+        "ip": ip,
+        "method": used_method,
+        "summary": summary,
+        "stdout": stdout_clean[:1500],
+        "stderr": stderr_clean[:500],
+        "hint": hint,
+        "can_auto_install_conntrack_tools": can_auto_install,
+    })
+
+
+@app.route("/api/xkeen/install-conntrack-tools", methods=["POST"])
+@requires_auth
+def api_xkeen_install_conntrack_tools():
+    """Установить пакет `conntrack` на роутере через opkg.
+
+    Зачем: без этого пакета кнопка 🔄 «Сбросить conntrack» не работает —
+    у KeeneticOS 4.x нет нативной CLI-команды для сброса conntrack-сессий
+    по фильтру (`clear` команды нет вообще — `no such command: clear`).
+    Единственный путь — поставить пакет `conntrack` (~50KB + ~150KB зависимостей).
+
+    Важно про имя пакета: в Debian/Ubuntu пакет называется `conntrack-tools`,
+    но в Entware (OpenWrt-style репо bin.entware.net) — просто `conntrack`.
+    Старая попытка `opkg install conntrack-tools` падала с "Unknown package".
+    После установки появится /opt/sbin/conntrack и flush-conntrack endpoint
+    автоматически переключится на метод 1.
+    """
+    # opkg update может тянуть индекс с сервера ~10 сек, install — ещё 20-40 сек
+    cmd = (
+        'echo "===PRECHECK==="; '
+        'test -x /opt/sbin/conntrack && echo "ALREADY_INSTALLED" || echo "NEEDED"; '
+        'echo "===OPKG_UPDATE==="; '
+        'opkg update 2>&1 | tail -8; '
+        'echo "===OPKG_INSTALL==="; '
+        'opkg install conntrack 2>&1 | tail -25; '
+        'echo "===POSTCHECK==="; '
+        'if [ -x /opt/sbin/conntrack ]; then '
+        '  echo "OK_INSTALLED"; '
+        '  /opt/sbin/conntrack --version 2>&1 | head -3; '
+        'else '
+        '  echo "FAIL_STILL_MISSING"; '
+        'fi'
+    )
+    r = keenetic_ssh(cmd, timeout=120)
+
+    ansi_re = re.compile(r'\x1b?\[[0-9;?]*[a-zA-Z]')
+    stdout = ansi_re.sub('', r.get("stdout", "") or "").strip()
+    stderr = ansi_re.sub('', r.get("stderr", "") or "").strip()
+
+    already_installed = "ALREADY_INSTALLED" in stdout
+    installed_now = "OK_INSTALLED" in stdout
+    failed = "FAIL_STILL_MISSING" in stdout
+
+    # Опкг-специфичные ошибки
+    hint = ""
+    if not (already_installed or installed_now):
+        if "wget" in stderr.lower() or "could not resolve" in stdout.lower() or "no route" in stdout.lower():
+            hint = "Роутер не достучался до opkg-репозитория. Проверь интернет на роутере: ndmc -c \"show interface\""
+        elif "no space left" in stdout.lower():
+            hint = "На /opt не хватает места. Освободи и попробуй снова."
+        elif "unknown package" in stdout.lower():
+            hint = "Пакет conntrack не найден в репозитории Entware. Проверь источники: opkg list | grep conntrack"
+        elif failed:
+            hint = "opkg отработал, но /opt/sbin/conntrack не появился. Проверь: which conntrack"
+
+    return jsonify({
+        "ok": already_installed or installed_now,
+        "already_installed": already_installed,
+        "installed_now": installed_now,
+        "stdout": stdout[:4000],
+        "stderr": stderr[:800],
+        "hint": hint,
+    })
+
+
+# ============== KEENETIC CONNECTION SETTINGS (runtime overrides) ==============
+@app.route("/api/keenetic/settings", methods=["GET", "POST"])
+@requires_auth
+def api_keenetic_settings():
+    """GET — вернуть текущие настройки + флаги overridden.
+    POST — сохранить (пустые значения → удалить override, останется default из config_local.py).
+    """
+    if request.method == "GET":
+        return jsonify(get_keenetic_settings_merged())
+
+    data = request.get_json(silent=True) or {}
+    rt = load_runtime_settings()
+    kn = rt.get("keenetic", {}) if isinstance(rt.get("keenetic"), dict) else {}
+
+    valid_keys = {k for k, _, _ in KEENETIC_RUNTIME_KEYS}
+    for rt_key, _cfg_attr, typ in KEENETIC_RUNTIME_KEYS:
+        if rt_key not in data:
+            continue
+        raw_val = data[rt_key]
+        if raw_val in (None, "", "null"):
+            kn.pop(rt_key, None)
+            continue
+        if typ == "int":
+            try:
+                v = int(raw_val)
+                if not (1 <= v <= 65535):
+                    return jsonify({"ok": False, "error": f"{rt_key}: порт должен быть 1..65535"}), 400
+                kn[rt_key] = v
+            except (ValueError, TypeError):
+                return jsonify({"ok": False, "error": f"{rt_key}: не число"}), 400
+        else:
+            kn[rt_key] = str(raw_val).strip()
+
+    rt["keenetic"] = kn
+    try:
+        save_runtime_settings(rt)
+        apply_runtime_overrides()
+    except Exception as ex:
+        return jsonify({"ok": False, "error": f"запись runtime_settings.json: {ex}"}), 500
+
+    merged = get_keenetic_settings_merged()
+    merged["ok"] = True
+    return jsonify(merged)
+
+
+@app.route("/api/keenetic/test-connection", methods=["POST"])
+@requires_auth
+def api_keenetic_test_connection():
+    """Живой SSH-пинг роутера с переданными параметрами (НЕ применяя их).
+    Тело: {host, port, user, ssh_key} — если поле пустое, берётся текущее из cfg.
+    """
+    data = request.get_json(silent=True) or {}
+    host    = (data.get("host") or "").strip() or cfg.KEENETIC_HOST
+    user    = (data.get("user") or "").strip() or cfg.KEENETIC_USER
+    ssh_key = (data.get("ssh_key") or "").strip() or cfg.KEENETIC_SSH_KEY
+    try:
+        port = int(data.get("port")) if data.get("port") not in (None, "") else cfg.KEENETIC_PORT
+    except (ValueError, TypeError):
+        port = cfg.KEENETIC_PORT
+
+    if not os.path.exists(ssh_key):
+        return jsonify({"ok": False, "stage": "key", "error": f"SSH-ключ не найден: {ssh_key}"})
+
+    args = [
+        "ssh",
+        "-i", ssh_key,
+        "-p", str(port),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=NUL",
+        "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes",
+        "-o", "LogLevel=ERROR",
+        f"{user}@{host}",
+        # одной строкой: kernel + версия XKeen (если есть) + проверка каталога конфигов
+        'echo "==UNAME=="; uname -a; '
+        'echo "==XKEEN=="; (xkeen -v 2>&1 || xkeen 2>&1 | head -2) | head -3; '
+        'echo "==CONFIGS=="; ls -1 ' + (data.get("xray_configs") or cfg.KEENETIC_XRAY_CONFIGS) + ' 2>&1 | head -10'
+    ]
+    try:
+        result = subprocess.run(args, capture_output=True, timeout=12)
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        if result.returncode == 0:
+            return jsonify({
+                "ok": True,
+                "stage": "ok",
+                "stdout": stdout,
+                "stderr": stderr,
+            })
+        # отдельно классифицируем самые частые ошибки SSH чтобы юзеру было понятно
+        err_low = (stderr or "").lower()
+        if "permission denied" in err_low:
+            stage, hint = "auth", "Ключ есть, но роутер его не принимает. Проверьте что публичная часть лежит в /opt/etc/dropbear/authorized_keys на роутере."
+        elif "connection refused" in err_low:
+            stage, hint = "tcp", f"TCP-порт {port} закрыт. Проверьте что SSH-сервер на роутере работает."
+        elif "no route to host" in err_low or "network is unreachable" in err_low:
+            stage, hint = "net", f"IP {host} недоступен по сети."
+        elif "could not resolve" in err_low or "name or service not known" in err_low:
+            stage, hint = "dns", f"Не удалось разрезолвить {host}."
+        elif "operation timed out" in err_low or "connect to host" in err_low and "timed out" in err_low:
+            stage, hint = "timeout", f"Таймаут подключения к {host}:{port}."
+        else:
+            stage, hint = "other", "См. stderr ниже."
+        return jsonify({
+            "ok": False,
+            "stage": stage,
+            "hint": hint,
+            "stdout": stdout,
+            "stderr": stderr,
+            "code": result.returncode,
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "stage": "timeout", "error": f"timeout: роутер {host}:{port} не ответил за 12 сек"})
+    except FileNotFoundError:
+        return jsonify({"ok": False, "stage": "ssh-bin", "error": "ssh.exe не найден в PATH"})
+    except Exception as ex:
+        return jsonify({"ok": False, "stage": "exc", "error": str(ex)})
+
+
+# ============== BOOTSTRAP CLEAN XKEEN ==============
+# Развёртывание watchdog/routing/cron/log-dir на свежеустановленном XKeen.
+# Файлы-шаблоны (watchdog.sh, 05_routing.template.json) лежат рядом с dashboard.py
+# в подкаталоге bootstrap/ либо в <scripts-path>\ (живые копии).
+BOOTSTRAP_SEARCH_DIRS = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "bootstrap"),
+    r"<scripts-path>",
+]
+
+def _bootstrap_find(filename):
+    """Найти baseline-файл (watchdog.sh.cur / 05_routing.template.json.cur)."""
+    for d in BOOTSTRAP_SEARCH_DIRS:
+        p = os.path.join(d, filename)
+        if os.path.exists(p):
+            return p
+    return None
+
+# Дефолтный watchdog.config для bootstrap — без личных данных (TG-токен, чужие tag'и).
+# Юзер должен выставить PRIMARY/FAILOVER/AI/YT_TAG через UI после развёртывания.
+DEFAULT_WATCHDOG_CONFIG = '''# /opt/etc/xray/watchdog.config — управляется дашбордом xray-dashboard
+# Создан bootstrap-кнопкой. Заполни PRIMARY/FAILOVER/AI/YT_TAG через UI панели.
+PRIMARY_TAG=""
+FAILOVER_TAGS=""
+AI_TAG=""
+AI_DOMAINS="ai.google.dev aistudio.google.com anthropic.com chat.deepseek.com chat.mistral.ai chatgpt.com claude.ai claudeusercontent.com copilot.cloud.microsoft copilot.microsoft.com deepseek.com designer.microsoft.com gemini.google.com generativelanguage.googleapis.com grok.com grok.x.ai hf.co huggingface.co mistral.ai oaistatic.com oaiusercontent.com openai.com perplexity.ai pplx.ai x.ai status.claude.com"
+AI_FAIL_BLOCK="1"
+YT_TAG=""
+YT_DOMAINS="ggpht.com googlevideo.com youtu.be youtube-nocookie.com youtube.com youtubei.googleapis.com yt3.ggpht.com yt4.ggpht.com ytimg.com"
+YT_FAIL_BLOCK="0"
+DIRECT_DOMAINS=""
+BLOCK_DOMAINS=""
+PRIMARY_PROBE_URL="https://www.cloudflare.com/cdn-cgi/trace"
+FAIL_THRESHOLD="2   # сколько раз primary должен упасть подряд → switch to failover"
+PASS_THRESHOLD="3   # сколько раз primary должен ожить подряд → switch back to primary"
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
+FORCE_MODE="auto"
+'''
+
+# Минимальные пустые meta-файлы (если ещё нет — создаём пустыми)
+EMPTY_OUTBOUND_META = "{}\n"
+EMPTY_SUBSCRIPTION_META = "{}\n"
+EMPTY_DOMAIN_NOTES = '{"ai": {}, "yt": {}, "direct": {}, "block": {}}\n'  # v1.7.0
+
+# Минимальный 04_outbounds.json с двумя стандартными outbound'ами:
+# - "direct" (freedom) — для виртуального канала «🌐 Напрямую без VPN» в PRIMARY/FAILOVER/AI/YT
+# - "block" (blackhole) — для outboundTag="block" (BLOCK_DOMAINS + kill-switch)
+# Без этих двух tag'ов watchdog генерит routing.json со ссылками на несуществующие outbound'ы
+# → xray валится с ошибкой config validation. Создаём их сразу в bootstrap чтобы юзер мог
+# выбрать «Напрямую» как PRIMARY без подписки (например для сценария рабочий PC = direct,
+# AI/YT по дефолту тоже direct пока не добавит VPN-канал).
+DEFAULT_OUTBOUNDS_JSON = """{
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {}
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole",
+      "settings": {}
+    }
+  ]
+}
+"""
+
+# Cron-строка для watchdog. Точная фраза — её ищет deploy-логика когда чистит дубли.
+WATCHDOG_CRON_LINE = "*/1 * * * * /opt/etc/xray/watchdog.sh"
+
+
+def _bootstrap_collect_state():
+    """Опросить роутер: есть ли xkeen, какие файлы уже лежат, есть ли cron-entry.
+    Возвращает dict: items=[{key, label, remote_path, remote_size, local_size, action, note}],
+    pre_checks=[{ok, msg}], counters={will_create, will_overwrite, will_skip}.
+    """
+    state = {
+        "ok": True,
+        "items": [],
+        "pre_checks": [],
+        "counters": {"will_create": 0, "will_overwrite": 0, "will_skip": 0},
+    }
+
+    # Pre-check: XKeen должен быть установлен
+    r = keenetic_ssh("which xkeen && test -d /opt/etc/xray && echo INSTALLED", timeout=8)
+    xkeen_installed = r["ok"] and "INSTALLED" in r.get("stdout", "")
+    state["pre_checks"].append({
+        "ok": xkeen_installed,
+        "msg": "XKeen установлен на роутере (есть /opt/sbin/xkeen и /opt/etc/xray/)" if xkeen_installed
+               else "❌ XKeen НЕ установлен. Сначала: opkg install xkeen && xkeen -i (см. раздел «🛠️ Установка XKeen с нуля» в Помощи).",
+    })
+    if not xkeen_installed:
+        state["ok"] = False
+        return state
+
+    # Pre-check: cron-демон есть?
+    r = keenetic_ssh("crontab -l >/dev/null 2>&1 && echo HAS_CRON || (which cron crond busybox | head -1)", timeout=5)
+    state["pre_checks"].append({
+        "ok": True,
+        "msg": "Cron доступен — " + (r["stdout"].strip()[:80] or "OK"),
+    })
+
+    # Pre-check: уже наполнен 04_outbounds (значит роутер НЕ чистый)
+    r = keenetic_ssh("wc -c < /opt/etc/xray/configs/04_outbounds.json 2>/dev/null || echo 0", timeout=5)
+    try:
+        outbounds_size = int((r["stdout"] or "0").strip())
+    except ValueError:
+        outbounds_size = 0
+    if outbounds_size > 500:
+        state["pre_checks"].append({
+            "ok": True,
+            "msg": f"⚠ В 04_outbounds.json уже {outbounds_size} байт — похоже роутер НЕ чистый. Bootstrap не тронет outbound'ы и текущий routing — добавит только watchdog/cron/log-dir.",
+        })
+
+    # Pre-check: есть ли встроенный freedom-outbound (для виртуальной опции «🌐 Напрямую без VPN»)
+    r = keenetic_ssh(
+        "grep -c '\"protocol\": *\"freedom\"' /opt/etc/xray/configs/04_outbounds.json 2>/dev/null || echo 0",
+        timeout=5,
+    )
+    try:
+        has_direct = int((r["stdout"] or "0").strip()) > 0
+    except ValueError:
+        has_direct = False
+    if has_direct:
+        state["pre_checks"].append({
+            "ok": True,
+            "msg": "✨ freedom-outbound (direct) найден в 04_outbounds.json — виртуальная опция «🌐 Напрямую без VPN» будет доступна в dropdown'ах PRIMARY/FAILOVER/AI/YT.",
+        })
+    else:
+        state["pre_checks"].append({
+            "ok": True,
+            "msg": "ℹ Freedom-outbound (direct) НЕ найден в 04_outbounds.json. Виртуальная опция «🌐 Напрямую без VPN» не появится. Это нестандартно — обычно XKeen-инсталлятор создаёт direct автоматически. Если нужно — добавь outbound с tag=\"direct\" и protocol=\"freedom\" вручную.",
+        })
+
+    # ---- Items ----
+    def add(key, label, remote_path, local_path, mode, source_desc, always_overwrite=False):
+        """mode: 'binary' (через base64) | 'text' (через stdin) | 'inline' (контент в local_path-строке вместо файла)"""
+        item = {
+            "key": key, "label": label,
+            "remote_path": remote_path,
+            "local_path": local_path if mode != "inline" else None,
+            "mode": mode,
+            "source": source_desc,
+        }
+        # Текущее состояние на роутере (BusyBox stat не умеет -c %s → используем wc -c)
+        r = keenetic_ssh(f"test -e {remote_path} && wc -c < {remote_path} || echo MISSING", timeout=5)
+        out = (r["stdout"] or "").strip()
+        if "MISSING" in out or not out:
+            item["remote_size"] = None
+        else:
+            try:
+                item["remote_size"] = int(out)
+            except ValueError:
+                item["remote_size"] = None
+        # Размер локального источника
+        if mode == "inline":
+            item["local_size"] = len(local_path.encode("utf-8"))
+        elif local_path and os.path.exists(local_path):
+            item["local_size"] = os.path.getsize(local_path)
+        else:
+            item["local_size"] = None
+            item["error"] = f"baseline-файл не найден ни в одном из: {BOOTSTRAP_SEARCH_DIRS}"
+
+        # Действие
+        if item["remote_size"] is None:
+            item["action"] = "create"
+        elif always_overwrite:
+            item["action"] = "overwrite"
+        else:
+            item["action"] = "keep"  # уже есть — по умолчанию не трогаем, но можно через checkbox
+
+        state["items"].append(item)
+        return item
+
+    sh_local = _bootstrap_find("watchdog.sh.cur")
+    add("watchdog_sh",
+        "Скрипт watchdog (PRIMARY↔FAILOVER переключение)",
+        "/opt/etc/xray/watchdog.sh",
+        sh_local,
+        "binary",
+        "D:\\Claude\\TelegramAssistent\\watchdog.sh.cur",
+        always_overwrite=True)
+
+    tmpl_local = _bootstrap_find("05_routing.template.json.cur")
+    add("routing_template",
+        "Шаблон routing для watchdog (с placeholder'ами __AI_RULE__/__YT_RULE_BLOCK__/...)",
+        "/opt/etc/xray/configs.bak/05_routing.template.json",
+        tmpl_local,
+        "text",
+        "D:\\Claude\\TelegramAssistent\\05_routing.template.json.cur",
+        always_overwrite=True)
+
+    add("watchdog_config",
+        "Конфиг watchdog (PRIMARY/FAILOVER/AI/YT_TAG, домены, threshold'ы)",
+        "/opt/etc/xray/watchdog.config",
+        DEFAULT_WATCHDOG_CONFIG,
+        "inline",
+        "встроенный дефолт (без личных данных)",
+        always_overwrite=False)
+
+    add("outbound_meta",
+        "outbound_meta.json (sidecar для UI: подписки/заметки по outbound'ам)",
+        "/opt/etc/xray/outbound_meta.json",
+        EMPTY_OUTBOUND_META,
+        "inline",
+        "пустой JSON {}",
+        always_overwrite=False)
+
+    add("subscription_meta",
+        "subscription_meta.json (sidecar для UI: связь sub-URL ↔ outbound'ы)",
+        "/opt/etc/xray/subscription_meta.json",
+        EMPTY_SUBSCRIPTION_META,
+        "inline",
+        "пустой JSON {}",
+        always_overwrite=False)
+
+    add("domain_notes",
+        "domain_notes.json (sidecar для UI v1.7.0: примечания к доменам AI/YT/DIRECT/BLOCK)",
+        "/opt/etc/xray/domain_notes.json",
+        EMPTY_DOMAIN_NOTES,
+        "inline",
+        "пустой JSON с 4 namespace",
+        always_overwrite=False)
+
+    # 04_outbounds.json — на свежем XKeen-installer'е содержит только //-комментарии
+    # (ссылки на генераторы конфигов). Watchdog генерит routing.json со ссылками на
+    # outbound'ы tag="direct" и tag="block" — без них xray не стартует. Создаём минимальные.
+    # Если у юзера уже есть outbounds (хотя бы один — например через подписку) — не трогаем.
+    add("outbounds_defaults",
+        "Базовые outbounds (direct + block) — нужны для «🌐 Напрямую» и BLOCK-списка",
+        "/opt/etc/xray/configs/04_outbounds.json",
+        DEFAULT_OUTBOUNDS_JSON,
+        "inline",
+        "встроенный JSON с outbounds [direct, block]",
+        always_overwrite=False)
+
+    # Cron entry — отдельный item, не файл
+    r = keenetic_ssh("crontab -l 2>/dev/null | grep -F '/opt/etc/xray/watchdog.sh' | head", timeout=5)
+    cron_present = bool((r["stdout"] or "").strip())
+    state["items"].append({
+        "key": "cron_entry",
+        "label": "Cron-запись (запуск watchdog каждую минуту)",
+        "remote_path": "crontab → " + WATCHDOG_CRON_LINE,
+        "local_path": None,
+        "mode": "cron",
+        "source": "встроенная строка",
+        "remote_size": 1 if cron_present else None,
+        "local_size": len(WATCHDOG_CRON_LINE),
+        "action": "keep" if cron_present else "create",
+    })
+
+    # Лог-директория
+    r = keenetic_ssh("test -d /opt/var/log/xray && echo EXISTS", timeout=5)
+    log_exists = "EXISTS" in (r["stdout"] or "")
+    state["items"].append({
+        "key": "log_dir",
+        "label": "Директория логов /opt/var/log/xray/",
+        "remote_path": "/opt/var/log/xray/",
+        "local_path": None,
+        "mode": "mkdir",
+        "source": "mkdir -p",
+        "remote_size": 1 if log_exists else None,
+        "local_size": 0,
+        "action": "keep" if log_exists else "create",
+    })
+
+    # Подсчёт
+    for it in state["items"]:
+        if it["action"] == "create":
+            state["counters"]["will_create"] += 1
+        elif it["action"] == "overwrite":
+            state["counters"]["will_overwrite"] += 1
+        else:
+            state["counters"]["will_skip"] += 1
+
+    return state
+
+
+def _bootstrap_deploy_item(item, overwrite_existing):
+    """Залить один item на роутер. Возвращает {ok, msg, action_taken}."""
+    key = item["key"]
+    remote = item["remote_path"]
+    mode = item["mode"]
+
+    # Спец-логика для outbounds_defaults ДО общей проверки `action == "keep"`.
+    # XKeen-installer создаёт 04_outbounds.json со ссылками-комментариями (// ...)
+    # и БЕЗ outbounds[] массива → файл есть на роутере (action="keep") но фактически пустой.
+    # Без этой спец-проверки на свежей установке юзер должен был ставить галочку
+    # «Перезаписать существующие файлы» — это неочевидно. Теперь записываем DEFAULT_OUTBOUNDS_JSON
+    # автоматически если в существующем файле нет outbounds[]. А если outbounds[] есть
+    # (юзер уже добавил через подписку или вручную) — не трогаем чтобы не потерять.
+    if key == "outbounds_defaults":
+        existing = keenetic_load_json(remote, timeout=5)
+        existing_outbounds = (existing or {}).get("outbounds", []) if isinstance(existing, dict) else []
+        if existing_outbounds:
+            return {
+                "ok": True,
+                "msg": f"уже есть {len(existing_outbounds)} outbound'ов — не трогаем",
+                "action_taken": "skip",
+            }
+        # outbounds[] нет (пустой / только комментарии) → записать наш default
+        # Игнорируем item["action"] == "keep" — мы знаем что фактически файл пустой.
+
+    # v1.5.2 (#11): защита sidecar-метаданных от перезаписи если они уже наполнены.
+    # outbound_meta.json и subscription_meta.json — sidecar файлы с маппингом «pbk → имя подписки».
+    # При bootstrap «Перезаписать существующие» юзер ожидает что **конфиги** сбросятся, но
+    # **метаданные подписок не пропадут**. Без этой защиты — после bootstrap dropdown'ы показывают
+    # «Reality h_z-q45m...» вместо «Юрков VPN» (см. сегодняшний баг).
+    elif key in ("outbound_meta", "subscription_meta") and overwrite_existing:
+        existing = keenetic_load_json(remote, timeout=5)
+        if isinstance(existing, dict):
+            # outbound_meta: top-level dict {tag: {...}} или {"tags": {...}}
+            # subscription_meta: {"version":N, "subs": {pbk: {...}}}
+            has_data = False
+            if key == "outbound_meta":
+                # Чисто пустой {} → нет данных. Если есть хотя бы один key — есть.
+                if any(k for k in existing.keys() if k not in ("version",)):
+                    has_data = True
+            elif key == "subscription_meta":
+                subs = existing.get("subs") if isinstance(existing.get("subs"), dict) else {}
+                if subs:
+                    has_data = True
+            if has_data:
+                n = len(existing.get("subs", {}) if key == "subscription_meta" else existing)
+                return {
+                    "ok": True,
+                    "msg": f"уже содержит {n} записей — не затираем (защита sidecar-метаданных)",
+                    "action_taken": "skip",
+                }
+
+    # Скип уже существующего, если не выбрано перезаписать
+    elif item["action"] == "keep" and not overwrite_existing:
+        return {"ok": True, "msg": "уже есть — пропущено", "action_taken": "skip"}
+
+    if key == "cron_entry":
+        # Чистим старую (если есть) и добавляем новую
+        cron_cmd = (
+            "(crontab -l 2>/dev/null | grep -vF '/opt/etc/xray/watchdog.sh'; "
+            f"echo '{WATCHDOG_CRON_LINE}') | crontab -"
+        )
+        r = keenetic_ssh(cron_cmd, timeout=10)
+        if not r["ok"]:
+            return {"ok": False, "msg": "crontab error: " + (r["stderr"] or r["stdout"])[:200], "action_taken": "fail"}
+        # Проверим что записалось
+        r2 = keenetic_ssh("crontab -l 2>/dev/null | grep -F '/opt/etc/xray/watchdog.sh'", timeout=5)
+        if not (r2["stdout"] or "").strip():
+            return {"ok": False, "msg": "после crontab не нашли запись", "action_taken": "fail"}
+        return {"ok": True, "msg": "cron-запись добавлена: " + WATCHDOG_CRON_LINE, "action_taken": "create"}
+
+    if key == "log_dir":
+        r = keenetic_ssh("mkdir -p /opt/var/log/xray && chmod 755 /opt/var/log/xray && echo OK", timeout=5)
+        if not r["ok"] or "OK" not in r["stdout"]:
+            return {"ok": False, "msg": "mkdir error: " + (r["stderr"] or r["stdout"])[:200], "action_taken": "fail"}
+        return {"ok": True, "msg": "каталог создан", "action_taken": "create"}
+
+    # Файловые items
+    content = None
+    if mode == "inline":
+        content = item.get("local_path") or DEFAULT_WATCHDOG_CONFIG
+        # для inline-items local_path в add() — это уже строка-контент. Найдём её в DEFAULTS:
+        if key == "watchdog_config":   content = DEFAULT_WATCHDOG_CONFIG
+        if key == "outbound_meta":     content = EMPTY_OUTBOUND_META
+        if key == "subscription_meta": content = EMPTY_SUBSCRIPTION_META
+        if key == "domain_notes":      content = EMPTY_DOMAIN_NOTES
+        if key == "outbounds_defaults": content = DEFAULT_OUTBOUNDS_JSON
+    elif mode in ("text", "binary"):
+        local_path = _bootstrap_find(os.path.basename(item["local_path"])) if item.get("local_path") else None
+        if not local_path or not os.path.exists(local_path):
+            return {"ok": False, "msg": f"baseline-файл не найден ни в одном из {BOOTSTRAP_SEARCH_DIRS}", "action_taken": "fail"}
+        try:
+            with open(local_path, "rb") as f:
+                raw = f.read()
+            # Для текста — декодируем чтобы потом нормально передать через stdin
+            content = raw.decode("utf-8") if mode == "text" else raw
+        except Exception as ex:
+            return {"ok": False, "msg": f"чтение {local_path}: {ex}", "action_taken": "fail"}
+
+    # Бэкап если файл уже есть
+    if item.get("remote_size") is not None:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        keenetic_ssh(f"cp {remote} {remote}.bak-bootstrap-{ts} 2>/dev/null", timeout=5)
+
+    # Заливаем
+    if mode == "binary":
+        # base64 round-trip — безопасно для shell-скриптов с любыми спец-символами.
+        # ВАЖНО: base64 передаётся через STDIN, не через command line argument.
+        # Раньше: `echo '<big_b64>' | base64 -d > file` — для файла 23 KB командная строка
+        # становилась ~31 KB и упиралась в ARG_MAX BusyBox + буферы dropbear → SSH рвал
+        # соединение «client_loop: send disconnect: Connection reset». Теперь через stdin.
+        import base64 as _b64
+        b64 = _b64.b64encode(content).decode("ascii")
+        cmd = f"mkdir -p $(dirname {remote}) && base64 -d > {remote}"
+        r = keenetic_ssh(cmd, timeout=30, stdin_data=b64)
+    else:
+        # text/inline — через stdin
+        cmd = f"mkdir -p $(dirname {remote}) && cat > {remote}"
+        r = keenetic_ssh(cmd, timeout=30, stdin_data=content)
+
+    if not r["ok"]:
+        return {"ok": False, "msg": "write error: " + (r["stderr"] or r["stdout"])[:200], "action_taken": "fail"}
+
+    # chmod +x для watchdog.sh
+    if key == "watchdog_sh":
+        keenetic_ssh(f"chmod +x {remote}", timeout=5)
+
+    # Проверка размера (BusyBox-safe)
+    r_chk = keenetic_ssh(f"wc -c < {remote} 2>/dev/null || echo -1", timeout=5)
+    try:
+        actual_size = int((r_chk["stdout"] or "-1").strip())
+    except (ValueError, AttributeError):
+        actual_size = -1
+    action_taken = "overwrite" if item.get("remote_size") is not None else "create"
+    return {"ok": True, "msg": f"записано, {actual_size} байт", "action_taken": action_taken}
+
+
+# ============== TELEGRAM-BOT SETTINGS (для алертов watchdog) ==============
+@app.route("/api/keenetic/tg-settings", methods=["GET", "POST"])
+@requires_auth
+def api_keenetic_tg_settings():
+    """GET — вернуть текущие TG_BOT_TOKEN/TG_CHAT_ID из watchdog.config.
+    POST — записать. Body: {token, chat_id}. Пустые значения = очистить.
+    """
+    if request.method == "GET":
+        cur = keenetic_read_watchdog_config() or {}
+        return jsonify({
+            "ok": True,
+            "token":   cur.get("TG_BOT_TOKEN", ""),
+            "chat_id": cur.get("TG_CHAT_ID", ""),
+        })
+
+    data = request.get_json(silent=True) or {}
+    token   = (data.get("token") or "").strip()
+    chat_id = (data.get("chat_id") or "").strip()
+    # Базовая валидация токена: цифры:буквы (Telegram bot format: \d+:[A-Za-z0-9_-]+)
+    if token and not re.match(r"^\d+:[A-Za-z0-9_-]{20,}$", token):
+        return jsonify({"ok": False, "error": "Token не похож на формат Telegram: ожидается «123456:AAA…»."}), 400
+    # chat_id: положительное число (приватный чат), отрицательное (группа/канал), либо @username
+    if chat_id and not re.match(r"^(-?\d+|@\w{4,})$", chat_id):
+        return jsonify({"ok": False, "error": "chat_id должен быть числом (или @username)."}), 400
+
+    try:
+        r = keenetic_write_watchdog_config({"TG_BOT_TOKEN": token, "TG_CHAT_ID": chat_id})
+    except Exception as ex:
+        return jsonify({"ok": False, "error": str(ex)}), 500
+    return jsonify({"ok": bool(r.get("ok")), "stderr": r.get("stderr", "")})
+
+
+@app.route("/api/keenetic/tg-test", methods=["POST"])
+@requires_auth
+def api_keenetic_tg_test():
+    """Отправить тестовое сообщение через указанный (либо текущий) бот.
+    Body: {token, chat_id} — опционально, иначе берёт из watchdog.config.
+    Шлёт через роутер (curl) — на нём настроен исход через VPN, обходит блокировку api.telegram.org для RU-IP.
+    """
+    data = request.get_json(silent=True) or {}
+    token   = (data.get("token")   or "").strip()
+    chat_id = (data.get("chat_id") or "").strip()
+    if not token or not chat_id:
+        cur = keenetic_read_watchdog_config() or {}
+        token   = token   or cur.get("TG_BOT_TOKEN", "")
+        chat_id = chat_id or cur.get("TG_CHAT_ID", "")
+    if not token or not chat_id:
+        return jsonify({"ok": False, "error": "Не задан token или chat_id (ни в форме, ни в watchdog.config)."}), 400
+
+    msg = (
+        "🧪 Тестовое сообщение от xray-dashboard\n"
+        f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} МСК\n"
+        "Если ты это видишь — TG-алерты watchdog'а будут работать."
+    )
+    # Запрос через роутер чтобы обойти блокировку api.telegram.org для RU-IP.
+    # На роутере есть curl (Entware). Шлём через SOCKS5-inbound xray (127.0.0.1:1080) если поднят,
+    # иначе обычным curl (для роутера через XKeen маршрутизация уже работает).
+    import shlex
+    cmd = (
+        f"curl -sS --max-time 10 "
+        f"-d chat_id={shlex.quote(chat_id)} "
+        f"--data-urlencode text={shlex.quote(msg)} "
+        f"https://api.telegram.org/bot{shlex.quote(token)}/sendMessage"
+    )
+    r = keenetic_ssh(cmd, timeout=15)
+    if not r["ok"]:
+        return jsonify({"ok": False, "error": "curl на роутере не сработал: " + (r["stderr"] or r["stdout"])[:300]})
+    # Telegram возвращает {"ok":true,...} либо {"ok":false,"error_code":...,"description":...}
+    try:
+        resp = json.loads(r["stdout"])
+    except Exception:
+        return jsonify({"ok": False, "error": "Не-JSON ответ от Telegram: " + (r["stdout"] or "")[:300]})
+    if resp.get("ok"):
+        return jsonify({"ok": True, "message_id": resp.get("result", {}).get("message_id"), "info": "Сообщение доставлено."})
+    err = resp.get("description") or "unknown"
+    code = resp.get("error_code", "?")
+    # типичные ошибки
+    hint = ""
+    if "chat not found" in err.lower():
+        hint = "💡 Чтобы chat_id заработал — сначала напиши боту /start, потом проверь URL https://api.telegram.org/bot<TOKEN>/getUpdates"
+    elif "unauthorized" in err.lower():
+        hint = "💡 Токен неверный или бот удалён в BotFather."
+    elif "bot was blocked" in err.lower():
+        hint = "💡 Ты заблокировал бота — разблокируй и напиши ему /start."
+    return jsonify({"ok": False, "error": f"Telegram API: {err} (code {code})", "hint": hint})
+
+
+@app.route("/api/keenetic/bootstrap-preview", methods=["GET"])
+@requires_auth
+def api_keenetic_bootstrap_preview():
+    """План развёртывания: что есть на роутере, что будет создано/перезаписано."""
+    try:
+        return jsonify(_bootstrap_collect_state())
+    except Exception as ex:
+        return jsonify({"ok": False, "error": str(ex)})
+
+
+@app.route("/api/keenetic/bootstrap-apply", methods=["POST"])
+@requires_auth
+def api_keenetic_bootstrap_apply():
+    """Развернуть выбранные компоненты. Body: {keys: [...], overwrite_existing: bool}."""
+    data = request.get_json(silent=True) or {}
+    selected_keys = set(data.get("keys") or [])
+    overwrite_existing = bool(data.get("overwrite_existing", False))
+
+    state = _bootstrap_collect_state()
+    if not state.get("ok"):
+        return jsonify({"ok": False, "error": "pre-check failed", "pre_checks": state["pre_checks"]})
+
+    log = []
+    overall_ok = True
+    # Порядок важен: сначала log_dir и watchdog.config, потом outbounds_defaults
+    # (direct + block) — ДО watchdog.sh, потому что watchdog генерит routing.json
+    # со ссылками на эти tag'и. Если watchdog запустится раньше — xray упадёт с
+    # «outbound tag 'direct' not found». Потом routing_template и watchdog.sh.
+    # Cron — последним.
+    order = ["log_dir", "watchdog_config", "outbound_meta", "subscription_meta",
+             "domain_notes", "outbounds_defaults", "routing_template", "watchdog_sh", "cron_entry"]
+    items_by_key = {it["key"]: it for it in state["items"]}
+
+    for key in order:
+        if key not in selected_keys:
+            continue
+        it = items_by_key.get(key)
+        if not it:
+            log.append({"key": key, "ok": False, "msg": "unknown key"})
+            overall_ok = False
+            continue
+        result = _bootstrap_deploy_item(it, overwrite_existing=overwrite_existing)
+        log.append({"key": key, "label": it["label"], **result})
+        if not result["ok"]:
+            overall_ok = False
+
+    # Если развернули watchdog.sh и cron — первый прогон вручную для немедленного эффекта.
+    # Timeout 90s: первый запуск пингует все 29 FAILOVER каналов (~30 сек) + генерит routing
+    # + делает xkeen -restart (5-15 сек) если конфиг изменился. На медленных каналах может
+    # упереться в 30 сек таймаут — поэтому 90. Cron всё равно запустит через ≤1 мин если что.
+    if overall_ok and "watchdog_sh" in selected_keys and "cron_entry" in selected_keys:
+        r = keenetic_ssh("/opt/etc/xray/watchdog.sh 2>&1 | tail -10", timeout=90)
+        log.append({"key": "first_run", "ok": r["ok"], "msg": "первый запуск watchdog: " + (r["stdout"] or r["stderr"])[:300]})
+
+    return jsonify({"ok": overall_ok, "log": log})
+
+
+# ============== УПРАВЛЕНИЕ XKEEN (status/restart/update) ==============
+# Whitelist-команды для управления XKeen-сервисом на роутере через xkeen CLI.
+# Раньше юзер вынужден был лезть руками по SSH чтобы запустить `xkeen -ux` или посмотреть status.
+# Теперь — кнопки в UI «🛠 Управление XKeen» → один SSH-вызов → output в textarea.
+XKEEN_COMMANDS = {
+    "status":         {"cmd": "xkeen -status 2>&1 | head -60",  "label": "📊 Статус",          "timeout": 15,  "stdin": None},
+    "restart":        {"cmd": "xkeen -restart 2>&1 | tail -30", "label": "▶️ Restart",        "timeout": 90,  "stdin": None},
+    # update-* команды xkeen-installer показывают список релизов и ждут выбор номера.
+    # Через non-interactive SSH с stdin="1\n" — выбирается первая (latest) версия.
+    # Для xkeen -ug это no-op (она не интерактивная, просто обновляет все базы), но stdin не ломает.
+    # Для xkeen -ux выбирается latest включая pre-release (может быть beta).
+    # Для xkeen -uk то же.
+    #
+    # version_cmd / version_label — для блока «ДО → ПОСЛЕ» в output.
+    # Запускается ДО и ПОСЛЕ основной команды, результат сравнивается.
+    # Для geofile — md5sum по 6 .dat-файлам, парсим как multi-line.
+    "update-xray":    {
+        "cmd": "xkeen -ux 2>&1 | tail -80",      "label": "🔄 Обновить Xray",   "timeout": 240, "stdin": "1\n",
+        "version_cmd": "/opt/sbin/xray version 2>&1 | head -1",
+        "version_label": "Xray",
+    },
+    "update-geofile": {
+        "cmd": "xkeen -ug 2>&1 | tail -40",      "label": "🌐 Обновить GeoFile","timeout": 180, "stdin": "1\n",
+        "version_cmd": "md5sum /opt/etc/xray/dat/*.dat 2>/dev/null",
+        "version_label": "GeoFile (md5)",
+    },
+    "update-xkeen":   {
+        "cmd": "xkeen -uk 2>&1 | tail -80",      "label": "🔄 Обновить XKeen",  "timeout": 240, "stdin": "1\n",
+        "version_cmd": "xkeen -v 2>&1 | head -1",
+        "version_label": "XKeen",
+    },
+}
+
+
+def _format_version_diff(before, after, label):
+    """Формирует блок «ДО → ПОСЛЕ» для output обновлений.
+    Однострочный вывод (xray version / xkeen -v) → 'ДО: ... → ПОСЛЕ: ...'.
+    Multi-line (md5sum для geofile) → построчный diff по filename + hash."""
+    if before is None and after is None:
+        return ""
+    before = (before or "").strip()
+    after = (after or "").strip()
+    bl = before.splitlines()
+    al = after.splitlines()
+
+    # Однострочный случай — xray version / xkeen -v
+    if len(bl) <= 1 and len(al) <= 1:
+        if not before and not after:
+            return ""
+        if before == after:
+            return f"ℹ️ {label}: версия не изменилась — уже latest\n   {after or '(пусто)'}"
+        return (
+            f"✅ {label} обновлён!\n"
+            f"   ДО:    {before or '(не было)'}\n"
+            f"   ПОСЛЕ: {after or '(не получилось определить)'}"
+        )
+
+    # Multi-line — md5sum для GeoFile. Парсим как 'hash  /path/file' → dict[basename]=hash.
+    def _parse(lines):
+        d = {}
+        for ln in lines:
+            parts = ln.strip().split(None, 1)
+            if len(parts) == 2:
+                # basename без полного пути — короче в выводе
+                fname = parts[1].rsplit('/', 1)[-1]
+                d[fname] = parts[0]
+        return d
+    b_map = _parse(bl)
+    a_map = _parse(al)
+    all_files = sorted(set(b_map) | set(a_map))
+    if not all_files:
+        return f"ℹ️ {label}: не удалось распарсить версии"
+    changes = []
+    for f in all_files:
+        bh = b_map.get(f)
+        ah = a_map.get(f)
+        if bh != ah:
+            bh_short = (bh[:12] + "…") if bh and len(bh) > 12 else (bh or "(новый)")
+            ah_short = (ah[:12] + "…") if ah and len(ah) > 12 else (ah or "(удалён)")
+            changes.append(f"   ✅ {f}: {bh_short} → {ah_short}")
+    if not changes:
+        return f"ℹ️ {label}: все файлы без изменений ({len(all_files)} шт)"
+    return f"✅ {label}: обновлено {len(changes)}/{len(all_files)} файлов\n" + "\n".join(changes)
+
+
+@app.route("/api/xkeen/cmd", methods=["POST"])
+@requires_auth
+def api_xkeen_cmd():
+    """Выполнить команду xkeen CLI на роутере. Body: cmd=<key>.
+    Whitelist в XKEEN_COMMANDS dict — нельзя выполнить произвольный bash."""
+    cmd_key = request.form.get("cmd", "").strip()
+    if cmd_key not in XKEEN_COMMANDS:
+        return jsonify({"ok": False, "error": f"Unknown command '{cmd_key}'. Allowed: {', '.join(XKEEN_COMMANDS.keys())}"}), 400
+
+    cmd_def = XKEEN_COMMANDS[cmd_key]
+
+    ansi_re = re.compile(r'\[[0-9;?]*[a-zA-Z]')
+    version_cmd = cmd_def.get("version_cmd")
+    version_label = cmd_def.get("version_label", "")
+
+    # ДО — для update-* команд получаем текущую версию (xray version / xkeen -v / md5sum geofile).
+    before_ver = None
+    if version_cmd:
+        r_before = keenetic_ssh(version_cmd, timeout=10)
+        if r_before.get("ok"):
+            before_ver = ansi_re.sub('', r_before.get("stdout") or "").strip()
+
+    # Для update-команд xkeen-installer ждёт выбор номера версии — подаём "1\n" через stdin
+    # автоматически (= latest версия в списке). Юзер увидит в output какая именно установилась.
+    r = keenetic_ssh(cmd_def["cmd"], timeout=cmd_def["timeout"], stdin_data=cmd_def.get("stdin"))
+
+    # XKeen использует ANSI escape codes ([93m...) для цветного вывода. В <pre>
+    # они показываются как мусор — чистим через regex.
+    clean_stdout = ansi_re.sub('', r["stdout"] or "")[:8000]
+    clean_stderr = ansi_re.sub('', r["stderr"] or "")[:2000]
+
+    # ПОСЛЕ — снова получаем версию и считаем diff. Приклеиваем блок с явным
+    # "ДО → ПОСЛЕ" в самый верх stdout — юзер сразу видит установилось/нет и какая версия.
+    after_ver = None
+    if version_cmd:
+        r_after = keenetic_ssh(version_cmd, timeout=10)
+        if r_after.get("ok"):
+            after_ver = ansi_re.sub('', r_after.get("stdout") or "").strip()
+        diff_block = _format_version_diff(before_ver, after_ver, version_label or cmd_key)
+        if diff_block:
+            sep = "═" * 60
+            clean_stdout = f"{sep}\n{diff_block}\n{sep}\n\n{clean_stdout}"
+
+    return jsonify({
+        "ok": r["ok"],
+        "cmd": cmd_key,
+        "label": cmd_def["label"],
+        "stdout": clean_stdout,
+        "stderr": clean_stderr,
+        "code": r["code"],
+        "before_version": before_ver,
+        "after_version": after_ver,
+    })
+
+
+# ============== СКАНИРОВАНИЕ GEOSITE/GEOIP DAT-ФАЙЛОВ ==============
+# Раньше юзер использовал в DIRECT-правилах `ext:geosite_v2fly.dat:yandex` / `:steam` / `:vk` /
+# `:category-gov-ru`, но не знал какие ещё категории доступны (нужно лезть на v2fly-community github).
+# Теперь endpoint показывает: (1) категории которые УЖЕ используются в template + (2) известный
+# топ-список категорий v2fly для подсказки.
+
+V2FLY_KNOWN_CATEGORIES = [
+    # Категории общего назначения
+    {"name": "private",               "desc": "Локальные/частные адреса (127.0.0.1, 192.168/16, и т.п.)"},
+    {"name": "category-ads-all",      "desc": "Все рекламные и трекинг-домены (большой список)"},
+    {"name": "category-ads",          "desc": "Реклама (без трекинга)"},
+    {"name": "category-public-tracker", "desc": "Публичные torrent-трекеры"},
+    {"name": "category-games",        "desc": "Игровые серверы общие"},
+    {"name": "category-games-platforms", "desc": "Игровые платформы (Steam, EpicGames, Battle.net и т.п.)"},
+    {"name": "category-porn",         "desc": "Adult-контент"},
+    {"name": "category-cryptocurrency", "desc": "Криптовалютные биржи и кошельки"},
+    # Региональные
+    {"name": "category-ru",           "desc": "Домены связанные с Россией (общая категория)"},
+    {"name": "category-gov-ru",       "desc": "Государственные сайты РФ (Госуслуги, ФНС, ЦИК и т.п.)"},
+    {"name": "tld-ru",                "desc": "Все домены .ru / .su / .рф (regex)"},
+    {"name": "geolocation-cn",        "desc": "Все домены связанные с Китаем"},
+    {"name": "category-tld-cn",       "desc": ".cn TLD"},
+    # Конкретные сервисы (RU)
+    {"name": "yandex",                "desc": "Яндекс (все сервисы: поиск, музыка, такси, диск, маркет, etc)"},
+    {"name": "vk",                    "desc": "ВКонтакте"},
+    {"name": "mail-ru",               "desc": "Mail.ru (почта, облако, мессенджер)"},
+    {"name": "ozon",                  "desc": "Ozon (маркетплейс)"},
+    {"name": "wildberries",           "desc": "Wildberries (маркетплейс)"},
+    {"name": "okru",                  "desc": "Одноклассники"},
+    # Конкретные сервисы (Global)
+    {"name": "google",                "desc": "Google (все сервисы — гиганский список)"},
+    {"name": "youtube",               "desc": "YouTube"},
+    {"name": "facebook",              "desc": "Meta / Facebook"},
+    {"name": "twitter",               "desc": "Twitter / X"},
+    {"name": "instagram",             "desc": "Instagram"},
+    {"name": "tiktok",                "desc": "TikTok"},
+    {"name": "telegram",              "desc": "Telegram"},
+    {"name": "discord",               "desc": "Discord"},
+    {"name": "reddit",                "desc": "Reddit"},
+    {"name": "twitch",                "desc": "Twitch"},
+    {"name": "github",                "desc": "GitHub"},
+    {"name": "microsoft",             "desc": "Microsoft (Office, Azure, Windows-update и т.п.)"},
+    {"name": "apple",                 "desc": "Apple (iCloud, App Store, Apple Music)"},
+    {"name": "steam",                 "desc": "Steam (валвовский лаунчер + игры)"},
+    {"name": "epicgames",             "desc": "Epic Games"},
+    {"name": "netflix",               "desc": "Netflix"},
+    {"name": "spotify",               "desc": "Spotify"},
+    {"name": "openai",                "desc": "OpenAI (ChatGPT и API)"},
+    {"name": "anthropic",             "desc": "Anthropic (Claude и API)"},
+    # CDN / инфраструктура
+    {"name": "cloudflare",            "desc": "Cloudflare (CDN + сервисы)"},
+    {"name": "amazon",                "desc": "Amazon (AWS, Prime, Twitch, etc)"},
+    {"name": "akamai",                "desc": "Akamai CDN"},
+    {"name": "fastly",                "desc": "Fastly CDN"},
+]
+
+
+# ============== SELF-HEALING / DIAGNOSE / AUTO-REPAIR (v1.5.1) ==============
+# Юзер не должен лезть в SSH чтобы починить «xkeen не запускается». Эта секция:
+# 1. /api/xkeen/diagnose — запускает 7+ проверок, возвращает структуру { checks: [...], can_fix: [...] }
+# 2. /api/xkeen/auto-fix — выполняет конкретный fix (set-primary-direct, restart-xkeen, regen-routing, ...)
+# Дома видим всё в UI секции «🚑 Восстановление и диагностика».
+
+
+@app.route("/api/xkeen/diagnose", methods=["GET"])
+@requires_auth
+def api_xkeen_diagnose():
+    """Запустить серию проверок состояния XKeen на роутере. Возвращает:
+        { ok: bool, checks: [ {id, label, ok, severity, detail, fix_id, fix_label, fix_explain} ] }
+    severity: critical | warning | info
+    fix_id: ID auto-fix (передаётся в /api/xkeen/auto-fix), None если автоматического fix нет.
+    """
+    checks = []
+    ansi_re = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+
+    def _add(check_id, label, ok, severity, detail, fix_id=None, fix_label=None, fix_explain=None):
+        checks.append({
+            "id": check_id, "label": label, "ok": ok, "severity": severity,
+            "detail": (detail or "")[:1500],
+            "fix_id": fix_id, "fix_label": fix_label, "fix_explain": fix_explain,
+        })
+
+    # ---- 1. Xray binary version + arch ----
+    r = keenetic_ssh("/opt/sbin/xray version 2>&1 | head -3", timeout=10)
+    xray_out = ansi_re.sub('', r.get("stdout") or "")
+    is_xray_ok = r["ok"] and "Xray" in xray_out and "SIGSEGV" not in xray_out
+    arch = ""
+    if "linux/mips" in xray_out:
+        arch = "mips32le" if "mipsle" in xray_out else "mips32 (BE — возможно неверная арх!)"
+    _add(
+        "xray_binary", "Xray binary доступен", is_xray_ok,
+        "critical" if not is_xray_ok else "info",
+        xray_out + (f"\n\nАрхитектура: {arch}" if arch else ""),
+        fix_id=None, fix_label=None,
+        fix_explain=("Если xray даёт Go runtime crash (SIGSEGV) — это арх mismatch. Нужно вручную скачать "
+                     "Xray-linux-mips32le.zip с XTLS/Xray-core releases (см. Help)." if not is_xray_ok else None),
+    )
+
+    # ---- 2. xkeen process status ----
+    r = keenetic_ssh("xkeen -status 2>&1", timeout=10)
+    status_out = ansi_re.sub('', (r.get("stdout") or "") + (r.get("stderr") or ""))
+    is_running = "запущен" in status_out and "не запущен" not in status_out
+    _add(
+        "xkeen_running", "xkeen (xray) запущен", is_running,
+        "critical" if not is_running else "info",
+        status_out,
+        fix_id="restart_xkeen" if not is_running else None,
+        fix_label="🔄 Запустить xkeen" if not is_running else None,
+        fix_explain=("xkeen -restart перезапустит xray. Если после рестарта снова "
+                     "«не запущен» — смотрим логи xray и валидность конфигов (см. ниже)." if not is_running else None),
+    )
+
+    # ---- 3. xray config validity (test mode) ----
+    r = keenetic_ssh("/opt/sbin/xray test -confdir /opt/etc/xray/configs 2>&1 | tail -15", timeout=20)
+    test_out = ansi_re.sub('', r.get("stdout") or "")
+    is_config_valid = "Configuration OK" in test_out or ("Failed to start" not in test_out and "infra/conf" not in test_out)
+    _add(
+        "config_valid", "xray-конфиги валидны", is_config_valid,
+        "critical" if not is_config_valid else "info",
+        test_out,
+        fix_id="regen_routing" if not is_config_valid else None,
+        fix_label="🔧 Перегенерить routing" if not is_config_valid else None,
+        fix_explain=("xray-конфиги невалидны. Самая частая причина — битый routing.json (пустой "
+                     "outboundTag или ссылка на несуществующий outbound). Перегенерация через watchdog "
+                     "обычно помогает." if not is_config_valid else None),
+    )
+
+    # ---- 4. watchdog.config: PRIMARY_TAG не пустой ----
+    r = keenetic_ssh("grep '^PRIMARY_TAG=' /opt/etc/xray/watchdog.config 2>/dev/null", timeout=5)
+    primary_line = (r.get("stdout") or "").strip()
+    primary_tag = ""
+    if "=" in primary_line:
+        primary_tag = primary_line.split("=", 1)[1].strip().strip('"')
+    has_primary = bool(primary_tag)
+    _add(
+        "watchdog_primary", "PRIMARY_TAG задан в watchdog.config", has_primary,
+        "critical" if not has_primary else "info",
+        primary_line or "(не найдено в watchdog.config)",
+        fix_id="set_primary_direct" if not has_primary else None,
+        fix_label="🔧 Установить PRIMARY = direct" if not has_primary else None,
+        fix_explain=("PRIMARY_TAG пустой → watchdog сгенерит routing с outboundTag='' → xray валится. "
+                     "Установим PRIMARY=direct (трафик через провайдера). Можно потом сменить через UI "
+                     "в секции «🎯 Основное и резервное подключение»." if not has_primary else None),
+    )
+
+    # ---- 5. direct + block в outbounds ----
+    r = keenetic_ssh("grep -oE '\"tag\": *\"(direct|block)\"' /opt/etc/xray/configs/04_outbounds.json 2>/dev/null", timeout=5)
+    out_text = r.get("stdout") or ""
+    has_direct = "direct" in out_text
+    has_block = "block" in out_text
+    has_both = has_direct and has_block
+    _add(
+        "outbounds_defaults", "direct + block в 04_outbounds.json", has_both,
+        "critical" if not has_both else "info",
+        f"direct: {'✅' if has_direct else '❌'}\nblock: {'✅' if has_block else '❌'}\n{out_text}",
+        fix_id="bootstrap_outbounds" if not has_both else None,
+        fix_label="🔧 Добавить direct + block" if not has_both else None,
+        fix_explain=("Без direct/block в outbounds — виртуальный канал «🌐 Напрямую» не работает, "
+                     "BLOCK_DOMAINS не работают. Auto-fix добавит их (existing outbounds останутся "
+                     "нетронутыми)." if not has_both else None),
+    )
+
+    # ---- 6. JSON syntax: 05_routing.json ----
+    r = keenetic_ssh(
+        "sed 's|^[[:space:]]*//.*$||' /opt/etc/xray/configs/05_routing.json | jq empty 2>&1",
+        timeout=10,
+    )
+    routing_json_valid = r["ok"] and not r.get("stdout", "").strip() and not r.get("stderr", "").strip()
+    _add(
+        "routing_json_valid", "05_routing.json — валидный JSON", routing_json_valid,
+        "critical" if not routing_json_valid else "info",
+        (r.get("stdout") + r.get("stderr"))[:500] if not routing_json_valid else "OK",
+        fix_id="regen_routing" if not routing_json_valid else None,
+        fix_label="🔧 Перегенерить routing из template" if not routing_json_valid else None,
+        fix_explain=("routing.json содержит синтаксическую ошибку JSON. Watchdog v9+ умеет валидировать "
+                     "перед записью, но если файл повреждён вручную — перегенерация исправит." if not routing_json_valid else None),
+    )
+
+    # ---- 7. Cron-задача watchdog ----
+    r = keenetic_ssh("crontab -l 2>/dev/null | grep -F '/opt/etc/xray/watchdog.sh'", timeout=5)
+    has_cron = bool((r.get("stdout") or "").strip())
+    _add(
+        "cron_watchdog", "Cron-задача watchdog активна", has_cron,
+        "warning" if not has_cron else "info",
+        (r.get("stdout") or "(не найдена)").strip(),
+        fix_id="bootstrap_cron" if not has_cron else None,
+        fix_label="🔧 Добавить cron-задачу" if not has_cron else None,
+        fix_explain=("Без cron-задачи watchdog не будет автоматически проверять каналы и переключаться "
+                     "при падении. xray запустится один раз, но failover не сработает." if not has_cron else None),
+    )
+
+    # ---- 8. Watchdog log: последние ошибки ----
+    r = keenetic_ssh("tail -20 /opt/var/log/xray/watchdog.log 2>/dev/null | grep -E 'ERROR|WARN' | tail -5", timeout=5)
+    recent_errors = (r.get("stdout") or "").strip()
+    no_errors = not recent_errors
+    _add(
+        "watchdog_no_errors", "Watchdog без свежих ошибок", no_errors,
+        "warning" if not no_errors else "info",
+        recent_errors or "(ошибок не найдено)",
+        fix_id=None, fix_label=None,
+        fix_explain=("В логе watchdog есть свежие ошибки/предупреждения. Это может быть нормально "
+                     "(например VPN-канал временно недоступен), но если повторяется — стоит разобраться." if not no_errors else None),
+    )
+
+    # ---- 9. v1.6.1: geoip.dat содержит используемые GeoIP-категории ----
+    # Симптом: xray test говорит "code not found in geoip.dat: TELEGRAM" → xkeen уходит в Mixed mode.
+    # Причина: стандартный v2fly geoip.dat содержит только страны (cn, ru, us...), сервисов нет.
+    # Решение: расширенный geoip.dat от Loyalsoldier (содержит и страны, и сервисы).
+    r = keenetic_ssh("grep '^YT_GEOIP_CATEGORIES=' /opt/etc/xray/watchdog.config 2>/dev/null", timeout=5)
+    geoip_line = (r.get("stdout") or "").strip()
+    geoip_cats = ""
+    if "=" in geoip_line:
+        geoip_cats = geoip_line.split("=", 1)[1].strip().strip('"')
+    clean_geoip = re.sub(r'[\s,]+', '', geoip_cats)
+
+    if not clean_geoip:
+        _add(
+            "geoip_categories", "geoip.dat содержит используемые категории", True,
+            "info",
+            "GeoIP-категории не настроены (YT_GEOIP_CATEGORIES пуст) — проверка не нужна.",
+            fix_id=None, fix_label=None, fix_explain=None,
+        )
+    else:
+        # Проверяем xray test на ошибку "code not found in geoip.dat"
+        r = keenetic_ssh("/opt/sbin/xray test -confdir /opt/etc/xray/configs 2>&1 | grep -iE 'code not found in geoip|failed to load GeoIP' | head -3", timeout=20)
+        missing_out = ansi_re.sub('', r.get("stdout") or "")
+        has_missing = bool(missing_out.strip())
+        _add(
+            "geoip_categories", "geoip.dat содержит используемые категории", not has_missing,
+            "critical" if has_missing else "info",
+            missing_out or f"Используемые категории: {geoip_cats}\nxray test прошёл без ошибок 'code not found'.",
+            fix_id="install_extended_geoip" if has_missing else None,
+            fix_label="📥 Установить расширенный geoip.dat" if has_missing else None,
+            fix_explain=(
+                "В geoip.dat нет нужной категории (например telegram). Стандартный v2fly geoip.dat "
+                "содержит только страны (cn, ru, us). Сервисы (telegram, discord) есть в расширенном "
+                "geoip.dat от Loyalsoldier/v2ray-rules-dat (~18MB). Auto-fix скачает и установит его, "
+                "потом перезапустит xkeen."
+            ) if has_missing else None,
+        )
+
+    # Общий статус — ok если все critical-проверки прошли
+    overall_ok = all(c["ok"] or c["severity"] != "critical" for c in checks)
+    failed_critical = [c for c in checks if not c["ok"] and c["severity"] == "critical"]
+
+    return jsonify({
+        "ok": overall_ok,
+        "checks": checks,
+        "summary": {
+            "total": len(checks),
+            "passed": sum(1 for c in checks if c["ok"]),
+            "failed_critical": len(failed_critical),
+            "failed_warning": sum(1 for c in checks if not c["ok"] and c["severity"] == "warning"),
+        },
+    })
+
+
+# Whitelist auto-fix-операций. Каждая — это безопасная операция с явным confirm в UI.
+XKEEN_AUTO_FIXES = {
+    "restart_xkeen": {
+        "label": "Перезапустить xkeen",
+        "explain": "xkeen -restart → xray заново стартует с текущими конфигами.",
+    },
+    "regen_routing": {
+        "label": "Перегенерить routing.json",
+        "explain": ("Запустить /opt/etc/xray/watchdog.sh → пересоберёт routing.json из template "
+                    "+ свежих значений из watchdog.config. Если генерация даст битый JSON — watchdog v9+ "
+                    "не применит его, старый рабочий routing останется."),
+    },
+    "set_primary_direct": {
+        "label": "PRIMARY_TAG = direct + перегенерить",
+        "explain": ("Записать в watchdog.config: PRIMARY_TAG=\"direct\". Затем запустить watchdog → "
+                    "regen routing → xkeen restart. Трафик пойдёт через провайдера (direct), VPN не нужен. "
+                    "Можно потом сменить через UI."),
+    },
+    "bootstrap_outbounds": {
+        "label": "Создать direct + block outbounds",
+        "explain": ("Если в 04_outbounds.json нет direct/block — добавить их в начало (existing "
+                    "outbound'ы из подписки останутся нетронутыми). Это нужно для виртуального канала "
+                    "«🌐 Напрямую» и для BLOCK_DOMAINS."),
+    },
+    "bootstrap_cron": {
+        "label": "Добавить cron-задачу watchdog",
+        "explain": ("Добавить запись `*/1 * * * * /opt/etc/xray/watchdog.sh` в crontab. Watchdog будет "
+                    "проверять каналы каждую минуту и переключаться при падении."),
+    },
+    "install_extended_geoip": {
+        "label": "Установить расширенный geoip.dat (Loyalsoldier)",
+        "explain": (
+            "Скачать с github.com/Loyalsoldier/v2ray-rules-dat расширенный geoip.dat (~18MB) — он "
+            "содержит категории сервисов (telegram, discord и др.) в дополнение к странам. "
+            "Стандартный v2fly geoip.dat и XKeen-installer ставят только страны — этого недостаточно "
+            "для геоблокировки конкретных сервисов. Текущий файл (если есть) будет сохранён как "
+            "geoip.dat.bak-<timestamp>. После скачивания xkeen перезапустится автоматически."
+        ),
+    },
+}
+
+
+@app.route("/api/xkeen/auto-fix", methods=["POST"])
+@requires_auth
+def api_xkeen_auto_fix():
+    """Выполнить конкретный auto-fix. Body: fix_id=<ID из XKEEN_AUTO_FIXES>.
+    Возвращает: { ok, fix_id, label, log: "..." }
+    """
+    fix_id = request.form.get("fix_id", "").strip()
+    if fix_id not in XKEEN_AUTO_FIXES:
+        return jsonify({"ok": False, "error": f"Unknown fix_id '{fix_id}'. Allowed: {list(XKEEN_AUTO_FIXES.keys())}"}), 400
+
+    fix = XKEEN_AUTO_FIXES[fix_id]
+    log_lines = [f"🔧 Применяю fix: {fix['label']}"]
+
+    if fix_id == "restart_xkeen":
+        r = keenetic_ssh("xkeen -restart 2>&1 | tail -10", timeout=90)
+        ansi_re = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+        log_lines.append(ansi_re.sub('', r.get("stdout") or "") or "(empty)")
+        # Проверка статуса
+        r2 = keenetic_ssh("xkeen -status 2>&1", timeout=10)
+        status = ansi_re.sub('', (r2.get("stdout") or "") + (r2.get("stderr") or ""))
+        log_lines.append("---")
+        log_lines.append(status)
+        ok = "запущен" in status and "не запущен" not in status
+
+    elif fix_id == "regen_routing":
+        r = keenetic_ssh("/opt/etc/xray/watchdog.sh 2>&1 | tail -10", timeout=30)
+        log_lines.append((r.get("stdout") or "") or "(watchdog отработал тихо)")
+        # Тест конфига после
+        r2 = keenetic_ssh("/opt/sbin/xray test -confdir /opt/etc/xray/configs 2>&1 | tail -5", timeout=15)
+        log_lines.append("---")
+        log_lines.append(r2.get("stdout") or "")
+        ok = "Configuration OK" in (r2.get("stdout") or "") or "Failed" not in (r2.get("stdout") or "")
+
+    elif fix_id == "set_primary_direct":
+        # Проверка что direct есть в outbounds — иначе нет смысла
+        r0 = keenetic_ssh("grep -c '\"tag\": *\"direct\"' /opt/etc/xray/configs/04_outbounds.json 2>/dev/null", timeout=5)
+        has_direct = (r0.get("stdout") or "0").strip() not in ("0", "")
+        if not has_direct:
+            log_lines.append("⚠ direct outbound отсутствует в 04_outbounds.json — сначала применить bootstrap_outbounds")
+            ok = False
+        else:
+            r1 = keenetic_ssh("sed -i 's/^PRIMARY_TAG=.*/PRIMARY_TAG=\"direct\"/' /opt/etc/xray/watchdog.config && grep '^PRIMARY_TAG=' /opt/etc/xray/watchdog.config", timeout=5)
+            log_lines.append(r1.get("stdout") or "")
+            r2 = keenetic_ssh("/opt/etc/xray/watchdog.sh 2>&1 | tail -5", timeout=30)
+            log_lines.append("---")
+            log_lines.append(r2.get("stdout") or "(watchdog отработал тихо)")
+            ok = r1["ok"] and r2["ok"]
+
+    elif fix_id == "bootstrap_outbounds":
+        # Через bootstrap-deploy одной item — outbounds_defaults со спец-логикой
+        # (если outbounds[] пусто — применит дефолт direct+block; если уже что-то есть — не тронет)
+        state = _bootstrap_collect_state()
+        item = next((it for it in state.get("items", []) if it["key"] == "outbounds_defaults"), None)
+        if not item:
+            ok = False
+            log_lines.append("❌ Не найден item 'outbounds_defaults' в bootstrap state")
+        else:
+            result = _bootstrap_deploy_item(item, overwrite_existing=False)
+            log_lines.append(result.get("msg", "(no msg)"))
+            ok = result.get("ok", False)
+
+    elif fix_id == "bootstrap_cron":
+        cron_line = "*/1 * * * * /opt/etc/xray/watchdog.sh"
+        cron_cmd = (
+            "(crontab -l 2>/dev/null | grep -vF '/opt/etc/xray/watchdog.sh'; "
+            f"echo '{cron_line}') | crontab -"
+        )
+        r = keenetic_ssh(cron_cmd, timeout=10)
+        # Verify
+        r2 = keenetic_ssh("crontab -l 2>/dev/null | grep -F '/opt/etc/xray/watchdog.sh'", timeout=5)
+        added = bool((r2.get("stdout") or "").strip())
+        log_lines.append(f"crontab после fix: {r2.get('stdout') or '(пусто!)'}")
+        ok = added
+
+    elif fix_id == "install_extended_geoip":
+        # Скачивает Loyalsoldier geoip.dat (содержит и страны, и сервисы).
+        # 1. Backup существующего geoip.dat (если есть) → .bak-<timestamp>
+        # 2. curl -kL → новый geoip.dat
+        # 3. xkeen -restart → xray перечитает routing с новой базой
+        ansi_re = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        # Объединённая команда: backup + download + size check
+        download_cmd = (
+            f"if [ -f /opt/etc/xray/dat/geoip.dat ]; then "
+            f"  cp /opt/etc/xray/dat/geoip.dat /opt/etc/xray/dat/geoip.dat.bak-{ts}; "
+            f"  echo \"Backup: geoip.dat.bak-{ts}\"; "
+            f"fi; "
+            f"rm -f /opt/etc/xray/dat/geoip.dat; "
+            f"curl -kL --max-time 120 -o /opt/etc/xray/dat/geoip.dat "
+            f"https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat 2>&1 | tail -3; "
+            f"ls -la /opt/etc/xray/dat/geoip.dat 2>&1"
+        )
+        r = keenetic_ssh(download_cmd, timeout=180)
+        out = ansi_re.sub('', r.get("stdout") or "") + ansi_re.sub('', r.get("stderr") or "")
+        log_lines.append(out or "(empty)")
+
+        # Проверка что файл скачался и имеет разумный размер (> 1MB)
+        size_check = keenetic_ssh(
+            "wc -c < /opt/etc/xray/dat/geoip.dat 2>/dev/null",
+            timeout=5,
+        )
+        try:
+            file_size = int((size_check.get("stdout") or "0").strip())
+        except (ValueError, AttributeError):
+            file_size = 0
+
+        if file_size < 1024 * 1024:
+            log_lines.append(f"❌ Файл geoip.dat не скачался или слишком маленький ({file_size} байт)")
+            log_lines.append("   Возможно нет интернета на роутере или GitHub недоступен.")
+            ok = False
+        else:
+            log_lines.append(f"✅ geoip.dat скачан: {file_size} байт ({file_size // 1024 // 1024} MB)")
+            # Перезапуск xkeen чтобы xray перечитал
+            r2 = keenetic_ssh("xkeen -restart 2>&1 | tail -8", timeout=90)
+            log_lines.append("---")
+            log_lines.append(ansi_re.sub('', r2.get("stdout") or "") or "(empty)")
+            # Status check
+            r3 = keenetic_ssh("xkeen -status 2>&1", timeout=10)
+            status = ansi_re.sub('', (r3.get("stdout") or "") + (r3.get("stderr") or ""))
+            log_lines.append("---")
+            log_lines.append(status)
+            # ok если xray запущен. v1.7.17: Mixed/TPROXY/Redirect — все валидные режимы
+            # работы XKeen, не маркер ошибки. Раньше считал Mixed как failure но юзер
+            # подтвердил через checkip.amazonaws.com что VPN полностью работает в Mixed-режиме.
+            # Реальный показатель ошибки загрузки категории — failed to load в error.log.
+            is_running = "запущен" in status and "не запущен" not in status
+            # Доп. проверка: в error.log не должно быть свежих "failed to load" про geoip/geosite
+            r4 = keenetic_ssh("tail -50 /opt/var/log/xray/error.log 2>/dev/null | grep -iE 'failed to load|cannot find|no such file' | tail -5", timeout=5)
+            load_errors = (r4.get("stdout") or "").strip()
+            if is_running and not load_errors:
+                ok = True
+                # Информационное сообщение про режим (без флага ошибки)
+                if "Mixed" in status:
+                    log_lines.append("ℹ️ xkeen в режиме Mixed — это валидный режим работы (один из трёх: TPROXY/Mixed/Redirect). VPN работает. Проверить можно через https://checkip.amazonaws.com — должен показать IP VPN-сервера, не твоего провайдера.")
+                elif "TPROXY" in status:
+                    log_lines.append("ℹ️ xkeen в режиме TPROXY — оптимальный режим.")
+            elif is_running and load_errors:
+                log_lines.append("⚠ xray запущен, но в error.log есть ошибки загрузки категорий:")
+                log_lines.append(load_errors)
+                log_lines.append("Возможно ещё какая-то категория отсутствует в geoip.dat / geosite.dat.")
+                ok = False
+            else:
+                log_lines.append("❌ xray не запустился после установки. Проверь /opt/var/log/xray/error.log на роутере.")
+                ok = False
+
+    else:
+        ok = False
+        log_lines.append(f"❌ Логика fix '{fix_id}' не реализована")
+
+    return jsonify({
+        "ok": ok,
+        "fix_id": fix_id,
+        "label": fix["label"],
+        "log": "\n".join(log_lines),
+    })
+
+
+@app.route("/api/xkeen/dat-categories", methods=["GET"])
+@requires_auth
+def api_xkeen_dat_categories():
+    """Информация о доступных категориях geosite/geoip + КУДА они применяются в routing.
+
+    Возвращает:
+      - usage: [{full, dat, category, outbound_tag, desc, source}] — категории используемые
+        в реальном routing.json + template, с указанием outboundTag (куда трафик идёт).
+      - known: статичный список топ-категорий v2fly с описаниями (для подсказки).
+      - dat_files: список .dat файлов на роутере с размерами и mtime.
+    """
+    # Map категорий → описание из known-списка
+    desc_by_name = {c["name"]: c["desc"] for c in V2FLY_KNOWN_CATEGORIES}
+
+    # Парсер JSON с комментариями — XKeen 05_routing.json начинается с // комментариями.
+    # Удаляем строки начинающиеся с //, потом стандартный json.loads.
+    import re as _re_local
+    def _strip_json_comments(text_):
+        return _re_local.sub(r'^\s*//.*$', '', text_, flags=_re_local.MULTILINE)
+
+    def _scan_rules_file(remote_path, source_label):
+        """Читает routing-файл с роутера, находит rules с ext:... ссылками.
+        Возвращает list of dicts: {full, dat, category, outbound_tag, source, rule_index}."""
+        raw = keenetic_read_file(remote_path)
+        if not raw:
+            return []
+        try:
+            cleaned = _strip_json_comments(raw)
+            data_ = json.loads(cleaned)
+        except Exception:
+            return []
+        result = []
+        rules = (data_.get("routing", {}) or {}).get("rules", []) or []
+        for idx, rule in enumerate(rules):
+            outbound = rule.get("outboundTag") or "(default)"
+            for field in ("domain", "ip"):
+                arr = rule.get(field, []) or []
+                if not isinstance(arr, list):
+                    continue
+                for item in arr:
+                    if isinstance(item, str) and item.startswith("ext:"):
+                        parts = item.split(":")
+                        if len(parts) >= 3:
+                            result.append({
+                                "full": item,
+                                "dat": parts[1],
+                                "category": parts[2],
+                                "outbound_tag": outbound,
+                                "source": source_label,
+                                "rule_index": idx,
+                                "field": field,
+                            })
+        return result
+
+    # Приоритет: фактический 05_routing.json (то что Xray сейчас исполняет).
+    # Если нет — template (для понимания что watchdog будет генерить).
+    usage = _scan_rules_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/05_routing.json", "routing.json")
+    if not usage:
+        usage = _scan_rules_file(f"{cfg.KEENETIC_XRAY_BAK_DIR}/05_routing.template.json", "template")
+
+    # Добавляем описание категории из known-списка (если есть)
+    for u in usage:
+        u["desc"] = desc_by_name.get(u["category"], "")
+
+    # in_use — обратная совместимость со старым UI (просто список ext:... без outbound)
+    in_use = [{"full": u["full"], "dat": u["dat"], "category": u["category"]} for u in usage]
+
+    # .dat файлы на роутере: имя, размер, mtime (для отображения «когда обновлялись»)
+    r = keenetic_ssh(
+        "for f in /opt/etc/xray/dat/*.dat; do "
+        "  size=$(wc -c < \"$f\" 2>/dev/null || echo 0); "
+        "  mtime=$(date -r \"$f\" \"+%Y-%m-%d %H:%M\" 2>/dev/null || echo \"?\"); "
+        "  echo \"$size|$mtime|$(basename $f)\"; "
+        "done 2>/dev/null",
+        timeout=8
+    )
+    dat_files = []
+    if r["ok"] and r["stdout"]:
+        for line in r["stdout"].strip().split("\n"):
+            parts = line.split("|", 2)
+            if len(parts) == 3:
+                try:
+                    size = int(parts[0])
+                    dat_files.append({
+                        "name": parts[2],
+                        "size": size,
+                        "size_mb": round(size / 1024 / 1024, 2),
+                        "mtime": parts[1],
+                    })
+                except ValueError:
+                    pass
+
+    return jsonify({
+        "ok": True,
+        "usage": usage,
+        "in_use": in_use,
+        "known": V2FLY_KNOWN_CATEGORIES,
+        "dat_files": dat_files,
+        "note": "Полный список категорий: https://github.com/v2fly/domain-list-community/tree/master/data",
+    })
+
+
+@app.route("/logout")
+def logout():
+    """Чистый logout: очищаем серверную сессию, редиректим на /login."""
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/favicon.ico")
+@app.route("/favicon.png")
+def favicon():
+    """Иконка вкладки. Файл лежит рядом с dashboard.py."""
+    return send_from_directory(
+        os.path.dirname(os.path.abspath(__file__)),
+        "icons8-favicon-64.png",
+        mimetype="image/png",
+    )
+
+
+def parse_user_agent(ua):
+    """Извлечь app/version/platform из User-Agent. Поддерживает форматы Happ, v2raytun, v2rayN, NekoBox."""
+    if not ua:
+        return {"app": "?", "app_version": "", "platform": "?", "raw": ""}
+    info = {"app": "?", "app_version": "", "platform": "?", "raw": ua}
+
+    # Формат: Happ/4.6.0/ios/2603181605583
+    m = re.match(r"^(Happ|v2raytun|NekoBox|v2rayN|Streisand|Shadowrocket|FoXray)/(\S+?)/(\w+)", ua)
+    if m:
+        info["app"] = m.group(1)
+        info["app_version"] = m.group(2)
+        info["platform"] = m.group(3)
+        return info
+
+    # Формат: v2rayN/X.Y.Z
+    m = re.match(r"^(\S+?)/(\S+)", ua)
+    if m:
+        info["app"] = m.group(1)
+        info["app_version"] = m.group(2)
+        # Определить платформу
+        ua_lower = ua.lower()
+        if "ios" in ua_lower or "iphone" in ua_lower:
+            info["platform"] = "iOS"
+        elif "android" in ua_lower:
+            info["platform"] = "Android"
+        elif "windows" in ua_lower:
+            info["platform"] = "Windows"
+        elif "mac" in ua_lower or "darwin" in ua_lower:
+            info["platform"] = "macOS"
+        elif "linux" in ua_lower:
+            info["platform"] = "Linux"
+    return info
+
+
+@app.route("/sub/<token>")
+def subscription(token):
+    """Endpoint подписки: отдаёт base64(всех vless URLs).
+    Залогиниться не нужно — но требуется правильный TOKEN в URL."""
+    if token != cfg.SUBSCRIPTION_TOKEN:
+        return Response("Forbidden", 403)
+
+    # Логируем User-Agent для статистики
+    ua = request.headers.get("User-Agent", "")
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
+    info = parse_user_agent(ua)
+    entry = {
+        "time": datetime.now(),
+        "ip": ip,
+        "user_agent": ua,
+        **info,
+    }
+    SUBS_LOG.append(entry)
+    # Trim log
+    limit = getattr(cfg, "SUBS_LOG_LIMIT", 200)
+    if len(SUBS_LOG) > limit:
+        del SUBS_LOG[: len(SUBS_LOG) - limit]
+
+    # Сборка тела подписки
+    urls = "\n".join(p["url"] for p in cfg.PROFILES) + "\n"
+    body = base64.b64encode(urls.encode("utf-8")).decode("ascii")
+
+    # Заголовки совместимости с Happ/v2rayN
+    title = getattr(cfg, "SUBSCRIPTION_TITLE", "Subscription")
+    update_hrs = getattr(cfg, "SUBSCRIPTION_UPDATE_HOURS", 24)
+    resp = Response(body, 200, mimetype="text/plain; charset=utf-8")
+    resp.headers["Profile-Update-Interval"] = str(update_hrs)
+    resp.headers["Subscription-Userinfo"] = f"upload=0; download=0; total={len(cfg.PROFILES)}; expire=0"
+    resp.headers["Profile-Title"] = title
+    # Некоторые клиенты ожидают base64 в Profile-Title для UTF-8 имён:
+    resp.headers["Profile-Title"] = "base64:" + base64.b64encode(title.encode("utf-8")).decode("ascii")
+    return resp
+
+
+@app.route("/api/tail")
+@requires_auth
+def api_tail():
+    """AJAX endpoint — последние N строк лога."""
+    log = request.args.get("log", "access")
+    n = int(request.args.get("n", 30))
+    path = cfg.XRAY_ACCESS_LOG if log == "access" else cfg.XRAY_ERROR_LOG
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()[-n:]
+        return jsonify(lines=[l.rstrip("\n") for l in lines])
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+
+# ============== TEMPLATES ==============
+DYNAMIC_TEMPLATE = r"""
+<p class="dim" style="margin:0 0 16px 0">обновлено в {{ now }}</p>
+
+<!-- ==================== СТАТУС ПРОЦЕССОВ ==================== -->
+<h2>📊 Статус процессов</h2>
+<div class="grid grid-2">
+  <div class="card">
+    <h3 style="margin-top:0">xray
+      {% if xray.alive %}<span class="badge badge-ok">RUNNING</span>{% else %}<span class="badge badge-bad">DOWN</span>{% endif %}
+    </h3>
+    {% if xray.alive %}
+      <table>
+        <tr><th>PID</th><td>{{ xray.pid }}</td></tr>
+        <tr><th>Запущен</th><td>{{ xray.start }}</td></tr>
+        <tr><th>Uptime</th><td>{{ xray.uptime }}</td></tr>
+        <tr><th>CPU</th><td>{{ xray.cpu }}%</td></tr>
+        <tr><th>RAM</th><td>{{ xray.mem_mb }} МБ</td></tr>
+      </table>
+    {% else %}<p class="bad">Процесс не найден.</p>{% endif %}
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">caddy
+      {% if caddy.alive %}<span class="badge badge-ok">RUNNING</span>{% else %}<span class="badge badge-bad">DOWN</span>{% endif %}
+    </h3>
+    {% if caddy.alive %}
+      <table>
+        <tr><th>PID</th><td>{{ caddy.pid }}</td></tr>
+        <tr><th>Запущен</th><td>{{ caddy.start }}</td></tr>
+        <tr><th>Uptime</th><td>{{ caddy.uptime }}</td></tr>
+        <tr><th>CPU</th><td>{{ caddy.cpu }}%</td></tr>
+        <tr><th>RAM</th><td>{{ caddy.mem_mb }} МБ</td></tr>
+      </table>
+    {% else %}<p class="bad">Процесс не найден.</p>{% endif %}
+  </div>
+</div>
+
+<!-- ==================== ПОРТЫ И КЛИЕНТЫ ==================== -->
+<h2>🔌 Активные порты и подключения</h2>
+<p class="dim" style="margin-top:0">⚠️ Keenetic делает source-NAT — все внешние клиенты приходят как <span class="mono">{{ keenetic_host }}</span>. Реальные external IP смотри в блоке «Недавние клиенты» ниже (из логов xray).</p>
+
+{% for owner, plist in ports_by_owner.items() %}
+<h3 style="margin-top:20px;margin-bottom:6px">
+  {% if owner == 'xray' %}🛡️ xray inbounds{% elif owner == 'caddy' %}🌐 Caddy{% else %}{{ owner }}{% endif %}
+</h3>
+<table>
+  <tr><th>Порт</th><th>Назначение</th><th>Слушает?</th><th>Реальных клиентов</th><th>TCP (без Keenetic)</th><th>Источники</th></tr>
+  {% for p in plist %}
+  <tr>
+    <td class="mono">TCP/{{ p.port }}</td>
+    <td class="dim">{{ p.purpose }}</td>
+    <td>{% if p.listening %}<span class="badge badge-ok">OK</span>{% else %}<span class="badge badge-bad">CLOSED</span>{% endif %}</td>
+    <td><strong>{{ p.real_unique_ips }}</strong></td>
+    <td class="dim">{{ p.real_tcp_count }}</td>
+    <td>
+      {% if p.clients %}
+        {% for c in p.clients %}{% if c.ip == keenetic_host %}<span class="mono dim">Keenetic</span> ({{ c.count }}){% else %}<span class="mono">{{ c.ip }}</span> ({{ c.count }}){% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
+        {% if p.stale_count > 0 %}<span class="dim"> + {{ p.stale_count }} stale TCP скрыты</span>{% endif %}
+      {% elif p.stale_count > 0 %}<span class="dim">{{ p.stale_count }} stale TCP скрыты (нет активности 30с)</span>
+      {% else %}<span class="dim">—</span>{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endfor %}
+<p class="dim" style="font-size:0.8em;margin-top:8px">«Реальных клиентов» = IP активные за последние 30с по access.log (без зависших TCP и без Keenetic-самопроверок). Зависшие TCP (которые netstat ещё видит, но трафика по ним нет) показываются справа как «N stale TCP скрыты».</p>
+
+<!-- ==================== АКТИВНЫЕ КЛИЕНТЫ ЗА 30С ПО ЛОГАМ ==================== -->
+<h2>⚡ Активные клиенты за 30 секунд (по access.log)</h2>
+<p class="dim" style="margin-top:0">Окно 30с (короче — мигает из-за коротких xhttp-циклов). Показывает уникальные IP по записям accepted в access.log.</p>
+{% set has_30s = namespace(v=false) %}
+{% for plist in ports_by_owner.values() %}{% for p in plist %}{% if active_30s.get(p.port) %}{% set has_30s.v = true %}{% endif %}{% endfor %}{% endfor %}
+{% if has_30s.v %}
+<table>
+  <tr><th>Порт</th><th>Inbound</th><th>Уникальных IP</th><th>Запросов</th><th>Источники (IP, count, ago)</th></tr>
+  {% for owner, plist in ports_by_owner.items() %}{% for p in plist %}
+    {% set clients = active_30s.get(p.port, []) %}
+    {% if clients %}
+    <tr>
+      <td class="mono">TCP/{{ p.port }}</td>
+      <td class="dim">{{ p.purpose }}</td>
+      <td><strong>{{ clients|length }}</strong></td>
+      <td class="dim">{{ clients|sum(attribute='count') }}</td>
+      <td>
+        {% for c in clients %}<span class="mono">{{ c.ip }}</span>{% if c.is_lan %} <span class="dim">(LAN)</span>{% endif %} ({{ c.count }}, {{ c.ago_sec }}с назад){% if not loop.last %}<br>{% endif %}{% endfor %}
+      </td>
+    </tr>
+    {% endif %}
+  {% endfor %}{% endfor %}
+</table>
+{% else %}
+<p class="dim">За последние 30 секунд активных клиентов не было (в access.log нет новых записей).</p>
+{% endif %}
+
+<!-- ==================== НЕДАВНИЕ КЛИЕНТЫ (REAL EXTERNAL IPs) ==================== -->
+<h2>👥 Недавние клиенты за 5 минут (по логам)</h2>
+<p class="dim" style="margin-top:0">Реальные external IP (видны через REALITY-handshake до Keenetic NAT)</p>
+{% if recent_clients %}
+<table>
+  <tr><th>External IP</th><th>Первое появление</th><th>Последнее</th><th>Событий</th><th>Reality-ошибок</th></tr>
+  {% for c in recent_clients %}
+  <tr>
+    <td class="mono">{{ c.ip }}</td>
+    <td class="mono dim">{{ c.first }}</td>
+    <td class="mono">{{ c.last }}</td>
+    <td>{{ c.events }}</td>
+    <td>{% if c.errors > 0 %}<span class="bad">{{ c.errors }}</span>{% else %}0{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="dim">Нет активности за последние 5 минут.</p>
+{% endif %}
+
+<!-- ==================== ПОСЛЕДНИЕ СЕССИИ ==================== -->
+<h2>📜 Последние VLESS-сессии (из error.log)</h2>
+<table>
+  <tr><th>Время</th><th>Куда (sniffed/target)</th><th>Outbound IP:port</th></tr>
+  {% for s in sessions[:30] %}
+  <tr>
+    <td class="mono dim">{{ s.time[11:] }}</td>
+    <td class="mono">{{ s.dest }}</td>
+    <td class="mono dim">{{ s.remote }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="3" class="dim">Нет данных</td></tr>
+  {% endfor %}
+</table>
+
+<!-- ==================== REALITY-ОШИБКИ ==================== -->
+{% if reality_errors %}
+<h2>⚠️ Reality-ошибки handshake (последние 30)</h2>
+<table>
+  <tr><th>Время</th><th>IP</th><th>Причина</th></tr>
+  {% for e in reality_errors %}
+  <tr>
+    <td class="mono dim">{{ e.time[11:] }}</td>
+    <td class="mono">{{ e.ip }}</td>
+    <td class="dim">{{ e.reason }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+<!-- ==================== ПОДПИСОЧНЫЕ КЛИЕНТЫ ==================== -->
+<h2>📦 Клиенты подписки <span class="dim" style="font-size:0.7em">(всего запросов: {{ subs_total }})</span></h2>
+{% if subs_view %}
+<table>
+  <tr><th>IP</th><th>Приложение</th><th>Платформа</th><th>Последний запрос</th><th>User-Agent (raw)</th></tr>
+  {% for s in subs_view %}
+  <tr>
+    <td class="mono">{{ s.ip }}</td>
+    <td><strong>{{ s.app }}</strong> <span class="dim">{{ s.app_version }}</span></td>
+    <td>{{ s.platform }}</td>
+    <td class="dim">{{ s.last }} <span class="mono">({{ s.ago_min }}мин назад)</span></td>
+    <td class="mono dim" style="font-size:0.75em">{{ s.user_agent }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="dim">Никто ещё не подписался. Используй subscription URL — см. блок «Профили подключения» ниже.</p>
+{% endif %}
+"""
+
+
+LOGIN_TEMPLATE = r"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>xray dashboard — вход</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: #f5f5f0; color: #222; margin: 0; padding: 0; height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .login-card { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 32px 36px; width: 360px; box-shadow: 0 2px 12px rgba(0,0,0,0.05); }
+  h1 { font-weight: normal; color: #222; margin: 0 0 8px 0; font-size: 1.6em; }
+  .subtitle { color: #888; margin-bottom: 24px; font-size: 0.9em; }
+  label { display: block; margin: 14px 0 4px; color: #555; font-size: 0.9em; }
+  input[type=text], input[type=password] { width: 100%; padding: 10px 12px; border: 1px solid #ccc; border-radius: 4px; font-size: 1em; }
+  input[type=text]:focus, input[type=password]:focus { border-color: #2a7; outline: none; }
+  .remember { margin: 16px 0; font-size: 0.9em; color: #555; }
+  .remember input { margin-right: 6px; vertical-align: middle; }
+  button[type=submit] { width: 100%; padding: 11px; background: #2a7; color: #fff; border: none; border-radius: 4px; font-size: 1em; cursor: pointer; margin-top: 8px; }
+  button[type=submit]:hover { background: #1a6; }
+  .error { background: #fbd7d7; color: #c33; padding: 10px 12px; border-radius: 4px; margin-bottom: 16px; font-size: 0.9em; }
+</style>
+</head>
+<body>
+<form class="login-card" method="POST">
+  <h1>xray dashboard</h1>
+  <p class="subtitle">Вход в панель управления</p>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <label>Логин</label>
+  <input type="text" name="username" autofocus required autocomplete="username">
+  <label>Пароль</label>
+  <input type="password" name="password" required autocomplete="current-password">
+  <div class="remember"><label><input type="checkbox" name="remember"> Запомнить на 30 дней</label></div>
+  <button type="submit">Войти</button>
+</form>
+</body>
+</html>"""
+
+
+TEMPLATE = r"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>xray dashboard — {{ now }}</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: #f5f5f0; color: #222; margin: 0; padding: 20px; max-width: 1200px; margin: 0 auto; }
+  h1 { font-weight: normal; color: #222; margin: 0 0 4px 0; }
+  .subtitle { color: #888; margin-bottom: 24px; font-size: 0.9em; }
+  h2 { color: #444; border-bottom: 1px solid #ddd; padding-bottom: 6px; margin-top: 30px; font-weight: normal; font-size: 1.3em; }
+  .grid { display: grid; gap: 16px; }
+  .grid-2 { grid-template-columns: 1fr 1fr; }
+  .grid-3 { grid-template-columns: repeat(3, 1fr); }
+  .card { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 16px; }
+  .ok { color: #2a7; font-weight: 600; }
+  .bad { color: #c33; font-weight: 600; }
+  .dim { color: #888; font-size: 0.9em; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; font-weight: 600; }
+  .badge-ok { background: #d4eedd; color: #2a7; }
+  .badge-bad { background: #fbd7d7; color: #c33; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.9em; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
+  th { background: #f9f9f4; font-weight: 600; color: #555; }
+  tr:hover td { background: #fafaf5; }
+  .mono { font-family: Consolas, monospace; font-size: 0.85em; }
+  .qr { width: 200px; height: 200px; }
+  .url-box { font-family: Consolas, monospace; font-size: 0.7em; word-break: break-all; background: #f9f9f4; padding: 8px; border-radius: 4px; max-height: 120px; overflow-y: auto; }
+  .copy-btn { background: #555; color: #fff; border: none; padding: 4px 12px; border-radius: 3px; cursor: pointer; font-size: 0.8em; margin-top: 8px; }
+  .copy-btn:hover { background: #333; }
+  pre.log { background: #1e1e1e; color: #ddd; padding: 12px; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.78em; max-height: 300px; overflow-y: auto; line-height: 1.4; }
+  .auto-refresh { float: right; font-size: 0.8em; color: #888; }
+  .reload-btn { background: #2a7; color: #fff; border: none; padding: 6px 12px; border-radius: 3px; cursor: pointer; font-size: 0.85em; }
+  .reload-btn:hover { background: #1a6; }
+  .logout-btn { background: #c33; color: #fff; border: none; padding: 6px 12px; border-radius: 3px; cursor: pointer; font-size: 0.85em; margin-left: 8px; text-decoration: none; display: inline-block; }
+  .logout-btn:hover { background: #a22; color: #fff; text-decoration: none; }
+  #dynamic { transition: opacity 0.15s; }
+  #dynamic.updating { opacity: 0.7; }
+  .live-dot { display:inline-block; width:8px; height:8px; background:#2a7; border-radius:50%; margin-right:6px; animation:pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+</style>
+</head>
+<body>
+
+<h1>xray dashboard <span class="auto-refresh">{{ username }} · <span class="live-dot"></span>live · <a href="/xkeen" style="color:#2a7; text-decoration:none; padding:0 8px;">🚦 XKeen роутер →</a> <button class="reload-btn" onclick="location.reload()">↻</button><a href="/logout" class="logout-btn">Выход</a></span></h1>
+<p class="subtitle">External IP: <span class="mono">{{ external_ip }}</span></p>
+
+<div id="dynamic">{{ dynamic_html|safe }}</div>
+
+<!-- Статичные блоки ниже — обновляются только при F5 -->
+
+<!-- ==================== NAT-ФОРВАРДЫ ==================== -->
+{% if nat_forwards %}
+<h2>🔁 NAT-форварды Keenetic</h2>
+<table>
+  <tr><th>Внешний порт</th><th>→ Внутренний (PC)</th><th>Inbound слушает?</th><th>Описание</th></tr>
+  {% for nf in nat_forwards %}
+  <tr>
+    <td class="mono">TCP/{{ nf.external }}</td>
+    <td class="mono">PC:{{ nf.internal }}</td>
+    <td>
+      {% if ports[nf.internal] and ports[nf.internal].listening %}
+        <span class="badge badge-ok">OK</span>
+      {% else %}
+        <span class="badge badge-bad">inbound DOWN</span>
+      {% endif %}
+    </td>
+    <td class="dim">{{ nf.description }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+<!-- ==================== SUBSCRIPTION URL ==================== -->
+<h2>📦 Subscription URL <span class="dim" style="font-size:0.7em">(одна ссылка = все 4 профиля сразу + автосинк в Happ)</span></h2>
+<div class="card">
+  <p style="margin-top:0">Импортируй эту ссылку в Happ как <strong>Subscription</strong> (а не как обычный профиль). Happ скачает все 4 vless-конфига сразу и будет периодически их обновлять.</p>
+  <div style="display:flex; gap:16px; align-items:flex-start">
+    <img class="qr" src="{{ sub_qr }}" alt="QR">
+    <div style="flex:1">
+      <div class="url-box" id="sub-url">{{ subscription_url }}</div>
+      <button class="copy-btn" onclick="copyText('sub-url')">📋 Скопировать</button>
+      <p class="dim" style="font-size:0.85em;margin-top:12px">⚠️ Не делись этой ссылкой публично — кто её получит, тот получит твои конфиги. Сменить токен можно в <span class="mono">config_local.py</span> → <span class="mono">SUBSCRIPTION_TOKEN</span>.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== ПРОФИЛИ С QR ==================== -->
+<h2>📱 Отдельные профили (для импорта по одному)</h2>
+<div class="grid grid-2">
+{% for p in profiles %}
+  <div class="card">
+    <h3 style="margin-top:0">{{ p.name }}</h3>
+    <p class="dim" style="margin-top:0">{{ p.subtitle }}</p>
+    <p>
+      {# Статус определяем по внутреннему порту (что реально слушает xray на PC) #}
+      {% set inb = ports[p.inbound_port] %}
+      <span class="badge {% if inb and inb.listening %}badge-ok{% else %}badge-bad{% endif %}">
+        порт {{ p.external_port }}{% if p.external_port != p.inbound_port %} → :{{ p.inbound_port }}{% endif %}
+        {% if inb and inb.listening %}OK{% else %}DOWN{% endif %}
+      </span>
+    </p>
+    <div style="display:flex; gap:16px; align-items:flex-start">
+      <img class="qr" src="{{ p.qr }}" alt="QR">
+      <div style="flex:1">
+        <div class="url-box" id="url-{{ loop.index }}">{{ p.url }}</div>
+        <button class="copy-btn" onclick="copyText('url-{{ loop.index }}')">📋 Скопировать</button>
+      </div>
+    </div>
+  </div>
+{% endfor %}
+</div>
+
+<!-- ==================== INBOUNDS из config.json ==================== -->
+<h2>⚙️ xray inbounds (из config.json)</h2>
+<table>
+  <tr><th>Tag</th><th>Порт</th><th>Протокол</th><th>Network</th><th>Security</th><th>SNI / serverNames</th><th>dest</th><th>shortIds</th><th>Клиентов</th></tr>
+  {% for ib in inbounds %}
+  <tr>
+    <td class="mono">{{ ib.tag }}</td>
+    <td class="mono">{{ ib.port }}</td>
+    <td>{{ ib.protocol }}</td>
+    <td>{{ ib.network }}</td>
+    <td>{{ ib.security }}</td>
+    <td class="mono">{{ ib.serverNames|join(', ') }}</td>
+    <td class="mono dim">{{ ib.dest }}</td>
+    <td class="mono dim">{{ ib.shortIds|join(', ') }}</td>
+    <td>{{ ib.clients_count }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<!-- ==================== LIVE-TAIL LOGS ==================== -->
+<h2>📡 Live-tail логов</h2>
+<div class="grid grid-2">
+  <div>
+    <h3 style="margin-top:0">access.log <span class="dim">(последние 30)</span></h3>
+    <pre class="log" id="access-log">загрузка...</pre>
+  </div>
+  <div>
+    <h3 style="margin-top:0">error.log <span class="dim">(последние 30)</span></h3>
+    <pre class="log" id="error-log">загрузка...</pre>
+  </div>
+</div>
+
+<script>
+function copyText(id) {
+  const el = document.getElementById(id);
+  const text = el.innerText;
+  const btn = event.target;
+  const orig = btn.innerText;
+  const flash = (msg) => {
+    btn.innerText = msg;
+    setTimeout(() => { btn.innerText = orig; }, 1800);
+  };
+
+  // Способ 1: современный clipboard API (требует HTTPS или localhost)
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(
+      () => flash("✓ скопировано"),
+      () => fallbackCopy(text, flash)
+    );
+  } else {
+    fallbackCopy(text, flash);
+  }
+}
+
+function fallbackCopy(text, flash) {
+  // Способ 2: legacy через временный textarea (работает на http)
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.left = "-9999px";
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    const ok = document.execCommand("copy");
+    flash(ok ? "✓ скопировано" : "выдели и Ctrl+C");
+  } catch (e) {
+    flash("выдели и Ctrl+C");
+  }
+  document.body.removeChild(ta);
+}
+
+
+async function fetchLog(name, elemId) {
+  try {
+    const r = await fetch('/api/tail?log=' + name + '&n=30');
+    const data = await r.json();
+    const el = document.getElementById(elemId);
+    if (data.lines) {
+      el.innerText = data.lines.join('\n');
+      el.scrollTop = el.scrollHeight;
+    } else {
+      el.innerText = data.error || 'no data';
+    }
+  } catch (e) { console.error(e); }
+}
+
+async function refreshDynamic() {
+  const el = document.getElementById('dynamic');
+  el.classList.add('updating');
+  try {
+    const r = await fetch('/api/state');
+    if (r.status === 401 || r.redirected) {
+      // Сессия истекла — перезагружаем страницу, чтобы попасть на /login
+      window.location.reload();
+      return;
+    }
+    const html = await r.text();
+    el.innerHTML = html;
+  } catch (e) {
+    console.error('refresh failed:', e);
+  } finally {
+    el.classList.remove('updating');
+  }
+}
+
+fetchLog('access', 'access-log');
+fetchLog('error', 'error-log');
+setInterval(() => fetchLog('access', 'access-log'), 5000);
+setInterval(() => fetchLog('error', 'error-log'), 5000);
+setInterval(refreshDynamic, 5000);
+</script>
+
+<p class="dim" style="margin-top:40px; text-align:center; font-size:0.8em">
+xray dashboard · {{ now }} · auto-refresh каждые 5 сек
+</p>
+
+</body>
+</html>"""
+
+
+XKEEN_TEMPLATE = r"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>XKeen — Кинетик 🚦</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: #f5f5f0; color: #222; margin: 0; padding: 20px; max-width: 1200px; margin: 0 auto; }
+  h1 { font-weight: normal; color: #222; margin: 0 0 4px 0; }
+  /* Главные разделы — крупно, цветная шапка сверху + полоса слева, светлый фон.
+     Визуально слиты с card снизу (нет нижней границы). Каждый раздел — свой цвет
+     через .sec-1..sec-5, чтобы глаз сразу узнавал «где я». Цвет передаётся через
+     CSS-переменные --sec-fg / --sec-bg / --sec-border. */
+  body { counter-reset: sec; }
+  h2 {
+    --sec-fg: #2a7; --sec-bg-1: #e8f3ea; --sec-bg-2: #f3f9f3; --sec-text: #1f4d2c; --sec-border: #c5dcc9;
+    color: var(--sec-text);
+    background: linear-gradient(180deg, var(--sec-bg-1) 0%, var(--sec-bg-2) 100%);
+    border: 1px solid var(--sec-border);
+    border-top: 5px solid var(--sec-fg);   /* цветная «шапка» сверху */
+    border-bottom: none;
+    border-left: 6px solid var(--sec-fg);
+    padding: 14px 20px;
+    margin: 44px 0 0 0;
+    font-weight: 600;
+    font-size: 1.4em;
+    border-radius: 4px 4px 0 0;
+    counter-increment: sec;
+    display: flex; align-items: center; gap: 12px;
+  }
+  h2::before {
+    content: counter(sec);
+    flex: 0 0 auto;
+    background: var(--sec-fg); color: #fff;
+    font-size: 0.75em; font-weight: 700;
+    width: 1.9em; height: 1.9em; line-height: 1.9em;
+    text-align: center; border-radius: 50%;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+  }
+  /* Цветовые варианты h2 — по разделам */
+  h2.sec-routing { --sec-fg: #2a7; --sec-bg-1: #e8f3ea; --sec-bg-2: #f3f9f3; --sec-text: #1f4d2c; --sec-border: #c5dcc9; }
+  h2.sec-add     { --sec-fg: #36a; --sec-bg-1: #e6eff8; --sec-bg-2: #f1f6fb; --sec-text: #1f3d6b; --sec-border: #b9cee2; }
+  h2.sec-sync    { --sec-fg: #c63; --sec-bg-1: #fbeee5; --sec-bg-2: #fcf6f1; --sec-text: #7a330b; --sec-border: #e6c2a8; }
+  h2.sec-list    { --sec-fg: #639; --sec-bg-1: #efe8f5; --sec-bg-2: #f6f1fa; --sec-text: #3d2061; --sec-border: #d0bfde; }
+  h2.sec-backup  { --sec-fg: #866; --sec-bg-1: #efe8e8; --sec-bg-2: #f6f1f1; --sec-text: #4a2a2a; --sec-border: #d2bdbd; }
+  h2.sec-help    { --sec-fg: #468; --sec-bg-1: #e6ecf3; --sec-bg-2: #f1f4f8; --sec-text: #1f3050; --sec-border: #b9c4d3; }
+  h2.sec-chain   { --sec-fg: #a73; --sec-bg-1: #f5ece0; --sec-bg-2: #faf3e8; --sec-text: #5a3a1c; --sec-border: #d8c19e; }
+  h2.sec-router  { --sec-fg: #777; --sec-bg-1: #ececec; --sec-bg-2: #f5f5f5; --sec-text: #333;    --sec-border: #c8c8c8; }
+  h2.sec-tg      { --sec-fg: #29b; --sec-bg-1: #e0eef5; --sec-bg-2: #ecf3f8; --sec-text: #15506b; --sec-border: #b3d3e3; }
+  h2.sec-xkmgmt  { --sec-fg: #74c; --sec-bg-1: #ece5f3; --sec-bg-2: #f3eef7; --sec-text: #3d2061; --sec-border: #c8b6dc; }
+  h2.sec-rescue  { --sec-fg: #c33; --sec-bg-1: #fbe5e5; --sec-bg-2: #fcefef; --sec-text: #6a1a1a; --sec-border: #dcb6b6; }
+  /* Card сразу после h2 — без верхнего margin/скругления и тонкая боковая граница в цвет раздела */
+  h2 + .card {
+    margin-top: 0;
+    border-top-left-radius: 0; border-top-right-radius: 0;
+    border-top: none;
+    border-left: 1px solid var(--sec-border, #ddd);
+    border-right: 1px solid var(--sec-border, #ddd);
+    border-bottom: 1px solid var(--sec-border, #ddd);
+  }
+  h2.sec-routing + .card { border-color: #c5dcc9; }
+  h2.sec-add     + .card { border-color: #b9cee2; }
+  h2.sec-sync    + .card { border-color: #e6c2a8; }
+  h2.sec-list    + .card { border-color: #d0bfde; }
+  h2.sec-backup  + .card { border-color: #d2bdbd; }
+  h2.sec-help    + .card { border-color: #b9c4d3; }
+  h2.sec-chain   + .card { border-color: #d8c19e; }
+  h2.sec-router  + .card { border-color: #c8c8c8; }
+  h2.sec-tg      + .card { border-color: #b3d3e3; }
+  h2.sec-xkmgmt  + .card { border-color: #c8b6dc; }
+  h2.sec-rescue  + .card { border-color: #dcb6b6; }
+  /* Collapsible-секции (по клику на h2 открывается/закрывается).
+     Оборачиваем h2+.card в <details><summary><h2></h2></summary><div class="card"></div></details>.
+     Браузеры поддерживают h2 внутри summary (не строго по spec, но работает). */
+  details.section-collapsible > summary { list-style: none; cursor: pointer; padding: 0; margin: 0; }
+  details.section-collapsible > summary::-webkit-details-marker { display: none; }
+  details.section-collapsible > summary > h2 { margin: 44px 0 0 0; position: relative; padding-right: 50px; }
+  details.section-collapsible:first-of-type > summary > h2 { margin-top: 0; }
+  /* Маркер ▶/▼ справа в шапке h2 */
+  details.section-collapsible > summary > h2::after {
+    content: '▶';
+    position: absolute;
+    right: 18px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 0.85em;
+    color: var(--sec-fg, #888);
+    transition: transform 0.15s;
+    opacity: 0.7;
+  }
+  details.section-collapsible[open] > summary > h2::after { content: '▼'; opacity: 1; }
+  /* Selector для .card внутри details — заменяет h2 + .card логику */
+  details.section-collapsible > .card {
+    margin-top: 0;
+    border-top-left-radius: 0; border-top-right-radius: 0;
+    border-top: none;
+    border-left: 1px solid var(--sec-border, #ddd);
+    border-right: 1px solid var(--sec-border, #ddd);
+    border-bottom: 1px solid var(--sec-border, #ddd);
+  }
+  /* Help-раздел — collapsible подразделы через <details> + примеры use-case */
+  .help-section {
+    border: 1px solid #d4dde8;
+    border-radius: 6px;
+    margin-bottom: 10px;
+    background: #fafbfd;
+    overflow: hidden;
+  }
+  .help-section > summary {
+    padding: 10px 14px;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 1.05em;
+    color: #1f3050;
+    background: #eaf0f7;
+    list-style: none;
+    user-select: none;
+  }
+  .help-section > summary::-webkit-details-marker { display: none; }
+  .help-section > summary::before { content: '▶ '; color: #888; font-size: 0.85em; }
+  .help-section[open] > summary::before { content: '▼ '; color: #468; }
+  .help-section[open] > summary { border-bottom: 1px solid #d4dde8; background: #dde6f0; }
+  .help-section .help-body { padding: 14px 18px; line-height: 1.55; color: #333; }
+  .help-section .help-body h4 { color: #1f3050; margin: 16px 0 6px; font-size: 1em; }
+  .help-section .help-body h4:first-child { margin-top: 0; }
+  .help-section .help-body p { margin: 8px 0; }
+  .help-section .help-body code { background: #eef2f7; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; color: #1f3050; }
+  .help-section .help-body ul, .help-section .help-body ol { margin: 6px 0; padding-left: 24px; }
+  .help-section .help-body li { margin: 4px 0; }
+  .help-section .help-body .kbd { display: inline-block; padding: 1px 6px; background: #fff; border: 1px solid #ccc; border-radius: 3px; font-family: Consolas, monospace; font-size: 0.85em; }
+  .help-section .help-body .tip { background: #fffbe5; border-left: 3px solid #d4a017; padding: 8px 12px; margin: 8px 0; border-radius: 3px; }
+  .help-section .help-body .warn { background: #fdecea; border-left: 3px solid #c33; padding: 8px 12px; margin: 8px 0; border-radius: 3px; }
+  /* Примеры use-cases — оформлены как мини-карточки */
+  .help-example {
+    background: #fff;
+    border: 1px solid #d4dde8;
+    border-left: 4px solid #468;
+    border-radius: 4px;
+    margin: 12px 0;
+    padding: 12px 16px;
+  }
+  .help-example > .help-example-title {
+    font-weight: 700;
+    color: #1f3050;
+    font-size: 1.02em;
+    margin-bottom: 8px;
+  }
+  .help-example ol { margin: 4px 0 0; padding-left: 22px; }
+  .help-example ol li { margin: 5px 0; }
+  /* Подразделы внутри card — единый стиль с цветовой семантикой */
+  .subsec {
+    margin: 22px 0 10px 0;
+    padding: 8px 14px;
+    border-left: 4px solid #888;
+    background: #fafafa;
+    color: #333;
+    font-size: 1.02em;
+    font-weight: 600;
+    border-radius: 0 4px 4px 0;
+  }
+  .subsec .subsec-hint { font-weight: 400; color: #888; font-size: 0.88em; margin-left: 6px; }
+  /* Цветовые варианты подразделов */
+  .subsec.subsec-status { border-left-color: #2a7; background: #eef7f0; color: #1f4d2c; margin-top: 0; }
+  .subsec.subsec-ai     { border-left-color: #6a3; background: #f3faf0; color: #3d6020; }
+  .subsec.subsec-yt     { border-left-color: #c33; background: #fbecec; color: #7a1818; }
+  .subsec.subsec-direct { border-left-color: #c63; background: #fbf3ed; color: #8a3a0c; }
+  .subsec.subsec-action { border-left-color: #36a; background: #eef4fa; color: #1f3d6b; }
+  .subsec.subsec-chain  { border-left-color: #639; background: #f3eff7; color: #4a2870; }
+  .subsec.subsec-log    { border-left-color: #888; background: #f5f5f3; color: #555; }
+  /* Когда подраздел — это <details>, делаем summary похожим на h3 */
+  details.subsec > summary {
+    list-style: none; cursor: pointer; margin: -8px -14px; padding: 8px 14px;
+    font-weight: 600; outline: none;
+  }
+  details.subsec > summary::-webkit-details-marker { display: none; }
+  details.subsec > summary::before { content: '▶ '; color: #999; font-size: 0.8em; }
+  details.subsec[open] > summary::before { content: '▼ '; color: #2a7; }
+  details.subsec[open] > summary { border-bottom: 1px dashed rgba(0,0,0,0.08); padding-bottom: 8px; }
+  details.subsec > .subsec-body { padding: 12px 0 4px 0; font-weight: normal; color: #222; font-size: 0.95em; }
+  .subtitle { color: #888; margin-bottom: 24px; font-size: 0.9em; }
+  .card { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 16px; margin-bottom: 12px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; font-weight: 600; }
+  .badge-ok { background: #d4eedd; color: #2a7; }
+  .badge-bad { background: #fbd7d7; color: #c33; }
+  .badge-active { background: #fff4cc; color: #997300; }
+  .badge-dim { background: #eee; color: #888; }
+  .mono { font-family: Consolas, monospace; font-size: 0.9em; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.92em; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; vertical-align: middle; }
+  th { background: #f9f9f4; font-weight: 600; color: #555; }
+  tr:hover td { background: #fafaf5; }
+  /* «не задействован» — outbound есть, но никуда не маршрутизируется. Делаем тусклой
+     чтобы глаз сразу видел чем эта подписка реально загружена, а что просто запасное. */
+  tr.inactive-row > td { background: #f6f6f6; color: #999; }
+  tr.inactive-row:hover > td { background: #eee; }
+  tr.inactive-row .mono { color: #999; }
+  tr.inactive-row td strong { font-weight: 500; color: #888; }
+  .btn { background: #2a7; color: #fff; border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 0.85em; box-shadow: 0 1px 2px rgba(0,0,0,0.15), inset 0 1px 0 rgba(255,255,255,0.15); transition: transform 0.05s ease, box-shadow 0.05s ease; }
+  .btn:hover { background: #1a6; }
+  .btn:active { transform: translateY(1px); box-shadow: 0 0 0 transparent, inset 0 1px 2px rgba(0,0,0,0.15); }
+  .btn-danger { background: #c33; }
+  .btn-danger:hover { background: #a22; }
+  .btn-warn { background: #e80; }
+  .btn-warn:hover { background: #c60; }
+  .btn-sm { padding: 4px 12px; font-size: 0.82em; }
+  .btn-secondary { background: #888; }
+  .btn-secondary:hover { background: #666; }
+  /* В flex-column .col кнопки по дефолту растягиваются на всю ширину (align-items:stretch)
+     и перестают выглядеть как кнопки. Сжимаем до auto-ширины и выравниваем слева. */
+  .col > button { align-self: flex-start; }
+  textarea { width: 100%; min-height: 100px; font-family: Consolas, monospace; font-size: 0.85em; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+  input[type=text] { padding: 6px 10px; font-size: 0.9em; border: 1px solid #ccc; border-radius: 4px; }
+  pre.log { background: #1e1e1e; color: #ddd; padding: 12px; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.78em; max-height: 300px; overflow-y: auto; line-height: 1.4; margin: 0; }
+  .form-row { margin-bottom: 12px; }
+  .form-row label { display: block; font-size: 0.85em; color: #555; margin-bottom: 4px; font-weight: 600; }
+  /* Form helpers (используются в секции «🔧 Подключение к роутеру») */
+  label.lbl { display: block; font-size: 0.82em; font-weight: 600; color: #444; margin-bottom: 4px; }
+  small.muted { display: inline-block; color: #999; font-size: 0.75em; margin-top: 3px; }
+  small.ovr   { display: inline-block; color: #c63; font-size: 0.75em; margin-top: 3px; font-weight: 600; }
+  .input-wide { padding: 7px 10px; font-size: 0.9em; border: 1px solid #c8c8c8; border-radius: 4px; font-family: Consolas, monospace; }
+  .input-wide:focus { border-color: #2a7; outline: none; }
+  .btn-primary { padding: 8px 16px; border: none; border-radius: 4px; font-size: 0.9em; font-weight: 600; cursor: pointer; }
+  .btn-primary:hover { filter: brightness(1.08); }
+  .btn-primary:active { filter: brightness(0.92); }
+  /* Результат «Проверить связь» — pre-блок с цветной рамкой */
+  .test-result-box { margin: 8px 0 0; padding: 10px 12px; border-radius: 6px; border: 1px solid; font-family: Consolas, monospace; font-size: 0.82em; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+  .test-result-box.ok  { background: #e8f5e8; border-color: #6c6; color: #1a5a1a; }
+  .test-result-box.bad { background: #fde8e8; border-color: #d66; color: #6a1a1a; }
+  .test-result-box .hint { display: block; font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 0.95em; font-weight: 600; margin-bottom: 6px; }
+  .nav { float: right; }
+  .nav a { color: #888; text-decoration: none; padding: 0 8px; font-size: 0.9em; }
+  .nav a:hover { color: #2a7; }
+  .flash { padding: 10px 14px; border-radius: 4px; margin-bottom: 12px; font-size: 0.9em; display: none; }
+  .flash.ok { background: #d4eedd; color: #2a7; border: 1px solid #2a7; }
+  .flash.bad { background: #fbd7d7; color: #c33; border: 1px solid #c33; }
+  .flash pre { font-size: 0.8em; margin: 6px 0 0; max-height: 200px; overflow-y: auto; }
+  .wd-state { font-size: 1.4em; font-weight: 700; padding: 4px 14px; border-radius: 4px; }
+  .wd-state.primary  { background: #d4eedd; color: #2a7; }
+  .wd-state.failover { background: #fff4cc; color: #997300; }
+  .wd-state.unknown  { background: #eee;    color: #888; }
+  .toolbar { margin: 8px 0; }
+  .toolbar > * { margin-right: 6px; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: stretch; }
+  .row > .col { flex: 1; min-width: 300px; display: flex; flex-direction: column; }
+  /* textarea внутри col растягивается чтобы выровнять высоту колонок —
+     если в одной колонке кнопок-пресетов больше (перенос строк), textarea в соседней
+     колонке вытянется и обе закончатся на одной горизонтальной линии. */
+  .row > .col textarea { flex-grow: 1; }
+  /* Kill-switch блок (AI и YT) — общий класс с min-height чтобы выровнять обе колонки.
+     Содержимое разное (AI обычно с длинным описанием, YT короче) → без min-height блоки разной высоты. */
+  .kill-switch-box {
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-radius: 4px;
+    min-height: 160px;  /* вмещает оба варианта текста (ВКЛ/ВЫКЛ) у AI и YT — чтобы блоки доменов начинались на одной высоте */
+  }
+  /* Outbound-info блок (вывод параметров выбранного канала) — фиксированная min-height,
+     чтобы пустой блок (когда канал ещё не выбран / без extra полей) занимал то же место. */
+  .outbound-info { min-height: 78px; }  /* вмещает header (2 строки бейджей) + params (2 строки при переносе длинного vless) — чтобы AI/YT info-блоки были одинаковой высоты независимо от длины параметров */
+  .outbound-info:empty { background: transparent; border-left-color: transparent; }
+  /* «Принудительно переключить watchdog» — 3 равных колонки: кнопка сверху + пояснение снизу.
+     Кнопки выровнены по верху, пояснения вытягиваются до одной нижней горизонтали. */
+  .force-mode-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-top: 4px;
+    margin-bottom: 12px;
+  }
+  .force-mode-cell { display: flex; flex-direction: column; }
+  .force-mode-cell button {
+    width: 100%;
+    padding: 8px 14px;
+    font-size: 0.95em;
+    font-weight: 600;
+  }
+  .force-mode-cell p.subtitle {
+    margin: 8px 0 0;
+    font-size: 0.82em;
+    line-height: 1.4;
+    flex-grow: 1;
+  }
+  /* На узком экране — 1 колонка */
+  @media (max-width: 700px) {
+    .force-mode-grid { grid-template-columns: 1fr; }
+  }
+  /* Заголовки 4 колонок (PRIMARY/FAILOVER/AI/YT) — крупно, ярко, с цветным фоном
+     и левой полосой. Чтобы сразу было видно что это шапка колонки, а не label. */
+  .col-header {
+    display: block;
+    margin: 0 0 10px 0;
+    padding: 8px 12px;
+    font-size: 1.18em;
+    font-weight: 700;
+    border-radius: 6px;
+    border-left: 5px solid;
+    line-height: 1.3;
+    letter-spacing: 0.2px;
+  }
+  .col-header.col-primary  { color: #1f4d2c; border-left-color: #2a7;    background: #e0f3e3; }
+  .col-header.col-failover { color: #7a5800; border-left-color: #c89308; background: #fef4d6; }
+  .col-header.col-ai       { color: #2d4f12; border-left-color: #6a3;    background: #e6f3da; }
+  .col-header.col-yt       { color: #7a1818; border-left-color: #c33;    background: #fbe0e0; }
+  /* Domain-section карточки — для AI-доменов / YT-доменов / DIRECT-доменов.
+     Визуально отделяют редакторы списков от остальных подразделов. Заголовок ярко выделен
+     цветной заливкой (шапка), контент на нейтральном фоне внутри карточки.
+     Кнопка «Сохранить» остаётся цветной, но визуально отличается от шапки за счёт фона тела. */
+  .domain-section {
+    margin-top: 16px;
+    border-radius: 8px;
+    border: 2px solid #ccc;
+    overflow: hidden;
+    background: #fff;
+    /* Растягиваем как и channel-card — чтобы AI/YT domain-section были одной высоты */
+    display: flex;
+    flex-direction: column;
+    flex-grow: 1;
+  }
+  .domain-section .domain-section-header {
+    margin: 0;
+    padding: 10px 14px;
+    font-size: 1.05em;
+    font-weight: 700;
+    color: #fff;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    border-radius: 0;
+    border-left: none;
+    background: #888;
+  }
+  .domain-section .domain-section-header .subsec-hint {
+    color: rgba(255,255,255,0.85);
+    font-weight: 400;
+    font-size: 0.82em;
+  }
+  .domain-section .domain-section-body {
+    padding: 12px 14px;
+    background: #fafaf7;
+    flex-grow: 1;          /* body тянется на остаток — синхронизирует высоту AI/YT */
+  }
+  .domain-section .domain-section-body > p:first-child { margin-top: 0; }
+  /* Цвета для трёх типов */
+  .domain-section.ds-ai     { border-color: #6a3; }
+  .domain-section.ds-ai     .domain-section-header { background: #6a3; }
+  .domain-section.ds-yt     { border-color: #c33; }
+  .domain-section.ds-yt     .domain-section-header { background: #c33; }
+  .domain-section.ds-direct { border-color: #c63; }
+  .domain-section.ds-direct .domain-section-header { background: #c63; }
+  .domain-section.ds-block  { border-color: #555; }
+  .domain-section.ds-block  .domain-section-header { background: #555; }
+  .domain-section.ds-clients { border-color: #4a7bbf; }
+  .domain-section.ds-clients .domain-section-header { background: #4a7bbf; }
+  .pc-table { width:100%; border-collapse:collapse; margin-top:8px; font-size:0.9em; }
+  .pc-table th, .pc-table td { padding:6px 10px; border-bottom:1px solid #eee; text-align:left; vertical-align:middle; }
+  .pc-table th { background:#f0f4f9; font-weight:600; color:#345; }
+  .pc-table tr.pc-xkeen { background:#eef5fc; }
+  .pc-table tr.pc-other { background:#f7f7f7; color:#777; }
+  .pc-table tr.pc-inactive td { color:#aaa; font-style:italic; }
+  .pc-badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:0.78em; font-weight:600; }
+  .pc-badge.pc-b-xkeen { background:#4a7bbf; color:#fff; }
+  .pc-badge.pc-b-other { background:#888; color:#fff; }
+  .pc-badge.pc-b-direct { background:#eee; color:#666; }
+  .pc-mac { font-family:Consolas, monospace; font-size:0.85em; color:#666; }
+  .pc-stats { background:#f0f4f9; padding:8px 12px; border-radius:4px; margin:8px 0; font-size:0.9em; }
+  .pc-stats strong { color:#4a7bbf; }
+  .pc-policy-select { padding:3px 6px; border:1px solid #bbb; border-radius:4px; font-size:0.88em; background:#fff; cursor:pointer; min-width:140px; }
+  .pc-policy-select:focus { outline:2px solid #4a7bbf; outline-offset:0; }
+  .pc-policy-select:disabled { background:#eee; cursor:wait; opacity:0.6; }
+  .pc-flush-btn { margin-left:4px; padding:2px 6px; font-size:0.95em; background:#f5f5f5; border:1px solid #ccc; border-radius:3px; cursor:pointer; line-height:1; }
+  .pc-flush-btn:hover:not(:disabled) { background:#e7f3ff; border-color:#4a7bbf; }
+  .pc-flush-btn:disabled { opacity:0.35; cursor:not-allowed; }
+  .pc-legend { font-size:0.82em; color:#666; background:#fafafa; border:1px solid #e5e5e5; border-radius:4px; padding:6px 10px; margin:6px 0 0; line-height:1.8; }
+  .pc-legend .pc-leg-item { display:inline-block; margin-right:14px; white-space:nowrap; }
+  .rt-rule { background:#fff; border:1px solid #e5e5e5; border-left:3px solid #6c757d; border-radius:3px; padding:8px 12px; margin:6px 0; font-size:0.9em; }
+  .rt-rule.rt-direct { border-left-color:#c63; }
+  .rt-rule.rt-block { border-left-color:#c33; }
+  .rt-rule .rt-type-badge { display:inline-block; font-size:0.78em; font-weight:600; padding:2px 8px; border-radius:10px; background:#6c757d; color:#fff; margin-right:6px; vertical-align:middle; }
+  .rt-rule .rt-out-badge { display:inline-block; font-size:0.78em; padding:2px 8px; border-radius:10px; background:#e9ecef; color:#495057; margin-left:6px; }
+  .rt-rule .rt-out-badge.rt-out-direct { background:#fce4d6; color:#7a5500; }
+  .rt-rule .rt-out-badge.rt-out-block { background:#f8d7da; color:#721c24; }
+  .rt-rule code { background:#f5f5f5; padding:1px 5px; border-radius:2px; font-size:0.92em; }
+  .rt-rule .rt-desc { color:#555; font-size:0.88em; margin-top:4px; }
+  .rt-rule .rt-items { margin:4px 0 0; padding-left:0; list-style:none; display:flex; flex-wrap:wrap; gap:4px; }
+  .rt-rule .rt-items li { background:#f0f0f0; padding:2px 6px; border-radius:3px; font-family:Consolas, monospace; font-size:0.85em; }
+  .domain-section.ds-action { border-color: #36a; }
+  .domain-section.ds-action .domain-section-header { background: #36a; }
+  /* Channel-card — обёртка для PRIMARY/FAILOVER/AI/YT блоков (визуально как domain-section).
+     Header (col-header) становится шапкой карточки без отступа снизу, тело — внутри body. */
+  .channel-card {
+    border-radius: 8px;
+    border: 2px solid #ccc;
+    overflow: hidden;
+    background: #fff;
+    /* Растягиваем по высоте колонки чтобы соседние карточки в .row были одинаковыми */
+    display: flex;
+    flex-direction: column;
+    flex-grow: 1;
+  }
+  .channel-card > .col-header {
+    margin: 0;             /* шапка прижата к верху карточки */
+    border-radius: 0;      /* углы — у карточки, не у шапки */
+    border-left: none;     /* левая полоса дублирует border карточки */
+  }
+  .channel-card .channel-card-body {
+    padding: 12px 14px;
+    flex-grow: 1;          /* body тянется на остаток высоты карточки */
+  }
+  .channel-card.cc-primary  { border-color: #2a7;    }
+  .channel-card.cc-failover { border-color: #c89308; }
+  .channel-card.cc-ai       { border-color: #6a3;    }
+  .channel-card.cc-yt       { border-color: #c33;    }
+</style>
+</head>
+<body>
+
+<h1>🚦 XKeen — управление Кинетиком
+  <span class="nav">
+    {% if not is_client_only %}<a href="/" title="Локальный мониторинг xray/Caddy/портов на этом PC">← дашборд</a>{% endif %}
+    <a href="javascript:restartDashboard()" title="Перезапустить панель прямо отсюда — кнопка отправит запрос на /api/xkeen/restart-dashboard, подождёт ~8 сек и обновит страницу. Если не сработает — откроется help с альтернативами.">🔄 рестарт панели</a>
+    <a href="https://github.com/yuran2000/xray-dashboard/releases/latest" target="_blank" class="health-badge" style="background:#f0e6ff; color:#5a3a99; border:1px solid #c9b3e0; text-decoration:none;" title="Версия панели. Клик → страница последнего релиза на GitHub. Сравни с тем что у тебя — если есть свежее, обнови через update.bat.">v{{ dashboard_version }}</a>
+    <span id="xray-status-badge" class="health-badge xs-pending" title="Состояние xray на роутере — обновляется каждые 60 сек. Клик → перейти к секции 📊 Статус XKeen.">⏳ xray ...</span>
+    <span id="dashboard-health-badge" class="health-badge health-pending" title="Проверка состояния процесса панели — обновляется автоматически каждые 15 сек">⏳ проверка...</span>
+    {% if is_first_run %}
+    <a href="#section-router-config" class="health-badge" style="background:#fde8c8; color:#7a5500; border:1px solid #e0c878; text-decoration:none; cursor:pointer; animation: blink 1.8s infinite;" title="Роутер не подключён — настрой SSH в разделе внизу страницы">⚠ роутер не подключён</a>
+    {% endif %}
+    <a href="/logout">выход ({{ username }})</a>
+  </span>
+</h1>
+<p class="subtitle">Веб-панель управления XKeen на роутере <span class="mono">{{ keenetic_settings.current.host }}:{{ keenetic_settings.current.port }}</span> через SSH · перед каждым изменением создаётся бэкап на роутере</p>
+
+<div id="flash" class="flash"></div>
+
+{% if is_first_run %}
+<!-- ===== WELCOME BANNER (роутер не подключён) ===== -->
+<div style="margin: 20px 0; padding: 20px 24px; background: linear-gradient(135deg, #fff8e7 0%, #fef3d5 100%); border: 2px solid #e80; border-radius: 10px; box-shadow: 0 2px 8px rgba(232, 136, 0, 0.15);">
+  <h3 style="margin: 0 0 10px; color: #7a5500; font-size: 1.3em;">👋 Добро пожаловать! Настрой подключение к роутеру</h3>
+  <p style="margin: 0 0 12px; line-height: 1.55; color: #5a4500;">
+    Эта панель управляет <strong>XKeen</strong> (xray на роутере Keenetic) через SSH. Сейчас связи с роутером нет —
+    поэтому все секции ниже пустые с предупреждениями «нет данных для tag=». Это <strong>не ошибка</strong>, просто нужно настроить подключение.
+  </p>
+  <ol style="margin: 8px 0 14px 22px; line-height: 1.7; color: #5a4500;">
+    <li>Кликни кнопку ниже — проскроллит к разделу <strong>«🔧 Подключение к роутеру»</strong> в самом низу страницы (там уже будет развёрнута форма).</li>
+    <li>Впиши <strong>IP роутера</strong> (обычно <code>192.168.1.1</code> для Keenetic), <strong>SSH-порт</strong> (стандарт XKeen — <code>222</code>), <strong>путь к SSH-ключу</strong> (если ключа ещё нет — там же раскрой свёрнутый блок «❓ Как получить SSH-ключ» с пошаговой инструкцией).</li>
+    <li>Нажми <strong>«🔌 Проверить связь»</strong> → если зелёный ✅ → <strong>«💾 Сохранить»</strong>.</li>
+    <li>Перезагрузи страницу (F5) — этот баннер пропадёт, появятся твои каналы и outbound'ы.</li>
+    <li>Если на роутере уже XKeen установлен но <strong>пустой</strong> (например, только что после <code>xkeen -i</code>) — в том же разделе есть кнопка <strong>«🚀 Развернуть на чистом XKeen»</strong> которая дольёт watchdog + cron + routing-шаблон.</li>
+    <li>Если XKeen <strong>ещё не установлен</strong> на роутере — открой раздел Помощи «🛠️ Установка XKeen с нуля» (между «Бэкап» и «Подключение к роутеру»).</li>
+  </ol>
+  <a href="#section-router-config" style="display: inline-block; background: #e80; color: #fff; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-weight: 700; font-size: 1em;">👇 Перейти к настройке роутера</a>
+  <span style="margin-left: 14px; color: #999; font-size: 0.9em;">или просто проскролль страницу в самый низ</span>
+</div>
+{% endif %}
+
+<!-- ===== ВЫБОР ОСНОВНОГО / РЕЗЕРВНОГО (вверху) ===== -->
+<h2 class="sec-routing">🎯 Основное и резервное подключение <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— маршрутизация и watchdog</span></h2>
+<div class="card">
+  <h3 class="subsec subsec-status">🎛 Каналы и текущее состояние watchdog</h3>
+  <div style="margin-bottom: 12px;">
+    Текущий режим watchdog:
+    <span class="wd-state {{ watchdog.state }}">{{ watchdog.state|upper }}</span>
+    <span class="mono" style="margin-left: 8px; color: #888;">counter={{ watchdog.counter }}</span>
+    <span class="mono" style="margin-left: 8px;">default сейчас → <strong style="color: {% if watchdog.current_default == targets.primary_tag %}#2a7{% else %}#e80{% endif %};">{{ watchdog.current_default or routing.default_outbound or '?' }}</strong></span>
+    {% if watchdog.current_default and watchdog.current_default != targets.primary_tag %}
+      <span class="subtitle" style="margin-left: 8px; color: #e80;">⚠️ работаем через резерв, PRIMARY ({{ targets.primary_tag }}) недоступен</span>
+    {% endif %}
+  </div>
+
+  <div class="row" style="margin-top: 16px;">
+    <div class="col">
+      <div class="channel-card cc-primary">
+        <label class="col-header col-primary">🟢 Основное (PRIMARY)</label>
+        <div class="channel-card-body">
+          <select id="select-primary" style="width: 100%; padding: 7px; font-size: 0.95em; border: 1px solid #ccc; border-radius: 4px;">
+            {% for grp in vless_option_groups %}
+            <optgroup label="📦 {{ grp.name }}">
+              {% for opt in grp.options %}
+              <option value="{{ opt.tag }}" {% if opt.tag == targets.primary_tag %}selected{% endif %} style="background-color: {{ grp.bg }};">{% if opt.is_direct %}🌐 Напрямую без VPN — через провайдера (без шифрования){% else %}{{ grp.name }} · {{ opt.tag }}{% if opt.is_anti_dpi %} · 🛡️ Обход{% elif opt.is_ru %} · 📺 Ютуб{% endif %}{% endif %}</option>
+              {% endfor %}
+            </optgroup>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm" style="margin-top: 6px;" onclick="setTarget('primary')">Сохранить PRIMARY</button>
+          <div id="info-primary" class="outbound-info"></div>
+          <p class="subtitle">Используется когда сам себя пингует и отвечает. Это «нормальный» канал.</p>
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="channel-card cc-failover">
+        <label class="col-header col-failover">🟡 Резервное (FAILOVER)</label>
+        <div class="channel-card-body">
+          <select id="select-failover" style="width: 100%; padding: 7px; font-size: 0.95em; border: 1px solid #ccc; border-radius: 4px;">
+            {% for grp in vless_option_groups %}
+            <optgroup label="📦 {{ grp.name }}">
+              {% for opt in grp.options %}
+              <option value="{{ opt.tag }}" {% if opt.tag == targets.failover_tag %}selected{% endif %} style="background-color: {{ grp.bg }};">{% if opt.is_direct %}🌐 Напрямую без VPN — через провайдера (без шифрования){% else %}{{ grp.name }} · {{ opt.tag }}{% if opt.is_anti_dpi %} · 🛡️ Обход{% elif opt.is_ru %} · 📺 Ютуб{% endif %}{% endif %}</option>
+              {% endfor %}
+            </optgroup>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm btn-warn" style="margin-top: 6px;" onclick="setTarget('failover')">Сохранить FAILOVER</button>
+          <p class="subtitle">Первый в цепочке резерва. При падении watchdog каскадно перебирает остальные tag'и из цепочки ниже сверху вниз.</p>
+          <div class="failover-active-label">🎯 Сейчас в роутинге как default:</div>
+          <div id="info-failover" class="outbound-info"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top: 16px;">
+    <div class="col">
+      <div class="channel-card cc-ai">
+        <label class="col-header col-ai">🤖 AI-sticky outbound</label>
+        <div class="channel-card-body">
+          <select id="select-ai" style="width: 100%; padding: 7px; font-size: 0.95em; border: 1px solid #ccc; border-radius: 4px;">
+            {% for grp in vless_option_groups %}
+            <optgroup label="📦 {{ grp.name }}">
+              {% for opt in grp.options %}
+              {% set ai_risk = opt.is_anti_dpi or opt.is_ru %}
+              <option value="{{ opt.tag }}" {% if opt.tag == targets.ai_tag %}selected{% endif %} {% if ai_risk %}data-anti-dpi="1" style="background-color: {{ grp.bg }}; color:#a60;"{% else %}style="background-color: {{ grp.bg }};"{% endif %}>{% if opt.is_direct %}🌐 Напрямую без VPN — через провайдера (без шифрования){% else %}{{ grp.name }} · {{ opt.tag }}{% if opt.is_anti_dpi %} · 🛡️ Обход{% elif opt.is_ru %} · 📺 Ютуб{% endif %}{% endif %}{% if ai_risk %} ⚠️ AI заблокирует{% endif %}</option>
+              {% endfor %}
+            </optgroup>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm" style="margin-top: 6px; background: #6a3;" onclick="setTarget('ai')">Сохранить AI outbound</button>
+          <div id="info-ai" class="outbound-info"></div>
+          <p class="subtitle">Через какой канал идёт трафик к AI-доменам из списка ниже. Sticky — независимо от PRIMARY/FAILOVER, обход блокировок Anthropic/OpenAI по IP.</p>
+          <div class="failover-active-label">🎯 Сейчас в роутинге для AI:</div>
+          <div id="info-ai-active" class="outbound-info"></div>
+
+          <!-- AI kill-switch статус + toggle -->
+          <div class="kill-switch-box" style="background: {% if watchdog.effective_ai == 'block' %}#fbd7d7{% else %}#eefbe5{% endif %};">
+            <div style="font-weight: 600; font-size: 0.9em;">
+              🛡️ Kill-switch:
+              {% if watchdog.effective_ai == 'block' %}
+                <span style="color: #c33;">🚨 АКТИВЕН — AI заблокирован</span>
+              {% elif watchdog.effective_ai == targets.ai_tag %}
+                <span style="color: #2a7;">✓ канал {{ watchdog.effective_ai }} жив</span>
+              {% elif watchdog.effective_ai %}
+                <span style="color: #e80;">⚠️ FALLBACK — AI идёт через {{ watchdog.effective_ai }}</span>
+              {% else %}
+                <span style="color: #888;">не активен (AI выключен)</span>
+              {% endif %}
+            </div>
+            <label style="font-size: 0.85em; margin-top: 6px; display: block; cursor: pointer;">
+              <input type="checkbox" id="ai-fail-block-toggle" {% if targets.ai_fail_block %}checked{% endif %} onchange="toggleAIFailBlock(this.checked)">
+              Блокировать AI-трафик если канал упал (рекомендую)
+            </label>
+            <p class="subtitle" style="margin: 4px 0 0;">
+              {% if targets.ai_fail_block %}
+                ВКЛ: если <code>{{ targets.ai_tag }}</code> не отвечает — AI-домены идут в <code>block</code> (drop). Защита от засветки RU IP в Anthropic/OpenAI.
+              {% else %}
+                ВЫКЛ: при падении <code>{{ targets.ai_tag }}</code> AI идёт через текущий default-канал (PRIMARY/FAILOVER). ⚠️ Если default = RU IP, Anthropic может забанить аккаунт.
+              {% endif %}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- AI-домены — список + пресеты, внутри AI-колонки -->
+      <div class="domain-section ds-ai">
+        <h3 class="domain-section-header">🤖 Список AI-доменов <span class="subsec-hint">(через outbound выше)</span></h3>
+        <div class="domain-section-body">
+          <p class="subtitle">
+            Через пробел или с новой строки. Поддомены подхватываются автоматически (<code>domain:claude.ai</code> покрывает <code>console.anthropic.com</code>).
+          </p>
+          <div style="margin-bottom: 8px;">
+            <strong style="font-size: 0.85em; color: #555;">Готовые пресеты:</strong><br>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('claude')">🟣 Claude</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('openai')">🟢 ChatGPT</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('gemini')">🔵 Gemini</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('copilot')">🟦 Copilot</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('perplexity')">🟠 Perplexity</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('mistral')">⚫ Mistral</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('grok')">⬛ Grok</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('deepseek')">🔷 DeepSeek</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('huggingface')">🤗 HuggingFace</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background:#4a4; color:#fff;" onclick="addAllAIPresets()">📥 Добавить ВСЕ AI</button>
+            <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearAIDomains()">🗑 Очистить</button>
+            <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="resetAIDefaults()">↩ Сброс к дефолту (Claude + ChatGPT)</button>
+          </div>
+          <textarea id="ai-domains" style="width: 100%; min-height: 100px; font-family: Consolas, monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">{% for d in targets.ai_domains %}{{ d }}
+{% endfor %}</textarea>
+          <button class="btn" style="margin-top: 6px; background: #6a3;" onclick="saveAIDomains()">💾 Сохранить AI-домены</button>
+          <p class="subtitle" style="margin: 4px 0 0; font-size: 0.85em;">Watchdog подхватит при следующем тике (≤1 мин).</p>
+
+          <!-- v8: v2fly geosite-категории для AI — автоподхват новых доменов после xkeen -ug -->
+          <details style="margin-top: 14px; border-top: 1px dashed #ccc; padding-top: 10px;" {% if targets.ai_ext_categories %}open{% endif %}>
+            <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">🩻 v2fly категории <span style="color: #888; font-weight: 400; font-size: 0.88em;">— автообновляются с GeoFile (тысячи поддоменов)</span> <a href="#help-v2fly-geoip" onclick="openHelpAnchor('help-v2fly-geoip'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; margin-left: 6px;" title="Открыть подробное описание v2fly категорий в разделе «Помощь»">❓ что это?</a></summary>
+            <div style="margin-top: 8px;">
+              <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">Дополнительно к ручному списку выше. Категория = весь набор доменов сервиса из <code>geosite_v2fly.dat</code>. После <code>xkeen -ug</code> новые поддомены подхватываются автоматически.</p>
+              <div style="background: #e8f5e9; border-left: 3px solid #2e7d32; padding: 6px 10px; margin: 0 0 8px; font-size: 0.82em; color: #1b4d1f;">
+                ℹ️ AI-категории <strong>безопасны через любой VPN-канал</strong> — нет блокировок РКН. <strong>Но AI-канал должен быть зарубежным</strong> (Нидерланды/Германия/...) — через RU-IP OpenAI/Anthropic банят аккаунты. Настраивается в dropdown «🤖 AI-sticky outbound» выше.
+              </div>
+              <div style="margin-bottom: 6px;">
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIExtCat('openai')" title="Добавить категорию openai (все домены ChatGPT/OpenAI из geosite_v2fly.dat). Автоподхват новых поддоменов после xkeen -ug.">🟢 openai</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIExtCat('anthropic')" title="Добавить категорию anthropic (все домены Claude/Anthropic).">🟣 anthropic</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIExtCat('deepseek')" title="Добавить категорию deepseek (домены DeepSeek AI).">🔷 deepseek</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIExtCat('mistral')" title="Добавить категорию mistral (домены Mistral AI).">⚫ mistral</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIExtCat('huggingface')" title="Добавить категорию huggingface (Hugging Face — модели + Spaces).">🤗 huggingface</button>
+                <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearAIExtCats()" title="Очистить все v2fly-категории AI. Ручные домены в textarea выше не трогаются.">🗑 Очистить</button>
+              </div>
+              <input id="ai-ext-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.ai_ext_categories or '' }}" placeholder="через пробел: openai anthropic deepseek" />
+              <button class="btn" style="margin-top: 6px; background: #6a3;" onclick="saveAIExtCategories()" title="Записать список v2fly-категорий в watchdog.config. Watchdog подхватит при следующем тике (≤1 мин).">💾 Сохранить категории</button>
+              <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Без префиксов — только имя категории. Полный список: <a href="https://github.com/v2fly/domain-list-community/tree/master/data" target="_blank">v2fly community</a> (есть кнопка «🩻 Просканировать» в секции «🛠 Управление XKeen»).</p>
+            </div>
+          </details>
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="channel-card cc-yt">
+        <label class="col-header col-yt">📺 YouTube-sticky outbound</label>
+        <div class="channel-card-body">
+          <select id="select-yt" style="width: 100%; padding: 7px; font-size: 0.95em; border: 1px solid #ccc; border-radius: 4px;">
+            {% for grp in vless_option_groups %}
+            <optgroup label="📦 {{ grp.name }}">
+              {% for opt in grp.options %}
+              <option value="{{ opt.tag }}" {% if opt.tag == targets.yt_tag %}selected{% endif %} style="background-color: {{ grp.bg }};">{% if opt.is_direct %}🌐 Напрямую без VPN — через провайдера (без шифрования){% else %}{{ grp.name }} · {{ opt.tag }}{% if opt.is_anti_dpi %} · 🛡️ Обход{% elif opt.is_ru %} · 📺 Ютуб{% endif %}{% endif %}</option>
+              {% endfor %}
+            </optgroup>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm" style="margin-top: 6px; background: #c33;" onclick="setTarget('yt')">Сохранить YouTube outbound</button>
+          <div id="info-yt" class="outbound-info"></div>
+          <p class="subtitle">Через какой канал идёт трафик к YouTube/Instagram/Discord. Полезно: RU-exit с DPI-обходом → YouTube БЕЗ рекламы (РФ-IP не ловит google_ads).</p>
+          <div class="failover-active-label">🎯 Сейчас в роутинге для YouTube:</div>
+          <div id="info-yt-active" class="outbound-info"></div>
+
+          <!-- YT kill-switch статус + toggle -->
+          <div class="kill-switch-box" style="background: {% if watchdog.effective_yt == 'block' %}#fbd7d7{% else %}#fff5f0{% endif %};">
+            <div style="font-weight: 600; font-size: 0.9em;">
+              🛡️ Kill-switch:
+              {% if watchdog.effective_yt == 'block' %}
+                <span style="color: #c33;">🚨 АКТИВЕН — YouTube заблокирован</span>
+              {% elif watchdog.effective_yt == targets.yt_tag %}
+                <span style="color: #2a7;">✓ канал {{ watchdog.effective_yt }} жив</span>
+              {% elif watchdog.effective_yt %}
+                <span style="color: #e80;">⚠️ FALLBACK — YT идёт через {{ watchdog.effective_yt }}</span>
+              {% else %}
+                <span style="color: #888;">не активен (YouTube выключен)</span>
+              {% endif %}
+            </div>
+            <label style="font-size: 0.85em; margin-top: 6px; display: block; cursor: pointer;">
+              <input type="checkbox" id="yt-fail-block-toggle" {% if targets.yt_fail_block %}checked{% endif %} onchange="toggleYTFailBlock(this.checked)">
+              Блокировать трафик если канал упал
+              <span class="subtitle" style="font-weight: normal;">— на выбор: ВКЛ = чисто без рекламы (видео не работает); ВЫКЛ = реклама вернётся, видео работает</span>
+            </label>
+            <p class="subtitle" style="margin: 4px 0 0;">
+              {% if targets.yt_fail_block %}
+                ВКЛ: если <code>{{ targets.yt_tag }}</code> не отвечает — YouTube/IG/Discord идут в <code>block</code> (drop). Видео не запустится.
+              {% else %}
+                ВЫКЛ: при падении <code>{{ targets.yt_tag }}</code> YouTube пойдёт через текущий default-канал (PRIMARY/FAILOVER) — реклама вернётся, но видео работает.
+              {% endif %}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- YT-домены — список + пресеты, внутри YT-колонки -->
+      <div class="domain-section ds-yt">
+        <h3 class="domain-section-header">📺 Список YouTube-доменов <span class="subsec-hint">(через outbound выше)</span></h3>
+        <div class="domain-section-body">
+          <p class="subtitle">
+            Через пробел или с новой строки. Поддомены подхватываются автоматически (<code>domain:youtube.com</code> покрывает <code>www.youtube.com</code>).
+            Пустой список = правило выключено, YT идёт через PRIMARY.
+          </p>
+          <div style="margin-bottom: 8px;">
+            <strong style="font-size: 0.85em; color: #555;">Готовые пресеты:</strong><br>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('youtube')">📺 YouTube</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('instagram')">📷 Instagram</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('discord')">💬 Discord</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('tiktok')">🎵 TikTok</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('twitch')">🎮 Twitch</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('twitter')">🐦 Twitter/X</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('reddit')">🔴 Reddit</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('telegram')">💌 Telegram</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('whatsapp')" title="WhatsApp домены (web + клиент + Meta MQTT backend + wa.me ссылки). Заблокирован DPI в РФ с 2025-08 — нужен VPN. ВАЖНО: для первичного связывания нового устройства (QR-код) пресета может быть мало — клиент при первой авторизации ходит на доп. Edge-серверы по IP. Решение: временно поставь PRIMARY = VPN (вместо direct) → сделай linking → верни PRIMARY обратно. После связывания обычная работа покрывается этим пресетом.">💚 WhatsApp</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('spotify')">🎧 Spotify</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background:#4a4; color:#fff;" onclick="addAllYTPresets()">📥 Добавить ВСЕ YT/IG/Discord</button>
+            <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearYTDomains()">🗑 Очистить</button>
+            <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="resetYTDefaults()">↩ Сброс к дефолту (YouTube)</button>
+          </div>
+          <textarea id="yt-domains" style="width: 100%; min-height: 100px; font-family: Consolas, monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">{% for d in targets.yt_domains %}{{ d }}
+{% endfor %}</textarea>
+          <button class="btn" style="margin-top: 6px; background: #c33;" onclick="saveYTDomains()">💾 Сохранить YT-домены</button>
+          <p class="subtitle" style="margin: 4px 0 0; font-size: 0.85em;">Watchdog подхватит при следующем тике (≤1 мин).</p>
+
+          <!-- v8: v2fly geosite-категории для YT — автоподхват новых поддоменов YouTube/TikTok -->
+          <details style="margin-top: 14px; border-top: 1px dashed #ccc; padding-top: 10px;" {% if targets.yt_ext_categories %}open{% endif %}>
+            <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">🩻 v2fly категории <span style="color: #888; font-weight: 400; font-size: 0.88em;">— автообновляются с GeoFile</span> <a href="#help-v2fly-geoip" onclick="openHelpAnchor('help-v2fly-geoip'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; margin-left: 6px;" title="Открыть подробное описание v2fly категорий в разделе «Помощь»">❓ что это?</a></summary>
+            <div style="margin-top: 8px;">
+              <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">Дополнительно к ручному списку выше. Полезно для youtube/tiktok — новые домены сервисов добавляются автоматически после <code>xkeen -ug</code>.</p>
+              <div style="background: #fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin: 0 0 8px; font-size: 0.82em; color: #6a4900;">
+                ⚠️ <strong>Категория должна подходить к каналу</strong>. Если YT-канал = российский (типа «🇷🇺_Россия_YouTube» для DPI-обхода) — добавляй только <code>youtube</code>, <code>tiktok</code>, <code>discord</code>. Категории <code>facebook</code> / <code>instagram</code> / <code>twitter</code> через RU-канал <strong>не пробьют РКН-блокировку Meta/X</strong> — Instagram сломается, xray зависнет в retries. Для Meta/X нужен <strong>зарубежный</strong> канал (Нидерланды, Германия и т.п.) или вынести их в отдельное правило с другим outbound.
+              </div>
+              <div style="margin-bottom: 6px;">
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('youtube')" title="Добавить категорию youtube (все домены YouTube из geosite_v2fly.dat). Безопасно через любой канал. Автоподхват новых поддоменов после xkeen -ug.">📺 youtube</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('tiktok')" title="Добавить категорию tiktok (все домены TikTok). Безопасно через любой канал.">🎵 tiktok</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('discord')" title="Добавить категорию discord (все домены Discord). Безопасно через любой канал.">💬 discord</button>
+                <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearYTExtCats()" title="Очистить все v2fly-категории YT. Ручные домены в textarea выше не трогаются.">🗑 Очистить</button>
+              </div>
+              <input id="yt-ext-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.yt_ext_categories or '' }}" placeholder="через пробел: youtube tiktok instagram" />
+              <button class="btn" style="margin-top: 6px; background: #c33;" onclick="saveYTExtCategories()" title="Записать список v2fly-категорий в watchdog.config. Watchdog подхватит при следующем тике (≤1 мин).">💾 Сохранить категории</button>
+              <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Без префиксов — только имя категории. Полный список: <a href="https://github.com/v2fly/domain-list-community/tree/master/data" target="_blank">v2fly community</a>.</p>
+            </div>
+          </details>
+
+          <!-- v1.6.0 (2026-05-18): GeoIP-категории для IP-only приложений (Telegram Desktop, Discord). -->
+          <details style="margin-top: 14px; border-top: 1px dashed #ccc; padding-top: 10px;" {% if targets.yt_geoip_categories %}open{% endif %}>
+            <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">🌍 GeoIP-категории <span style="color: #888; font-weight: 400; font-size: 0.88em;">— для IP-only приложений типа Telegram Desktop</span> <a href="#help-v2fly-geoip" onclick="openHelpAnchor('help-v2fly-geoip'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; margin-left: 6px;" title="Открыть подробное описание GeoIP-категорий в разделе «Помощь»">❓ что это?</a></summary>
+            <div style="margin-top: 8px;">
+              <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">
+                Доменные правила не ловят трафик приложений, которые коннектятся напрямую к IP датацентров минуя DNS — Telegram Desktop, Discord native client.
+                GeoIP-категории матчат по IP-диапазонам из <code>geoip.dat</code>.
+                Генерируется как <strong>отдельное правило</strong> с <code>"ip": ["geoip:NAME"]</code>, outbound = YT_TAG (тот же что и для доменов).
+              </p>
+              <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 6px 10px; margin: 0 0 8px; font-size: 0.82em; color: #1a5276;">
+                💡 <strong>Когда нужно</strong>: если приложение через VPN не подключается (зависает на «Connecting…»), а через браузер тот же сервис работает — это IP-only-проблема. Добавь нужную категорию (например <code>telegram</code>) — трафик пойдёт через YT-канал по IP, не по доменам.
+              </div>
+              <div style="background: #fff3cd; border-left: 3px solid #f0c200; padding: 8px 10px; margin: 0 0 10px; font-size: 0.85em; color: #6a4900;">
+                ⚠️ <strong>Требует расширенный <code>geoip.dat</code></strong>. XKeen-installer ставит только базы со странами (geoip_refilter, geoip_zkeen) — категорий сервисов вроде <code>telegram</code> в них <strong>нет</strong>. Если xkeen после сохранения уходит в режим Mixed <strong>И в <code>error.log</code> есть <code>code not found</code>/<code>failed to load</code></strong> — значит категория действительно не найдена. Нажми кнопку ниже один раз. <span style="color:#666; font-size:0.9em;">(Mixed без ошибок в error.log — валидный режим, VPN работает; проверить через <code>https://checkip.amazonaws.com</code>.)</span>
+                <div style="margin-top: 8px;">
+                  <button type="button" class="btn btn-sm" style="background:#4a4; color:#fff; margin: 2px;" onclick="installExtendedGeoip()" title="Скачать расширенный geoip.dat от Loyalsoldier (~18MB) — содержит и страны, и сервисы (telegram, discord). Текущий файл будет в .bak-&lt;timestamp&gt;. После скачивания xkeen перезапустится автоматически. Делается один раз на роутер.">📥 Установить расширенный geoip.dat (Loyalsoldier)</button>
+                  <span style="font-size: 0.78em; color: #6a4900; margin-left: 4px;">~18MB с GitHub. Текущий файл сохранится в .bak-&lt;timestamp&gt;. xkeen перезапустится автоматически.</span>
+                </div>
+              </div>
+              <div style="margin-bottom: 6px;">
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTGeoipCat('telegram')" title="Добавить категорию telegram (IP-диапазоны датацентров Telegram: 149.154.x.x, 91.108.x.x и др.). Нужно для Telegram Desktop — он коннектится по IP минуя DNS.">📱 telegram</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTGeoipCat('discord')" title="Добавить категорию discord (IP-диапазоны серверов Discord). Нужно для Discord native client при IP-only-блокировках.">💬 discord</button>
+                <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearYTGeoipCats()" title="Очистить все GeoIP-категории. IP-only приложения снова пойдут через PRIMARY-канал.">🗑 Очистить</button>
+              </div>
+              <input id="yt-geoip-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.yt_geoip_categories or '' }}" placeholder="через пробел: telegram discord" />
+              <button class="btn" style="margin-top: 6px; background: #c33;" onclick="saveYTGeoipCategories()" title="Записать GeoIP-категории в watchdog.config. Watchdog подхватит при следующем тике (≤1 мин). После сохранения проверь что xkeen не ушёл в режим Mixed — если ушёл, нужно установить расширенный geoip.dat кнопкой выше.">💾 Сохранить GeoIP-категории</button>
+              <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Без префиксов — только имя категории. Требует watchdog v10+ и расширенный geoip.dat (см. кнопку выше).</p>
+            </div>
+          </details>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- DIRECT + BLOCK в одну строку (parallel: один разрешает через провайдера, второй полностью блокирует) -->
+  <div class="row" style="gap: 16px; margin-top: 16px;">
+  <div class="col" style="flex: 1 1 460px; min-width: 0;">
+  <!-- DIRECT домены — сайты идут напрямую без VPN -->
+  <div class="domain-section ds-direct">
+    <h3 class="domain-section-header">🚫 Сайты НАПРЯМУЮ без VPN <span class="subsec-hint">(DIRECT — пойдут через провайдера, без VPN)</span></h3>
+    <div class="domain-section-body">
+      <p class="subtitle">
+        Эти домены пойдут через твоего обычного провайдера (без VPN). Полезно: банки/Госуслуги (требуют RU IP),
+        российские стримминги (Okko/Кинопоиск), почта (Mail.ru) — для скорости и совместимости.<br>
+        <strong>⚠️ Уже работает автоматически</strong> через базовые правила в шаблоне: <code>regex *.ru / *.su / *.рф</code>
+        + <code>geosite</code> (yandex, vk, category-gov-ru, steam, private) + <code>geoip:ru</code>.
+        <strong>Здесь имеет смысл добавлять только:</strong> <code>.com</code> / <code>.net</code> / <code>.tv</code> /
+        <code>.cloud</code> варианты российских сервисов которые НЕ ловятся regex *.ru.
+        Можно добавить и <code>.ru</code> для прозрачности (что они <em>точно</em> direct) — дубль не ломает работу.
+      </p>
+      <div style="margin-bottom: 8px;">
+        <strong style="font-size: 0.9em; color: #555;">Готовые пресеты:</strong><br>
+        <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('vk')">🔵 VK сервисы</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('mailru')">📧 Mail.ru</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('max')">💬 MAX (мессенджер)</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('okko')">🎬 Okko</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('kinopoisk')">🎬 Кинопоиск</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('gov')">🏛️ Госуслуги</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('banks')">💰 Банки (Сбер/ВТБ/Альфа/Тинькофф)</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('marketplaces')">🛒 Маркетплейсы (Ozon/WB)</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('yandex')">🟡 Yandex (все сервисы)</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px; background:#4a4; color:#fff;" onclick="addAllDirectPresets()">📥 Добавить ВСЕ DIRECT</button>
+        <button type="button" class="btn btn-sm btn-secondary" style="margin: 3px;" onclick="clearDirectDomains()">🗑 Очистить</button>
+        <button type="button" class="btn btn-sm btn-secondary" style="margin: 3px;" onclick="resetDirectDefaults()">↩ Сброс к дефолту (VK + Mail.ru + Okko)</button>
+      </div>
+      <textarea id="direct-domains" style="width: 100%; min-height: 100px; font-family: Consolas, monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">{% for d in targets.direct_domains %}{{ d }}
+{% endfor %}</textarea>
+      <button class="btn" style="margin-top: 6px; background: #c63;" onclick="saveDirectDomains()">💾 Сохранить список доменов</button>
+      <span class="subtitle" style="margin-left: 8px;">Пусто = только базовые <code>*.ru/*.su/*.рф/geosite</code> работают. Watchdog подхватит при следующем тике.</span>
+    </div>
+  </div>
+  </div><!-- /col DIRECT -->
+
+  <div class="col" style="flex: 1 1 460px; min-width: 0;">
+  <!-- BLOCK домены — полностью заблокировать (outbound `block` / blackhole) -->
+  <div class="domain-section ds-block">
+    <h3 class="domain-section-header">⛔ Заблокированные сайты <span class="subsec-hint">(BLOCK — outbound `block`/blackhole, пакеты дропаются)</span></h3>
+    <div class="domain-section-body">
+      <p class="subtitle">
+        Эти домены полностью <strong>заблокированы</strong> на роутере — приложения которые к ним обращаются получат «нет ответа».
+        Полезно для:
+        <strong>отключения Windows Update / Telemetry</strong> (Microsoft не сможет тянуть обновления и слать данные),
+        <strong>блокировки Adobe Genuine</strong> (если использовался крякнутый Photoshop — без блока он выдаст «non-genuine» и заблокирует фичи),
+        <strong>отрезки рекламных трекеров</strong> на уровне роутера (вместо AdGuard на каждом устройстве).
+        <br>⚠️ Используй <strong>аккуратно</strong> — заблокированный сайт перестанет работать на ВСЕХ устройствах в твоей LAN.
+      </p>
+      <div style="margin-bottom: 8px;">
+        <strong style="font-size: 0.9em; color: #555;">Готовые пресеты:</strong><br>
+        <button type="button" class="btn btn-sm" style="margin: 3px; background:#555; color:#fff;" onclick="addBlockPreset('windows-update')">🛡 Windows Update (отключить обновления)</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px; background:#555; color:#fff;" onclick="addBlockPreset('windows-telemetry')">📊 Windows Telemetry (отключить слежку)</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px; background:#555; color:#fff;" onclick="addBlockPreset('adobe')">🎨 Adobe Genuine (для крякнутого Photoshop)</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px; background:#555; color:#fff;" onclick="addBlockPreset('office-telemetry')">📎 Office Telemetry</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px; background:#4a4; color:#fff;" onclick="addAllBlockPresets()">📥 Добавить ВСЕ BLOCK</button>
+        <button type="button" class="btn btn-sm btn-secondary" style="margin: 3px;" onclick="clearBlockDomains()">🗑 Очистить</button>
+      </div>
+      <textarea id="block-domains" style="width: 100%; min-height: 100px; font-family: Consolas, monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">{% for d in targets.block_domains %}{{ d }}
+{% endfor %}</textarea>
+      <button class="btn" style="margin-top: 6px; background: #555;" onclick="saveBlockDomains()">💾 Сохранить список доменов</button>
+      <span class="subtitle" style="margin-left: 8px;">Пусто = ничего не блокируется. Watchdog подхватит при следующем тике (≤1 мин).</span>
+    </div>
+  </div>
+  </div><!-- /col BLOCK -->
+  </div><!-- /row DIRECT+BLOCK -->
+
+  <!-- v1.7.18 — Базовые правила маршрутизации из template (read-only, свёрнуто) -->
+  <details class="domain-section ds-template-rules" style="margin: 16px 0; padding: 0; border-radius: 4px;">
+    <summary style="cursor: pointer; padding: 10px 14px; background: #6c757d; color: #fff; border-radius: 4px; font-weight: 700;">📐 Базовые правила маршрутизации (зашиты в template, read-only) <span style="font-weight: 400; opacity: 0.85; font-size: 0.88em;">— что захардкожено в 05_routing.template.json помимо твоих DIRECT/BLOCK/AI/YT доменов</span></summary>
+    <div style="padding: 12px 16px; background: #fafafa; border: 1px solid #ddd; border-top: 0; border-radius: 0 0 4px 4px;">
+      <p class="subtitle" style="margin-top: 0;">
+        Это правила которые применяются <strong>ко всем клиентам в политике XKeen</strong> — независимо от того, что ты добавляешь в DIRECT/BLOCK секции. Например, <code>regexp:^*.ru$</code> отправляет ВСЕ .ru домены через провайдера (мимо VPN), даже если тебя нет в DIRECT-списке. Эти правила <strong>невозможно поменять через дашборд</strong> — они в template на роутере (<code>/opt/etc/xray/configs.bak/05_routing.template.json</code>), редактировать нужно через SSH.
+      </p>
+      <button class="btn btn-sm" style="background:#6c757d; color:#fff;" onclick="loadRoutingTemplateRules()">🔄 Загрузить правила</button>
+      <div id="routing-template-rules-output" style="margin-top: 12px;">
+        <p class="subtitle" style="color:#888;">Нажми «Загрузить правила» чтобы прочитать актуальный template с роутера.</p>
+      </div>
+    </div>
+  </details>
+
+  <!-- v1.7.6 — Клиенты в политике XKeen (read-only) -->
+  <div class="domain-section ds-clients">
+    <h3 class="domain-section-header">👥 Клиенты в политике XKeen <span class="subsec-hint">(меняй политику прямо в таблице через dropdown)</span></h3>
+    <div class="domain-section-body">
+      <p class="subtitle">
+        В Keenetic-политике <code>XKeen</code> хранится список клиентов LAN, чей трафик помечается fwmark'ом и попадает в XKeen-iptables (а оттуда — в xray).
+        <strong>Клиенты вне политики идут напрямую через провайдера</strong>, минуя xray. CPU роутера грузит именно содержимое этого списка — чем больше клиентов, тем выше нагрузка.
+        <br><strong>Как менять</strong>: dropdown в колонке «Политика» — выбери XKeen / другую политику / «напрямую» → команда уйдёт по SSH через ndmc и автоматически сохранится через <code>system configuration save</code>. Альтернативно — через Keenetic Web UI: «Сетевые правила» → «Приоритеты подключений» → вкладка «Применение политик».
+        <br><strong>Кнопка 🔄 рядом с dropdown</strong>: сбрасывает <code>conntrack</code>-записи клиента — все его существующие TCP/UDP-соединения переоткроются и новая политика применится мгновенно (без переподключения устройства). Полезно если только что сменил политику и хочешь увидеть результат сразу.
+      </p>
+      <button class="btn btn-sm" style="background:#4a7bbf; color:#fff;" onclick="loadPolicyClients()">🔄 Обновить список</button>
+      <a href="http://{{ keenetic_settings.current.host or '192.168.1.1' }}/" target="_blank" class="btn btn-sm btn-secondary" style="margin-left:6px;">🌐 Открыть Keenetic Web UI</a>
+      <div id="policy-clients-output" style="margin-top:10px;">
+        <p class="subtitle" style="color:#888;">Нажми «Обновить список» чтобы спросить роутер какие клиенты сейчас в политике XKeen.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="domain-section ds-action">
+    <h3 class="domain-section-header">⚡ Принудительно переключить watchdog <span class="subsec-hint">(меняет только default-канал, AI/YT не трогает)</span></h3>
+    <div class="domain-section-body">
+      <div style="background: #eefbe5; border-left: 4px solid #2a7; padding: 8px 12px; margin: 0 0 12px; border-radius: 3px; font-size: 0.88em;">
+        <strong style="color: #2a7;">🛡️ Безопасно для AI:</strong> кнопки ниже меняют <strong>только default-канал</strong> (общий трафик).
+        🤖 <strong>AI-sticky</strong> (<code>{{ targets.ai_tag }}</code>) и 📺 <strong>YouTube-sticky</strong> (<code>{{ targets.yt_tag }}</code>) <strong>не затрагиваются</strong> — продолжают идти через свои выбранные каналы.
+        Anthropic <strong>не увидит твой IP</strong> при нажатии FAILOVER — AI-трафик как шёл через <code>{{ targets.ai_tag }}</code>, так и идёт.
+        Поменять AI/YT канал можно только через их собственные dropdown'ы выше в этом же разделе.
+      </div>
+      <div class="force-mode-grid">
+        <div class="force-mode-cell">
+          <button class="btn" onclick="forceMode('primary')">🟢 PRIMARY</button>
+          <p class="subtitle">Жёстко держать <strong>основной</strong> канал (<code>{{ targets.primary_tag }}</code>) — игнорировать probe, не переключаться на резерв даже если упадёт.</p>
+        </div>
+        <div class="force-mode-cell">
+          <button class="btn btn-warn" onclick="forceMode('failover')">🟡 FAILOVER</button>
+          <p class="subtitle">Жёстко переключиться на <strong>первый живой</strong> из цепочки резерва. PRIMARY обратно <strong>не вернётся</strong>, пока не нажмёшь AUTO.</p>
+        </div>
+        <div class="force-mode-cell">
+          <button class="btn btn-secondary" onclick="forceMode('auto')">🔄 AUTO</button>
+          <p class="subtitle">Вернуть <strong>автоматический</strong> режим (probe + state machine). Также: <strong>применить изменения сейчас</strong> — после правки AI/YT/DIRECT доменов не ждать 1 мин до следующего тика.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <details class="subsec subsec-log">
+    <summary>📋 Лог watchdog <span class="subsec-hint">(последние 30 строк — события переключений)</span></summary>
+    <div class="subsec-body">
+    <pre class="log" style="margin: 0;">{% for line in watchdog.log %}{{ line }}
+{% endfor %}</pre>
+    </div>
+  </details>
+
+
+</div>
+
+<!-- ===== ЦЕПОЧКА FAILOVER (отдельный раздел, важная штука, сворачиваемая) ===== -->
+<details class="section-collapsible">
+<summary><h2 class="sec-chain">⛓️ Цепочка FAILOVER <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— порядок перебора резервных каналов watchdog'ом</span></h2></summary>
+<div class="card">
+  <p class="subtitle" style="margin-top: 0;">
+    Watchdog при падении PRIMARY пробует резервные каналы <strong>сверху вниз по этой таблице</strong>
+    и переключается на <strong>первый живой</strong>. Если он тоже упадёт — перейдёт на следующий.
+    Сними галку чтобы исключить outbound из каскада (тогда его можно будет удалить через таблицу «Все outbounds» ниже).
+    <br><strong>Цветовая полоска слева</strong> и <strong>колонка «Подписка»</strong> — показывают к какому провайдеру принадлежит каждый сервер
+    (группировка по Reality publicKey+SNI). Так проще выбрать какие включать в каскад: например,
+    чтобы при падении Provider A не переключаться на платную Provider B, а только на резервные Provider A.
+  </p>
+  <style>
+    #failover-chain tr.draggable { cursor: grab; user-select: none; }
+    #failover-chain tr.draggable:hover { background: #f5f5e8 !important; }
+    #failover-chain tr.dragging { opacity: 0.4; }
+    #failover-chain tr.drop-target-above { border-top: 2px solid #2a7; }
+    #failover-chain tr.drop-target-below { border-bottom: 2px solid #2a7; }
+    .drag-handle { color: #aaa; cursor: grab; font-size: 1.3em; }
+    /* Цветная боковая полоска слева — индикатор подписки */
+    #failover-chain td.group-cell { border-left: 5px solid transparent; padding-left: 8px; }
+    #failover-chain tr.grp-0 td.group-cell { border-left-color: #2a7;  background: #f0f8f0; }
+    #failover-chain tr.grp-1 td.group-cell { border-left-color: #36a;  background: #eef3f9; }
+    #failover-chain tr.grp-2 td.group-cell { border-left-color: #c63;  background: #fbf2ec; }
+    #failover-chain tr.grp-3 td.group-cell { border-left-color: #963;  background: #f7f0e8; }
+    #failover-chain tr.grp-4 td.group-cell { border-left-color: #639;  background: #f3eef7; }
+    #failover-chain tr.grp-5 td.group-cell { border-left-color: #c99;  background: #faf3f3; }
+    .group-name-badge { font-size: 0.78em; color: #555; padding: 1px 5px; border-radius: 3px; background: rgba(255,255,255,0.7); display: inline-block; }
+  </style>
+  <table id="failover-chain" style="margin-top: 6px; max-width: 850px;">
+    <tr><th style="width:30px"></th><th style="width: 80px;">№</th><th style="width: 80px;">В цепочке</th><th>Tag</th><th style="width: 140px;">Подписка</th><th>Host:Port</th><th>Сейчас / роль</th></tr>
+    {% for o in chain_outbounds %}
+    {% set order_in_chain = (targets.failover_tags or []).index(o.tag) + 1 if o.tag in (targets.failover_tags or []) else 0 %}
+    {% if o.is_primary %}
+      {# PRIMARY — read-only строка, не draggable, не редактируется #}
+      <tr class="grp-{{ o.group_color_idx or 0 }}" style="color:#888;" data-tag="{{ o.tag }}" data-primary="1">
+        <td style="text-align:center; color:#bbb;" title="PRIMARY не часть цепочки резерва — он отдельная роль">🟢</td>
+        <td style="color:#aaa; text-align:center;">—</td>
+        <td style="text-align:center;"><input type="checkbox" disabled title="PRIMARY всегда вне цепочки FAILOVER"></td>
+        <td class="mono"><strong>{{ o.tag }}</strong>{% if o.note %}<br><span style="font-style:italic; font-size:0.8em; color:#3a6;">📝 {{ o.note }}</span>{% endif %}</td>
+        <td class="group-cell"><span class="group-name-badge" title="pbk={{ o.group_pbk_short }}">{{ o.group_name or '?' }}</span></td>
+        <td class="mono">{{ o.host }}:{{ o.port }}</td>
+        <td><span class="badge badge-ok">🟢 PRIMARY</span>{% if o.tag == watchdog.current_default %} <span class="badge badge-active">⚡ активен</span>{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr class="draggable grp-{{ o.group_color_idx or 0 }}" draggable="true" data-tag="{{ o.tag }}">
+        <td><span class="drag-handle" title="Перетащи чтобы изменить порядок">⋮⋮</span></td>
+        <td><input type="number" min="0" max="99" value="{{ order_in_chain }}" style="width: 60px;" class="fc-order" data-tag="{{ o.tag }}"></td>
+        <td style="text-align:center"><input type="checkbox" {% if o.in_failover_chain %}checked{% endif %} class="fc-check" data-tag="{{ o.tag }}" style="transform: scale(1.3);"></td>
+        <td class="mono"><strong>{{ o.tag }}</strong>{% if o.note %}<br><span style="font-style:italic; font-size:0.8em; color:#3a6;">📝 {{ o.note }}</span>{% endif %}</td>
+        <td class="group-cell"><span class="group-name-badge" title="pbk={{ o.group_pbk_short }}">{{ o.group_name or '?' }}</span></td>
+        <td class="mono">{{ o.host }}:{{ o.port }}</td>
+        <td>{% if o.tag == watchdog.current_default %}<span class="badge badge-active">⚡ активен</span>{% endif %}{% if o.is_ai %} <span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}</td>
+      </tr>
+    {% endif %}
+    {% endfor %}
+  </table>
+  <div style="margin-top: 12px;">
+    <button class="btn" onclick="saveFailoverChain()">💾 Сохранить цепочку</button>
+    <span class="subtitle" style="margin-left: 10px;">
+      <strong>Перетащи строки</strong> за ⋮⋮ слева чтобы изменить порядок (или редактируй № вручную).
+      Сними галку чтобы исключить из каскада. После сохранения unchecked станут «не задействован» → появится кнопка 🗑 Удалить.
+    </span>
+  </div>
+</div>
+
+</details>
+
+<!-- ===== ALL OUTBOUNDS ===== -->
+<h2 class="sec-list">📋 Все outbounds <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— {{ outbounds|length }} шт., сгруппированы по провайдерам</span>
+  <button class="btn btn-sm" onclick="refreshStatuses()" id="status-refresh-btn" style="margin-left: auto; font-size: 0.7em;" title="Заново TCP-probe всех outbound'ов (игнорирует 60s кэш)">🔄 Проверить статус</button>
+  <span id="status-refresh-info" class="subtitle" style="font-size: 0.7em;"></span>
+</h2>
+<div class="card">
+  <p class="subtitle" style="margin-top: 0; margin-bottom: 12px;">
+    Outbound'ы сгруппированы по <strong>publicKey + SNI</strong> (Reality identity) — это значит «одна подписка от одного провайдера». Имя группы берётся из meta-поля «Провайдер» (если задано) или из общего префикса tag (например, provider-a-de1, provider-a-nl → группа «Provider A»). Сворачивай неинтересные группы ▶ чтобы не загромождать.
+  </p>
+  {% for group in outbound_groups %}
+  <details data-group-key="{{ group.key }}" data-group-name="{{ group.name }}" style="margin-bottom: 14px; border: 1px solid #e0e0e0; border-radius: 6px; padding: 8px 12px; {% if group.any_active %}background: #f7fbf3;{% endif %}">
+    <summary style="cursor: pointer; font-weight: 600; padding: 4px 0;">
+      <span style="font-size: 1.05em;">{% if group.key == 'service' %}🔒{% elif group.any_active %}⚡{% else %}📦{% endif %} {{ group.name }}</span>
+      {% if group.sub_expires_at %}
+        {% set d = group.sub_days_left %}
+        {% if d is none %}
+          <span style="margin-left: 8px; font-size: 0.85em; color:#888; font-weight: normal;">⏰ {{ group.sub_expires_at }}</span>
+        {% elif d < 0 %}
+          <span style="margin-left: 8px; font-size: 0.82em; font-weight: bold; background:#c33; color:#fff; padding:1px 6px; border-radius:3px;">⚠️ ИСТЕКЛА {{ -d }} дн. назад</span>
+        {% elif d < 7 %}
+          <span style="margin-left: 8px; font-size: 0.82em; font-weight: bold; background:#fff0d0; color:#a55a18; padding:1px 6px; border-radius:3px;">⏰ через {{ d }} дн. ({{ group.sub_expires_at }})</span>
+        {% elif d < 30 %}
+          <span style="margin-left: 8px; font-size: 0.82em; background:#f0f5f0; color:#5a7c2c; padding:1px 6px; border-radius:3px;">⏰ через {{ d }} дн. ({{ group.sub_expires_at }})</span>
+        {% else %}
+          <span style="margin-left: 8px; font-size: 0.85em; color:#888; font-weight: normal;">⏰ {{ group.sub_expires_at }} (~{{ d }} дн.)</span>
+        {% endif %}
+      {% endif %}
+      <span class="subtitle" style="margin-left: 8px; font-weight: normal;">— {{ group.count }} {% if group.count == 1 %}outbound{% elif group.count < 5 %}outbound'а{% else %}outbound'ов{% endif %}{% if group.pbk_short %} · <code style="font-size:0.85em;">pbk={{ group.pbk_short }}</code>{% endif %}{% if group.sni %} · <code style="font-size:0.85em;">sni={{ group.sni }}</code>{% endif %}{% if group.inactive_count %} · <span style="color:#999;">😴 не задействовано: {{ group.inactive_count }}</span>{% endif %}</span>
+    </summary>
+    {% if group.pbk %}
+    <div style="margin: 6px 0 10px; padding: 6px 10px; background:#fff; border-left: 3px solid #d8eecc; border-radius: 3px; font-size: 0.88em; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+      {% if group.sub_note %}
+        <span style="color:#3a6; font-style:italic;">📝 {{ group.sub_note }}</span>
+      {% endif %}
+      {% if group.sub_expires_at %}
+        {% set d = group.sub_days_left %}
+        {% if d is none %}
+          <span style="color:#888;">⏰ {{ group.sub_expires_at }}</span>
+        {% elif d < 0 %}
+          <span style="background:#c33; color:#fff; padding:2px 6px; border-radius:3px; font-weight:bold;">⚠️ ИСТЕКЛА {{ -d }} дн. назад ({{ group.sub_expires_at }})</span>
+        {% elif d < 7 %}
+          <span style="background:#fff0d0; color:#a55a18; padding:2px 6px; border-radius:3px; font-weight:bold;">⏰ истекает через {{ d }} дн. ({{ group.sub_expires_at }})</span>
+        {% elif d < 30 %}
+          <span style="background:#f0f5f0; color:#5a7c2c; padding:2px 6px; border-radius:3px;">⏰ истекает через {{ d }} дн. ({{ group.sub_expires_at }})</span>
+        {% else %}
+          <span style="color:#888;">⏰ истекает {{ group.sub_expires_at }} (~{{ d }} дн.)</span>
+        {% endif %}
+      {% endif %}
+      {% if group.sub_url %}
+        <span title="{{ group.sub_url }}" style="font-size:0.85em; color:#666;">🔗 sub URL</span>
+      {% endif %}
+      {% if not group.sub_note and not group.sub_expires_at and not group.sub_url %}
+        <span class="subtitle" style="color:#bbb;">— нет данных по подписке —</span>
+      {% endif %}
+      <button class="btn btn-sm" style="margin-left:auto; padding:1px 8px; font-size:0.8em; background:#f0f5f0; color:#3a6; border:1px solid #b8d5b8;"
+              data-pbk="{{ group.pbk }}"
+              data-note="{{ group.sub_note or '' }}"
+              data-expires="{{ group.sub_expires_at or '' }}"
+              data-sub-url="{{ group.sub_url or '' }}"
+              data-name="{{ group.name }}"
+              data-custom-name="{{ group.custom_name or '' }}"
+              onclick="editSubMetaFromBtn(this)"
+              title="Редактировать название, примечание, дату истечения и Subscription URL">✏️ Подписка</button>
+    </div>
+    {% endif %}
+    {% if group.key != 'service' %}
+    <div style="margin: 4px 0 8px; padding: 5px 10px; background:#fafafa; border-left: 3px solid #d0d0d0; border-radius: 3px; font-size: 0.83em; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+      <span style="color:#666;">Массовые действия:</span>
+      <button class="btn btn-sm" style="padding:2px 8px; font-size:0.85em; background:#eef3f9; color:#36a; border:1px solid #b8c5d8;"
+              onclick="bulkSelectInactive(this)" title="Отметить все «не задействован» в этой группе">☑️ Все неактивные ({{ group.inactive_count }})</button>
+      <button class="btn btn-sm" style="padding:2px 8px; font-size:0.85em; background:#f5f5f5; color:#666; border:1px solid #ccc;"
+              onclick="bulkSelectAll(this)" title="Отметить вообще все outbound'ы в группе">☑️ Все</button>
+      <button class="btn btn-sm" style="padding:2px 8px; font-size:0.85em; background:#f5f5f5; color:#666; border:1px solid #ccc;"
+              onclick="bulkClearSelection(this)">⬜ Снять</button>
+      <button class="btn btn-sm bulk-remove-btn" style="margin-left:auto; padding:2px 10px; font-size:0.85em; background:#c33; color:#fff; opacity:0.5; cursor:not-allowed;"
+              data-group-name="{{ group.name }}"
+              onclick="bulkRemoveSelected(this)" disabled
+              title="Удалить отмеченные outbound'ы одной транзакцией. Активные в watchdog (PRIMARY/FAILOVER/AI/в цепочке) — будут пропущены автоматически.">🗑 Удалить выделенные (<span class="bulk-count">0</span>)</button>
+    </div>
+    {% endif %}
+  <table style="margin-top: 8px;">
+    <tr>{% if group.key != 'service' %}<th style="width:24px;" title="Отметить для массового действия"></th>{% endif %}<th>tag</th><th>примечание</th><th>protocol</th><th>host:port</th><th>network</th><th>security</th><th title="TCP-probe с дашборда. Зелёный = host:port отвечает. ⚠️ Это не гарантия что VPN-протокол работает — только что TCP-порт открыт.">статус</th><th>роль</th><th></th></tr>
+    {% for o in group.outbounds %}
+    <tr data-tag="{{ o.tag }}"{% if o.is_inactive %} class="inactive-row"{% endif %}>
+      {% if group.key != 'service' %}
+      <td style="text-align:center; padding:4px;">
+        {% if o.tag not in ('direct','block') %}
+          <input type="checkbox" class="bulk-cb" data-tag="{{ o.tag }}"{% if o.is_inactive %} data-inactive="1"{% endif %} onchange="bulkOnChange(this)" style="transform: scale(1.2); cursor:pointer;">
+        {% endif %}
+      </td>
+      {% endif %}
+      <td class="mono"><strong>{{ o.tag }}</strong>
+        {% if o.sub_expired %}
+          <span class="badge" style="background:#fbd7d7; color:#a22; padding:1px 5px; border-radius:3px; font-size:0.75em; margin-left:4px;" title="Подписка истекла {{ o.sub_expires_at }} ({{ -o.sub_days_left }} дн. назад). Reality handshake скорее всего не работает.">⏳ истекла</span>
+        {% elif o.sub_expires_soon %}
+          <span class="badge" style="background:#fff4d0; color:#a55a18; padding:1px 5px; border-radius:3px; font-size:0.75em; margin-left:4px;" title="Подписка истекает {{ o.sub_expires_at }} (через {{ o.sub_days_left }} дн.)">⏰ {{ o.sub_days_left }}д</span>
+        {% endif %}
+      </td>
+      <td style="font-size:0.9em;">
+        {% if o.note %}<span style="font-style:italic; color:#3a6; background:#f7fbf3; padding:2px 6px; border-radius:3px; display:inline-block;" title="Личное примечание сервера">📝 {{ o.note }}</span>{% else %}<span class="subtitle" style="color:#bbb;">—</span>{% endif %}
+        {% if o.tag not in ('direct','block') %}
+          <button class="btn btn-sm meta-edit-btn" style="margin-left:4px; padding:1px 6px; font-size:0.8em;"
+                  data-tag="{{ o.tag }}"
+                  data-note="{{ o.note or '' }}"
+                  onclick="editMetaFromBtn(this)"
+                  title="Редактировать примечание сервера">✏️</button>
+        {% endif %}
+      </td>
+      <td>{{ o.protocol }}</td>
+      <td class="mono">{{ o.host }}{% if o.port %}:{{ o.port }}{% endif %}</td>
+      <td>{{ o.network or '—' }}</td>
+      <td>{{ o.security or '—' }}</td>
+      <td class="status-cell">
+        {% if o.status_kind == 'local' %}
+          <span class="badge badge-dim" title="служебный outbound, не сетевой">—</span>
+        {% elif o.status_kind == 'tcp_nc' %}
+          <span class="badge" style="background:#dfe8ff; color:#1a55cc;" title="TCP-порт открыт · TLS не отвечает (Reality без фолбэка — это норма, VPN работает)">🔌 TCP</span>
+        {% elif o.status_ok %}
+          {% if o.status_ms is none %}
+            <span class="badge badge-ok" title="handshake успешен">🟢</span>
+          {% elif o.status_ms < 300 %}
+            <span class="badge badge-ok" title="TCP+TLS handshake — быстро"><strong>🟢 {{ o.status_ms }} ms</strong></span>
+          {% elif o.status_ms < 500 %}
+            <span class="badge" style="background:#e9f5d8; color:#5a7c2c;" title="TCP+TLS handshake — норма"><strong>🟡 {{ o.status_ms }} ms</strong></span>
+          {% elif o.status_ms < 800 %}
+            <span class="badge" style="background:#fff0d0; color:#a55a18;" title="TCP+TLS handshake — медленно"><strong>🟠 {{ o.status_ms }} ms</strong></span>
+          {% else %}
+            <span class="badge" style="background:#ffe0e0; color:#a33;" title="TCP+TLS handshake — очень медленно"><strong>🔴 {{ o.status_ms }} ms</strong></span>
+          {% endif %}
+        {% elif o.status_ok is none %}
+          <span class="badge badge-dim" title="статус не проверялся — нажми «🔄 Проверить статус» в шапке таблицы">⚪ —</span>
+        {% else %}
+          <span class="badge" style="background:#333; color:#fff;" title="TCP+TLS handshake не прошёл — {% if o.status_kind == 'noaddr' %}нет адреса{% else %}порт закрыт / таймаут / сервер мёртв{% endif %}"><strong>⛔ не отвечает</strong></span>
+        {% endif %}
+      </td>
+      <td style="vertical-align: top;">
+        {% set has_current = o.is_default or o.is_primary or o.is_failover or o.in_failover_chain or o.is_ai or o.tag in ('direct','block') %}
+        <div style="background: #f0f5f0; border-left: 3px solid #6a9; padding: 4px 8px; border-radius: 3px; margin-bottom: 6px; min-height: 42px;">
+          <span style="color:#3a6; font-size:0.72em; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px;">▼ сейчас:</span><br>
+          {% if has_current %}
+            {% if o.is_default %}<span class="badge badge-active">⚡ default сейчас</span>{% endif %}
+            {% if o.is_primary %}<span class="badge badge-ok">🟢 primary</span>{% endif %}
+            {% if o.is_failover %}<span class="badge badge-active">🟡 failover</span>{% endif %}
+            {% if o.in_failover_chain and not o.is_failover %}<span class="badge badge-dim">↩️ в цепочке резерва</span>{% endif %}
+            {% if o.is_ai %}<span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}
+            {% if o.tag in ('direct','block') %}<span class="badge badge-dim">служ.</span>{% endif %}
+          {% else %}
+            <span class="badge badge-dim" style="opacity:0.7;">не задействован</span>
+          {% endif %}
+        </div>
+        {% if o.protocol == 'vless' and not (o.is_primary and o.is_failover and o.is_ai) %}
+          <div style="opacity: 0.85; padding: 2px 4px;">
+            <span style="color:#aaa; font-size:0.7em; text-transform:uppercase; letter-spacing:0.3px;">сделать:</span>
+            <div style="margin-top: 2px; display: flex; gap: 3px; flex-wrap: wrap;">
+              {% if not o.is_primary %}
+                <button class="btn btn-sm role-btn" style="background:#fafafa; color:#2a5; border:1px dashed #2a5; padding:1px 6px; font-size:0.72em;"
+                  onclick="setRole('{{ o.tag }}', 'primary')"
+                  title="Сделать основным каналом — весь default трафик пойдёт через него">→ 🟢 PRIMARY</button>
+              {% endif %}
+              {% if not o.is_failover %}
+                <button class="btn btn-sm role-btn" style="background:#fafafa; color:#a55; border:1px dashed #a55; padding:1px 6px; font-size:0.72em;"
+                  onclick="setRole('{{ o.tag }}', 'failover')"
+                  title="Сделать первым резервом (head of FAILOVER_TAGS) — watchdog переключится сюда при падении PRIMARY">→ 🟡 FAILOVER</button>
+              {% endif %}
+              {% if not o.is_ai %}
+                <button class="btn btn-sm role-btn" style="background:#fafafa; color:#3a6; border:1px dashed #3a6; padding:1px 6px; font-size:0.72em;"
+                  data-anti-dpi="{{ '1' if o.is_anti_dpi else '0' }}"
+                  onclick="setRole('{{ o.tag }}', 'ai', this.dataset.antiDpi === '1')"
+                  title="Sticky-канал для AI (claude/openai/anthropic) — независимо от default. Важно: AI не должен прыгать между странами, иначе бан аккаунта{% if o.is_anti_dpi %}. ⚠️ ВНИМАНИЕ: этот outbound помечен как anti-DPI — вероятно RU exit-IP, AI сервисы геоблокируют РФ{% endif %}">→ 🤖 AI</button>
+              {% endif %}
+            </div>
+          </div>
+        {% endif %}
+      </td>
+      <td>
+        {% if o.tag in ('direct','block') %}
+          <span class="badge badge-dim" title="служебный">🔒</span>
+        {% else %}
+          <button class="btn btn-sm" style="background:#2a7d2a; color:#fff;" onclick="prepareUpdateOutbound('{{ o.tag }}')" title="Обновить параметры (новый vless URL / новый ключ)">🔄 Обновить</button>
+          {% if o.is_primary or o.is_failover or o.is_ai or o.in_failover_chain %}
+            <span class="badge badge-dim" title="используется watchdog'ом — сначала убери из роли">🔒 активен</span>
+          {% else %}
+            <button class="btn btn-sm btn-danger" onclick="removeOutbound('{{ o.tag }}')">🗑 Удалить</button>
+          {% endif %}
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  </details>
+  {% endfor %}
+  <p class="subtitle" style="margin-top: 10px;">
+    <strong>⚪ Статус</strong> — нажми кнопку <strong>«🔄 Проверить статус»</strong> в шапке таблицы → дашборд через SSH запустит на роутере параллельный HTTPS-`curl` к host:port каждого outbound'а и покажет **TCP+TLS handshake** (как в Happ "via Proxy"): 🟢 быстро (&lt;300ms) · 🟡 норм (300-500) · 🟠 медленно (500-800) · 🔴 очень медленно (&gt;800) · <span style="background:#dfe8ff; color:#1a55cc; padding:1px 4px;">🔌 TCP</span> порт открыт (Reality без фолбэка — TLS не прошёл, но VPN работает) · ⛔ <strong style="background:#333; color:#fff; padding:1px 4px;">не отвечает</strong> (порт закрыт — сервер мёртв). Числа будут меньше чем в Happ примерно в 1.5-2 раза (Happ делает 3-5 RTT через VLESS-туннель + запрос на gstatic.com; мы 2 RTT до Reality-fallback'а), но порядки сходятся. Результат кэшируется 60 сек. Probe идёт **с роутера**, потому что XKeen перехватывает TCP-трафик с PC через redirect+tproxy и handshake завершается локально за ~1ms.
+    <strong>⚡ default</strong> — через какой outbound идёт основной трафик прямо сейчас (читается из watchdog.state).
+    <strong>🟢 primary</strong> — основной канал watchdog.
+    <strong>🟡 failover</strong> — первый резервный (watchdog переключится сюда при падении PRIMARY).
+    <strong>↩️ в цепочке резерва</strong> — каскадный резерв (watchdog возьмёт если первый failover тоже мёртв).
+    <strong>🤖 AI</strong> — sticky-канал для claude/openai независимо от default.
+    <strong>не задействован</strong> — доступен но никуда не маршрутизируется (свободный сервер).
+    Кнопка 🗑 появляется только у не-активных outbound'ов — нельзя удалить тот что используется в watchdog (иначе xray не стартанёт).
+  </p>
+</div>
+
+<!-- ===== ADD OUTBOUND ===== -->
+<details class="section-collapsible">
+<summary><h2 class="sec-add">➕ Добавить новый outbound <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— vless:// URL или JSON-конфиг</span></h2></summary>
+<div class="card">
+  <div class="form-row">
+    <label>vless:// URL или JSON-конфиг от провайдера</label>
+    <textarea id="payload" placeholder='vless://uuid@host:port?type=...&security=reality&...#tag
+
+ИЛИ полный xray-config JSON (с outbounds-секцией)'></textarea>
+  </div>
+  <div class="form-row">
+    <label>Tag (опционально — переопределить имя)</label>
+    <input type="text" id="tag" placeholder="оставь пустым → возьмётся из URL fragment (после #)"/>
+    <div style="font-size:0.82em; color:#666; margin-top:4px; padding:6px 8px; background:#f9f9f4; border-left:3px solid #ccc; border-radius:3px;">
+      <strong style="color:#a55a18;">⚠️ Менять нежелательно</strong> если хочешь, чтобы серверы одной подписки собирались в общую группу с красивым именем (например, «Provider A»).
+      Имя группы выводится из общего префикса tag'ов (до <code>-</code>): <code>provider-a-de1</code>, <code>provider-a-nl</code> → группа <strong>Provider A</strong>.
+      Если у одного tag префикс другой — группа всё равно соберётся <em>(по pbk Reality)</em>, но имя станет <code>Reality &lt;pbk&gt;…</code> вместо красивого.<br>
+      <strong>Менять полезно</strong>, если провайдер выдал безликие имена типа <code>#Germany</code> / <code>#USA</code> — тогда добавь префикс провайдера: <code>brava-de</code>, <code>brava-us</code>. Это и красиво, и защищает от collision с другим провайдером у которого тоже могут быть `#Germany`.
+    </div>
+  </div>
+  <div class="form-row">
+    <label>Примечание (опц.) — твоя заметка про этот outbound</label>
+    <input type="text" id="add-note" placeholder="например: купил в марте, истекает в августе"/>
+    <div style="font-size:0.82em; color:#888; margin-top:2px;">
+      После добавления можно отредактировать через ✏️ в таблице — там же есть поле Subscription URL (для dropdown «Сохранённый URL» в форме sync, если понадобится).
+    </div>
+  </div>
+  <div class="form-row">
+    <label><input type="checkbox" id="overwrite"/> Перезаписать если такой tag уже есть</label>
+  </div>
+  <button class="btn" onclick="addOutbound()">Добавить и применить</button>
+  <span class="subtitle" style="margin-left: 12px;">→ <code>scp + xkeen -restart</code> выполнится автоматически (~5 сек)</span>
+</div>
+
+<!-- ===== OUTBOUNDS ===== -->
+<!-- ===== SUBSCRIPTION SYNC ===== -->
+</details>
+
+<details class="section-collapsible">
+<summary><h2 class="sec-sync">📡 Обновить из подписки <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— provider sync</span></h2></summary>
+<div class="card">
+  <p class="subtitle" style="margin-top: 0;">
+    Если провайдер обновил параметры (UUID, ключи, host, порт) — введи URL подписки сюда,
+    дашборд скачает свежий список vless URLs и обновит существующие outbound'ы
+    <strong>по совпадению tag</strong> (имя после <code>#</code> в URL).
+    Опционально (через чекбоксы ниже): можно <strong>добавлять новые</strong> outbound'ы
+    из подписки или <strong>удалять отсутствующие</strong>.
+  </p>
+  <p class="subtitle" style="margin-top: 0;">
+    ⚠️ Не все провайдеры разрешают прямой fetch подписки — Provider A, например, требует Happ-клиент.
+    Для них работай через <code>Import-Provider ABatch.ps1</code> или ручную копию URL'ов.
+  </p>
+  {% if saved_sub_urls %}
+  <div style="margin-top: 6px; padding: 6px 10px; background:#f0f5f8; border-left: 3px solid #2a7; border-radius: 3px; font-size: 0.88em;">
+    <label style="color:#444;">💾 Сохранённый URL (из «✏️ Подписка» групп):
+      <select id="saved-sub-url-picker" onchange="fillSubUrl(this.value)" style="padding:4px; font-size:0.9em; min-width: 260px; margin-left: 4px;">
+        <option value="">— выбрать —</option>
+        {% for s in saved_sub_urls %}
+        <option value="{{ s.url }}" title="Подписка: {{ s.groups|join(', ') }}">{{ s.label }} → {{ s.groups|join(', ') }}</option>
+        {% endfor %}
+      </select>
+      <span class="subtitle" style="margin-left:6px; font-size:0.85em;">подставляет URL в поле ниже</span>
+    </label>
+  </div>
+  {% endif %}
+  <div style="margin-top: 10px;">
+    <input type="text" id="sub-url" placeholder="https://provider.com/sub/TOKEN"
+           style="width: 50%; padding: 7px; font-size: 0.9em; border: 1px solid #ccc; border-radius: 4px;">
+    <button class="btn btn-secondary" onclick="previewSubscription()">🔍 Предпросмотр</button>
+    <button class="btn" onclick="syncSubscription()">📥 Скачать и обновить</button>
+  </div>
+  <div style="margin-top: 10px; padding: 8px 12px; background: #f9f9f4; border-radius: 4px; font-size: 0.9em;">
+    <label style="display: block; margin-bottom: 4px; cursor: pointer;">
+      <input type="checkbox" id="sub-add-new" checked> ➕ <strong>Добавить новые</strong> outbound'ы которые есть в подписке но нет у тебя
+      <span class="subtitle" style="color:#888;">— безопасно, по умолчанию включено</span>
+    </label>
+    <label style="display: block; cursor: pointer; margin-bottom: 4px;">
+      <input type="checkbox" id="sub-remove-orphans"> 🗑 <strong>Удалить отсутствующие</strong> outbound'ы которые у тебя есть, но провайдер их убрал
+      <span class="subtitle" style="color:#a55;">— потенциально destructive, осознанная галка. Защита: активные в watchdog PRIMARY/FAILOVER/AI/цепочке НЕ удалятся</span>
+    </label>
+    <label style="display: block; cursor: pointer;">
+      <input type="checkbox" id="sub-update-expires" checked> 📅 <strong>Автоматически обновлять дату истечения</strong>
+      <span class="subtitle" style="color:#888;">— если провайдер шлёт <code>Subscription-Userinfo: expire=&lt;ts&gt;</code> header (Provider B умеет, Provider A нет). Если у группы уже была своя дата — будет предупреждение</span>
+    </label>
+  </div>
+  <div id="sub-preview" style="margin-top: 12px;"></div>
+  <p class="subtitle" style="margin-top: 8px; font-size: 0.85em;">
+    Matching по <strong>tag</strong> (текст после <code>#</code> в URL). Если в подписке
+    <code>...#provider-a-nl</code> — обновится outbound с tag=<code>provider-a-nl</code>.<br>
+    ⚠️ <strong>Имена должны совпадать!</strong> Provider A часто даёт <code>#Netherlands</code> а не <code>#provider-a-nl</code> —
+    тогда выгоднее использовать «🔄 Обновить» в таблице ниже на каждом outbound отдельно
+    (или <code>Import-Provider ABatch.ps1</code> с переименованием).<br>
+    💡 Жми «Предпросмотр» сначала — увидишь что найдено и что совпадёт.
+  </p>
+</div>
+
+</details>
+
+
+<!-- ===== БЭКАП / ВОССТАНОВЛЕНИЕ ===== -->
+<h2 class="sec-backup">💾 Бэкап и восстановление <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— все настройки XKeen одним файлом</span></h2>
+<div class="card">
+  <p class="subtitle" style="margin-top: 0;">
+    Сохраняет/восстанавливает <strong>ВСЕ настройки XKeen</strong> одним файлом — 16 конфигов:
+    <details style="display: inline; margin-left: 4px;">
+      <summary style="cursor: pointer; display: inline; color: #2a7;">список файлов</summary>
+      <div style="margin-top: 6px; padding: 8px; background: #f9f9f4; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.85em;">
+        Активные xray (01-06): <code>01_log.json</code> · <code>02_dns.json</code> · <code>03_inbounds.json</code> · <code>04_outbounds.json</code> · <code>05_routing.json</code> · <code>06_policy.json</code><br>
+        Шаблоны/legacy: <code>05_routing.template.json</code> · <code>05_routing.{primary,failover,original-balancer}.json</code> · <code>07_observatory.disabled.json</code><br>
+        Watchdog: <code>watchdog.sh</code> · <code>watchdog.config</code> · <code>watchdog.state</code><br>
+        Системное: <code>crontab</code> · <code>dropbear authorized_keys</code>
+      </div>
+    </details>
+    Используй перед экспериментами или для переезда на другой роутер.
+  </p>
+  <div style="margin-top: 12px;">
+    <button class="btn" onclick="saveSnapshotToDisk()">💾 Сохранить snapshot на диск</button>
+    <span class="subtitle" style="margin-left: 8px;">→ без диалога, в <code>C:\xray-dashboard\backups\xkeen-snapshot-manual-&lt;ts&gt;.json</code></span>
+  </div>
+  <div style="margin-top: 8px;">
+    <a href="/api/xkeen/backup" class="btn btn-secondary" download style="font-size:0.85em;">📥 Скачать в Downloads (с диалогом)</a>
+    <span class="subtitle" style="margin-left: 8px;">альтернативный путь — если хочешь сохранить вне стандартной папки бэкапов</span>
+  </div>
+  <div style="margin-top: 12px;">
+    <input type="file" id="restore-file" accept=".json" style="font-size: 0.9em;">
+    <button class="btn btn-warn" onclick="restoreSnapshot()">🔄 Восстановить из файла</button>
+    <span class="subtitle" style="margin-left: 8px;">⚠️ Перепишет конфиги. Предыдущие сохранятся как <code>*.bak-pre-restore-&lt;ts&gt;</code> на роутере.</span>
+  </div>
+
+  <!-- v1.7.25 — миграция через entware_backup.tar.gz -->
+  <div style="margin-top: 16px; padding: 10px 14px; background: #f0f7ff; border-left: 4px solid #4a7bbf; border-radius: 4px;">
+    <strong style="color:#2c5aa0;">🚚 Миграция XKeen на новый роутер</strong>
+    <p class="subtitle" style="margin: 6px 0;">
+      Полный архив <code>/opt/</code> с роутера (Entware + xkeen + xray + наш watchdog + GeoIP-базы + все конфиги) — для миграции через USB-флешку.
+      Когда Keenetic при базовой установке Entware видит <code>entware_backup.tar.gz</code> в папке <code>install/</code> на USB рядом с <code>mipsel-installer.tar.gz</code> — он автоматически распакует архив. Новый роутер получает идентичный setup за один шаг.
+    </p>
+    <button class="btn" style="background:#4a7bbf; color:#fff;" onclick="createMigrationBackup(this)">📦 Создать архив миграции</button>
+    <span class="subtitle" style="margin-left: 8px;">→ tar.gz (~50-100 МБ) в <code>C:\xray-dashboard\backups\entware_backup_&lt;ts&gt;.tar.gz</code>. На роутере ~30-60 сек + scp ~30 сек.</span>
+    <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin: 8px 0; font-size: 0.88em;">
+      💾 <strong>Требования к USB-флешке для миграции</strong>:
+      <ul style="margin: 4px 0 0 18px; padding: 0;">
+        <li><strong>Размер: минимум 4 ГБ, рекомендуется 8-16 ГБ.</strong> Хотя сам архив ~50-100 МБ, после распаковки на новом роутере вся Entware/xkeen/xray + GeoIP-базы + opkg-кэш будут жить НА этой флешке постоянно. С учётом будущих обновлений и логов 4 ГБ — впритык, 8-16 ГБ — комфортно.</li>
+        <li><strong>Тип</strong>: USB 2.0 работает (но медленно при обновлении GeoIP), USB 3.0 заметно быстрее. Для micro-SD через адаптер — Class A1/A2.</li>
+        <li><strong>Качество</strong>: SLC/MLC надёжнее для постоянной нагрузки (24/7 в роутере). Дешёвые TLC/QLC флешки изнашиваются за полгода-год.</li>
+        <li><strong>Файловая система</strong>: <strong>ext4</strong> (форматируется через MiniTool Partition Wizard на Windows-PC — стандартный exFAT/NTFS не подойдёт, Keenetic не сможет на них развернуть /opt).</li>
+        <li><strong>USB должна быть постоянно вставлена в роутер</strong> — на ней живёт <code>/opt/</code> со всеми бинарниками. Если вытащить — XKeen перестанет работать.</li>
+      </ul>
+    </div>
+    <details style="margin-top: 8px;">
+      <summary style="cursor: pointer; color: #2c5aa0; font-size: 0.9em; font-weight: 600;">📖 Что в архиве и как использовать для миграции</summary>
+      <div style="margin-top: 6px; font-size: 0.88em; line-height: 1.55;">
+        <p><strong>Что в архиве</strong> (точно как <code>tar czf /opt/entware_backup.tar.gz --exclude=... -C /opt .</code> из README XKeen):</p>
+        <ul>
+          <li>Entware (<code>/opt/sbin/</code>, <code>/opt/bin/</code>, <code>/opt/lib/</code>, <code>/opt/etc/</code>)</li>
+          <li>xkeen (<code>/opt/sbin/xkeen</code>, <code>/opt/sbin/.xkeen/</code>)</li>
+          <li>xray бинарь и конфиги (<code>/opt/etc/xray/</code>) — outbounds с твоей подпиской, watchdog, 05_routing.template.json</li>
+          <li>GeoIP-базы (<code>/opt/etc/xray/dat/</code>) — Loyalsoldier 18MB</li>
+          <li>XKeen-конфиги (<code>/opt/etc/xkeen/</code>) — порты, ip_exclude</li>
+          <li>Кэш opkg-пакетов</li>
+        </ul>
+        <p><strong>Как использовать для миграции на новый роутер</strong>:</p>
+        <ol>
+          <li>Создай этот архив кнопкой выше → файл в <code>C:\xray-dashboard\backups\</code></li>
+          <li>Подготовь USB-флешку (формат ext4 через MiniTool Partition Wizard или аналог)</li>
+          <li>Создай на USB папку <code>install/</code></li>
+          <li>В <code>install/</code> положи <strong>2 файла</strong>:
+            <ul>
+              <li><code>mipsel-installer.tar.gz</code> — стандартный Entware-инсталлятор от Corvus-Malus (взять из <a href="https://github.com/Corvus-Malus/XKeen" target="_blank">репо XKeen</a>)</li>
+              <li><code>entware_backup.tar.gz</code> — этот архив (переименуй из <code>entware_backup_YYYYMMDD-HHMMSS.tar.gz</code> просто в <code>entware_backup.tar.gz</code>)</li>
+            </ul>
+          </li>
+          <li>Вставь USB в новый Keenetic</li>
+          <li>В Web UI Keenetic → <strong>«Управление» → «Файлы» → выбери <code>mipsel-installer.tar.gz</code> на USB → «Установить компонент»</strong></li>
+          <li>Keenetic распакует Entware + автоматически развернёт <code>entware_backup.tar.gz</code> в <code>/opt/</code></li>
+          <li>После reboot — настрой <strong>политику XKeen</strong> в Keenetic Web UI (Шаг 8) + <strong>привяжи клиентов</strong> к политике через «Применение политик»</li>
+          <li>Подключи этот дашборд к новому роутеру (поменяй <code>KEENETIC_HOST</code> в <code>config_local.py</code>) → готово, все настройки на месте</li>
+        </ol>
+        <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin-top: 8px; font-size: 0.92em;">
+          ⚠ Архив содержит твою подписку (UUID/publicKey VLESS), SSH-ключ роутера и другие чувствительные данные. <strong>Не теряй флешку</strong>, не публикуй архив, форматируй USB после миграции.
+        </div>
+      </div>
+    </details>
+  </div>
+
+  <p class="subtitle" style="margin-top: 10px; font-size: 0.85em;">
+    💾 <strong>Автоматический ежедневный snapshot</strong> можно настроить через Task Scheduler — запуск
+    скрипта <code>xkeen_snapshot_daily.py</code> рядом с <code>dashboard.py</code>. Подробности в Помощи (раздел «💾 Бэкап и восстановление»).
+  </p>
+</div>
+
+<!-- ===== ИНФО О РОУТЕРЕ ===== -->
+<details style="margin-top: 20px;">
+  <summary style="cursor: pointer; color: #888; font-weight: 600;">📂 Что где лежит на роутере (для отладки)</summary>
+  <div class="card" style="margin-top: 8px;">
+    <table>
+      <tr><td><strong>SSH доступ</strong></td><td class="mono">ssh -p {{ keenetic_settings.current.port or 222 }} -i {{ keenetic_settings.current.ssh_key or 'C:\\Users\\<username>\\.ssh\\id_ed25519' }} root@{{ keenetic_settings.current.host or '192.168.1.1' }}</td></tr>
+      <tr><td><strong>xray конфиги</strong></td><td class="mono">/opt/etc/xray/configs/0{1..7}_*.json</td></tr>
+      <tr><td><strong>Routing шаблон</strong></td><td class="mono">/opt/etc/xray/configs.bak/05_routing.template.json — placeholder'ы <code>__DEFAULT_TAG__</code>, <code>__AI_RULE_BLOCK__</code>, <code>__DIRECT_RULE_BLOCK__</code> (v5)</td></tr>
+      <tr><td><strong>Watchdog config</strong></td><td class="mono">/opt/etc/xray/watchdog.config — PRIMARY_TAG, FAILOVER_TAGS, AI_TAG, AI_DOMAINS, AI_FAIL_BLOCK, DIRECT_DOMAINS, PRIMARY_PROBE_URL, FAIL/PASS_THRESHOLD, FORCE_MODE, TG_*</td></tr>
+      <tr><td><strong>Watchdog script</strong></td><td class="mono">/opt/etc/xray/watchdog.sh — v6 с каскадным failover, probe-of-PRIMARY (curl), AI kill-switch, md5-compare</td></tr>
+      <tr><td><strong>Watchdog state</strong></td><td class="mono">/opt/etc/xray/watchdog.state — формат: <code>&lt;state&gt; &lt;counter&gt; &lt;current_default_tag&gt;</code></td></tr>
+      <tr><td><strong>Watchdog log</strong></td><td class="mono">/opt/var/log/xray/watchdog.log — события переключений</td></tr>
+      <tr><td><strong>Cron daemon</strong></td><td class="mono">/opt/sbin/crond -L /dev/null</td></tr>
+      <tr><td><strong>Crontab</strong></td><td class="mono">/opt/etc/crontabs/root — управление через <code>crontab -l</code> / <code>crontab -e</code></td></tr>
+      <tr><td><strong>Cron-задачи</strong></td><td class="mono">*/1 * * * * /opt/etc/xray/watchdog.sh<br>00 17 * * * /opt/sbin/xkeen -ug</td></tr>
+      <tr><td><strong>Управление XKeen</strong></td><td class="mono">xkeen -restart / -start / -stop / -status / -ug</td></tr>
+      <tr><td><strong>Debug панели</strong></td><td class="mono">
+        <a href="/api/xkeen/debug" target="_blank">/api/xkeen/debug</a> — SSH-проверка + parsed targets + raw config<br>
+        <a href="/api/xkeen/state" target="_blank">/api/xkeen/state</a> — компактный JSON текущего состояния (outbounds, routing, watchdog, log)
+      </td></tr>
+    </table>
+    <p class="subtitle" style="margin-top: 10px;">
+      <strong>Watchdog v6 (2026-05-14)</strong>: запускается cron'ом каждую минуту, читает <code>watchdog.config</code>,
+      пингует PRIMARY через curl (PRIMARY_PROBE_URL, exit-codes 7/28 = down). При FAIL_THRESHOLD (default 2) fail подряд переключается
+      в failover (каскадно: первый живой из FAILOVER_TAGS). При PASS_THRESHOLD (default 3) pass подряд возвращается на PRIMARY.
+      Дополнительно: AI kill-switch (если AI_FAIL_BLOCK=1 и AI_TAG мёртв → AI-домены идут в <code>block</code>).
+      Генерит финальный <code>05_routing.json</code> из template'а через awk-подмену <code>__DEFAULT_TAG__</code> / <code>__AI_RULE_BLOCK__</code> / <code>__DIRECT_RULE_BLOCK__</code>;
+      запись только если md5 отличается. Все изменения через эту панель автоматически бэкапят оригиналы на роутере (<code>*.bak-&lt;timestamp&gt;</code>).
+    </p>
+  </div>
+</details>
+
+<!-- ====== Конфигурационные разделы (редко меняются — перенесены в конец) ====== -->
+<!-- ===== ПОДКЛЮЧЕНИЕ К РОУТЕРУ (runtime overrides) ===== -->
+<details class="section-collapsible" id="section-router-config" {% if is_first_run %}open{% endif %}>
+<summary><h2 class="sec-router">🔧 Подключение к роутеру <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— SSH-настройки, нужны при смене роутера или передаче панели другу</span></h2></summary>
+<div class="card">
+  <p class="subtitle" style="margin-top: 0;">
+    Эти настройки используются для SSH-доступа к Keenetic (чтение и запись XKeen-конфигов).
+    По умолчанию берутся из <code>config_local.py</code>, но любое поле можно <strong>переопределить отсюда</strong> —
+    значения сохранятся в <code>runtime_settings.json</code> и переживут обновление панели.
+    <br>Пустое поле = «использовать значение из config_local.py» (override сбрасывается).
+  </p>
+
+  <form id="keenetic-settings-form" onsubmit="return false;">
+    <div class="row" style="gap: 16px;">
+      <div class="col" style="flex: 1 1 220px;">
+        <label class="lbl">IP роутера или hostname</label>
+        <input type="text" name="host" value="{{ keenetic_settings.current.host or '' }}" placeholder="192.168.1.1" class="input-wide">
+        {% if not keenetic_settings.overridden.host %}<small class="muted">из config_local.py</small>{% else %}<small class="ovr">⚙ override</small>{% endif %}
+      </div>
+      <div class="col" style="flex: 0 0 130px;">
+        <label class="lbl">SSH-порт</label>
+        <input type="number" name="port" min="1" max="65535" value="{{ keenetic_settings.current.port or '' }}" placeholder="222" class="input-wide">
+        {% if not keenetic_settings.overridden.port %}<small class="muted">из config_local.py</small>{% else %}<small class="ovr">⚙ override</small>{% endif %}
+      </div>
+      <div class="col" style="flex: 0 0 150px;">
+        <label class="lbl">Пользователь</label>
+        <input type="text" name="user" value="{{ keenetic_settings.current.user or '' }}" placeholder="root" class="input-wide">
+        {% if not keenetic_settings.overridden.user %}<small class="muted">из config_local.py</small>{% else %}<small class="ovr">⚙ override</small>{% endif %}
+      </div>
+    </div>
+
+    <div style="margin-top: 12px;">
+      <label class="lbl">Путь к SSH-ключу (приватный ed25519 или rsa)</label>
+      <input type="text" name="ssh_key" value="{{ keenetic_settings.current.ssh_key or '' }}" placeholder="C:\Users\<username>\.ssh\id_ed25519" class="input-wide" style="width: 100%;">
+      <small class="muted">
+        Если кнопка «Проверить связь» вернёт <code>Permission denied</code> — на роутере в
+        <code>/opt/etc/dropbear/authorized_keys</code> должна лежать публичная часть ключа.
+        {% if not keenetic_settings.overridden.ssh_key %}<span class="muted"> · сейчас: из config_local.py</span>{% else %}<span class="ovr"> · ⚙ override</span>{% endif %}
+      </small>
+    </div>
+
+    <details style="margin-top: 14px;">
+      <summary style="cursor: pointer; font-weight: 600; color: #555;">⚙ Дополнительно — пути на роутере (обычно менять не нужно)</summary>
+      <div style="margin-top: 10px; padding: 10px; background: #fafafa; border-radius: 6px;">
+        <label class="lbl">Каталог конфигов xray</label>
+        <input type="text" name="xray_configs" value="{{ keenetic_settings.current.xray_configs or '' }}" placeholder="/opt/etc/xray/configs" class="input-wide" style="width: 100%;">
+
+        <label class="lbl" style="margin-top: 8px;">Каталог шаблонов routing (configs.bak)</label>
+        <input type="text" name="xray_bak_dir" value="{{ keenetic_settings.current.xray_bak_dir or '' }}" placeholder="/opt/etc/xray/configs.bak" class="input-wide" style="width: 100%;">
+
+        <label class="lbl" style="margin-top: 8px;">Файл состояния watchdog</label>
+        <input type="text" name="watchdog_state" value="{{ keenetic_settings.current.watchdog_state or '' }}" placeholder="/opt/etc/xray/watchdog.state" class="input-wide" style="width: 100%;">
+
+        <label class="lbl" style="margin-top: 8px;">Лог watchdog</label>
+        <input type="text" name="watchdog_log" value="{{ keenetic_settings.current.watchdog_log or '' }}" placeholder="/opt/var/log/xray/watchdog.log" class="input-wide" style="width: 100%;">
+      </div>
+    </details>
+
+    <div class="btn-row" style="margin-top: 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+      <button type="button" id="btn-test-keenetic" class="btn-primary" style="background:#444; color:#fff;">🔌 Проверить связь</button>
+      <button type="button" id="btn-save-keenetic" class="btn-primary" style="background:#2a7; color:#fff;">💾 Сохранить</button>
+      <button type="button" id="btn-reset-keenetic" class="btn-primary" style="background:#999; color:#fff;" title="Очистить runtime override — вернуться к значениям из config_local.py">↺ Сбросить override</button>
+      <span id="keenetic-settings-status" class="mono" style="margin-left: 10px; color: #666;"></span>
+    </div>
+
+    <div id="keenetic-test-result" style="margin-top: 12px;"></div>
+  </form>
+
+  <!-- ====== BOOTSTRAP CLEAN XKEEN ====== -->
+  <div style="margin-top: 22px; padding-top: 14px; border-top: 1px dashed #ccc;">
+    <h4 style="margin: 0 0 8px; color: #36a;">🚀 Развернуть на чистом XKeen</h4>
+    <p style="margin: 0 0 10px; font-size: 0.92em; color: #555; line-height: 1.5;">
+      Если на роутере уже стоит XKeen но он <strong>пустой</strong> (только что после <code>xkeen -i</code>) —
+      эта кнопка дольёт всё что нужно для управления через панель:
+      <strong>watchdog.sh</strong> + <strong>05_routing.template.json</strong> + <strong>watchdog.config</strong> (с дефолтами) +
+      <strong>cron-запись</strong> (раз в минуту) + директория логов + пустые meta-файлы.
+      <br>Перед тем как заливать — покажет план: что есть, что будет создано, что перезаписано.
+      Сами outbound'ы (<code>04_outbounds.json</code>) и текущий routing — <strong>не трогает</strong>.
+    </p>
+    <button type="button" id="btn-bootstrap-preview" class="btn-primary" style="background:#36a; color:#fff;">📋 Показать план развёртывания</button>
+    <span id="bootstrap-status" class="mono" style="margin-left: 10px; color: #666;"></span>
+  </div>
+
+  <!-- Modal-overlay для bootstrap preview/apply -->
+  <div id="bootstrap-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:9999; align-items:flex-start; justify-content:center; overflow-y:auto; padding:40px 20px;">
+    <div style="background:#fff; border-radius:8px; max-width:850px; width:100%; padding:24px; box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+      <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #eee; padding-bottom:12px; margin-bottom:16px;">
+        <h3 style="margin:0; color:#1f3d6b;">🚀 Развёртывание на чистом XKeen</h3>
+        <button type="button" id="btn-bootstrap-close" class="btn-primary" style="background:#aaa; color:#fff;">✕ Закрыть</button>
+      </div>
+
+      <div id="bootstrap-prechecks" style="margin-bottom:14px;"></div>
+      <div id="bootstrap-items"></div>
+      <div id="bootstrap-log" style="margin-top:14px;"></div>
+
+      <div style="margin-top:18px; padding-top:14px; border-top:1px solid #eee; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <label style="display:flex; align-items:center; gap:6px; font-size:0.9em; color:#7a5500;">
+          <input type="checkbox" id="bootstrap-overwrite"> Перезаписать существующие файлы (по умолчанию: только создавать недостающее)
+        </label>
+        <button type="button" id="btn-bootstrap-apply" class="btn-primary" style="background:#c63; color:#fff; margin-left:auto;">✅ Применить выбранное</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== HELP: как получить SSH-ключ и записать на роутер ====== -->
+  <details style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 14px;">
+    <summary style="cursor: pointer; font-weight: 700; color: #36a; font-size: 1.05em;">
+      ❓ Как получить SSH-ключ и записать его на роутер (пошагово)
+    </summary>
+    <div style="margin-top: 14px; line-height: 1.55;">
+
+      <p>Панель ходит на роутер по SSH <strong>по ключу</strong>, а не по паролю — так безопаснее и не нужно
+      хранить пароль в конфиге. Сделать это нужно один раз. Дальше — забыть.</p>
+
+      <details open style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">🪟 Шаг 1. Сгенерировать пару ключей на компьютере</summary>
+        <div style="margin-top: 8px;">
+          <p>Открой PowerShell и выполни (путь и комментарий можно поменять):</p>
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">ssh-keygen -t ed25519 -f C:\Users\<username>\.ssh\id_ed25519 -C "my-pc-$(Get-Date -Format yyyy-MM-dd)" -N '""'</pre>
+          <p>Что получится:</p>
+          <ul style="margin: 6px 0 6px 22px;">
+            <li><code>C:\Users\<username>\.ssh\id_ed25519</code> — <strong>приватный</strong> ключ (его адрес впиши в форму выше, в поле «Путь к SSH-ключу»). Никому не отдавать!</li>
+            <li><code>C:\Users\<username>\.ssh\id_ed25519.pub</code> — <strong>публичный</strong> ключ (одна строка, начинается с <code>ssh-ed25519 AAAA…</code>). Его надо положить на роутер.</li>
+          </ul>
+          <p class="muted">⚠ Если в имени файла каталоги ещё не существуют (<code>C:\Users\&lt;username&gt;\.ssh\</code>) — сначала создай папку: <code>mkdir C:\Users\&lt;username&gt;\.ssh</code>.</p>
+          <p class="muted">⚠ Windows-грабля: на приватный ключ должны быть restrictive ACL, иначе ssh будет ругаться <code>UNPROTECTED PRIVATE KEY FILE</code>. Лечится:
+          <pre style="background:#1e1e1e; color:#ddd; padding:8px 10px; border-radius:4px; font-size:0.82em; overflow-x:auto;">icacls C:\Users\<username>\.ssh\id_ed25519 /inheritance:r /grant:r "$($env:USERNAME):(R)"</pre>
+          </p>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">📋 Шаг 2. Скопировать публичную часть в буфер</summary>
+        <div style="margin-top: 8px;">
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">Get-Content C:\Users\<username>\.ssh\id_ed25519.pub | Set-Clipboard</pre>
+          <p>Теперь у тебя в буфере одна строка вида:
+          <code style="display:block; margin-top:4px; padding:6px 8px; background:#f0f0f0; border-radius:4px; font-size:0.85em; word-break:break-all;">ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI… my-pc-2026-05-17</code></p>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">🔑 Шаг 3. Зайти на роутер один раз по паролю и добавить ключ</summary>
+        <div style="margin-top: 8px;">
+          <p>Для первого захода нужен пароль admin-пользователя роутера (тот же что от web-морды).
+          В PowerShell:</p>
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_settings.current.port or 222 }}</pre>
+          <p>После ввода пароля попадёшь в shell роутера. Там выполни <strong>одной командой</strong>
+          (вместо <code>ssh-ed25519 AAAA…</code> вставь свою публичную часть из шага 2):</p>
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">mkdir -p /opt/etc/dropbear &amp;&amp; \
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI… my-pc-2026-05-17" \
+  &gt;&gt; /opt/etc/dropbear/authorized_keys &amp;&amp; \
+chmod 600 /opt/etc/dropbear/authorized_keys &amp;&amp; \
+chmod 700 /opt/etc/dropbear &amp;&amp; \
+echo OK</pre>
+          <p>Если вывелось <code>OK</code> — выйди (<code>exit</code>) и переходи к шагу 4.</p>
+          <p class="muted">💡 Почему именно <code>/opt/etc/dropbear/authorized_keys</code>? Keenetic использует
+          dropbear SSH-сервер из пакета Entware (OPKG), а не системный OpenSSH. Стандартный путь
+          <code>/root/.ssh/authorized_keys</code> на Keenetic не работает — dropbear туда не смотрит.</p>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #2a7; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f4d2c;">✅ Шаг 4. Проверить связь и сохранить</summary>
+        <div style="margin-top: 8px;">
+          <ol style="margin: 6px 0 6px 22px;">
+            <li>В форме выше впиши путь к <strong>приватному</strong> ключу (например <code>C:\Users\<username>\.ssh\id_ed25519</code>) в поле «Путь к SSH-ключу».</li>
+            <li>Заполни IP/порт/пользователя если они отличаются от значений по умолчанию.</li>
+            <li>Нажми <strong>«🔌 Проверить связь»</strong> — должно вывести информацию о роутере: <code>Linux … mips GNU/Linux</code>, версию XKeen и список конфигов.</li>
+            <li>Если всё хорошо — нажми <strong>«💾 Сохранить»</strong>. Настройки запишутся в <code>runtime_settings.json</code> и сразу применятся (рестарт панели не нужен).</li>
+          </ol>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #fff8e7; border-left: 4px solid #e80; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #7a5500;">🛠 Если SSH по паролю отключён на роутере</summary>
+        <div style="margin-top: 8px;">
+          <p>Тогда нужен альтернативный канал — выбери любой:</p>
+          <ul style="margin: 6px 0 6px 22px;">
+            <li><strong>Telnet</strong> на тот же IP, порт 23, логин <code>admin</code> + пароль admin'а. После входа:
+              <code>system configuration save</code> ничего не делает,
+              нужно через <code>opkg</code>-shell: набери <code>exec sh</code>, и оттуда уже та же команда из шага 3.</li>
+            <li><strong>Web-морда роутера</strong> (<a href="http://{{ keenetic_settings.current.host or '192.168.1.1' }}" target="_blank">http://{{ keenetic_settings.current.host or '192.168.1.1' }}</a>) → System → Components → убедись что включён OPKG + Dropbear, перезапусти OPKG. SSH-по-ключу обычно работает out-of-the-box, но если выключен — включи галку «Разрешить вход по SSH» в настройках OPKG.</li>
+            <li><strong>MobaXterm</strong> (Windows GUI SSH-клиент) — умеет принять самоподписанный host-key и работает там где встроенный PowerShell-ssh ругается.</li>
+            <li><strong>Физический ресет</strong> — крайняя мера. Кнопка Reset на 10+ секунд, потом полная переинициализация.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #f0f4f8; border-left: 4px solid #468; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3050;">📂 Альтернатива — использовать уже существующий ключ</summary>
+        <div style="margin-top: 8px;">
+          <p>Если у тебя уже есть SSH-ключ (например для GitHub или другого сервера) — можно использовать его же,
+          не генерируя новый. Просто впиши путь к приватной части в поле «Путь к SSH-ключу» и выполни <strong>только шаги 2–3</strong>
+          (добавить публичную часть на роутер).</p>
+          <p>Стандартные места где люди хранят ключи:</p>
+          <ul style="margin: 6px 0 6px 22px; font-family: Consolas, monospace; font-size: 0.85em;">
+            <li>C:\Users\<i>имя</i>\.ssh\id_ed25519</li>
+            <li>C:\Users\<i>имя</i>\.ssh\id_rsa</li>
+            <li>C:\Users\<username>\.ssh\id_ed25519 <span style="color:#888; font-family:sans-serif; font-size:0.95em;">(используется этой панелью по умолчанию)</span></li>
+          </ul>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #fde8e8; border-left: 4px solid #c33; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #6a1a1a;">🆘 Если «🔌 Проверить связь» возвращает Permission denied</summary>
+        <div style="margin-top: 8px;">
+          <ul style="margin: 6px 0 6px 22px;">
+            <li>Убедись что на роутер положена именно <strong>публичная</strong> часть (<code>.pub</code>), а не приватный ключ.</li>
+            <li>Проверь права: <code>ls -la /opt/etc/dropbear/authorized_keys</code> — должно быть <code>-rw-------</code> (600). Если нет — <code>chmod 600 /opt/etc/dropbear/authorized_keys</code>.</li>
+            <li>Проверь что путь к приватному ключу в форме указан правильно и файл существует.</li>
+            <li>Проверь права на приватный ключ (см. предупреждение в шаге 1 про <code>icacls</code>).</li>
+            <li>Зайди на роутер по паролю и посмотри лог: <code>logread | grep dropbear | tail -20</code> — там будет причина отказа.</li>
+          </ul>
+        </div>
+      </details>
+
+    </div>
+  </details>
+</div>
+</details>
+
+<!-- ===== УПРАВЛЕНИЕ XKEEN — status/restart/update buttons ===== -->
+<details class="section-collapsible">
+<summary><h2 class="sec-xkmgmt">🛠 Управление XKeen <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— status, restart, обновления xkeen-cli</span></h2></summary>
+<div class="card">
+  <p class="subtitle" style="margin-top: 0;">
+    Прямой доступ к <code>xkeen</code> CLI на роутере — раньше эти команды нужно было запускать руками через SSH.
+    Теперь — кнопка в UI. Output показывается ниже (последние 30-60 строк, обрезаны).
+  </p>
+
+  <div class="btn-row" style="display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0;">
+    <button type="button" class="btn-primary" style="background:#36a; color:#fff;" onclick="xkeenCmd('status')">📊 Статус XKeen</button>
+    <button type="button" class="btn-primary" style="background:#2a7; color:#fff;" onclick="xkeenCmd('restart')">▶️ Restart XKeen</button>
+    <button type="button" class="btn-primary" style="background:#74c; color:#fff;" title="Обновить xray-core до latest (включая pre-release)" onclick="xkeenCmd('update-xray')">🔄 Обновить Xray</button>
+    <button type="button" class="btn-primary" style="background:#74c; color:#fff;" title="Обновить geosite.dat и geoip.dat от v2fly community" onclick="xkeenCmd('update-geofile')">🌐 Обновить GeoFile</button>
+    <button type="button" class="btn-primary" style="background:#74c; color:#fff;" title="Обновить bash-обёртку xkeen до latest" onclick="xkeenCmd('update-xkeen')">🔄 Обновить XKeen</button>
+    <span id="xkmgmt-status" class="mono" style="margin-left: 10px; color: #666; align-self: center;"></span>
+  </div>
+  <p style="font-size: 0.85em; color: #888; margin: 0;">
+    Кнопки update-* запускают <code>xkeen -ux / -ug / -uk</code> через SSH с автоматическим выбором первой (latest) версии из списка релизов.
+    Для Xray это может быть pre-release (бета) — если хочешь именно stable, используй TTY-SSH с ручным выбором номера (см. пояснение ниже).
+  </p>
+
+  <details style="margin-top: 8px;">
+    <summary style="cursor: pointer; font-weight: 600; color: #555;">❓ Что делают эти команды и в чём разница между Xray и XKeen</summary>
+    <div style="margin: 10px 0 6px; font-size: 0.92em; line-height: 1.55;">
+
+      <h4 style="margin: 12px 0 6px;">Аналогия: Xray ≠ XKeen</h4>
+      <p>Это <strong>разные сущности</strong>, у каждой своя версия и свой релизный цикл:</p>
+      <table style="width:100%; max-width: 780px; border-collapse: collapse; font-size: 0.9em; margin: 6px 0;">
+        <thead><tr style="background:#f0f0f0;">
+          <th style="padding:6px 10px; text-align:left; border-bottom: 2px solid #ccc;"></th>
+          <th style="padding:6px 10px; text-align:left; border-bottom: 2px solid #ccc;">Xray</th>
+          <th style="padding:6px 10px; text-align:left; border-bottom: 2px solid #ccc;">XKeen</th>
+        </tr></thead>
+        <tbody>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:5px 10px;"><strong>Что это</strong></td><td style="padding:5px 10px;">Прокси-движок (Go-binary)</td><td style="padding:5px 10px;">Bash-обёртка / менеджер</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:5px 10px;"><strong>Делает</strong></td><td style="padding:5px 10px;">Реальную работу — обрабатывает VLESS/Reality/TLS, маршрутизирует трафик</td><td style="padding:5px 10px;">Управляет xray: ставит, обновляет, перезапускает, настраивает iptables</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:5px 10px;"><strong>Файл</strong></td><td style="padding:5px 10px;"><code>/opt/sbin/xray</code> (~33 MB)</td><td style="padding:5px 10px;"><code>/opt/sbin/xkeen</code> (~50 KB)</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:5px 10px;"><strong>Автор</strong></td><td style="padding:5px 10px;"><a href="https://github.com/XTLS/Xray-core" target="_blank">XTLS/Xray-core</a></td><td style="padding:5px 10px;">Skrill0 / jameszeroX (community)</td></tr>
+          <tr><td style="padding:5px 10px;"><strong>Версия</strong></td><td style="padding:5px 10px;">26.2.6 (latest stable: 26.3.27)</td><td style="padding:5px 10px;">отдельная от XKeen-проекта</td></tr>
+        </tbody>
+      </table>
+      <p style="margin: 10px 0; color: #666; font-size: 0.95em;">
+        💡 <strong>Аналогия:</strong> Xray — это <em>сам Chrome</em> (браузерный движок). XKeen — это <em>установщик и менеджер для него</em> (типа winget или Chocolatey). У них независимые версии и обновления.
+      </p>
+
+      <h4 style="margin: 14px 0 6px;">Команды xkeen-CLI</h4>
+      <ul style="margin: 6px 0 6px 22px;">
+        <li><strong>📊 Статус XKeen</strong> — <code>xkeen -status</code>. Показывает что запущено (xray, mihomo если есть), в каком режиме (Mixed/TPROXY).</li>
+        <li><strong>▶️ Restart XKeen</strong> — <code>xkeen -restart</code>. Перезапускает xray-процесс на роутере (~2 сек, разрыв соединений). Watchdog не трогает — он отдельный cron-job.</li>
+        <li><strong>🔄 Обновить Xray</strong> — <code>xkeen -ux</code>. Обновляет <strong>прокси-движок</strong> (новые фичи xray, баг-фиксы VLESS/Reality, perf). Релиз раз в 1-3 месяца. Долго (1-2 мин).</li>
+        <li><strong>🌐 Обновить GeoFile</strong> — <code>xkeen -ug</code>. Обновляет <strong>списки доменов</strong>: <code>geosite.dat</code> + <code>geoip.dat</code> от <a href="https://github.com/v2fly/domain-list-community" target="_blank">v2fly community</a>. Релиз раз в 1-2 недели — туда добавляют новые AI/реклама/трекеры.</li>
+        <li><strong>🔄 Обновить XKeen</strong> — <code>xkeen -uk</code>. Обновляет <strong>сам менеджер</strong> (bash-скрипт). Редко (~раз в полгода).</li>
+      </ul>
+
+      <h4 style="margin: 14px 0 6px;">Что чаще нужно обновлять?</h4>
+      <table style="width:100%; max-width: 780px; border-collapse: collapse; font-size: 0.9em;">
+        <thead><tr style="background:#f0f0f0;">
+          <th style="padding:6px 10px; text-align:left; border-bottom: 2px solid #ccc;">Что</th>
+          <th style="padding:6px 10px; text-align:left; border-bottom: 2px solid #ccc;">Частота</th>
+          <th style="padding:6px 10px; text-align:left; border-bottom: 2px solid #ccc;">Польза / Риск</th>
+        </tr></thead>
+        <tbody>
+          <tr style="background:#e8f5e8; border-bottom:1px solid #eee;"><td style="padding:5px 10px;">🌐 GeoFile</td><td style="padding:5px 10px;">Раз в 1-2 недели</td><td style="padding:5px 10px;">✅ <strong>Самое полезное.</strong> Свежие списки доменов (новые AI-сайты, реклама, трекеры). Минимальный риск — только списки, не бинарь.</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:5px 10px;">🔄 Xray</td><td style="padding:5px 10px;">Раз в 1-3 месяца</td><td style="padding:5px 10px;">⚠️ Реже. Баг-фиксы и новые фичи xray. Если стабильно работает — «работает = не трогай».</td></tr>
+          <tr><td style="padding:5px 10px;">🔄 XKeen</td><td style="padding:5px 10px;">Раз в полгода</td><td style="padding:5px 10px;">⚪ Редко нужно. Обновляет сам bash-менеджер. Только если что-то в командах xkeen-CLI поломалось.</td></tr>
+        </tbody>
+      </table>
+
+      <p style="margin: 10px 0; color: #666; font-size: 0.92em;">
+        💡 <strong>Если решил что-то обновить — начни с GeoFile</strong>. Минимальный риск, максимальная польза. Команды update-* интерактивные — нажми кнопку, появится готовая SSH-команда для запуска в терминале.
+      </p>
+
+    </div>
+  </details>
+
+  <div id="xkmgmt-output-box" style="margin-top: 14px; display: none;">
+    <h4 style="margin: 0 0 6px;">Output (последний run):</h4>
+    <pre id="xkmgmt-output" style="background:#1e1e1e; color:#ddd; padding:12px 14px; border-radius:6px; font-size:0.82em; max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; margin: 0;"></pre>
+  </div>
+
+  <!-- ====== ГДЕ ПРИМЕНЯЮТСЯ GEOFILE-БАЗЫ ====== -->
+  <details id="dat-categories-section" open style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 14px;">
+    <summary style="cursor: pointer; font-weight: 700; color: #2e7d32; font-size: 1.05em;">
+      📍 Где применяются GeoFile-базы (категории geosite/geoip в твоих правилах)
+    </summary>
+    <div style="margin-top: 14px; line-height: 1.55;">
+      <p style="margin: 0 0 8px;">GeoFile — это базы доменов и IP в файлах <code>/opt/etc/xray/dat/*.dat</code> от community-проекта <a href="https://github.com/v2fly/domain-list-community/tree/master/data" target="_blank">v2fly</a>. Они <strong>не применяются автоматически</strong> — Xray использует их только если в правиле есть ссылка <code>ext:geosite_v2fly.dat:&lt;категория&gt;</code>.</p>
+      <p style="margin: 0 0 10px;">Кнопка ниже покажет — какие категории у тебя <strong>сейчас задействованы</strong> в <code>05_routing.json</code>, в какое правило и куда направляется трафик (BLOCK / DIRECT / VPN-канал):</p>
+      <button type="button" class="btn-primary" style="background:#2e7d32; color:#fff; margin: 8px 0;" onclick="scanDatCategories()">🩻 Просканировать — где применяются GeoFile-базы</button>
+      <div id="dat-categories-output" style="margin-top: 12px;"></div>
+    </div>
+  </details>
+</div>
+</details>
+
+<!-- ===== 🚨 АЛЕРТЫ при падении xray (v1.7.19-v1.7.21) ===== -->
+<details class="section-collapsible">
+<summary><h2 class="sec-xkmgmt">🚨 Алерты при падении xray <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— индикатор в шапке + browser-алерты + Windows toast</span></h2></summary>
+<div class="card">
+  <p class="subtitle" style="margin-top: 0;">
+    Дашборд раз в минуту опрашивает <code>xkeen -status</code> на роутере и отображает состояние xray в шапке. При падении xray срабатывают визуальные и звуковые алерты — разные сценарии в зависимости от того где ты в этот момент.
+  </p>
+
+  <h4 style="margin-top: 16px;">🟢 Индикатор xray-status в шапке (v1.7.19)</h4>
+  <p>В верхней панели рядом с <code>v{{ dashboard_version }}</code> и <code>✓ панель здорова</code> появляется индикатор xray:</p>
+  <table style="border-collapse: collapse; margin: 8px 0; width: 100%; font-size: 0.92em;">
+    <thead><tr style="background:#f0f0f0;">
+      <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left;">Цвет</th>
+      <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left;">Состояние</th>
+      <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left;">Значение</th>
+    </tr></thead>
+    <tbody>
+      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟢 зелёный</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>ok</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray в TPROXY-режиме, error.log чистый — оптимально</td></tr>
+      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟡 жёлтый</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>warn</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray в Mixed/Redirect режиме — рабочий, но не оптимальный. VPN работает.</td></tr>
+      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟠 оранжевый (мигает)</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>error</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray запущен, но в error.log есть <code>failed to load</code> / <code>cannot find</code> / <code>panic</code> / <code>fatal</code> — что-то поломалось в конфиге.</td></tr>
+      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🔴 красный (мигает)</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>stopped</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray НЕ запущен — VPN не работает совсем.</td></tr>
+      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">⚪ серый</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>unreachable</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">SSH-таймаут к роутеру — сам роутер недоступен (нет связи).</td></tr>
+    </tbody>
+  </table>
+  <p>Hover на бейдж → tooltip с деталями (PRIMARY-tag, режим, последние строки error.log). Click → скролл к секции «🛠 Управление XKeen» где ручной restart/status.</p>
+  <p class="subtitle" style="font-size: 0.88em;">Endpoint: <code>GET /api/xkeen/header-status</code> — кэш 30s на сервере, polling с фронта 60s. На N открытых вкладках всё равно 1 SSH/минуту на роутер. На <code>/xkeen</code> страницу нагрузка ~0 (раз в минуту).</p>
+
+  <h4 style="margin-top: 18px;">🔔 Browser-алерты когда дашборд открыт (v1.7.19-1.7.20)</h4>
+  <p>При <strong>переходе</strong> состояния из <code>ok</code>/<code>warn</code> в <code>error</code>/<code>stopped</code> — три сигнала одновременно:</p>
+  <ul>
+    <li><strong>🔊 Beep</strong> через Web Audio API (2 коротких писка 880Hz + 1100Hz по 200ms). Работает только если ты <strong>уже кликал по странице</strong> хотя бы раз (browser autoplay policy блокирует AudioContext до первого user-interaction).</li>
+    <li><strong>📛 Title-мигание</strong>: каждые 800ms <code>document.title</code> переключается между «🔴 xray НЕ запущен» и оригиналом. Видно если ты в другой вкладке.</li>
+    <li><strong>🎨 Favicon-swap</strong>: favicon страницы меняется на иконку с красной кляксой и восклицательным знаком в углу. Видно даже в <strong>закреплённой (pinned) вкладке Chrome</strong> где title скрыт.</li>
+  </ul>
+  <p>При остающемся плохом состоянии — beep <strong>повторяется каждые 3 минуты</strong> (не спам). При восстановлении в <code>ok</code>/<code>warn</code> — все алерты снимаются.</p>
+
+  <h4 style="margin-top: 18px;">🍞 Windows Toast когда дашборд закрыт (v1.7.21)</h4>
+  <p>Browser-алерты работают только если <strong>вкладка дашборда открыта</strong> в браузере. Если ты закрыл вкладку или браузер вообще — JS не выполняется, никаких алертов. Для таких случаев — отдельный daemon-скрипт <code>xkeen_toast_daemon.py</code>:</p>
+  <ul>
+    <li>Бежит в фоне как Task Scheduler-задача <code>XrayToastAlerts</code> под твоим юзером (<code>/IT</code> = interactive — Windows toast виден только из interactive-сессии, поэтому НЕ под SYSTEM)</li>
+    <li>Раз в 60 сек HTTP GET <code>/api/xkeen/header-status</code> на локальный дашборд (cookie-auth через PASSWORD из <code>config_local.py</code>)</li>
+    <li>При падении xray → Windows toast «🔴 Xray упал!» в правом нижнем углу</li>
+    <li>Повтор каждые 10 минут пока xray валяется</li>
+    <li>При восстановлении → toast «✅ Xray восстановлен» один раз</li>
+    <li>Single-instance lock (PID-файл) — не запускается дважды</li>
+  </ul>
+
+  <p><strong>Как включить</strong> (один раз):</p>
+  <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">cd C:\xray-dashboard
+.\install_toast_alerts.bat   # двойной клик из проводника
+# UAC спросит «Да» → авто-elevate → создаст Task Scheduler-задачу
+# Затем запустит daemon сразу → проверь xkeen_toast_daemon.log</pre>
+
+  <p><strong>Управление daemon'ом</strong>:</p>
+  <table style="border-collapse: collapse; margin: 8px 0; font-size: 0.88em;">
+    <tr><td style="border:1px solid #ccc; padding: 4px 8px;"><code>schtasks /Run /TN XrayToastAlerts</code></td><td style="border:1px solid #ccc; padding: 4px 8px;">Запустить сейчас</td></tr>
+    <tr><td style="border:1px solid #ccc; padding: 4px 8px;"><code>schtasks /End /TN XrayToastAlerts</code></td><td style="border:1px solid #ccc; padding: 4px 8px;">Остановить</td></tr>
+    <tr><td style="border:1px solid #ccc; padding: 4px 8px;"><code>.\uninstall_toast_alerts.bat</code></td><td style="border:1px solid #ccc; padding: 4px 8px;">Удалить задачу полностью</td></tr>
+    <tr><td style="border:1px solid #ccc; padding: 4px 8px;"><code>type xkeen_toast_daemon.log</code></td><td style="border:1px solid #ccc; padding: 4px 8px;">Прочитать лог daemon</td></tr>
+  </table>
+
+  <p><strong>Не используется Telegram-алерт</strong> для падения xray — потому что Telegram-бот шлёт через локальный SOCKS5 (<code>127.0.0.1:10808</code>) который идёт через xray. Если xray упал — Telegram-алерт не уйдёт по определению. Поэтому только Windows toast (локальный, не зависит от VPN).</p>
+
+  <div style="background:#eefbe5; border-left: 4px solid #2a7; padding: 8px 12px; margin: 12px 0; font-size: 0.92em;">
+    💡 <strong>Тест что toast реально работает</strong>: временно положи xray на роутере → подожди ~90 сек (60s polling + 30s server-cache) → должен прийти toast «🔴 Xray упал!». Потом подними обратно — через минуту придёт «✅ Xray восстановлен».
+    <pre style="background:#1e1e1e; color:#ddd; padding:6px 10px; border-radius:3px; font-size:0.82em; overflow-x:auto; margin-top:6px;">ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_settings.current.port or 222 }} "xkeen -stop"
+# жди toast, потом:
+ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_settings.current.port or 222 }} "xkeen -start"</pre>
+  </div>
+</div>
+</details>
+
+
+<!-- ===== 🚑 RESCUE / RECOVERY / AUTO-REPAIR (v1.5.1) ===== -->
+<details class="section-collapsible">
+<summary><h2 class="sec-rescue">🚑 Восстановление и диагностика <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— если xkeen не запускается / что-то сломалось</span></h2></summary>
+<div class="card">
+  <p class="subtitle" style="margin-top: 0;">
+    <strong>Единая точка</strong> для починки и диагностики. Если xkeen не запускается, что-то странно работает или хочется проверить состояние конфигов на роутере — сначала <strong>сюда</strong>.
+  </p>
+
+  <div style="background:#fff3cd; border-left: 4px solid #f0c200; padding:10px 14px; margin: 10px 0; font-size:0.92em;">
+    💡 <strong>Сначала бэкап</strong>: если есть свежий бэкап в «💾 Бэкап и восстановление» — большинство проблем решается за 5 сек через «🔄 Восстановить из файла». Эта секция — на случай если бэкапа нет или не помогает.
+  </div>
+
+  <div style="margin: 12px 0;">
+    <button id="btn-diagnose" type="button" class="btn-primary" style="background:#c33; color:#fff;">🔬 Диагностика XKeen</button>
+    <span style="margin-left: 8px; font-size: 0.85em; color: #888;">Запустит 8 проверок состояния (xray binary, configs, watchdog.config, cron, ...) и предложит auto-fix для каждой найденной проблемы.</span>
+  </div>
+
+  <div id="diagnose-output" style="margin-top: 12px;"></div>
+
+  <details style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 14px;">
+    <summary style="cursor: pointer; font-weight: 600; color: #6a1a1a; font-size: 0.95em;">📚 Что проверяет «Диагностика» и какие auto-fix доступны</summary>
+    <div style="margin-top: 10px; font-size: 0.9em; line-height: 1.55;">
+      <table style="width: 100%; border-collapse: collapse; font-size: 0.92em;">
+        <thead><tr style="background: #f5f5f5;">
+          <th style="padding: 6px 10px; text-align: left; border-bottom: 1px solid #ccc;">Проверка</th>
+          <th style="padding: 6px 10px; text-align: left; border-bottom: 1px solid #ccc;">Когда не проходит — что значит и как чинится</th>
+        </tr></thead>
+        <tbody>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>xray binary</code></td><td style="padding: 5px 10px;">Бинарь /opt/sbin/xray даёт SIGSEGV (Go runtime crash) — обычно <strong>неправильная архитектура</strong> (mips32 BE вместо mips32le на MT7621). Auto-fix НЕТ — нужно вручную скачать <code>Xray-linux-mips32le.zip</code> с XTLS/Xray-core releases (см. Help-секция).</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>xkeen запущен</code></td><td style="padding: 5px 10px;">xray-процесс не запущен. Auto-fix: <strong>🔄 Запустить xkeen</strong> (xkeen -restart). Если после рестарта снова «не запущен» — проблема в конфигах, проверяй следующие пункты.</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>configs валидны</code></td><td style="padding: 5px 10px;"><code>xray test</code> показывает ошибки. Самая частая — <strong>пустой outboundTag</strong> в routing.json или ссылка на несуществующий outbound. Auto-fix: <strong>🔧 Перегенерить routing</strong> (через watchdog.sh из template).</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>PRIMARY_TAG</code></td><td style="padding: 5px 10px;">В <code>watchdog.config</code> поле <code>PRIMARY_TAG=""</code> (пустое). Watchdog не может построить routing → xray валится. Auto-fix: <strong>🔧 PRIMARY = direct</strong> (трафик через провайдера, безопасный default).</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>direct + block</code></td><td style="padding: 5px 10px;">В <code>04_outbounds.json</code> отсутствуют outbound'ы с <code>tag=direct</code> или <code>tag=block</code>. Без них не работает «🌐 Напрямую» и BLOCK-список. Auto-fix: <strong>🔧 Добавить direct + block</strong> (existing outbound'ы из подписки сохраняются).</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>routing.json валиден</code></td><td style="padding: 5px 10px;"><code>05_routing.json</code> содержит синтаксическую ошибку JSON (trailing comma, битый escape, etc). Auto-fix: <strong>🔧 Перегенерить routing</strong>. После v9 watchdog сам не записывает битый JSON (см. v1.5.0 changelog), но если файл уже битый — нужна перегенерация.</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>cron watchdog</code></td><td style="padding: 5px 10px;">Cron-задача для watchdog отсутствует — failover при падении канала не сработает. Auto-fix: <strong>🔧 Добавить cron</strong> (запись <code>*/1 * * * * /opt/etc/xray/watchdog.sh</code>).</td></tr>
+          <tr><td style="padding: 5px 10px; vertical-align: top;"><code>watchdog log без ошибок</code></td><td style="padding: 5px 10px;">В <code>/opt/var/log/xray/watchdog.log</code> свежие WARN/ERROR. Auto-fix НЕТ — нужно посмотреть детали в раскрытой проверке. Может быть нормально (временная недоступность канала).</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+
+  <details style="margin-top: 14px;">
+    <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.92em;">🆘 Если auto-fix не помог</summary>
+    <div style="margin-top: 8px; font-size: 0.9em; line-height: 1.55;">
+      <ol style="margin: 0 0 0 22px; padding: 0;">
+        <li><strong>«💾 Бэкап и восстановление» → «🔄 Восстановить из файла»</strong> — самый надёжный способ. Возврат к последнему сохранённому рабочему состоянию.</li>
+        <li><strong>«🔧 Подключение к роутеру» → «🚀 Развернуть на чистом XKeen»</strong> + галочка «Перезаписать существующие файлы» — пересоздаст конфиги XKeen из шаблонов. Outbound'ы из подписки сохранятся (v1.4.7+ защита).</li>
+        <li><strong>Если ничего не помогает</strong> — SSH в роутер (порт 222, root) и <code>xkeen -start 2>&amp;1 | tail -30</code>. Скопируй вывод и пиши в issue на GitHub.</li>
+      </ol>
+    </div>
+  </details>
+</div>
+</details>
+
+<!-- ===== TELEGRAM-БОТ ДЛЯ АЛЕРТОВ ===== -->
+<details class="section-collapsible">
+<summary><h2 class="sec-tg">🤖 Telegram-бот для алертов <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— уведомления о переключениях watchdog и падениях каналов</span></h2></summary>
+<div class="card">
+  <p class="subtitle" style="margin-top: 0;">
+    Watchdog шлёт в Telegram сообщения о важных событиях: переключение PRIMARY↔FAILOVER,
+    активация/снятие AI/YT kill-switch, падение каналов, полный отказ. Если ничего не задать —
+    алерты просто не идут (watchdog работает обычным режимом). Подходит <strong>любой</strong>
+    Telegram-бот: создай нового в <a href="https://t.me/BotFather" target="_blank">@BotFather</a> или
+    укажи существующего. Хранится на роутере в <code>/opt/etc/xray/watchdog.config</code>
+    (НЕ в файлах панели — при передаче её другу токен не утечёт).
+  </p>
+
+  <form id="tg-settings-form" onsubmit="return false;">
+    <div class="row" style="gap: 16px;">
+      <div class="col" style="flex: 2 1 380px;">
+        <label class="lbl">Bot Token <span class="muted" style="font-weight:400;">— <code>123456789:AAH...</code></span></label>
+        <div style="display: flex; gap: 6px; align-items: center;">
+          <input type="password" name="token" id="tg-token" autocomplete="off" placeholder="123456789:AAHXXXXXXXXXXXXXXXXXXXX_XXXXXXXX" class="input-wide" style="flex: 1;">
+          <button type="button" id="btn-tg-toggle" class="btn-primary" style="background:#aaa; color:#fff;" title="Показать/скрыть токен">👁</button>
+        </div>
+      </div>
+      <div class="col" style="flex: 1 1 200px;">
+        <label class="lbl">Chat ID <span class="muted" style="font-weight:400;">— число или @username</span></label>
+        <input type="text" name="chat_id" id="tg-chat-id" autocomplete="off" placeholder="123456789" class="input-wide" style="width: 100%;">
+      </div>
+    </div>
+
+    <div class="btn-row" style="margin-top: 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+      <button type="button" id="btn-tg-save" class="btn-primary" style="background:#2a7; color:#fff;">💾 Сохранить</button>
+      <button type="button" id="btn-tg-test" class="btn-primary" style="background:#29b; color:#fff;">📨 Отправить тестовое сообщение</button>
+      <button type="button" id="btn-tg-clear" class="btn-primary" style="background:#999; color:#fff;" title="Очистить TG_BOT_TOKEN и TG_CHAT_ID — алерты перестанут отправляться">✖ Очистить (отключить)</button>
+      <span id="tg-settings-status" class="mono" style="margin-left: 10px; color: #666;"></span>
+    </div>
+
+    <div id="tg-test-result" style="margin-top: 12px;"></div>
+  </form>
+
+  <!-- Help: как получить токен и chat_id -->
+  <details style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 14px;">
+    <summary style="cursor: pointer; font-weight: 700; color: #29b; font-size: 1.05em;">
+      ❓ Где взять Bot Token и Chat ID (пошагово)
+    </summary>
+    <div style="margin-top: 14px; line-height: 1.55;">
+
+      <details open style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #29b; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #15506b;">🤖 Шаг 1. Создать (или взять существующего) Telegram-бота</summary>
+        <div style="margin-top: 8px;">
+          <p>В Telegram найди <a href="https://t.me/BotFather" target="_blank"><strong>@BotFather</strong></a> (официальный бот для создания ботов) и напиши ему:</p>
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em;">/newbot</pre>
+          <p>Он спросит:</p>
+          <ol>
+            <li><strong>Имя бота</strong> (display name, можно русский, например «Мои алерты XKeen»)</li>
+            <li><strong>Username бота</strong> — должен заканчиваться на <code>_bot</code>, например <code>my_xkeen_alerts_bot</code>. Должен быть уникальным.</li>
+          </ol>
+          <p>BotFather пришлёт ответ с токеном вида:</p>
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">Done! Congratulations on your new bot. ...
+Use this token to access the HTTP API:
+<strong style="color:#ffd700;">123456789:AAHfXXXXXXXXXXXXXXXXXXXXXXXXXXXX</strong></pre>
+          <p>Скопируй эту строку — это и есть твой <strong>Bot Token</strong>. Вставь в поле выше.</p>
+          <p class="muted">💡 Если у тебя уже есть бот — открой переписку с @BotFather, напиши <code>/mybots</code> → выбери бота → API Token.</p>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #29b; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #15506b;">💬 Шаг 2. Узнать свой Chat ID</summary>
+        <div style="margin-top: 8px;">
+          <p>Chat ID — это куда бот будет слать сообщения. Чаще всего — твой личный chat с ботом.</p>
+          <p><strong>Способ A — через того же бота:</strong></p>
+          <ol>
+            <li>Найди своего нового бота в Telegram (по username, например <code>@my_xkeen_alerts_bot</code>)</li>
+            <li>Напиши ему <code>/start</code> (любое сообщение)</li>
+            <li>Открой в браузере URL (вставив свой токен вместо <code>YOUR_TOKEN</code>):
+              <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">https://api.telegram.org/botYOUR_TOKEN/getUpdates</pre>
+            </li>
+            <li>В ответе ищи поле <code>"chat":{"id": <strong>123456789</strong>, ...}</code> — это и есть твой Chat ID.</li>
+          </ol>
+          <p><strong>Способ B — через @userinfobot:</strong> найди в Telegram <a href="https://t.me/userinfobot" target="_blank">@userinfobot</a>, напиши <code>/start</code> — он сразу пришлёт твой ID.</p>
+          <p class="muted">💡 Для приватного чата ID — положительное число. Для группы — отрицательное (типа <code>-1001234567890</code>). Можно вместо ID указать <code>@username</code> канала (если бот туда admin).</p>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #2a7; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f4d2c;">✅ Шаг 3. Проверить и сохранить</summary>
+        <div style="margin-top: 8px;">
+          <ol>
+            <li>Вставь Bot Token и Chat ID в форму выше.</li>
+            <li>Нажми <strong>«📨 Отправить тестовое сообщение»</strong> — придёт в Telegram сообщение «🧪 Тестовое сообщение от xray-dashboard …». Если пришло — всё ок.</li>
+            <li>Нажми <strong>«💾 Сохранить»</strong>. Watchdog подхватит новые настройки на следующем тике (в течение минуты).</li>
+          </ol>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #fde8e8; border-left: 4px solid #c33; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #6a1a1a;">🆘 Если тест не доходит</summary>
+        <div style="margin-top: 8px;">
+          <ul>
+            <li><strong>chat not found</strong> — ты не написал боту <code>/start</code>. Сначала напиши, потом тестируй.</li>
+            <li><strong>Unauthorized</strong> — токен неверный или бот удалён в BotFather.</li>
+            <li><strong>bot was blocked</strong> — ты заблокировал бота в Telegram. Разблокируй и напиши /start.</li>
+            <li><strong>Timeout / connection refused</strong> — роутер не может выйти на <code>api.telegram.org</code>. Проверь, что PRIMARY/FAILOVER канал работает (раздел ниже).</li>
+          </ul>
+        </div>
+      </details>
+
+    </div>
+  </details>
+</div>
+</details>
+
+
+<!-- ===== РАЗДЕЛ «ПОМОЩЬ» — длинная документация для будущей памяти ===== -->
+<details class="section-collapsible">
+<summary><h2 class="sec-help">❓ Помощь <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— как тут всё устроено и работает</span></h2></summary>
+<div class="card">
+  <p class="subtitle" style="margin-top: 0;">
+    Подробное описание всего что есть в этой панели + примеры use-case'ов в конце.
+    Ничего не запоминать — вернись сюда когда забудешь как что работает.
+    Подразделы свёрнуты — открой нужный.
+  </p>
+
+  <details class="help-section">
+    <summary>🪟 Что это и зачем</summary>
+    <div class="help-body">
+      <p><strong>Эта панель — для управления XKeen (xray-клиентом на роутере Keenetic) с Windows-PC через SSH.</strong>
+      Альтернатива ручному редактированию JSON-конфигов на роутере через SSH/Notepad.</p>
+
+      <h4>Где работает</h4>
+      <ul>
+        <li>✅ <strong>Windows 10/11</strong> + Python 3.10+ (через venv, ставится автоматически install.bat)</li>
+        <li>✅ Любой роутер <strong>Keenetic</strong> с установленным XKeen (OPKG-пакет)</li>
+        <li>⚠️ На Linux/macOS теоретически запустится (это Flask), но не тестировалось — установочные <code>.bat</code> скрипты заточены под Windows</li>
+      </ul>
+
+      <h4>Какие задачи решает</h4>
+      <ul>
+        <li><strong>Подписки VPN</strong>: добавить subscription URL (любой VLESS-совместимый провайдер) — панель скачивает список серверов с провайдера, выкладывает их как outbounds на роутер. Группировка по подписке, дата истечения с цветной шкалой, ручное обновление кнопкой.</li>
+        <li><strong>Outbounds</strong>: видеть, добавлять, удалять, переименовывать VPN-каналы (читает/пишет <code>04_outbounds.json</code> на роутере). Bulk-удаление через чекбоксы.</li>
+        <li><strong>Routing</strong>: куда какой трафик идёт — PRIMARY / FAILOVER / AI-sticky / YouTube-sticky / DIRECT / BLOCK</li>
+        <li><strong>Watchdog</strong>: автоматический failover между каналами каждую минуту</li>
+        <li><strong>Списки доменов</strong>: VK / Mail.ru / Yandex / банки (DIRECT), Windows Update / Adobe / телеметрия (BLOCK)</li>
+        <li><strong>Бэкап</strong>: snapshot всех XKeen-настроек одним JSON, восстановление на новый роутер за один клик</li>
+        <li><strong>Telegram-алерты</strong>: при падении канала</li>
+        <li><strong>Bootstrap</strong>: разворачивание на чистом XKeen (свежий <code>xkeen -i</code>) одной кнопкой</li>
+      </ul>
+    </div>
+  </details>
+
+  <details class="help-section">
+    <summary>📜 Скрипты управления (.bat / .ps1) — кто что делает</summary>
+    <div class="help-body">
+      <p>В корне <code>C:\xray-dashboard\</code> лежит около 10 batch-скриптов. Вот таблица что каждый делает и когда использовать:</p>
+
+      <h4 style="margin-top: 12px;">🚀 Установка и запуск</h4>
+      <table style="border-collapse: collapse; width: 100%; font-size: 0.9em;">
+        <thead><tr style="background:#f0f0f0;">
+          <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left; width: 180px;">Скрипт</th>
+          <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left;">Что делает</th>
+          <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left; width: 230px;">Когда использовать</th>
+        </tr></thead>
+        <tbody>
+          <tr>
+            <td style="border:1px solid #ccc; padding: 6px 10px;"><code>install.bat</code></td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Создаёт <code>.venv</code>, ставит зависимости через pip, копирует <code>config_local.example.py</code> → <code>config_local.py</code>, генерит свежие <code>SECRET_KEY</code> + <code>SUBSCRIPTION_TOKEN</code>, спрашивает свободный порт (5000-5019), открывает <code>config_local.py</code> в Notepad для ввода PASSWORD</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">При <strong>первой установке</strong> после <code>git clone</code>. Запускается двойным кликом, ничего не ломает если уже есть config_local.py</td>
+          </tr>
+          <tr>
+            <td style="border:1px solid #ccc; padding: 6px 10px;"><code>start.bat</code></td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Запускает <code>python dashboard.py</code> в видимом окне cmd. Все логи Flask выводятся в это окно. <strong>Окно должно быть открыто</strong> — закроется = панель закроется.</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Для <strong>отладки</strong>: хочешь видеть какие запросы приходят, какие ошибки Python. Не для постоянной работы.</td>
+          </tr>
+          <tr>
+            <td style="border:1px solid #ccc; padding: 6px 10px;"><code>start-bg.bat</code></td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Запускает <code>pythonw dashboard.py</code> (windowless) в фоне. Окно cmd закрывается, процесс продолжает работать.</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Для <strong>повседневной работы</strong> без сервиса. Жмёшь — забываешь — пользуешься. Перезапуск Windows = панель не стартанёт автоматически.</td>
+          </tr>
+          <tr>
+            <td style="border:1px solid #ccc; padding: 6px 10px;"><code>stop.bat</code></td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Находит pythonw-процесс на порту 5000 (или твоём из <code>DASHBOARD_PORT</code>) и убивает его.</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Если запускал через <code>start-bg.bat</code>. <strong>Не работает</strong> для сервисного режима (Task Scheduler) — там нужен <code>schtasks /End</code> или <code>Restart-Clean.bat</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4 style="margin-top: 16px;">🔧 Обновление и обслуживание</h4>
+      <table style="border-collapse: collapse; width: 100%; font-size: 0.9em;">
+        <thead><tr style="background:#f0f0f0;">
+          <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left; width: 180px;">Скрипт</th>
+          <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left;">Что делает</th>
+          <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left; width: 230px;">Когда использовать</th>
+        </tr></thead>
+        <tbody>
+          <tr>
+            <td style="border:1px solid #ccc; padding: 6px 10px;"><code>update.bat</code></td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Wrapper для <code>update.ps1</code>. Останавливает панель → <code>git pull</code> (с auto-stash при локальных правках) → обновляет зависимости только если <code>requirements.txt</code> изменился → запускает обратно через <code>start-bg.bat</code> или <code>schtasks</code> в зависимости от того как было запущено.</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;"><strong>Регулярно</strong> (раз в неделю или при объявлении новых релизов на GitHub). Универсальный — работает и для start-bg, и для сервисного режима.</td>
+          </tr>
+          <tr>
+            <td style="border:1px solid #ccc; padding: 6px 10px;"><code>Restart-Clean.bat</code></td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Чистый рестарт через <code>schtasks /End</code> + <code>schtasks /Run</code> для XrayDashboard task. Не делает <code>git pull</code> — просто пересоздаёт процесс. Auto-elevate через UAC.</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Если панель работает как сервис (после <code>install_service.bat</code>) и нужно <strong>применить локальные правки</strong> dashboard.py без обновления с GitHub. Также — если порт «залип» с двумя listener'ами.</td>
+          </tr>
+          <tr>
+            <td style="border:1px solid #ccc; padding: 6px 10px;"><code>update.ps1</code></td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">PowerShell-логика обновления. Не запускается напрямую — только через <code>update.bat</code>.</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Не трогать — служебный файл. Раньше всё было в <code>update.bat</code>, но из-за бага «cmd читает .bat пока он выполняется, git pull меняет файл → парсер сбивается» — логику вынесли в .ps1.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4 style="margin-top: 16px;">⚙ Сервисный режим (опционально)</h4>
+      <table style="border-collapse: collapse; width: 100%; font-size: 0.9em;">
+        <thead><tr style="background:#f0f0f0;">
+          <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left; width: 180px;">Скрипт</th>
+          <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left;">Что делает</th>
+          <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left; width: 230px;">Когда использовать</th>
+        </tr></thead>
+        <tbody>
+          <tr>
+            <td style="border:1px solid #ccc; padding: 6px 10px;"><code>install_service.bat</code></td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Тонкий wrapper, запускает <code>install_service.ps1</code> с правами админа (UAC promot).</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Один раз — чтобы зарегистрировать панель как Task Scheduler сервис.</td>
+          </tr>
+          <tr>
+            <td style="border:1px solid #ccc; padding: 6px 10px;"><code>install_service.ps1</code></td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Создаёт Task Scheduler task <code>XrayDashboard</code> под <strong>SYSTEM</strong> с <code>/SC ONSTART /RL HIGHEST</code>. После reboot панель стартует автоматически без логина юзера. Авто-чинит MS Store Python (если venv там), копирует SSH-ключ из <code>~/.ssh/</code> в проектную папку с правильным ACL для SYSTEM.</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Когда хочешь чтобы панель работала <strong>24/7</strong> без необходимости логиниться в Windows. Сценарий «PC включён всегда» (домашний сервер).</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4 style="margin-top: 16px;">🚨 Toast-алерты (опционально, требует панель работающей)</h4>
+      <table style="border-collapse: collapse; width: 100%; font-size: 0.9em;">
+        <thead><tr style="background:#f0f0f0;">
+          <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left; width: 180px;">Скрипт</th>
+          <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left;">Что делает</th>
+          <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left; width: 230px;">Когда использовать</th>
+        </tr></thead>
+        <tbody>
+          <tr>
+            <td style="border:1px solid #ccc; padding: 6px 10px;"><code>install_toast_alerts.bat</code></td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Регистрирует <code>xkeen_toast_daemon.py</code> как Task Scheduler task <code>XrayToastAlerts</code> под <strong>текущим юзером</strong> (<code>/RU yuran /IT</code> = interactive — toast виден только в interactive-сессии). Auto-elevate через UAC.</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Один раз — чтобы получать Windows toast «🔴 Xray упал!» в правом нижнем углу когда панель закрыта в браузере. Подробности — в разделе «🚨 Алерты при падении xray».</td>
+          </tr>
+          <tr>
+            <td style="border:1px solid #ccc; padding: 6px 10px;"><code>uninstall_toast_alerts.bat</code></td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Удаляет task <code>XrayToastAlerts</code>. Auto-elevate через UAC.</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Если решил отключить toast-уведомления.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div style="background:#eefbe5; border-left: 4px solid #2a7; padding: 10px 14px; margin: 14px 0; font-size: 0.92em;">
+        💡 <strong>Сводно: какой когда использовать</strong>
+        <ul style="margin: 6px 0 0 18px; padding: 0;">
+          <li><strong>Первая установка</strong>: <code>install.bat</code> → <code>start-bg.bat</code></li>
+          <li><strong>Перезагрузил Windows</strong>, панель не стартанула? → <code>start-bg.bat</code> (или ставь <code>install_service.bat</code> чтобы автоматически)</li>
+          <li><strong>Обновить с GitHub</strong>: <code>update.bat</code></li>
+          <li><strong>Применить локальные правки</strong> (без git pull): <code>Restart-Clean.bat</code> (если сервисный режим) или <code>stop.bat</code> + <code>start-bg.bat</code> (если просто фоновой)</li>
+          <li><strong>Сервис 24/7</strong>: <code>install_service.bat</code> — один раз от админа</li>
+          <li><strong>Toast-алерты</strong>: <code>install_toast_alerts.bat</code> — один раз двойным кликом</li>
+        </ul>
+      </div>
+
+      <p class="subtitle" style="font-size: 0.85em; margin-top: 12px;">
+        ℹ Все скрипты <strong>идемпотентны</strong> — можно запускать повторно без вреда. <code>install.bat</code> не перетрёт config_local.py если он уже есть. <code>install_service.bat</code> пересоздаст task с нуля. <code>install_toast_alerts.bat</code> сначала удалит старый task потом создаст новый. И т.п.
+      </p>
+
+      <p class="subtitle" style="font-size: 0.85em; margin-top: 8px;">
+        ℹ <strong>Все .bat в репо — pure ASCII</strong> (английские строки в echo). Это нужно потому что cmd.exe в Windows читает .bat в OEM-кодировке (cp866 на русской Windows), и UTF-8 без BOM ломает парсер на русских строках («ОШИБКА: 'rocess' is not recognized...»). Если будешь править .bat — оставляй ASCII.
+      </p>
+    </div>
+  </details>
+
+  <details class="help-section">
+    <summary>📡 4 канала: PRIMARY · FAILOVER · AI-sticky · YouTube-sticky</summary>
+    <div class="help-body">
+      <h4>🟢 PRIMARY — основной канал</h4>
+      <p>Через него идёт <strong>весь трафик</strong> (кроме того что попадает под специальные правила: AI / YouTube / DIRECT).
+      Дефолт — <code>vless-reality</code> (твой собственный VPN-сервер). Watchdog раз в минуту пингует его через <code>https://&lt;your-vpn-domain&gt;:8444/</code>.
+      Если 2 пинга подряд провалились → переключается на FAILOVER. Если потом 3 пинга подряд успешны → возвращается обратно.</p>
+
+      <h4>🟡 FAILOVER — резервный канал</h4>
+      <p>Это <strong>цепочка</strong> резервных каналов (см. подраздел ⛓️ «Цепочка FAILOVER» внизу страницы) — watchdog при падении PRIMARY перебирает их сверху вниз и переключается на <strong>первый живой</strong>. В dropdown'е показан только <strong>головной</strong> канал цепочки (он первый в списке).</p>
+
+      <h4>🤖 AI-sticky outbound</h4>
+      <p>Sticky-канал именно для AI-сайтов из списка <code>📦 Список AI-доменов</code>. <strong>Независим</strong> от PRIMARY/FAILOVER — даже если default переключился, AI всё равно идёт через выбранный канал.</p>
+      <p>Зачем: AI-сервисы (Anthropic, OpenAI, Gemini) <strong>геоблокируют российские IP</strong> — получишь 403/region-denied. Поэтому выбирай EU-канал (Германия, Нидерланды, Финляндия). НЕ выбирай канал с бейджем <strong>🛡️ Обход</strong> или <strong>📺 Ютуб</strong> — это RU-exit, AI заблокирует. В dropdown'е такие подсвечены коричневым с предупреждением.</p>
+      <p><strong>Kill-switch (рекомендую включён)</strong>: если AI-канал упал — AI-домены идут в <code>block</code> (drop), а не через PRIMARY. Защита от засветки твоего RU-IP в Anthropic/OpenAI (после такого аккаунт могут заблокировать).</p>
+
+      <h4>📺 YouTube-sticky outbound</h4>
+      <p>Sticky-канал для YouTube/Instagram/Discord/TikTok из списка <code>📺 Список YouTube-доменов</code>. Аналог AI-sticky.</p>
+      <p>Зачем: при просмотре YouTube через EU/US-VPN — <strong>лезет реклама</strong> (Google показывает по geo-IP). Если же канал — <strong>RU-exit</strong> (через российский IP), реклама в YouTube не показывается (РКН-Google решение). Поэтому выбирай канал с бейджем <strong>📺 Ютуб</strong> в dropdown'е (это RU-exit без anti-DPI маскировки) — например <code>🇷🇺_Россия_YouTube</code> от Provider C или <code>🇷🇺_Санкт-Петербург_⚡️_YouTube_Instagram_Discord</code> от Provider B.</p>
+      <p><strong>Kill-switch выключен по умолчанию</strong> — если YT-канал упал, YouTube идёт через PRIMARY (с рекламой, но работает). Включи галочку «Блокировать трафик если канал упал» если хочешь чтобы YT вообще не работал без RU-канала.</p>
+    </div>
+  </details>
+
+  <details class="help-section">
+    <summary>🌐 Маршрутизация по доменам — AI / YT / DIRECT списки</summary>
+    <div class="help-body">
+      <h4>Что такое «список доменов»</h4>
+      <p>Это <strong>текстовое поле</strong> со списком доменов (через пробел или с новой строки). Watchdog генерирует правило xray: «<code>трафик к этим доменам → через выбранный outbound</code>».</p>
+      <p>Поддомены подхватываются автоматически: <code>youtube.com</code> покрывает <code>www.youtube.com</code>, <code>m.youtube.com</code>, <code>music.youtube.com</code> и т.д.</p>
+
+      <h4>🤖 Список AI-доменов (зелёная карточка)</h4>
+      <p>Домены AI-сервисов которые должны идти через AI-sticky outbound. Готовые пресеты-кнопки (🟣 Claude, 🟢 ChatGPT, 🔵 Gemini, …) добавляют известные домены сразу.</p>
+
+      <h4>📺 Список YouTube-доменов (красная карточка)</h4>
+      <p>Домены YouTube/IG/Discord/Twitch/Twitter/Reddit/Telegram/Spotify которые идут через YT-sticky.</p>
+      <p><strong>Пустой список = правило выключено</strong>, YT идёт через PRIMARY.</p>
+
+      <h4>🚫 Сайты НАПРЯМУЮ без VPN — DIRECT (оранжевая карточка)</h4>
+      <p>Домены которые идут <strong>через твоего обычного провайдера</strong> минуя VPN. Полезно для:</p>
+      <ul>
+        <li>Банков (Сбер/ВТБ/Альфа/Тинькофф) — они проверяют RU-IP, через VPN могут не пустить</li>
+        <li>Госуслуг (требуют RU-IP)</li>
+        <li>Российских стримингов (Okko, Кинопоиск) — через RU-IP быстрее</li>
+        <li>Mail.ru / Yandex — нет смысла гонять через заграницу</li>
+      </ul>
+      <div class="tip">⚠️ Большая часть RU-сайтов <strong>уже идёт direct автоматически</strong> через regex <code>*.ru</code> / <code>*.su</code> / <code>*.рф</code> + <code>geosite</code> (yandex, vk, steam). В этот список добавляй ТОЛЬКО варианты <code>.com</code> / <code>.net</code> / <code>.tv</code> / <code>.cloud</code> которые НЕ ловятся базовым regex.</div>
+
+      <h4>После сохранения</h4>
+      <p>Watchdog подхватит новый список <strong>в течение 1 минуты</strong> (на следующем тике cron). Чтобы применить <strong>сразу</strong> — нажми кнопку <strong>🔄 AUTO</strong> в подразделе «⚡ Принудительно переключить watchdog».</p>
+    </div>
+  </details>
+
+  <details class="help-section" id="help-v2fly-geoip">
+    <summary>🩻 v2fly категории и 🌍 GeoIP-категории — что это и когда нужно</summary>
+    <div class="help-body">
+      <p>В AI- и YT-секциях есть <strong>дополнительные свёрнутые блоки</strong> рядом с обычным списком доменов:</p>
+      <ul>
+        <li><strong>🩻 v2fly категории</strong> — автообновляемые списки <em>доменов</em></li>
+        <li><strong>🌍 GeoIP-категории</strong> — списки <em>IP-диапазонов</em> (только в YT)</li>
+      </ul>
+      <p>Оба <strong>необязательны</strong>. Если ручных доменов в списке достаточно — можешь не трогать.</p>
+
+      <h4>🩻 v2fly категории — зачем</h4>
+      <p>Это списки доменов которые ведёт <a href="https://github.com/v2fly/domain-list-community/tree/master/data" target="_blank" rel="noopener">v2fly community</a>. Watchdog подставляет их как <code>ext:geosite_v2fly.dat:NAME</code> рядом с твоими ручными доменами.</p>
+      <p><strong>Преимущество над ручными доменами</strong>: когда сервис добавит новый поддомен (например <code>music-beta.youtube.com</code>), он попадёт в правило <strong>автоматически</strong> после <code>xkeen -ug</code> — без правок UI. Категория <code>youtube</code> покрывает <em>все</em> известные домены YouTube, включая редкие региональные.</p>
+      <p><strong>Типичные категории</strong>: <code>youtube</code>, <code>tiktok</code>, <code>discord</code>, <code>spotify</code>, <code>twitter</code>, <code>facebook</code>, <code>instagram</code>, <code>openai</code>, <code>anthropic</code>, <code>google</code>.</p>
+
+      <h4>🩻 v2fly категории — когда ломается</h4>
+      <ol>
+        <li><strong>Категория несовместима с каналом</strong>. Если YT-канал = российский (для DPI-обхода YouTube без рекламы) — <code>facebook</code> / <code>instagram</code> / <code>twitter</code> через него <strong>не пробьют РКН-блокировку Meta/X</strong>. Instagram сломается, xray зависнет в retries. <strong>Через RU-канал безопасно</strong>: только <code>youtube</code>, <code>tiktok</code>, <code>discord</code>.</li>
+        <li><strong>Опечатка в имени</strong> (<code>youtub</code> вместо <code>youtube</code>) → xray не найдёт в <code>geosite_v2fly.dat</code> → упадёт с <code>code not found</code> → xkeen уйдёт в Mixed mode. Точные имена — в репо v2fly community (ссылка выше).</li>
+        <li><strong>Слишком жирная категория</strong> (например <code>google</code>) — перехватит дофига сайтов, что-то неожиданное сломается. Лучше использовать узкие категории.</li>
+      </ol>
+
+      <h4>🌍 GeoIP-категории — зачем</h4>
+      <p>Доменные правила не ловят трафик приложений, которые коннектятся <strong>напрямую к IP-датацентров минуя DNS</strong>. Классический пример — <strong>Telegram Desktop</strong> и <strong>Discord native client</strong>: они идут на IP вроде <code>149.154.x.x</code> / <code>91.108.x.x</code>, доменное правило <code>domain:telegram.org</code> их трафик не видит.</p>
+      <p>GeoIP-категория матчит по <strong>IP-диапазонам</strong> из <code>geoip.dat</code>. Watchdog генерирует <strong>отдельное правило</strong> <code>"ip": ["geoip:telegram"]</code> с тем же outboundTag что у YT-домен правила (и с тем же kill-switch через YT_FAIL_BLOCK).</p>
+      <p><strong>Когда использовать</strong>: если приложение «зависает на Connecting», а тот же сервис через браузер работает — это IP-only-проблема. Добавь категорию (<code>telegram</code>, <code>discord</code>) → трафик пойдёт через YT-канал по IP.</p>
+
+      <h4>🌍 GeoIP-категории — обязательный шаг</h4>
+      <div class="warn">⚠️ XKeen-installer ставит GeoIP-базы только <strong>со странами</strong> (geoip_refilter, geoip_zkeen) — категорий <em>сервисов</em> (telegram, discord) в них <strong>нет</strong>. Если после сохранения GeoIP-категории xkeen уходит в режим <strong>Mixed</strong> — нужно установить <strong>расширенный <code>geoip.dat</code></strong> от Loyalsoldier.</div>
+      <p>В UI GeoIP-секции есть зелёная кнопка <strong>📥 Установить расширенный geoip.dat (Loyalsoldier)</strong> — один клик, без SSH:</p>
+      <ol>
+        <li>Бэкап текущего geoip.dat → <code>.bak-&lt;timestamp&gt;</code></li>
+        <li>Скачивание ~18MB с <a href="https://github.com/Loyalsoldier/v2ray-rules-dat" target="_blank" rel="noopener">github.com/Loyalsoldier/v2ray-rules-dat</a></li>
+        <li>Автоматический <code>xkeen -restart</code></li>
+        <li>Verify через Get-NetTCPConnection</li>
+      </ol>
+      <p>Делается <strong>один раз на роутер</strong>. Дальше можно добавлять любые geoip-категории через UI без SSH.</p>
+      <div class="tip">💡 <strong>Self-healing</strong> в секции 🚑 «Восстановление и диагностика» имеет check #9 «geoip.dat содержит используемые категории». Если он fail — там та же кнопка установки расширенного geoip.dat в auto-fix.</div>
+
+      <h4>Разница между всеми тремя списками (на примере YT)</h4>
+      <ul>
+        <li><strong>📺 Список YouTube-доменов</strong> (textarea) — ручные домены, нужно вписать каждый. Срабатывает <strong>по доменам</strong> (через DNS).</li>
+        <li><strong>🩻 v2fly категории</strong> — автообновляемые списки доменов из geosite_v2fly.dat. Срабатывает <strong>по доменам</strong> (через DNS).</li>
+        <li><strong>🌍 GeoIP-категории</strong> — IP-диапазоны из geoip.dat. Срабатывает <strong>по IP</strong> (DNS не нужен — для приложений которые коннектятся напрямую).</li>
+      </ul>
+      <p>Все три работают <strong>одновременно</strong> и независимо. Можно использовать только нужные.</p>
+    </div>
+  </details>
+
+  <details class="help-section" id="help-scenarios">
+    <summary>🎯 Готовые сценарии настройки (рецепты для типовых задач)</summary>
+    <div class="help-body">
+      <p>Если не знаешь с чего начать — выбери сценарий который ближе всего к твоей задаче и пройди по шагам. В UI секция «🎯 Основное и резервное подключение» — там все основные dropdown'ы.</p>
+
+      <details open style="margin: 10px 0; padding: 10px 14px; background: #f0f9ff; border-left: 4px solid #0288d1; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #01579b;">📺 Сценарий 1: VPN только для YouTube / Instagram / Telegram, остальное напрямую</summary>
+        <div style="margin-top: 8px;">
+          <p><strong>Цель</strong>: обычный трафик идёт быстро через провайдера (банки, Госуслуги, Яндекс, рабочие сайты), а через VPN — только то что иначе не работает: YouTube (без рекламы или вообще не открывается), Instagram (РКН), Telegram Desktop (IP-блокировка провайдера).</p>
+
+          <p><strong>Что получаешь:</strong></p>
+          <ul>
+            <li>Браузер по умолчанию → через провайдера (скорость нативного интернета)</li>
+            <li>youtube.com / instagram.com → через VPN</li>
+            <li>Telegram Desktop → через VPN (IP-route)</li>
+            <li>Всё остальное → через провайдера, без потерь VPN-overhead</li>
+          </ul>
+
+          <h4 style="margin: 12px 0 6px;">Шаг 1. PRIMARY = «Напрямую без VPN»</h4>
+          <p>Секция <strong>«🎯 Основное и резервное подключение»</strong> → dropdown <strong>«🛡️ Основной канал (PRIMARY)»</strong> → выбери первый вариант <code>🌐 Напрямую без VPN — через провайдера</code> → жми зелёную кнопку <strong>«💾 Сохранить PRIMARY»</strong>.</p>
+
+          <h4 style="margin: 12px 0 6px;">Шаг 2. YT-канал = твой VPN-outbound</h4>
+          <p>Та же секция → dropdown <strong>«📺 YouTube-sticky outbound»</strong> → выбери VPN-канал. Какой именно — зависит от приоритетов:</p>
+          <table style="border-collapse: collapse; margin: 8px 0; width: 100%;">
+            <thead><tr style="background:#f0f0f0;"><th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">Канал</th><th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">YouTube</th><th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">Instagram</th><th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">Telegram</th></tr></thead>
+            <tbody>
+              <tr>
+                <td style="border:1px solid #ccc; padding:6px 10px;">🇷🇺 RU-канал с DPI-обходом (бейдж 📺 в dropdown)</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">✅ <strong>без рекламы</strong></td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">❌ <strong>сломается</strong> (РКН блокирует Meta)</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">✅ работает</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ccc; padding:6px 10px;">🇳🇱/🇩🇪 EU-канал (Нидерланды/Германия)</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">⚠ с рекламой (Google по geo-IP)</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">✅ работает</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">✅ работает</td>
+              </tr>
+            </tbody>
+          </table>
+          <p>Большинство юзеров выбирает <strong>EU-канал</strong> — потерпеть рекламу в YouTube ради рабочего Instagram. Жми <strong>«Сохранить YouTube outbound»</strong>.</p>
+
+          <h4 style="margin: 12px 0 6px;">Шаг 3. YT-домены — пресетами</h4>
+          <p>Раздел <strong>«📺 Список YouTube-доменов»</strong> (красная карточка ниже dropdown'ов). Нажми по очереди кнопки-пресеты:</p>
+          <ul>
+            <li><strong>📺 YouTube</strong> — youtube.com, ytimg.com, googlevideo.com, youtu.be и т.д.</li>
+            <li><strong>📷 Instagram</strong> — instagram.com, cdninstagram.com, fbcdn.net и т.д.</li>
+            <li><strong>💌 Telegram</strong> — telegram.org, t.me, web.telegram.org, cdn-telegram.org и т.д.</li>
+            <li><strong>💚 WhatsApp</strong> — whatsapp.com, whatsapp.net (subdomain-match ловит все *.whatsapp.com/.net), web.whatsapp.com, wa.me (короткие ссылки), mmg.whatsapp.net + Meta-backend (mqtt-mini/mqtt/chatd/latest.facebook.com). Заблокирован DPI в РФ с 2025-08 — через VPN обязательно. ⚠ Для первого <strong>связывания нового устройства</strong> (QR-код) пресета может быть мало — клиент ходит на доп. Edge-серверы по IP. Лайфхак: временно поставь PRIMARY=VPN → linking → верни PRIMARY обратно.</li>
+          </ul>
+          <p>В textarea появятся домены. Жми <strong>«💾 Сохранить YT-домены»</strong>.</p>
+
+          <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #1a5276;">
+            💡 <strong>Пресет нужен для web-версии</strong> (в браузере) — там трафик идёт по DNS (открыл youtube.com → DNS lookup → правило сработало). Для <strong>десктоп- и мобильных приложений</strong> некоторые сервисы (Telegram Desktop, Discord native) ходят по IP без DNS — для них пресета недостаточно, нужен GeoIP (см. Шаг 5).
+          </div>
+
+          <h4 style="margin: 12px 0 6px;">Шаг 4. v2fly категории (для автоподхвата новых доменов)</h4>
+          <p>Под YT-доменами раскрой <strong>«🩻 v2fly категории»</strong> → добавь <strong>📺 youtube</strong>. Это нужно чтобы новые поддомены YouTube (которые Google запустит завтра) автоматически попадали через VPN после <code>xkeen -ug</code> без правок руками.</p>
+          <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin: 4px 0; font-size: 0.9em;">
+            ⚠ Если YT-канал = <strong>RU</strong> — НЕ добавляй <code>facebook</code> / <code>instagram</code> / <code>twitter</code>: РКН блокирует Meta на выходе, Instagram перестанет работать. Если YT-канал = <strong>EU/DE</strong> — можно добавить <code>instagram</code>.
+          </div>
+          <p>Жми <strong>«💾 Сохранить категории»</strong>.</p>
+
+          <h4 style="margin: 12px 0 6px;">Шаг 5. GeoIP-категории для Telegram Desktop (по IP, не по домену)</h4>
+          <p>Раскрой <strong>«🌍 GeoIP-категории»</strong> → нажми <strong>📱 telegram</strong> → жми <strong>«💾 Сохранить GeoIP-категории»</strong>.</p>
+          <p>Это нужно потому что Telegram Desktop коннектится напрямую к IP датацентров минуя DNS — без GeoIP-правила он бы шёл через PRIMARY (провайдера) и не подключался.</p>
+
+          <p><strong>Шпаргалка</strong>: для каких сервисов что нужно добавить?</p>
+          <table style="border-collapse: collapse; margin: 8px 0; width: 100%;">
+            <thead><tr style="background:#f0f0f0;">
+              <th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">Сервис</th>
+              <th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">Пресет YT-доменов</th>
+              <th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">GeoIP-категория</th>
+              <th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">Почему</th>
+            </tr></thead>
+            <tbody>
+              <tr>
+                <td style="border:1px solid #ccc; padding:6px 10px;"><strong>YouTube</strong></td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ обязательно</td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#888;">не нужна</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">Всё через DNS (youtube.com, googlevideo.com)</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ccc; padding:6px 10px;"><strong>Instagram</strong></td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ обязательно</td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#888;">не нужна</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">И web, и app используют DNS (Meta за CDN)</td>
+              </tr>
+              <tr style="background:#fff8e7;">
+                <td style="border:1px solid #ccc; padding:6px 10px;"><strong>Telegram</strong></td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ обязательно</td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#c33;"><strong>✅ обязательно</strong></td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">Web — по DNS. Desktop/Mobile app — по IP минуя DNS. Нужны <strong>оба</strong>.</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ccc; padding:6px 10px;"><strong>Discord</strong></td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ обязательно</td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#e80;">⚠ опционально</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">Web и desktop в основном по DNS, но WebRTC/voice могут идти по IP — GeoIP помогает, но не критично.</td>
+              </tr>
+              <tr style="background:#f0fff0;">
+                <td style="border:1px solid #ccc; padding:6px 10px;"><strong>WhatsApp</strong></td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ обязательно</td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#888;">не нужна</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">Web и мобильный клиент ходят по DNS (whatsapp.com/whatsapp.net + wa.me + Meta MQTT-эндпоинты). Категории <code>whatsapp</code> в Loyalsoldier geoip.dat нет — а <code>facebook</code> захватил бы FB/IG, не подходит. ⚠ <strong>Для первичного linking устройства</strong> пресета может быть недостаточно — клиент при первой авторизации (сканировании QR) ходит на доп. Edge-серверы по IP. Лайфхак: временно поставь PRIMARY = VPN → сделай linking → верни PRIMARY обратно. Дальше всё покрывается пресетом. Заблокирован DPI в РФ с 2025-08.</td>
+              </tr>
+              <tr>
+                <td style="border:1px solid #ccc; padding:6px 10px;"><strong>TikTok / Twitch / Twitter / Reddit / Spotify</strong></td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ обязательно</td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#888;">не нужна</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">Всё через DNS</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin: 4px 0; font-size: 0.9em;">
+            ⚠ Если после сохранения GeoIP <code>xkeen -status</code> покажет «в режиме <strong>Mixed</strong>» — <strong>проверь <code>error.log</code></strong>: если там <code>code not found</code>/<code>failed to load</code>, то категория действительно не найдена в geoip.dat → в жёлтом блоке там же нажми зелёную кнопку <strong>«📥 Установить расширенный geoip.dat (Loyalsoldier)»</strong>. <em>Если error.log чистый — Mixed это валидный режим работы XKeen, VPN работает (проверка через <code>https://checkip.amazonaws.com</code> покажет VPN-IP).</em>
+          </div>
+
+          <h4 style="margin: 12px 0 6px;">Шаг 6. Проверка</h4>
+          <ul>
+            <li>Открой <a href="https://2ip.ru" target="_blank">2ip.ru</a> → должен показать IP <strong>твоего провайдера</strong> (потому что 2ip.ru не в YT-списке)</li>
+            <li>Открой <a href="https://youtube.com" target="_blank">youtube.com</a> → должен открыться (через VPN — Google IP не RU)</li>
+            <li>Открой Instagram в браузере → должен работать (если канал EU/US)</li>
+            <li>Открой Telegram Desktop → должен подключиться</li>
+          </ul>
+
+          <h4 style="margin: 12px 0 6px;">Опционально: AI-канал (Claude / ChatGPT)</h4>
+          <p>Если пользуешься AI-сервисами (OpenAI/Anthropic/Gemini) — те же шаги для <strong>«🤖 AI-sticky outbound»</strong> в той же секции. Выбери <strong>EU/US-канал</strong> (RU-IP они банят аккаунты). Включи <strong>kill-switch AI</strong> (галочка «Блокировать если канал упал») — чтобы при падении канала твой RU-IP не засветился в Anthropic. См. подсекцию «📡 4 канала» выше.</p>
+
+          <h4 style="margin: 12px 0 6px;">Что НЕ нужно делать в этом сценарии</h4>
+          <ul>
+            <li><strong>FAILOVER</strong> необязателен — PRIMARY=direct, провайдер не может «упасть» так чтобы failover понадобился (если упал провайдер — упал и роутер).</li>
+            <li><strong>DIRECT-домены</strong> необязательны — там собираются домены которые «всегда напрямую». В нашем сценарии PRIMARY=direct, поэтому ВСЁ кроме YT уже идёт напрямую. Список используй только если хочешь явно зафиксировать что определённые сайты будут через провайдера даже если когда-то поменяешь PRIMARY.</li>
+            <li><strong>BLOCK-домены</strong> отдельная задача — выкл. Windows Update / Adobe Genuine / телеметрию. К этому сценарию не относится.</li>
+          </ul>
+        </div>
+      </details>
+
+      <p style="margin-top: 12px;" class="muted">Хочешь больше сценариев — например «полный VPN для всего» или «AI + банки направления» — напиши, добавим.</p>
+    </div>
+  </details>
+
+  <details class="help-section">
+    <summary>💬 Примечания у доменов (v1.7.0) — кто откуда, как навести порядок</summary>
+    <div class="help-body">
+      <h4>Зачем</h4>
+      <p>В секциях <strong>AI / YT / DIRECT / BLOCK</strong> часто накапливается куча доменов из разных пресетов вперемешку с ручными добавлениями. Чтобы не путаться — каждый домен помечается заметкой:</p>
+      <ul>
+        <li><strong>📦 &lt;имя пресета&gt;</strong> — добавлен через кнопку-пресет (например <code>📦 youtube</code>, <code>📦 whatsapp</code>)</li>
+        <li><strong>✏️ &lt;твоё описание&gt;</strong> — добавлен вручную, можно подписать (или оставить пустым)</li>
+      </ul>
+
+      <h4>Как это выглядит в textarea</h4>
+      <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">claude.ai           # 📦 claude
+anthropic.com       # 📦 claude
+openai.com          # 📦 openai
+chatgpt.com         # 📦 openai
+my-vpn-server.io    # ✏️ запасной канал для теста
+another-server.io   # ✏️</pre>
+      <p>После символа <code>#</code> — заметка. Можешь редактировать в textarea как обычный текст: добавлять / менять заметки. Парсится при сохранении.</p>
+
+      <h4>Где хранятся заметки</h4>
+      <p>В отдельном файле <code>/opt/etc/xray/domain_notes.json</code> на роутере (sidecar JSON, не trogает <code>watchdog.config</code>). Попадает в наш бэкап-snapshot, так что не теряется при миграции на новый роутер.</p>
+
+      <h4>Новые элементы управления над каждой textarea</h4>
+      <ul>
+        <li><strong>🔍 Найти домен...</strong> — введи часть домена → Enter → курсор прыгнет на match (native browser highlight)</li>
+        <li><strong>🔤 А-Я</strong> — отсортировать по алфавиту</li>
+        <li><strong>📦 По пресету</strong> — сгруппировать: сначала пресеты (по имени), потом ручные</li>
+        <li><strong>⚠ N дублей</strong> — бейдж, если эти домены встречаются также в других секциях (hover для деталей)</li>
+      </ul>
+
+      <h4>Кнопка 🧹 рядом с каждым пресетом</h4>
+      <p>В блоке кнопок-пресетов теперь есть маленькая кнопка <strong>🧹</strong> сразу после каждой. Жмёшь — удаляются только домены этого пресета. Ручные домены (с пометкой <code>✏️</code>) остаются. Удобно для отката случайного выбора.</p>
+
+      <div style="background:#e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+        💡 <strong>Backward-compat</strong>: если у тебя были домены без заметок (со старых версий) — они показываются как есть, заметки появятся постепенно по мере нажатий на пресеты. Можешь дописать вручную после <code>#</code>.
+      </div>
+
+      <h4>Подсветка дублей</h4>
+      <p>Если один и тот же домен случайно попал в <strong>и YT и DIRECT</strong> — увидишь бейдж <code>⚠ N дублей</code>. Hover → tooltip покажет какой домен где. Это <strong>не ошибка</strong>, просто warning — в routing.json приоритет правил: BLOCK → DIRECT → AI → YT → PRIMARY. То есть домен попавший и в YT и в DIRECT → пойдёт через DIRECT (правило DIRECT выше по приоритету).</p>
+    </div>
+  </details>
+
+  <details class="help-section">
+    <summary>⛓️ Watchdog — как переключается между PRIMARY и FAILOVER</summary>
+    <div class="help-body">
+      <h4>Принцип работы</h4>
+      <p><code>cron</code> на роутере каждую минуту запускает <code>/opt/etc/xray/watchdog.sh</code>:</p>
+      <ol>
+        <li>Пингует PRIMARY (через <code>curl https://{{ cfg.EXTERNAL_DOMAIN or '&lt;your-vpn-domain&gt;' }}:8444/</code>) — fail/up</li>
+        <li>Считает счётчик подряд: если 2 fail подряд → переключается на FAILOVER (выбирает первый живой из цепочки)</li>
+        <li>Если в режиме FAILOVER пингует PRIMARY 3 раза подряд успешно → возвращается на PRIMARY</li>
+        <li>Генерирует новый <code>05_routing.json</code> из template — подменяет placeholder'ы (<code>__DEFAULT_TAG__</code>, AI-rule, YT-rule, DIRECT-rule)</li>
+        <li>Сравнивает с текущим routing.json через md5 — если отличается → <code>xkeen -restart</code> (~2 сек)</li>
+      </ol>
+
+      <h4>⚡ Кнопки «Принудительно переключить»</h4>
+      <ul>
+        <li><strong>🟢 PRIMARY</strong> — жёстко держать основной канал, игнорировать probe (даже если упал)</li>
+        <li><strong>🟡 FAILOVER</strong> — жёстко переключиться на первый живой из цепочки. PRIMARY обратно НЕ вернётся пока не нажмёшь AUTO</li>
+        <li><strong>🔄 AUTO</strong> — вернуть автоматику + применить любые свежие правки конфига сразу (без ожидания тика)</li>
+      </ul>
+
+      <h4>Гистерезис против флапа</h4>
+      <p><strong>2 fail / 3 pass</strong> подряд — это защита от мерцания: один случайный потеря пакета не вызовет переключения. Только устойчивые проблемы.</p>
+    </div>
+  </details>
+
+  <details class="help-section">
+    <summary>📦 Подписки, группы и бейджи (🛡️ Обход / 📺 Ютуб)</summary>
+    <div class="help-body">
+      <h4>Что такое «подписка»</h4>
+      <p>Платный VPN-провайдер даёт тебе ссылку (URL) — это «подписка». По ссылке скачивается список их серверов (vless-конфиги). Примеры провайдеров:</p>
+      <ul>
+        <li><strong>Provider A</strong> — основная платная подписка (страны EU/JP и т.д.)</li>
+        <li><strong>Provider B</strong> — анти-DPI обход + RU-каналы для YT (если есть)</li>
+        <li><strong>Provider C / Provider D</strong> — большая подписка (много серверов разных стран)</li>
+        <li><strong>VLESS</strong> (служебная) — твой собственный VPN-сервер (если есть)</li>
+      </ul>
+
+      <h4>Группировка в dropdown'ах</h4>
+      <p>Все 4 dropdown'а каналов (PRIMARY/FAILOVER/AI/YT) группируют опции по подпискам через <code>&lt;optgroup&gt;</code>. Внутри каждой группы опции имеют пастельный фон цвета подписки (зелёный/синий/бежевый/фиолетовый — ротация 6 цветов).</p>
+
+      <h4>Бейджи в опциях</h4>
+      <ul>
+        <li><strong>🛡️ Обход</strong> — канал использует <strong>DPI-обход</strong> (маскировку SNI под другой домен или явные anti-DPI слова в имени: «обход», «антиглушилки», «whitelist», «тспу», «ркн»). Полезно если провайдер блокирует обычные VPN.</li>
+        <li><strong>📺 Ютуб</strong> — канал с <strong>RU-IP без anti-DPI обхода</strong> (флаг 🇷🇺 в имени или префикс <code>ru_</code>). Идеально для YouTube — российский IP не показывает рекламу.</li>
+        <li><strong>Без бейджа</strong> — обычный EU/US/Asia канал. Подходит для всего остального (PRIMARY/FAILOVER/AI).</li>
+      </ul>
+      <div class="warn">⚠️ В <strong>AI-dropdown</strong> любой канал с бейджем (🛡️ или 📺) подсвечен коричневым с предупреждением «AI заблокирует» — Anthropic/OpenAI геоблокируют RU-IP. Не ставь такие в роль AI.</div>
+    </div>
+  </details>
+
+  <details class="help-section">
+    <summary>➕ Добавление outbound'ов (vless URL, JSON, sync с подписки)</summary>
+    <div class="help-body">
+      <h4>Один outbound — vless URL</h4>
+      <p>В разделе <strong>«➕ Добавить новый outbound»</strong> вставь vless-URL (начинается с <code>vless://</code>) и нажми «Добавить и применить». Вариант для разовых конфигов — например друг прислал свой VPN.</p>
+
+      <h4>Один outbound — JSON-конфиг</h4>
+      <p>Тот же раздел — можешь вставить полный <code>xray-config JSON</code> (с секцией <code>outbounds</code>). Полезно если конфиг сложный (с reality-настройками, multiplexer'ом и т.п.).</p>
+
+      <h4>Много серверов — sync с подписки</h4>
+      <p>Раздел <strong>«📡 Обновить из подписки»</strong> — введи URL подписки (или выбери из сохранённых) и нажми «🔍 Предпросмотр» → увидишь что будет добавлено/обновлено. Потом «📥 Скачать и обновить».</p>
+      <p>Чекбоксы:</p>
+      <ul>
+        <li><strong>➕ Добавлять новые</strong> — outbound'ы которые есть в подписке но нет у тебя (по умолчанию вкл)</li>
+        <li><strong>🗑 Удалять отсутствующие</strong> — если провайдер убрал сервер, удалить и у тебя (потенциально опасно — выкл по умолчанию, активные роли защищены)</li>
+        <li><strong>📅 Автоматически обновлять дату истечения</strong> — если провайдер шлёт header <code>Subscription-Userinfo: expire=&lt;ts&gt;</code> (Provider B умеет, Provider A нет)</li>
+      </ul>
+
+      <h4>Tag (имя outbound'а)</h4>
+      <p>Tag берётся из URL после символа <code>#</code>. Группировка по подпискам делается по <strong>tag-префиксу</strong> (до первого <code>-</code>) ИЛИ по pbk Reality identity. Поэтому: <code>provider-a-de1</code>, <code>provider-a-nl</code> → группа «Provider A».</p>
+    </div>
+  </details>
+
+  <details class="help-section">
+    <summary>📨 TG-алерты — что приходит в Telegram</summary>
+    <div class="help-body">
+      <h4>Бот: <strong>Telegram-бот</strong> (любой, заводится в секции «🤖 Telegram-бот для алертов» наверху страницы)</h4>
+      <p>Подойдёт любой бот, созданный через <a href="https://t.me/BotFather" target="_blank">@BotFather</a>. Шлёт алерты от имени <code>XKeen watchdog</code>. Конфиг хранится на роутере в <code>/opt/etc/xray/watchdog.config</code> (поля <code>TG_BOT_TOKEN</code> + <code>TG_CHAT_ID</code>) — НЕ в файлах панели, при передаче панели другу токен не утечёт.</p>
+      <h4>Какие события вызывают алерт</h4>
+      <ul>
+        <li>🚦 <strong>PRIMARY → FAILOVER</strong> — &lt;your-vpn&gt; упал, переключились на резерв</li>
+        <li>🚦 <strong>FAILOVER → PRIMARY</strong> — &lt;your-vpn&gt; ожил, вернулись</li>
+        <li>🛡️ <strong>AI kill-switch активен</strong> — AI-канал упал, AI-домены заблокированы (если включён kill-switch)</li>
+        <li>✅ <strong>AI kill-switch снят</strong> — AI-канал восстановился</li>
+        <li>📺 <strong>YT kill-switch активен/snят</strong> — то же для YouTube (если включён)</li>
+        <li>⚠️ <strong>Failover-каналов мало (≤2 живых)</strong> — резерв под угрозой</li>
+        <li>✅ <strong>Failover-каналы восстановились</strong> — резерв снова в норме</li>
+        <li>🚨 <strong>Полный отказ</strong> — PRIMARY И ВСЕ failover мертвы (катастрофа)</li>
+      </ul>
+      <div class="tip">💡 Алерты идут <strong>через VPN</strong> (SOCKS5 на роутере → выбранный outbound) потому что в некоторых странах блокируется <code>api.telegram.org</code>. Если PRIMARY упадёт — некоторые алерты могут не дойти.</div>
+    </div>
+  </details>
+
+  <details class="help-section">
+    <summary>📦 Передать панель другу — что включить, что вычеркнуть</summary>
+    <div class="help-body">
+      <p>Если хочешь дать копию этой панели другу — нужно <strong>отделить персональные секреты</strong>
+      от общих компонентов. Иначе друг получит твой пароль от панели, токен подписки, домашний внешний
+      IP и vless-ссылки с UUID/pbk/sid (твои реальные VPN-профили).</p>
+
+      <h4>✅ Что положить в архив для друга</h4>
+      <table style="width:100%; border-collapse:collapse; font-size:0.92em; margin: 8px 0;">
+        <thead><tr style="background:#f0f0f0;">
+          <th style="text-align:left; padding:6px 10px; border-bottom:2px solid #ccc;">Файл/папка</th>
+          <th style="text-align:left; padding:6px 10px; border-bottom:2px solid #ccc;">Назначение</th>
+        </tr></thead>
+        <tbody>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>dashboard.py</code></td><td style="padding:6px 10px;">основной код панели</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>requirements.txt</code></td><td style="padding:6px 10px;">список Python-зависимостей (Flask, qrcode, psutil)</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>icons8-favicon-64.png</code></td><td style="padding:6px 10px;">иконка вкладки</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>install.bat</code> / <code>install_service.bat</code> / <code>start.bat</code></td><td style="padding:6px 10px;">скрипты установки (создание venv, регистрация в Task Scheduler)</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>README.md</code> и любые другие <code>*.md</code> с документацией</td><td style="padding:6px 10px;">если есть</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>bootstrap/</code></td><td style="padding:6px 10px;">шаблоны watchdog.sh и 05_routing.template.json для «🚀 Развернуть на чистом XKeen»</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>sub_expiry_notifier.py</code> / <code>xkeen_snapshot_daily.py</code></td><td style="padding:6px 10px;">опциональные скрипты (бэкапы, нотификации)</td></tr>
+          <tr style="background:#e8f5e8; border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><strong><code>config_local.example.py</code></strong></td><td style="padding:6px 10px;"><strong>образец конфига БЕЗ секретов</strong>. Друг скопирует в <code>config_local.py</code> и заполнит своими значениями.</td></tr>
+        </tbody>
+      </table>
+
+      <h4>❌ Что НЕ класть в архив</h4>
+      <table style="width:100%; border-collapse:collapse; font-size:0.92em; margin: 8px 0;">
+        <thead><tr style="background:#fde8e8;">
+          <th style="text-align:left; padding:6px 10px; border-bottom:2px solid #c66;">Файл</th>
+          <th style="text-align:left; padding:6px 10px; border-bottom:2px solid #c66;">Что в нём</th>
+        </tr></thead>
+        <tbody>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>config_local.py</code></td><td style="padding:6px 10px;"><strong>пароль панели, SECRET_KEY, SUBSCRIPTION_TOKEN, домашний внешний IP, vless URL с UUID/pbk/sid</strong></td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>runtime_settings.json</code></td><td style="padding:6px 10px;">IP твоего роутера, путь к твоему SSH-ключу</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>backups/</code></td><td style="padding:6px 10px;">снимки твоих XKeen-конфигов со всеми outbound'ами/паролями</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>.venv/</code></td><td style="padding:6px 10px;">локальный Python-environment (большой и под другую ОС не подойдёт — друг создаст свой через <code>install.bat</code>)</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>__pycache__/</code></td><td style="padding:6px 10px;">кэш Python (не нужен — пересоберётся)</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>*.bak-*</code>, <code>*.log</code></td><td style="padding:6px 10px;">бэкапы и логи могут содержать персональные данные</td></tr>
+        </tbody>
+      </table>
+
+      <h4>📋 Команда для PowerShell — собрать архив автоматически</h4>
+      <p>Запусти в PowerShell в папке панели (C:\xray-dashboard\ или C:\xray-dashboard-dev\):</p>
+      <pre style="background:#1e1e1e; color:#ddd; padding:12px; border-radius:4px; font-size:0.83em; overflow-x:auto;">$src = "C:\xray-dashboard"
+$dst = "$env:USERPROFILE\Desktop\xray-dashboard-for-friend.zip"
+$exclude = @(
+    "config_local.py",                # ⚠ пароль, токен, IP, vless URL
+    "runtime_settings.json",          # ⚠ IP роутера, путь к ключу
+    ".venv",                          # большая папка под твою ОС
+    "__pycache__",                    # кэш
+    "backups",                        # снимки XKeen-конфигов
+    "*.bak-*",                        # бэкапы перед правками
+    "*.log"                           # логи
+)
+# Соберём пути с исключениями
+Get-ChildItem -Path $src -Recurse |
+  Where-Object { $skip=$false; foreach($e in $exclude){ if($_.FullName -like "*\$e*"){$skip=$true; break} }; -not $skip } |
+  Compress-Archive -DestinationPath $dst -Force
+Write-Output "Готово: $dst"</pre>
+
+      <h4>📩 Что сказать другу при передаче архива</h4>
+      <ol>
+        <li>Распакуй архив в любую папку (например <code>C:\xray-dashboard</code>).</li>
+        <li>Установи Python 3.10+ (если нет): <a href="https://www.python.org/downloads/" target="_blank">python.org/downloads</a></li>
+        <li>Запусти <code>install.bat</code> — он создаст <code>.venv</code> и поставит зависимости.</li>
+        <li>Скопируй <code>config_local.example.py</code> → <code>config_local.py</code>, открой в любом редакторе и заполни значения по комментариям внутри (минимум: <code>PASSWORD</code>, <code>SECRET_KEY</code>, <code>SUBSCRIPTION_TOKEN</code>, <code>EXTERNAL_IP</code>, <code>KEENETIC_SSH_KEY</code>).</li>
+        <li>Запусти <code>start.bat</code> — панель поднимется на <code>http://localhost:5000</code> .</li>
+        <li>Открой в браузере → войди → раздел <strong>«🔧 Подключение к роутеру»</strong> → впиши IP/SSH-ключ → <strong>«🔌 Проверить связь»</strong> → <strong>«💾 Сохранить»</strong>.</li>
+        <li>Если на роутере уже стоит XKeen но пустой — нажми <strong>«🚀 Развернуть на чистом XKeen»</strong> в той же секции.</li>
+        <li>Если в Telegram нужны алерты — раздел <strong>«🤖 Telegram-бот для алертов»</strong>, заведи своего бота через @BotFather (см. справку там).</li>
+      </ol>
+
+      <div style="margin-top: 12px; padding: 10px 14px; background: #fff8e7; border-left: 4px solid #e80; border-radius: 4px;">
+        <strong style="color:#7a5500;">💡 Совет:</strong> токен Telegram-бота и chat_id хранятся <strong>на роутере</strong>
+        (<code>/opt/etc/xray/watchdog.config</code>), не в файлах панели. При передаче архива другу
+        они не утекут — у друга будет свой бот и свой роутер с пустыми TG-полями.
+      </div>
+
+      <h4 style="margin-top: 24px; padding-top: 14px; border-top: 1px dashed #ccc;">🤖 Сделать панель «всегда доступной» — автозапуск через Планировщик Windows</h4>
+      <p>Если запускать <code>start.bat</code> вручную каждый раз — панель умрёт после reboot'а компьютера
+      или logoff'а пользователя. Чтобы она поднималась автоматически и работала <strong>всегда</strong>
+      (даже без залогиненного юзера) — её надо зарегистрировать как задачу Планировщика под
+      аккаунтом <strong>SYSTEM</strong>. В архиве уже есть готовый скрипт <code>install_service.bat</code>,
+      который это сделает.</p>
+
+      <details open style="margin: 12px 0; padding: 10px 14px; background: #e8f5e8; border-left: 4px solid #2a7; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f4d2c;">▶ Способ 1 (рекомендуемый) — готовый install_service.bat</summary>
+        <div style="margin-top: 10px;">
+          <p><strong>Кликни правой кнопкой</strong> по файлу <code>install_service.bat</code> в проводнике →
+          <strong>«Запустить от имени администратора»</strong>. Скрипт сам:</p>
+          <ol>
+            <li>Проверит что у тебя админские права</li>
+            <li>Проверит что <code>.venv</code> создан (то есть <code>install.bat</code> ранее запускался)</li>
+            <li>Зарегистрирует задачу <code>XrayDashboard</code> в Планировщике Windows со следующими настройками:
+              <ul style="margin-top:6px;">
+                <li><strong>Запуск от:</strong> <code>NT AUTHORITY\SYSTEM</code> (наивысшие права, не привязан к user-сессии)</li>
+                <li><strong>Триггер:</strong> <code>AtStartup</code> (стартует при загрузке Windows, до логина)</li>
+                <li><strong>Действие:</strong> <code>C:\xray-dashboard\.venv\Scripts\pythonw.exe dashboard.py</code>
+                  (с рабочей директорией <code>C:\xray-dashboard\</code>; <code>pythonw</code> = python без консольного окна)</li>
+                <li><strong>Авто-рестарт:</strong> при падении — до 10 раз с интервалом 1 минута</li>
+                <li><strong>Прочее:</strong> работает на батарее, не останавливается при переходе на батарею, скрыт от UI, без ограничения времени выполнения</li>
+              </ul>
+            </li>
+            <li>Запустит задачу сразу же (без ожидания reboot'а)</li>
+            <li>Покажет статус: запущен ли pythonw, слушает ли :5000</li>
+          </ol>
+          <p>После — панель будет жить как Windows-сервис. Перезагружай PC сколько хочешь — она поднимется заранее.</p>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #888; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #444;">▶ Способ 2 — вручную через GUI Планировщика (если не доверяешь скриптам)</summary>
+        <div style="margin-top: 10px;">
+          <p><kbd>Win</kbd>+<kbd>R</kbd> → <code>taskschd.msc</code> → <strong>«Создать задачу…»</strong> (НЕ «простую задачу» — нужны расширенные параметры). Заполни так:</p>
+
+          <p><strong>Вкладка «Общие»</strong></p>
+          <ul>
+            <li>Имя: <code>XrayDashboard</code></li>
+            <li>«Изменить…» под <em>«При выполнении задачи использовать следующую учётную запись»</em> → вписать <code>SYSTEM</code> → ОК</li>
+            <li>☑ <strong>Выполнить с наивысшими правами</strong></li>
+            <li>☑ <strong>Скрытая задача</strong></li>
+            <li>«Настроить для:» — <em>Windows 10</em> (или твоя версия)</li>
+          </ul>
+
+          <p><strong>Вкладка «Триггеры» → «Создать…»</strong></p>
+          <ul>
+            <li>«Начать задачу:» — <em>При запуске</em></li>
+            <li>☑ <strong>Включено</strong></li>
+          </ul>
+
+          <p><strong>Вкладка «Действия» → «Создать…»</strong></p>
+          <ul>
+            <li>Действие: <em>Запуск программы</em></li>
+            <li>Программа или сценарий: <code>C:\xray-dashboard\.venv\Scripts\pythonw.exe</code></li>
+            <li>Добавить аргументы: <code>dashboard.py</code></li>
+            <li>Рабочая папка: <code>C:\xray-dashboard\</code></li>
+          </ul>
+
+          <p><strong>Вкладка «Условия»</strong></p>
+          <ul>
+            <li>☐ <strong>Снять</strong> галку «Запускать только при питании от электросети» (иначе на ноутбуке не стартует от батареи)</li>
+            <li>☐ Снять «Останавливать при переходе на питание от батарей»</li>
+          </ul>
+
+          <p><strong>Вкладка «Параметры»</strong></p>
+          <ul>
+            <li>☑ <strong>При сбое перезапуск через:</strong> 1 минута, до <strong>10</strong> раз</li>
+            <li>«Если выполняется дольше, остановить через:» — <em>не ограничено</em> (галка <strong>снята</strong>)</li>
+            <li>«Если выполняющаяся задача не завершается по запросу:» — <em>принудительно остановить</em></li>
+          </ul>
+
+          <p>ОК. Задача создана. Теперь правый клик по ней в списке → <strong>«Выполнить»</strong> — поднимется сразу.</p>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">🔍 Как проверить что задача работает</summary>
+        <div style="margin-top: 8px;">
+          <p>В PowerShell:</p>
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;"># Статус задачи
+schtasks /Query /TN XrayDashboard /V /FO LIST | findstr /I "Status User"
+
+# Слушает ли что-то порт 5000
+Get-NetTCPConnection -LocalPort 5000 -State Listen | Format-Table LocalAddress, OwningProcess
+
+# Кто это (должен быть pythonw)
+Get-Process -Id (Get-NetTCPConnection -LocalPort 5000 -State Listen).OwningProcess | Select-Object Name, Path</pre>
+          <p>Открой <code>http://localhost:5000</code> — должно открыться окно логина.</p>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #fde8e8; border-left: 4px solid #c33; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #6a1a1a;">🗑 Как удалить задачу из Планировщика</summary>
+        <div style="margin-top: 8px;">
+          <p>В PowerShell от Администратора:</p>
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em;">schtasks /End /TN XrayDashboard
+schtasks /Delete /TN XrayDashboard /F</pre>
+          <p>Или через GUI: <code>taskschd.msc</code> → найти XrayDashboard → правый клик → «Удалить».</p>
+        </div>
+      </details>
+
+      <details style="margin: 12px 0; padding: 10px 14px; background: #fff8e7; border-left: 4px solid #e80; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #7a5500;">⚠ Почему именно SYSTEM, а не обычный пользователь?</summary>
+        <div style="margin-top: 8px;">
+          <ul>
+            <li><strong>Стартует ДО логина.</strong> Триггер <em>AtStartup</em> у user-аккаунта не сработает пока юзер не зайдёт. SYSTEM запускается сразу после старта Windows — панель будет доступна с момента когда ОС загрузилась.</li>
+            <li><strong>Не умирает при logoff.</strong> Если ты вышел из своей учётки или сменился — user-задача остановится, SYSTEM продолжит работать.</li>
+            <li><strong>Нет проблем с правами файлов</strong> — SYSTEM имеет доступ ко всему. (Юзер должен убедиться что приватный SSH-ключ для роутера лежит там где SYSTEM его прочитает — обычно <code>C:\</code> или <code>D:\</code> подходят; в <code>C:\Users\&lt;имя&gt;\</code> SYSTEM по умолчанию доступа НЕ имеет, ключ оттуда не прочитается.)</li>
+            <li><strong>Защищено от sleep/standby.</strong> User-сессия может уйти в сон, SYSTEM-сервисы продолжают работать в фоне.</li>
+          </ul>
+          <p class="muted"><strong>Минус:</strong> SYSTEM не имеет HOME-папки и стандартных env-vars. Если тебе нужно
+          в <code>config_local.py</code> прописать какие-то пути относительно USERPROFILE — пиши абсолютные пути.</p>
+        </div>
+      </details>
+    </div>
+  </details>
+
+  <details class="help-section">
+    <summary>💻 Установка панели на новый PC (git clone vs ZIP-архив)</summary>
+    <div class="help-body">
+      <p>Эта инструкция — для случая когда ты разворачиваешь панель на <strong>новом компьютере</strong> (например купил новый ноут, переустановил Windows, или хочешь поставить дома + на работе). XKeen-роутер уже настроен — теперь нужна панель управления на этом PC.</p>
+
+      <h4>🥇 Путь 1 (рекомендую): git clone</h4>
+      <p>Один раз клонировать репозиторий, потом обновляться двойным кликом на <code>update.bat</code>:</p>
+      <ol>
+        <li>Установи <strong>Git for Windows</strong>: <a href="https://git-scm.com/download/win" target="_blank">git-scm.com</a> (~50MB, 1 минута)</li>
+        <li>Открой PowerShell в любой папке → выполни:
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">git clone https://github.com/yuran2000/xray-dashboard.git C:\xray-dashboard
+cd C:\xray-dashboard
+.\install.bat</pre>
+        </li>
+        <li><code>install.bat</code> создаст venv, поставит зависимости, скопирует <code>config_local.example.py</code> → <code>config_local.py</code>, откроет в Notepad для редактирования</li>
+        <li>В <code>config_local.py</code> отредактируй: <code>KEENETIC_HOST</code> (IP роутера), <code>KEENETIC_USER</code>, <code>KEENETIC_SSH_KEY</code> (путь к ключу), <code>ADMIN_PASSWORD</code>, при желании — <code>DASHBOARD_PORT</code> (если 5000 занят)</li>
+        <li>Запусти <code>start-bg.bat</code> (фоновый режим) или <code>start.bat</code> (с окном для дебага)</li>
+        <li>Опционально — <code>install_service.bat</code> от админа: панель будет запускаться при boot Windows как Task Scheduler-сервис (auto-чинит SSH-ключ + MS Store Python в v1.5.6+)</li>
+        <li>Открой <code>http://localhost:5000</code></li>
+      </ol>
+      <p><strong>Обновления потом</strong>: двойной клик на <code>C:\xray-dashboard\update.bat</code> — он сам делает <code>git pull</code> + рестарт сервиса. С v1.6.7 при локальных изменениях auto-stash.</p>
+
+      <h4>🥈 Путь 2 (для разовой установки): ZIP-архив</h4>
+      <p>Если Git ставить не хочется (например на чужой PC, или гость в чужой Windows), можно скачать ZIP:</p>
+      <ul>
+        <li><strong>Последняя версия</strong>: <a href="https://github.com/yuran2000/xray-dashboard/archive/refs/heads/main.zip" target="_blank">main.zip</a> (всегда свежайший с main)</li>
+        <li><strong>Конкретная версия</strong>: на странице <a href="https://github.com/yuran2000/xray-dashboard/releases" target="_blank">Releases</a> у каждого тега есть «Source code (zip)» и «Source code (tar.gz)»</li>
+      </ul>
+      <p>Распакуй в <code>C:\xray-dashboard\</code> (содержимое одной папки внутри ZIP — переименуй так чтобы было правильно). Дальше как в Путь 1 с шага 3 (<code>install.bat</code>).</p>
+
+      <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+        ⚠ <strong>Что НЕ работает с ZIP-архивом</strong>:
+        <ul style="margin: 4px 0;">
+          <li><code>update.bat</code> — он внутри делает <code>git pull</code> → ошибка «Not a git repository»</li>
+          <li>Все скрипты которые ожидают <code>.git</code> папку</li>
+        </ul>
+        Если потом захочешь обновляться нормально — конвертируй папку в git-репозиторий (см. ниже).
+      </div>
+
+      <h4>⚠ ZIP поверх git-папки — НЕ делать!</h4>
+      <p>Если уже установлено через <code>git clone</code> — для обновления используй <strong>`update.bat`</strong> или <code>git pull</code>, не качай ZIP.</p>
+      <p>Если всё-таки скачал ZIP и разархивировал поверх — что произойдёт:</p>
+      <ul>
+        <li><strong>Tracked файлы</strong> (<code>dashboard.py</code>, <code>update.bat</code>, <code>bootstrap/*</code>) — перезаписаны новой версией ✅</li>
+        <li><strong>Untracked</strong> (<code>config_local.py</code>, <code>.venv/</code>, <code>.ssh/</code>, бэкапы) — не тронуты ✅</li>
+        <li>Папка <code>.git</code> — не тронута (ZIP её не содержит) ✅</li>
+        <li><strong>HEAD остался на старом commit</strong>, а файлы на диске = новая версия → <code>git status</code> покажет «modified: …» (git считает это локальными изменениями, хотя по факту это новая версия из ZIP)</li>
+        <li>При следующем <code>git pull</code> будет конфликт «local changes would be overwritten»</li>
+      </ul>
+      <p><strong>Как починить</strong> если уже сделал ZIP-overlay:</p>
+      <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;"># Вариант 1 (мягкий): запусти update.bat - в v1.6.7+ auto-stash сам решит конфликт.
+# Stash засорится "мусор-копией" - удали потом вручную:
+git stash list                    # увидишь auto-stash-by-update-...
+git stash drop stash@{0}           # удалить верхний stash
+
+# Вариант 2 (чистый): жёстко выровнять с remote, выбросив локальные "изменения":
+git fetch origin
+git reset --hard origin/main      # config_local.py не тронется (он не tracked)</pre>
+
+      <h4>🔄 Конвертация ZIP-папки в git-репозиторий (для обновлений в будущем)</h4>
+      <p>Если ставил из ZIP, а потом передумал и хочешь иметь возможность обновляться через <code>update.bat</code>:</p>
+      <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">cd C:\xray-dashboard
+git init
+git remote add origin https://github.com/yuran2000/xray-dashboard.git
+git fetch origin
+git reset --hard origin/main
+git branch -M main</pre>
+      <p>После этого папка превратилась в git checkout последней версии main. <code>update.bat</code> теперь работает. Если на момент конверсии в папке были локальные правки — они потеряются (<code>reset --hard</code> их затрёт). Сделай бэкап файлов перед конверсией если что-то ценное правил руками.</p>
+
+      <h4>📋 Что должно быть в config_local.py (минимум)</h4>
+      <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">KEENETIC_HOST = "192.168.1.1"  # IP роутера
+KEENETIC_USER = "root"
+KEENETIC_SSH_PORT = 222
+KEENETIC_SSH_KEY = r"C:\xray-dashboard\.ssh\id_keenetic"  # путь к приватному ключу
+ADMIN_PASSWORD = "ваш-пароль-для-входа-в-панель"
+SECRET_KEY = "случайная-строка-для-flask-сессий-сюда"
+SUBSCRIPTION_TOKEN = "случайная-строка"
+DASHBOARD_PORT = 5000  # опционально, если порт 5000 занят</pre>
+      <p><code>install.bat</code> в v1.4+ сам генерирует случайные <code>SECRET_KEY</code> и <code>SUBSCRIPTION_TOKEN</code> при первой установке. Остальное нужно вписать руками.</p>
+
+      <h4>🔑 SSH-ключ для роутера</h4>
+      <p>Если ключа ещё нет — сгенерируй:</p>
+      <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">ssh-keygen -t ed25519 -f C:\xray-dashboard\.ssh\id_keenetic -N ""</pre>
+      <p>Публичную часть (<code>.pub</code>) скопируй на роутер в <code>/opt/etc/dropbear/authorized_keys</code>. На v1.5.6+ при <code>install_service.bat</code> от админа — скрипт сам предложит скопировать ключ из <code>~/.ssh/</code> в проектную папку с правильными permissions для SYSTEM.</p>
+    </div>
+  </details>
+
+  <details class="help-section">
+    <summary>🛠️ Установка XKeen с нуля на новый роутер</summary>
+    <div class="help-body">
+      <p>Эта инструкция — для случая когда у тебя <strong>новый чистый Keenetic</strong>, на нём ничего нет,
+      и нужно поставить XKeen (xray-клиент) чтобы эта панель могла им управлять.
+      Что в итоге получится: на роутере — пакеты <code>xkeen</code> + <code>xray_s</code>, автозапуск через init.d,
+      конфиги в <code>/opt/etc/xray/configs/</code>, доступ по SSH-ключу.</p>
+
+      <details open style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">📋 Что понадобится</summary>
+        <div style="margin-top: 8px;">
+          <ul>
+            <li><strong>Роутер Keenetic</strong> с поддержкой OPKG (почти все актуальные модели: Giga, Ultra, Hero, Hopper, Sprinter, …). Проверить можно в Web → Управление → Общие настройки → Компоненты — должен быть пункт «Менеджер пакетов OPKG».</li>
+            <li><strong>USB-флешка ≥ 4 ГБ</strong> (лучше 16+ ГБ, ext4). На неё установится Entware/OPKG и сам XKeen. Кинетик с ней работает в режиме <code>/opt</code>-mount, так что флешка должна быть всегда подключена.</li>
+            <li><strong>KeeneticOS</strong> актуальной версии (3.6+ как минимум, 4.x лучше). Обновить можно через Web → Управление → Общие настройки → Обновить.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">💾 Шаг 1. Подготовить USB-флешку (форматировать в ext4 на PC)</summary>
+        <div style="margin-top: 8px;">
+          <p>Флешка должна быть в формате <strong>ext4</strong> — это обязательное требование Entware/OPKG для <code>/opt</code>-маунта. NTFS и FAT32 не подойдут. Windows не умеет форматировать в ext4 нативно, поэтому нужна сторонняя программа:</p>
+
+          <ul>
+            <li><strong><a href="https://www.minitool.com/partition-manager/partition-wizard-home.html" target="_blank" rel="noopener">MiniTool Partition Wizard Free</a></strong> — бесплатная Windows-программа. Запустить → ПКМ на флешке → Format → File System: <strong>Ext4</strong> → OK → Apply.</li>
+            <li>Альтернатива: WSL2 (<code>wsl --mount &lt;диск&gt; --bare</code> + <code>mkfs.ext4</code>) или загрузочный Linux-USB.</li>
+          </ul>
+
+          <p><strong>Все данные на флешке будут стёрты.</strong> Используй чистую флешку или ту что не жалко (минимум 1 ГБ, лучше 4+ ГБ).</p>
+
+          <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+            💡 <strong>Не вытаскивай флешку в Windows после форматирования</strong>, чтобы скопировать туда установщик — Windows не умеет писать в ext4 без сторонних драйверов. <strong>Папку <code>install</code> и сам файл-установщик загрузим через Web UI Keenetic на Шаге 3</strong> — роутер с ext4 работает нативно.
+          </div>
+
+          <p>На этом этап «PC» закончен. Дальше всё через Web UI Keenetic.</p>
+        </div>
+      </details>
+
+      <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">📦 Шаг 2. Установить компонент OPKG в KeeneticOS</summary>
+        <div style="margin-top: 8px;">
+          <p>Web → <strong>Управление → Общие настройки → Изменить набор компонентов</strong> (кнопка «Изменить набор компонентов»). В разделе «Утилиты и сервисы» найди и поставь галку:</p>
+          <ul>
+            <li><strong>Менеджер пакетов OPKG</strong> (обязательно)</li>
+            <li><strong>Модули ядра для USB-накопителей: ext4</strong> (если ещё не включён)</li>
+            <li><strong>Доступ к командной строке (CLI)</strong> — если хочешь зайти по SSH</li>
+          </ul>
+          <p>Нажми «Установить обновление» и подожди — роутер скачает компоненты и перезагрузится.</p>
+        </div>
+      </details>
+
+      <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">⚙ Шаг 3. Установить Entware через Web UI Keenetic (папка <code>install</code> + tar.gz)</summary>
+        <div style="margin-top: 8px;">
+          <p>Воткни ext4-флешку (из Шага 1) в USB-порт роутера. Дальше всё через Web UI Keenetic — НЕ нужно вытаскивать флешку обратно в Windows.</p>
+
+          <ol>
+            <li>Открой Web UI: <code>http://{{ keenetic_settings.current.host or '192.168.1.1' }}</code></li>
+            <li><strong>«Управление» → «Приложения»</strong> → увидишь свою флешку в списке USB-накопителей (по имени тома)</li>
+            <li>Кликни на флешку — откроется файловый менеджер. <strong>Создай папку <code>install</code></strong> в корне флешки. Имя точное, lowercase.</li>
+            <li>Скачай на PC <strong>Entware-установщик</strong>: <a href="https://github.com/Corvus-Malus/XKeen/releases" target="_blank" rel="noopener">github.com/Corvus-Malus/XKeen/releases</a> → файл <code>mipsel-installer.tar.gz</code> (для MT7621-роутеров — Giga/Ultra/Hero/Hopper/Sprinter; для другой архитектуры см. таблицу в README репозитория).</li>
+            <li><strong>Через Web UI Keenetic загрузи</strong> <code>mipsel-installer.tar.gz</code> в созданную папку <code>install/</code> (drag&amp;drop или кнопка «Загрузить»).</li>
+            <li><strong>«Настройки» → «OPKG»</strong> (этот раздел появляется только после установки компонента из Шага 2!) → в выпадающем списке «Накопитель» выбери свою флешку → <strong>«Применить»</strong>.</li>
+            <li>Keenetic найдёт <code>install/mipsel-installer.tar.gz</code> и развернёт Entware на флешке. Прогресс видно в <strong>«Диагностика»</strong> (журнал событий). Занимает ~3-5 минут.</li>
+          </ol>
+
+          <div style="background:#e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+            💡 <strong>Что это за tar.gz и почему именно он</strong>: <code>mipsel-installer.tar.gz</code> от Corvus-Malus — это <strong>Entware-установщик</strong> (базовая система <code>opkg</code> + <code>busybox</code> + <code>dropbear</code>), НЕ сам XKeen. После Entware флешка станет <code>/opt</code>-маунтом, и на неё можно ставить любые пакеты через <code>opkg install</code>. XKeen поставим следующим, через installer jameszeroX (Шаг 6).
+          </div>
+
+          <div style="background:#fff8e7; border-left: 3px solid #e80; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+            ⚠️ <strong>Если флешка не видна в «Управление → Приложения»</strong> — проверь Шаг 2 (компонент «Модули ядра для USB-накопителей: ext4» должен быть включён). Без этого компонента KeeneticOS не распознаёт ext4-разделы.
+          </div>
+        </div>
+      </details>
+
+      <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">🔐 Шаг 4. SSH на роутер :222 + смена пароля + зависимости</summary>
+        <div style="margin-top: 8px;">
+          <p>После установки Entware на флешку (Шаг 3) Keenetic автоматически поднимает <strong>dropbear из Entware</strong> на порту <code>222</code>. <strong>Не путать</strong> с системным SSH Keenetic на порту 22 — там другой shell (<code>ndm</code>-CLI), другие учётки и совсем другая система.</p>
+
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p 222</pre>
+
+          <p>Дефолтный пароль <code>root</code> на свежем dropbear: <code>keenetic</code>. <strong>СРАЗУ ПОМЕНЯЙ</strong>:</p>
+
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">passwd root</pre>
+
+          <p>Поставь зависимости которые понадобятся для XKeen-installer:</p>
+
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">opkg update
+opkg install curl tar unzip
+opkg install ca-bundle ca-certificates</pre>
+
+          <p>Это потянет ~30 MB зависимостей (libcurl, openssl, libnghttp2, libzstd и др.) — 1-2 минуты. Это нормально, происходит автоматически.</p>
+
+          <div style="background:#e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+            💡 <strong>SSH-ключи лучше пароля</strong>. Сгенерируй на PC ключ <code>ssh-keygen -t ed25519</code>, скопируй публичную часть в <code>/opt/etc/dropbear/authorized_keys</code> на роутере, отключи парольный вход. См. подраздел «🔧 Подключение к роутеру» в этой панели.
+          </div>
+        </div>
+      </details>
+
+      <details open style="margin: 10px 0; padding: 10px 14px; background: #fff8e7; border-left: 4px solid #e80; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #7a5500;">📥 Шаг 5. Скачать Xray-mips32le ВРУЧНУЮ (важно!)</summary>
+        <div style="margin-top: 8px;">
+          <p>Это <strong>самая частая грабля</strong> на MT7621-роутерах. XKeen-installer от jameszeroX иногда некорректно определяет архитектуру и скачивает <code>mips32</code> (big-endian) или <code>mips32-softfloat</code> вместо правильного <code>mips32le</code> — xray падает с <code>SIGSEGV</code> при запуске.</p>
+
+          <p>Чтобы избежать — скачаем правильный binary <strong>заранее</strong>, потом скажем installer'у пропустить его загрузку:</p>
+
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">cd /tmp
+curl -L -O https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-mips32le.zip
+unzip -o Xray-linux-mips32le.zip
+./xray version
+# Должно показать: Xray ... (...) linux/mipsle — БЕЗ SIGSEGV
+
+# Положить в /opt/sbin
+mkdir -p /opt/sbin
+cp /tmp/xray /opt/sbin/xray
+chmod +x /opt/sbin/xray
+/opt/sbin/xray version</pre>
+
+          <div style="background:#fde8e8; border-left: 3px solid #c33; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+            ⚠ <strong>unzip обязательно с флагом <code>-o</code></strong>. Без него при повторном запуске будет интерактивный prompt «replace? [y/n]» — если ты копируешь следующую команду как ответ, скрипт ломается.
+          </div>
+
+          <p class="muted">💡 На свежей Entware-установке детекция архитектуры в xkeen-installer обычно работает правильно. Но безопаснее ВСЕГДА класть xray руками заранее — даёт 100% контроль над binary + гарантирует версию которую ты тестировал.</p>
+        </div>
+      </details>
+
+      <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">📦 Шаг 6. Запустить XKeen-installer (jameszeroX) с пропуском Xray</summary>
+        <div style="margin-top: 8px;">
+          <p>Теперь когда наш проверенный <code>/opt/sbin/xray</code> уже лежит — можем запустить installer и сказать ему «не качай xray, используй существующий»:</p>
+
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">sh -c "$(curl -sSL https://raw.githubusercontent.com/jameszeroX/XKeen/main/install.sh)"</pre>
+
+          <p>Будет несколько prompt'ов — отвечай так:</p>
+
+          <table style="border-collapse: collapse; margin: 8px 0; width: 100%;">
+            <thead>
+              <tr style="background: #f0f0f0;">
+                <th style="border: 1px solid #ccc; padding: 6px 10px; text-align: left;">Prompt</th>
+                <th style="border: 1px solid #ccc; padding: 6px 10px; text-align: left;">Ответ</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td style="border: 1px solid #ccc; padding: 6px 10px;">«Какую версию XKeen»</td><td style="border: 1px solid #ccc; padding: 6px 10px;"><code>1</code> (Stable)</td></tr>
+              <tr><td style="border: 1px solid #ccc; padding: 6px 10px;">«Выберите ядро проксирования»</td><td style="border: 1px solid #ccc; padding: 6px 10px;"><code>1</code> (Xray)</td></tr>
+              <tr><td style="border: 1px solid #ccc; padding: 6px 10px;"><strong>«Выберите номер релиза Xray»</strong></td><td style="border: 1px solid #ccc; padding: 6px 10px;"><strong><code>0</code></strong> (ПРОПУСТИТЬ — у нас уже свой)</td></tr>
+              <tr><td style="border: 1px solid #ccc; padding: 6px 10px;">«Действия для GeoSite»</td><td style="border: 1px solid #ccc; padding: 6px 10px;"><code>1</code> (Установить все)</td></tr>
+              <tr><td style="border: 1px solid #ccc; padding: 6px 10px;">«Действия для GeoIP»</td><td style="border: 1px solid #ccc; padding: 6px 10px;"><code>1</code> (Установить все)</td></tr>
+              <tr><td style="border: 1px solid #ccc; padding: 6px 10px;">«Автообновление GeoFile»</td><td style="border: 1px solid #ccc; padding: 6px 10px;"><code>1</code> (Включить cron)</td></tr>
+            </tbody>
+          </table>
+
+          <div style="background:#fde8e8; border-left: 3px solid #c33; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+            ⚠ <strong>Пункт «0. Пропустить загрузку»</strong> работает ТОЛЬКО если <code>/opt/sbin/xray</code> уже существует. Если ввести 0 при пустой <code>/opt/sbin/</code> — installer скажет «Невозможно установить XKeen без ядра» и отменит установку. Поэтому Шаг 5 обязателен ДО Шага 6.
+          </div>
+
+          <p>После установки проверь:</p>
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">xkeen -status
+ls -la /opt/etc/xray/configs/
+/opt/sbin/xray version</pre>
+        </div>
+      </details>
+
+      <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">🚀 Шаг 7. Развернуть наши скрипты через панель (Bootstrap)</summary>
+        <div style="margin-top: 8px;">
+          <p>XKeen-installer ставит сам xray + GeoFile + базовую структуру конфигов. Но <strong>watchdog</strong> (failover между каналами), <strong>05_routing.template.json</strong> (с placeholder'ами AI/YT/DIRECT/BLOCK/GeoIP) и <strong>watchdog.config</strong> нужно положить отдельно. Делаем одной кнопкой через эту панель:</p>
+
+          <ol>
+            <li>На PC открой эту панель (<code>http://localhost:{{ cfg.DASHBOARD_PORT or 5000 }}/xkeen</code>)</li>
+            <li>Раскрой секцию <strong>«🔧 Подключение к роутеру»</strong> в конце страницы → пропиши IP роутера, порт <code>222</code>, путь к SSH-ключу → <strong>«🔌 Проверить связь»</strong> → должно показать «✅ Связь есть»</li>
+            <li>Раскрой <strong>«🚀 Развернуть на чистом XKeen»</strong> → <strong>«Показать план»</strong></li>
+            <li>Все галочки уже выставлены правильно — на свежей установке <strong>галочку «Перезаписать существующие файлы» ставить НЕ нужно</strong>. С v1.4.9 наш bootstrap сам подменяет шаблонный <code>04_outbounds.json</code> от XKeen-installer'а (374 байта, только комментарии) на минимальный с <code>direct + block</code>, даже без галочки.</li>
+            <li>Нажми <strong>«✅ Применить выбранное»</strong></li>
+          </ol>
+
+          <p>Что произойдёт:</p>
+          <ul>
+            <li><code>watchdog.sh</code> → <code>/opt/etc/xray/watchdog.sh</code> + chmod +x</li>
+            <li><code>05_routing.template.json</code> → <code>/opt/etc/xray/configs.bak/</code></li>
+            <li><code>watchdog.config</code> → <code>/opt/etc/xray/watchdog.config</code> (дефолтный с PRIMARY=direct)</li>
+            <li><code>04_outbounds.json</code> ← дефолтный с <code>direct + block</code> outbounds</li>
+            <li><code>outbound_meta.json</code>, <code>subscription_meta.json</code> ← пустые JSON если их нет</li>
+            <li>Cron-запись <code>*/1 * * * * /opt/etc/xray/watchdog.sh</code></li>
+            <li>Лог-директория <code>/opt/var/log/xray/</code></li>
+          </ul>
+
+          <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+            ⚠ <strong>Когда галочка «Перезаписать» нужна</strong>: только если делаешь <strong>полный сброс</strong> уже работающей установки (см. раздел «🔄 Полный сброс конфигов» ниже) — тогда галочка нужна чтобы перетереть существующие <code>watchdog.config</code> / <code>05_routing.template.json</code>. На свежей установке (только что после <code>xkeen -i</code>) — НЕ ставь. Если уже добавил подписку и outbound'ы — тем более НЕ ставь (потеряешь их).
+          </div>
+        </div>
+      </details>
+
+      <details open style="margin: 10px 0; padding: 10px 14px; background: #fff8e7; border-left: 4px solid #e80; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #7a5500;">🌐 Шаг 8. Создать политику «XKeen» в Keenetic Web UI + привязать клиентов (ВРУЧНУЮ!)</summary>
+        <div style="margin-top: 8px;">
+          <p>XKeen-installer создаёт всё на стороне Entware (xray, конфиги, iptables-правила) — но <strong>политика доступа в Keenetic Web UI НЕ добавляется автоматически</strong>. Без неё ни один клиент не получит метку fwmark, без fwmark XKeen-iptables не сработает, и трафик пойдёт мимо xray.</p>
+
+          <div style="background:#fde8e8; border-left: 3px solid #c33; padding: 10px 14px; margin: 10px 0; font-size: 0.92em;">
+            🔴 <strong>Имя политики должно быть СТРОГО <code>XKeen</code></strong> (case-sensitive, без пробелов, без префиксов/суффиксов). XKeen-installer ищет политику по <em>description</em> ровно «XKeen» — если назовёшь иначе, fwmark не подцепится и xray-перехват не сработает. Внутреннее имя политики у Keenetic своё (Policy0/Policy1/Policy2…) — его не правь, оно генерируется автоматически.
+          </div>
+
+          <p><strong>Часть A — Создать политику</strong>:</p>
+          <ol>
+            <li>Web-интерфейс роутера: <code>http://{{ keenetic_settings.current.host or '192.168.1.1' }}</code></li>
+            <li>Раздел <strong>«Сетевые правила» → «Приоритеты подключений»</strong> → вкладка <strong>«Политики доступа в интернет»</strong></li>
+            <li>«<strong>+ Добавить политику</strong>» → <strong>имя: <code>XKeen</code></strong> (только так!)</li>
+            <li>В списке подключений политики отметь <strong>провайдера (или нескольких)</strong> — например <code>ROSTELEKOM</code> / <code>Подключение Ethernet</code>. Это нужно как fallback на случай если xray ляжет.<br>
+              <span style="color:#777; font-size:0.9em;">⚠ <strong>«Интерфейс xray» в этом списке НЕ появится</strong> — xray работает на уровне iptables в обход маршрутизации Keenetic. Не ищи его и не отмечай ничего лишнего.</span></li>
+            <li>«<strong>Сохранить</strong>»</li>
+          </ol>
+
+          <p><strong>Часть B — Привязать клиентов к политике</strong> (без этого xray не получит ни одного пакета!):</p>
+          <ol>
+            <li>В том же разделе перейди на вкладку <strong>«Применение политик»</strong></li>
+            <li>Найди созданную политику <code>XKeen</code> → «<strong>+ Добавить цель</strong>»</li>
+            <li>Выбери <strong>«Клиент»</strong> (для одного устройства) или <strong>«Сеть»</strong> (для подсети, например <code>192.168.1.0/24</code> чтобы весь LAN)</li>
+            <li>При выборе «Клиент» отметь нужные устройства из списка (можно несколько) → «<strong>Сохранить</strong>»</li>
+          </ol>
+
+          <div style="background:#eefbe5; border-left: 3px solid #2a7; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+            💡 <strong>Кто привязан — тот через xray, кто нет — мимо.</strong> Не привязывай к политике XKeen то, чему VPN не нужен: принтеры, IoT-розетки, IP-камеры (если им не нужен удалённый доступ из-за границы), гостевой Wi-Fi. Каждый лишний клиент в политике XKeen — это нагрузка на CPU роутера (особенно на MT7621-классе типа Keenetic Hopper/Giga/Ultra). Список фактически привязанных клиентов смотри в секции <strong>«👥 Клиенты в политике XKeen»</strong> на главной /xkeen.
+          </div>
+
+          <div style="background:#fde8e8; border-left: 3px solid #c33; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+            ⚠ <strong>Применение политик тяжёлое</strong>. Web UI может зависнуть на 1-2 минуты пока Keenetic пересобирает fwmark/routing-таблицы. <strong>Не нажимай повторно</strong>, не reboot'й роутер. Подожди.
+          </div>
+
+          <p><strong>Проверка</strong>: открой <a href="https://2ip.ru" target="_blank">2ip.ru</a> с того клиента которого ты привязал к политике XKeen — должен показаться IP <strong>VPN-сервера</strong> (или провайдера твоего VPN-канала), а не твоего домашнего ROSTELEKOM/Билайн. С клиента который НЕ в политике — IP должен быть твоего домашнего провайдера.</p>
+
+          <p style="font-size:0.88em; color:#666;">📚 Источник: <a href="https://github.com/Corvus-Malus/XKeen" target="_blank">README Corvus-Malus/XKeen</a> раздел «Предварительные настройки», а также <a href="https://jameszero.net/faq-xkeen.htm" target="_blank">FAQ jameszero</a>.</p>
+        </div>
+      </details>
+
+      <details open style="margin: 10px 0; padding: 10px 14px; background: #fff8e7; border-left: 4px solid #e80; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #7a5500;">💾 Шаг 9. Сохранить PRIMARY в UI (ОБЯЗАТЕЛЬНЫЙ нюанс!)</summary>
+        <div style="margin-top: 8px;">
+          <p>После Bootstrap (Шаг 7) в <code>watchdog.config</code> лежит <code>PRIMARY_TAG="vless-reality"</code> — placeholder который вряд ли совпадает с твоим реальным outbound'ом. Нужно явно выбрать и <strong>обязательно сохранить</strong>:</p>
+
+          <ol>
+            <li>В UI открой секцию <strong>«🎯 Основное и резервное подключение»</strong></li>
+            <li>В dropdown <strong>«🛡️ Основной канал (PRIMARY)»</strong> выбери:
+              <ul>
+                <li><strong>«🌐 Напрямую без VPN»</strong> — если у тебя ещё нет подписки (минимальная рабочая конфигурация: трафик идёт через провайдера, VPN не нужен), или</li>
+                <li>Конкретный VPN-канал из подписки (например <code>provider-a-nl</code>) — если подписку уже добавил.</li>
+              </ul>
+            </li>
+            <li><strong>ОБЯЗАТЕЛЬНО нажми зелёную кнопку «💾 Сохранить PRIMARY»</strong> под dropdown'ом!</li>
+            <li>Через ≤1 мин watchdog подхватит и:
+              <ul>
+                <li>В шапке исчезнет «⚠ работаем через резерв»</li>
+                <li><code>xkeen -status</code> покажет «Прокси-клиент xray запущен в режиме Mixed»</li>
+              </ul>
+            </li>
+          </ol>
+
+          <div style="background:#fde8e8; border-left: 3px solid #c33; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+            ⚠ <strong>Грабля</strong>: выбор в dropdown НЕ сохраняется автоматически. Только клик «💾 Сохранить PRIMARY» записывает в watchdog.config. Без него xray ругается «outbound tag not found», в UI висит «PRIMARY () недоступен», ничего не работает.
+          </div>
+        </div>
+      </details>
+
+      <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">📡 Шаг 10. Добавить VLESS-подписку (опционально, если есть платный провайдер)</summary>
+        <div style="margin-top: 8px;">
+          <p>Если ты на PRIMARY=direct, всё уже работает — Шаг 10 не нужен. Подписка нужна когда хочешь использовать платный VPN-провайдер (3X-UI, Provider A/B/C/D и т.п.).</p>
+
+          <ol>
+            <li>Получи у провайдера <strong>subscription URL</strong> (обычно начинается с <code>https://...sub=...</code>, при открытии в браузере отдаёт base64 со списком серверов)</li>
+            <li>В UI открой секцию <strong>«📡 Обновить из подписки»</strong></li>
+            <li>Впиши URL → <strong>«🔍 Предпросмотр»</strong> → увидишь сколько outbound'ов добавится</li>
+            <li><strong>«📥 Скачать и обновить»</strong></li>
+            <li>В шапке после обновления увидишь outbound'ы сгруппированными по подписке (с цветными бейджами)</li>
+          </ol>
+
+          <p>После этого можешь поменять PRIMARY на конкретный сервер из подписки в Шаге 9. И настроить AI-sticky / YT-sticky на нужные каналы.</p>
+        </div>
+      </details>
+
+      <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">🔁 Опционально. Перезагрузка роутера + удаление залипшей политики через Keenetic CLI</summary>
+        <div style="margin-top: 8px;">
+          <p>После Шага 8 (применения политики) Web UI может стать тормозным. Часто помогает <strong>reboot роутера</strong> — после него load average падает с 30 до 3, swap очищается, CPU idle вырастает с 0% до ~20%.</p>
+
+          <p>Если в Web UI создалась <strong>пустая или сломанная политика</strong> которую невозможно удалить через интерфейс (Web виснет) — удалить через Keenetic CLI:</p>
+
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;"># Зайти в Keenetic CLI (НЕ Entware!) на :22 как admin
+ssh admin@{{ keenetic_settings.current.host or '192.168.1.1' }}
+
+# В Keenetic CLI shell:
+show ip policy           # покажет список политик с их именами
+# Найди в выводе строку типа: Policy "XKeen-Policy" ...
+no ip policy XKeen-Policy
+system configuration save
+exit</pre>
+
+          <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+            💡 В имени политики важно <strong>точное</strong> совпадение. Используй то имя что видишь в <code>show ip policy</code>. Если в имени пробелы — кавычки: <code>no ip policy "My Policy"</code>.
+          </div>
+        </div>
+      </details>
+
+      <details style="margin: 10px 0; padding: 10px 14px; background: #f0f9ff; border-left: 4px solid #0288d1; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #01579b;">📊 Производительность MT7621 — нормативы и тревожные показатели</summary>
+        <div style="margin-top: 8px;">
+          <p>После установки + работающего xray на MT7621-роутерах CPU может казаться загруженным — это нормально, потому что нагрузка идёт не от xray (он почти 0% CPU), а от ядра при роутинге через iptables TPROXY-цепочки.</p>
+
+          <table style="border-collapse: collapse; margin: 8px 0; width: 100%;">
+            <thead><tr style="background: #f0f0f0;"><th style="border:1px solid #ccc; padding: 6px 10px; text-align: left;">Метрика</th><th style="border:1px solid #ccc; padding: 6px 10px; text-align: left;">Нормально</th><th style="border:1px solid #ccc; padding: 6px 10px; text-align: left;">Тревожно (reboot)</th></tr></thead>
+            <tbody>
+              <tr><td style="border:1px solid #ccc; padding: 6px 10px;">Load average</td><td style="border:1px solid #ccc; padding: 6px 10px;">2-5</td><td style="border:1px solid #ccc; padding: 6px 10px;">&gt; 10</td></tr>
+              <tr><td style="border:1px solid #ccc; padding: 6px 10px;">CPU idle</td><td style="border:1px solid #ccc; padding: 6px 10px;">10-30%</td><td style="border:1px solid #ccc; padding: 6px 10px;">&lt; 5%</td></tr>
+              <tr><td style="border:1px solid #ccc; padding: 6px 10px;">RAM used</td><td style="border:1px solid #ccc; padding: 6px 10px;">40-70%</td><td style="border:1px solid #ccc; padding: 6px 10px;">&gt; 90%</td></tr>
+              <tr><td style="border:1px solid #ccc; padding: 6px 10px;">Swap used</td><td style="border:1px solid #ccc; padding: 6px 10px;">0-5%</td><td style="border:1px solid #ccc; padding: 6px 10px;">&gt; 30% (особенно на USB-флешке)</td></tr>
+            </tbody>
+          </table>
+
+          <p><strong>Рекомендация</strong>: reboot роутера раз в неделю. Linux на embedded не любит длинный uptime, swap копится. Не применяй «Применить» в Web UI Keenetic чаще раза в минуту — каждый раз тяжёлая пересборка iptables.</p>
+        </div>
+      </details>
+
+      <details style="margin: 10px 0; padding: 10px 14px; background: #e8f5e9; border-left: 4px solid #2e7d32; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1b4d1f;">💾 Бэкапы — лучший способ страховки</summary>
+        <div style="margin-top: 8px;">
+          <p>В этой панели есть секция <strong>«💾 Бэкап и восстановление»</strong> — она снимает все XKeen-настройки роутера в один JSON-файл. <strong>Делай бэкап после каждой стабильной конфигурации</strong>:</p>
+
+          <ul>
+            <li>✅ Сразу после успешной установки + первой настройки</li>
+            <li>✅ После добавления подписки и настройки PRIMARY/FAILOVER/AI/YT</li>
+            <li>✅ Перед массовыми изменениями (правка template, удаление BLOCK_DOMAINS и т.п.)</li>
+            <li>✅ Перед обновлением Xray-binary</li>
+          </ul>
+
+          <p>Кнопкой <strong>«💾 Создать бэкап»</strong> — скачается файл вида <code>xkeen-backup-2026-05-18-13-00.json</code>. Сохраняй в надёжное место (Google Drive, Dropbox).</p>
+          <p>Если эксперимент сломал работу — <strong>«🔄 Восстановить из файла»</strong> → выбираешь нужный бэкап → за 5 секунд возврат в рабочее состояние. Без потери подписки, outbound'ов, доменов и т.п.</p>
+        </div>
+      </details>
+
+      <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">🔄 Полный сброс конфигов / откат к чистому состоянию</summary>
+        <div style="margin-top: 8px;">
+          <p>Если эксперименты привели в неисправное состояние и проще «снести всё, начать заново»:</p>
+
+          <h4 style="margin: 8px 0;">Опция A — Только template (если поломан routing)</h4>
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">cp /opt/etc/xray/configs.bak/05_routing.template.json.bak-min /opt/etc/xray/configs.bak/05_routing.template.json
+/opt/etc/xray/watchdog.sh
+xkeen -restart</pre>
+          <p>Сохраняет watchdog.config, outbounds, подписки. Восстанавливает только template.</p>
+
+          <h4 style="margin: 8px 0;">Опция B — Полный bootstrap (потеря подписки)</h4>
+          <ol>
+            <li><strong>Сохрани URL подписки</strong> в блокнот: <code>cat /opt/etc/xray/subscription_meta.json</code> на роутере</li>
+            <li>В UI → «🚀 Развернуть на чистом XKeen» → ✅ галочка «Перезаписать» → «✅ Применить»</li>
+            <li>Это сбросит watchdog.config / 04_outbounds.json / 05_routing.template.json к дефолтам. <strong>Подписка теряется</strong>.</li>
+            <li>Добавь подписку заново через «📡 Обновить из подписки»</li>
+            <li>Настрой PRIMARY/AI/YT через UI</li>
+          </ol>
+
+          <h4 style="margin: 8px 0;">Опция C — Snапшот из бэкапа</h4>
+          <p>Если у тебя есть свежий бэкап (см. выше) — просто восстанови из него. Это самый надёжный путь, без потери данных.</p>
+        </div>
+      </details>
+
+      <details style="margin: 10px 0; padding: 10px 14px; background: #fff8e7; border-left: 4px solid #e80; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #7a5500;">🆘 Если что-то пошло не так — полный список граблей</summary>
+        <div style="margin-top: 8px;">
+          <ul>
+            <li><strong>Раздел «OPKG» не появился в Web → Настройки</strong> — проверь что в Шаге 2 поставил компонент «Менеджер пакетов OPKG» (после установки нужна перезагрузка роутера). Раздел появляется только после этого.</li>
+            <li><strong>Флешка не видна в Web → Управление → Приложения</strong> — нужен компонент «Модули ядра для USB-накопителей: ext4» (Шаг 2). NTFS/FAT32 для <code>/opt</code> не подойдут — обязательно ext4, отформатированный на PC через MiniTool Partition Wizard (Шаг 1).</li>
+            <li><strong>«Применить» в Web → Настройки → OPKG не запускает установку</strong> — проверь что: (1) папка точно называется <code>install</code> (lowercase, не <code>Install</code>); (2) файл точно <code>mipsel-installer.tar.gz</code> (не переименован, не распакован); (3) он лежит ВНУТРИ папки <code>install/</code>, не в корне флешки.</li>
+            <li><strong>XKeen-installer (Шаг 6) ругается на сеть</strong> — у тебя на роутере должен быть выход в интернет (не через XKeen). Проверь что обычный VPN отключён, и роутер ходит наружу.</li>
+            <li><strong>xray даёт SIGSEGV / runtime crash при запуске</strong> — это арх-mismatch (xkeen-installer скачал mips32 BE вместо mips32le). Решение — Шаг 5 (скачать xray-mips32le вручную) + Шаг 6 (installer с ответом 0 «пропустить ядро»).</li>
+            <li><strong>«Невозможно установить XKeen без ядра»</strong> при ответе 0 в installer — это значит <code>/opt/sbin/xray</code> ещё не существует. Сначала Шаг 5 (положить xray руками), потом Шаг 6.</li>
+            <li><strong>После Шага 6 нет <code>/opt/sbin/xkeen</code></strong> — установка прервалась (sigint / нет интернета / нехватка места). <code>xkeen -dk</code> (deinstall) и снова с Шага 6.</li>
+            <li><strong><code>xkeen -status</code> показывает «не запущен»</strong> — смотри логи: <code>/opt/var/log/xray/error.log</code> + <code>logread | grep -i xray</code>. Самые частые причины: битый <code>05_routing.json</code> (Шаг 7 с галочкой «Перезаписать» должен помочь), отсутствует direct/block в <code>04_outbounds.json</code>, ссылка на несуществующий outbound.</li>
+            <li><strong>XKeen запущен, но трафик идёт мимо</strong> (2ip.ru показывает IP провайдера) — частые причины: <br>
+                <strong>(а)</strong> Шаг 8 Часть A не сделан или политика названа НЕ <code>XKeen</code> (case-sensitive!) — без точного совпадения description XKeen-installer не подцепит fwmark; <br>
+                <strong>(б)</strong> Шаг 8 Часть B не сделан — политика создана, но ни одного клиента к ней не привязано во вкладке «Применение политик»; <br>
+                <strong>(в)</strong> Клиент с которого ты проверяешь 2ip.ru — НЕ привязан к политике XKeen (она whitelist'ная: кто не привязан, тот через провайдера напрямую). Проверь привязки в секции «👥 Клиенты в политике XKeen» на главной /xkeen.</li>
+            <li><strong>В шапке «PRIMARY () недоступен»</strong> — Шаг 9 не сделан (не нажата «💾 Сохранить PRIMARY»).</li>
+            <li><strong>Web UI Keenetic завис после применения политики</strong> — это нормально на 1-2 минуты (пересборка iptables). Если затянулось — reboot роутера через ndmsv2 SSH (admin@host:22 → <code>system reboot</code>) или через Web UI Управление.</li>
+            <li><strong>Залипшая пустая политика, нельзя удалить через Web UI</strong> — через Keenetic CLI (см. опциональный шаг «Удаление политики через Keenetic CLI»).</li>
+            <li><strong>«unzip: replace?» / прерывание prompt'ом</strong> — всегда используй <code>unzip -o</code> (force overwrite, без интерактивности).</li>
+            <li><strong>Telegram Desktop / Discord native виснет на «Connecting»</strong> — это IP-only-проблема. Доменные правила их не ловят, нужны GeoIP-категории. См. подраздел «🩻 v2fly категории и 🌍 GeoIP-категории» выше.</li>
+            <li><strong>geoip:telegram не работает (xkeen в Mixed + в error.log <code>code not found</code>)</strong> — стандартный <code>geoip.dat</code> от XKeen-installer содержит только страны. Нужен расширенный от Loyalsoldier — кнопка в самой панели в секции «🌍 GeoIP-категории». ⚠ Если в Mixed но в error.log пусто — это просто другой режим работы XKeen, VPN при этом работает. Проверь через <code>curl https://checkip.amazonaws.com</code> с устройства в политике XKeen — должен показать VPN-IP.</li>
+            <li><strong>Полная переустановка</strong> — <code>xkeen -remove</code> снесёт всё подчистую (xray + конфиги + cron). Можно начать заново с Шага 5.</li>
+          </ul>
+          <p class="muted">💡 Актуальная официальная документация и обсуждение проблем — в Telegram-канале XKeen
+          (поиск по слову «XKeen» в Telegram) и в README пакета: <code>cat /opt/share/doc/xkeen/README</code> после установки.</p>
+        </div>
+      </details>
+
+    </div>
+  </details>
+
+  <details class="help-section">
+    <summary>💾 Бэкап и восстановление</summary>
+    <div class="help-body">
+      <h4>Snapshot одним файлом</h4>
+      <p>Раздел <strong>«💾 Бэкап и восстановление»</strong> наверху страницы умеет за один клик:</p>
+      <ul>
+        <li><strong>🔽 Скачать бэкап</strong> — собирает все XKeen-конфиги с роутера (<code>/opt/etc/xray/configs/*</code> + <code>outbound_meta.json</code> + <code>subscription_meta.json</code> + <code>watchdog.config</code>) в один JSON-файл. Можно сохранять локально, в облако, передавать.</li>
+        <li><strong>💾 Сохранить на диск</strong> — пишет тот же snapshot в <code>C:\xray-dashboard\backups\xkeen-snapshot-manual-&lt;timestamp&gt;.json</code> (рядом с автоматическими если настроены).</li>
+        <li><strong>🔄 Восстановить из файла</strong> — обратная операция: выбираешь JSON-файл → панель заливает все конфиги обратно на роутер и перезапускает xray. Используется при миграции на новый роутер, откате после сломанной правки, передаче друзьям.</li>
+      </ul>
+
+      <h4>Автоматизировать ежедневный snapshot (опционально)</h4>
+      <p>Скрипт <code>xkeen_snapshot_daily.py</code> рядом с <code>dashboard.py</code> делает то же что кнопка «💾 Сохранить на диск», но без UI — можно запустить через Task Scheduler:</p>
+      <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">schtasks /Create /TN "XkeenSnapshotDaily" /TR "C:\xray-dashboard\.venv\Scripts\python.exe C:\xray-dashboard\xkeen_snapshot_daily.py" /SC DAILY /ST 23:05 /RU SYSTEM /RL HIGHEST</pre>
+      <p>Файлы будут копиться в <code>C:\xray-dashboard\backups\xkeen-snapshot-YYYYMMDD-HHMMSS.json</code> (скрипт сам ротирует, держит последние 14).</p>
+
+      <h4>Что внутри snapshot'а</h4>
+      <p>Это plain JSON со всеми XKeen-конфигами роутера: <code>01_log</code>, <code>02_dns</code>, <code>03_inbounds</code>, <code>04_outbounds</code>, <code>05_routing</code>, <code>06_dns_servers</code>, <code>07_observatory</code> + sidecar-файлы (<code>outbound_meta.json</code>, <code>subscription_meta.json</code>, <code>watchdog.config</code>). Один файл = полный state роутера.</p>
+
+      <h4>Если всё совсем плохо — восстановление с нуля</h4>
+      <p>Если потерял и панель и snapshot — но роутер живой:</p>
+      <ol>
+        <li>На любом PC поставь панель из архива (см. «📦 Передать панель другу»).</li>
+        <li>В «🔧 Подключение к роутеру» введи IP/SSH-ключ → «🔌 Проверить связь».</li>
+        <li>В «📋 Все outbounds» увидишь все конфиги с роутера — никуда не делись.</li>
+      </ol>
+      <p>Если потерял и роутер — нужен последний snapshot + новый роутер с XKeen (см. «🛠️ Установка XKeen с нуля» → «🚀 Развернуть на чистом XKeen» → «🔄 Восстановить из файла»).</p>
+    </div>
+  </details>
+</div>
+</details>
+
+<style>
+.health-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.82em; font-weight: 600; margin-left: 4px; cursor: pointer; vertical-align: middle; }
+.health-badge.health-ok      { background: #e8f5e8; color: #2a7;  border: 1px solid #b6dcb6; }
+.health-badge.health-warn    { background: #fff4cc; color: #997300; border: 1px solid #e0c878; animation: blink 1.5s infinite; }
+.health-badge.health-bad     { background: #fbd7d7; color: #c33;  border: 1px solid #e09898; animation: blink 1s infinite; }
+.health-badge.health-pending { background: #eee;    color: #888;  border: 1px solid #ccc; }
+.health-badge.xs-ok      { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+.health-badge.xs-warn    { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+.health-badge.xs-err     { background: #ffd6a5; color: #7a4500; border: 1px solid #ffb74d; animation: blink 1.8s infinite; }
+.health-badge.xs-bad     { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; animation: blink 1s infinite; font-weight: 700; }
+.health-badge.xs-unk     { background: #e2e3e5; color: #383d41; border: 1px solid #d6d8db; }
+.health-badge.xs-pending { background: #fafafa; color: #888;    border: 1px solid #ddd; }
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+.outbound-info { margin-top: 6px; background: #f5f5f0; border-left: 3px solid #ccc; border-radius: 3px; font-size: 0.82em; color: #555; font-family: Consolas, monospace; line-height: 1.45; overflow: hidden; }
+.outbound-info .oi-header {
+  padding: 6px 10px;
+  font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+  font-size: 1.05em;
+  font-weight: 700;
+  color: #222;
+  border-bottom: 1px solid rgba(0,0,0,0.08);
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.outbound-info .oi-header .oi-title {
+  /* Matrix-стиль: ядовито-зелёный неоновый текст на чёрной плашке + glow.
+     Чтобы выбранный канал моментально цеплял глаз. */
+  color: #39ff14;
+  background: #0a0a0a;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-family: 'Courier New', Consolas, monospace;
+  letter-spacing: 0.5px;
+  text-shadow: 0 0 6px rgba(57, 255, 20, 0.8), 0 0 12px rgba(57, 255, 20, 0.4);
+  word-break: break-all;
+}
+.outbound-info .oi-header .oi-sub { font-weight: 500; color: rgba(0,0,0,0.6); font-size: 0.85em; }
+.outbound-info .oi-header .oi-badge { background: rgba(0,0,0,0.65); color: #fff; padding: 1px 6px; border-radius: 3px; font-size: 0.78em; font-weight: 600; }
+.outbound-info .oi-header .oi-expires { padding: 1px 6px; border-radius: 3px; font-size: 0.78em; font-weight: 600; white-space: nowrap; }
+.outbound-info .oi-params { padding: 6px 10px; }
+.outbound-info .oi-proto  { color: #639; font-weight: 600; }
+.outbound-info .oi-target { color: #c63; font-weight: 600; }
+.outbound-info .oi-host { color: #2a5; font-weight: 600; }
+.outbound-info .oi-net  { color: #36a; }
+.outbound-info .oi-sec  { color: #963; }
+.outbound-info .oi-k    { color: #888; }
+.outbound-info .oi-v    { color: #333; }
+.outbound-info .oi-missing { color: #c33; font-style: italic; padding: 6px 10px; }
+.outbound-info .oi-header .oi-active-note { font-size: 0.78em; font-weight: 600; max-width: 100%; flex-basis: 100%; }
+.outbound-info .oi-probe-btn { background: rgba(255,255,255,0.85); border: 1px solid rgba(0,0,0,0.15); border-radius: 3px; padding: 0 5px; cursor: pointer; font-size: 0.9em; line-height: 1.2; vertical-align: middle; box-shadow: 0 1px 1px rgba(0,0,0,0.08); }
+.outbound-info .oi-probe-btn:hover { background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.15); }
+.outbound-info .oi-probe-btn:active { transform: translateY(1px); }
+.outbound-info .oi-probe-btn:disabled { cursor: wait; opacity: 0.6; }
+.failover-active-label { font-size: 0.82em; font-weight: 600; color: #555; margin-top: 10px; margin-bottom: 4px; }
+</style>
+<script>
+const VLESS_META = {{ vless_meta_json|safe }};
+const ANTI_DPI_TAGS = new Set({{ anti_dpi_tags_json|safe }});
+// v1.7.11: IP этого PC (dashboard host) — для warning при сбросе conntrack самого себя
+window.PC_LAN_HOST = "{{ cfg.LAN_HOST or '' }}";
+
+// ============== v1.7.0: Domain notes (sidecar JSON на роутере) ==============
+// WINDOW_DOMAIN_NOTES хранит {sectionKey: {domain: note}} для всех 4 секций.
+// При нажатии пресета — note автоматически = "📦 <preset-name>".
+// При ручном вводе — note пустой, юзер может дописать после `#` в textarea.
+// При save — JS парсит строки, домены идут в watchdog.config, notes в sidecar JSON.
+let WINDOW_DOMAIN_NOTES = {{ domain_notes_json|safe }};
+// Гарантируем что все 4 namespace есть (если backend вернул битую структуру)
+['ai', 'yt', 'direct', 'block'].forEach(k => {
+  if (!WINDOW_DOMAIN_NOTES[k] || typeof WINDOW_DOMAIN_NOTES[k] !== 'object') {
+    WINDOW_DOMAIN_NOTES[k] = {};
+  }
+});
+// Маппинг sectionKey → textarea id и getter для presetDict.
+// v1.7.3: getter (а не имя переменной) — потому что `const AI_PRESETS = {...}` создаёт lexical
+// binding но НЕ свойство window. window['AI_PRESETS'] вернул бы undefined → autoMatchPresets
+// молча выходил. Getter-функция вызывается в момент работы, когда presets уже определены.
+const DOMAIN_SECTIONS = {
+  ai:     { taId: 'ai-domains',     getPresets: () => (typeof AI_PRESETS     !== 'undefined') ? AI_PRESETS     : null, label: 'AI'      },
+  yt:     { taId: 'yt-domains',     getPresets: () => (typeof YT_PRESETS     !== 'undefined') ? YT_PRESETS     : null, label: 'YT'      },
+  direct: { taId: 'direct-domains', getPresets: () => (typeof DIRECT_PRESETS !== 'undefined') ? DIRECT_PRESETS : null, label: 'DIRECT'  },
+  block:  { taId: 'block-domains',  getPresets: () => (typeof BLOCK_PRESETS  !== 'undefined') ? BLOCK_PRESETS  : null, label: 'BLOCK'   },
+};
+
+// Регекс парсинга одной строки textarea: "domain   # note" → [_, "domain", "note"]
+// note может быть пустым или отсутствовать. # внутри note сохраняется.
+const _DOMAIN_LINE_RE = /^\s*(\S+)\s*(?:#\s*(.*?))?\s*$/;
+
+// Парсит value текстареа → [{domain, note}, ...]. Пустые строки и комментарии без домена скип.
+// Backward-compat: если строка БЕЗ # содержит несколько whitespace/запятая-separated токенов
+// (старый формат типа "youtube.com googlevideo.com ytimg.com") — все они становятся отдельными
+// доменами без note. Это критично потому что watchdog.config исторически хранил domains
+// в shell-формате "d1 d2 d3" — при load jinja отдаёт их в одну строку через пробел.
+function parseDomainsTextarea(value) {
+  if (!value) return [];
+  const result = [];
+  const seen = new Set();  // dedup в пределах textarea (раньше дубли проходили в watchdog.config)
+  value.split(/\r?\n/).forEach(line => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) return;
+    if (trimmed.includes('#')) {
+      // Строка с inline-комментарием: parse "domain  # note"
+      const m = trimmed.match(_DOMAIN_LINE_RE);
+      if (m && m[1] && !seen.has(m[1])) {
+        seen.add(m[1]);
+        result.push({ domain: m[1], note: (m[2] || '').trim() });
+      }
+    } else {
+      // Строка без `#`: может быть один домен или несколько через пробел/запятую (старый формат)
+      trimmed.split(/[\s,]+/).forEach(d => {
+        const dom = d.trim();
+        if (dom && !seen.has(dom)) {
+          seen.add(dom);
+          result.push({ domain: dom, note: '' });
+        }
+      });
+    }
+  });
+  return result;
+}
+
+// Форматирует массив доменов с notes в строку для textarea (выровненные колонки).
+// Если note пустой — строка только из домена (чтобы не плодить пустые # в конце).
+// v1.7.4: гарантия минимум 1 пробел перед # даже если домен длиннее maxLen (не ломает выравнивание).
+function formatDomainsTextarea(items) {
+  if (!items.length) return '';
+  // Ширина колонки = длина самого длинного домена (минимум 20, максимум 50).
+  // Учитываем только домены с notes — пустые не влияют на колонку.
+  let maxLen = 0;
+  items.forEach(it => {
+    if (it.note && it.domain.length > maxLen) maxLen = it.domain.length;
+  });
+  maxLen = Math.max(20, Math.min(50, maxLen));
+  return items.map(it => {
+    if (!it.note) return it.domain;
+    // Если домен короче maxLen — пэддинг пробелами до maxLen+2, потом "# note"
+    // Если домен длиннее — хотя бы 1 пробел перед #, иначе строка `domain# note` слипнется
+    if (it.domain.length <= maxLen) {
+      return it.domain.padEnd(maxLen + 2, ' ') + '# ' + it.note;
+    }
+    return it.domain + ' # ' + it.note;
+  }).join('\n');
+}
+
+// Прочитать секцию: возвращает {domains: [...], notes: {dom: note, ...}, items: [{domain, note}, ...]}
+function readSection(sectionKey) {
+  const sec = DOMAIN_SECTIONS[sectionKey];
+  const ta = document.getElementById(sec.taId);
+  if (!ta) return { domains: [], notes: {}, items: [] };
+  const items = parseDomainsTextarea(ta.value);
+  const domains = items.map(it => it.domain);
+  const notes = {};
+  items.forEach(it => { if (it.note) notes[it.domain] = it.note; });
+  return { domains, notes, items };
+}
+
+// Записать секцию: items[] → textarea (с форматированием) + WINDOW_DOMAIN_NOTES[sectionKey] (sync).
+function writeSection(sectionKey, items) {
+  const sec = DOMAIN_SECTIONS[sectionKey];
+  const ta = document.getElementById(sec.taId);
+  if (!ta) return;
+  // Сортировка по умолчанию: пресеты сверху по алфавиту пресета, ручные снизу
+  // (если юзер нажал кнопку сортировки — она перепишет порядок).
+  ta.value = formatDomainsTextarea(items);
+  // Sync WINDOW_DOMAIN_NOTES
+  WINDOW_DOMAIN_NOTES[sectionKey] = {};
+  items.forEach(it => { if (it.note) WINDOW_DOMAIN_NOTES[sectionKey][it.domain] = it.note; });
+  // Подсветка дублей с другими секциями (v1.7.0 фича 4)
+  highlightDuplicatesBadge(sectionKey);
+}
+
+// При первой загрузке: rerender textarea с inline-комментариями из WINDOW_DOMAIN_NOTES.
+function rerenderSectionFromNotes(sectionKey) {
+  const sec = DOMAIN_SECTIONS[sectionKey];
+  const ta = document.getElementById(sec.taId);
+  if (!ta) return;
+  // Берём существующие домены из textarea (jinja отрендерил их без notes)
+  const items = parseDomainsTextarea(ta.value);
+  // Доклеиваем notes из WINDOW_DOMAIN_NOTES (если есть)
+  items.forEach(it => {
+    if (!it.note && WINDOW_DOMAIN_NOTES[sectionKey][it.domain]) {
+      it.note = WINDOW_DOMAIN_NOTES[sectionKey][it.domain];
+    }
+  });
+  ta.value = formatDomainsTextarea(items);
+}
+
+// Универсальное добавление пресета: записывает note "📦 <name>" для всех новых доменов.
+// Возвращает кол-во ДОБАВЛЕННЫХ (без учёта дублей).
+function addPresetGeneric(sectionKey, presetName, presetDomains) {
+  const sec = readSection(sectionKey);
+  const existing = new Set(sec.domains);
+  let added = 0;
+  presetDomains.forEach(d => {
+    if (!existing.has(d)) {
+      sec.items.push({ domain: d, note: '📦 ' + presetName });
+      existing.add(d);
+      added++;
+    } else {
+      // Если домен уже есть БЕЗ note — проставим note про пресет (полезно при upgrade со старой версии)
+      const found = sec.items.find(it => it.domain === d);
+      if (found && !found.note) found.note = '📦 ' + presetName;
+    }
+  });
+  writeSection(sectionKey, sec.items);
+  flash(true, `Добавлено ${added} новых доменов (пресет "${presetName}"). Не забудь нажать «Сохранить».`, null, {noScroll: true});
+  return added;
+}
+
+// Универсальное удаление всех доменов конкретного пресета (по note "📦 <name>").
+// Ручные домены (note начинается с "✏️" или пустой) НЕ трогает.
+function removePresetGeneric(sectionKey, presetName) {
+  const sec = readSection(sectionKey);
+  const beforeCount = sec.items.length;
+  const noteMarker = '📦 ' + presetName;
+  const filtered = sec.items.filter(it => it.note !== noteMarker);
+  const removed = beforeCount - filtered.length;
+  if (removed === 0) {
+    flash(true, `Пресет "${presetName}" пустой — нечего удалять.`, null, {noScroll: true});
+    return 0;
+  }
+  if (!confirm(`Удалить ${removed} доменов из пресета "${presetName}"?\n\nРучные домены (с пометкой ✏️) останутся.`)) return 0;
+  writeSection(sectionKey, filtered);
+  flash(true, `Удалено ${removed} доменов пресета "${presetName}". Нажми «Сохранить».`, null, {noScroll: true});
+  return removed;
+}
+
+// Сортировка секции. mode = 'alpha' (по домену) / 'preset' (по note: пресеты сверху по алфавиту, ручные снизу).
+function sortSection(sectionKey, mode) {
+  const sec = readSection(sectionKey);
+  if (mode === 'alpha') {
+    sec.items.sort((a, b) => a.domain.localeCompare(b.domain));
+  } else if (mode === 'preset') {
+    sec.items.sort((a, b) => {
+      const aP = a.note && a.note.startsWith('📦');
+      const bP = b.note && b.note.startsWith('📦');
+      if (aP && !bP) return -1;
+      if (!aP && bP) return 1;
+      if (a.note !== b.note) return (a.note || '').localeCompare(b.note || '');
+      return a.domain.localeCompare(b.domain);
+    });
+  }
+  writeSection(sectionKey, sec.items);
+}
+
+// Поиск в textarea: подсветить первый match через setSelectionRange + scrollIntoView.
+function searchInSection(sectionKey, query) {
+  const sec = DOMAIN_SECTIONS[sectionKey];
+  const ta = document.getElementById(sec.taId);
+  if (!ta || !query) return;
+  const text = ta.value;
+  const idx = text.toLowerCase().indexOf(query.toLowerCase());
+  if (idx === -1) {
+    flash(true, `«${query}» не найдено в ${sec.label}-секции.`, null, {noScroll: true});
+    return;
+  }
+  // Найдём конец совпадения
+  ta.focus();
+  ta.setSelectionRange(idx, idx + query.length);
+  // Браузер сам подсветит — но scrollIntoView помогает увидеть строку
+  ta.scrollTop = Math.max(0, (text.substring(0, idx).split('\n').length - 3) * 18);  // 18px per line
+}
+
+// Подсветка дублей: проверяет есть ли домены этой секции в ДРУГИХ секциях.
+// Если есть — обновляет бейдж #dup-badge-<sectionKey> текстом "⚠ N дублей".
+function highlightDuplicatesBadge(sectionKey) {
+  const sec = readSection(sectionKey);
+  const myDomains = new Set(sec.domains);
+  const conflicts = {};  // {domain: [otherSection, ...]}
+  Object.keys(DOMAIN_SECTIONS).forEach(otherKey => {
+    if (otherKey === sectionKey) return;
+    const otherTa = document.getElementById(DOMAIN_SECTIONS[otherKey].taId);
+    if (!otherTa) return;
+    const otherItems = parseDomainsTextarea(otherTa.value);
+    otherItems.forEach(it => {
+      if (myDomains.has(it.domain)) {
+        if (!conflicts[it.domain]) conflicts[it.domain] = [];
+        conflicts[it.domain].push(DOMAIN_SECTIONS[otherKey].label);
+      }
+    });
+  });
+  const badge = document.getElementById('dup-badge-' + sectionKey);
+  if (!badge) return;
+  const n = Object.keys(conflicts).length;
+  if (n === 0) {
+    badge.style.display = 'none';
+    badge.title = '';
+  } else {
+    badge.style.display = 'inline-block';
+    badge.textContent = '⚠ ' + n + ' дубл' + (n === 1 ? 'ь' : (n < 5 ? 'я' : 'ей'));
+    badge.title = Object.entries(conflicts)
+      .map(([d, secs]) => `${d} — также в: ${secs.join(', ')}`)
+      .join('\n');
+  }
+}
+
+// Сохраняет notes в sidecar JSON на роутере. Вызывается ПОСЛЕ saveXDomains (которая обновила
+// watchdog.config). Notes для несуществующих доменов фильтруются (cleanup осиротевших).
+async function saveDomainNotesSidecar() {
+  // Собираем актуальные notes для всех 4 секций (только для доменов которые реально в textarea)
+  const allNotes = { ai: {}, yt: {}, direct: {}, block: {} };
+  Object.keys(DOMAIN_SECTIONS).forEach(sectionKey => {
+    const sec = readSection(sectionKey);
+    sec.items.forEach(it => {
+      if (it.note) allNotes[sectionKey][it.domain] = it.note;
+    });
+  });
+  WINDOW_DOMAIN_NOTES = allNotes;  // sync in-memory
+  try {
+    const res = await fetch('/api/xkeen/set-domain-notes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notes: allNotes }),
+    });
+    return await res.json();
+  } catch (e) {
+    return { ok: false, stderr: String(e) };
+  }
+}
+
+// Имя add-функции и remove-функции для каждой секции (используется для UI injection).
+const _SECTION_FN_MAP = {
+  ai:     { add: 'addPreset',       remove: 'removePreset'       },
+  yt:     { add: 'addYTPreset',     remove: 'removeYTPreset'     },
+  direct: { add: 'addDirectPreset', remove: 'removeDirectPreset' },
+  block:  { add: 'addBlockPreset',  remove: 'removeBlockPreset'  },
+};
+
+// Инжектит UI-controls (поиск + сортировка + бейдж дублей) НАД каждой textarea + кнопки 🧹
+// рядом с каждой кнопкой пресета. Делается через JS чтобы не трогать 4 HTML-блока вручную.
+function injectSectionControls(sectionKey) {
+  const sec = DOMAIN_SECTIONS[sectionKey];
+  const ta = document.getElementById(sec.taId);
+  if (!ta) return;
+
+  // === 1. Controls bar над textarea (поиск + сортировка + бейдж дублей)
+  if (!document.getElementById('ctrl-bar-' + sectionKey)) {
+    const bar = document.createElement('div');
+    bar.id = 'ctrl-bar-' + sectionKey;
+    bar.style.cssText = 'display:flex; gap:6px; align-items:center; margin:6px 0 4px; flex-wrap:wrap; font-size:0.88em;';
+    bar.innerHTML =
+      '<input type="text" id="search-' + sectionKey + '" placeholder="🔍 Найти домен..." ' +
+        'style="flex:1 1 180px; min-width:140px; padding:4px 8px; font-family:Consolas,monospace; font-size:0.9em; border:1px solid #ccc; border-radius:3px;" ' +
+        'onkeydown="if(event.key===\'Enter\'){event.preventDefault();searchInSection(\'' + sectionKey + '\',this.value);}" />' +
+      '<button type="button" class="btn btn-sm" style="padding:2px 8px; font-size:0.85em;" ' +
+        'onclick="sortSection(\'' + sectionKey + '\',\'alpha\')" title="Отсортировать домены по алфавиту">🔤 А-Я</button>' +
+      '<button type="button" class="btn btn-sm" style="padding:2px 8px; font-size:0.85em;" ' +
+        'onclick="sortSection(\'' + sectionKey + '\',\'preset\')" title="Сначала пресеты (сгруппированы по имени), потом ручные домены">📦 По пресету</button>' +
+      '<span id="dup-badge-' + sectionKey + '" ' +
+        'style="display:none; padding:2px 8px; background:#fff3cd; color:#7a4d00; border:1px solid #f0c200; border-radius:10px; cursor:help; font-weight:600;" ' +
+        'title="">⚠ дубли</span>';
+    ta.parentNode.insertBefore(bar, ta);
+  }
+
+  // === 1.5. AutoFormat при onblur (v1.7.4) — если юзер редактировал руками или вставил
+  //          из буфера → при потере фокуса переформатировать с правильным padding колонок.
+  //          Иначе строки типа "domain # note" без выравнивания живут до save и юзер видит «слетевшее» форматирование.
+  if (!ta.dataset.autoFormatBound) {
+    ta.addEventListener('blur', () => {
+      const items = parseDomainsTextarea(ta.value);
+      if (items.length === 0) return;
+      ta.value = formatDomainsTextarea(items);
+      // Sync WINDOW_DOMAIN_NOTES + перепроверка дублей
+      WINDOW_DOMAIN_NOTES[sectionKey] = {};
+      items.forEach(it => { if (it.note) WINDOW_DOMAIN_NOTES[sectionKey][it.domain] = it.note; });
+      highlightDuplicatesBadge(sectionKey);
+    });
+    ta.dataset.autoFormatBound = '1';
+  }
+
+  // === 2. Кнопки 🧹 рядом с каждой кнопкой-пресетом этой секции
+  const addFnName = _SECTION_FN_MAP[sectionKey].add;
+  const removeFnName = _SECTION_FN_MAP[sectionKey].remove;
+  // Ищем все кнопки с onclick содержащим имя add-функции
+  const allBtns = document.querySelectorAll('button[onclick]');
+  allBtns.forEach(btn => {
+    const oc = btn.getAttribute('onclick') || '';
+    // Pattern: addXPreset('name') или addXPreset("name") — извлекаем name
+    const re = new RegExp(addFnName + "\\(['\"]([^'\"]+)['\"]\\)");
+    const m = oc.match(re);
+    if (!m) return;
+    const presetName = m[1];
+    // Не добавлять для all_ai / all_yt / addAllXPresets (групповых)
+    if (presetName === 'all_ai' || presetName === 'all_yt' || presetName === 'all_direct' || presetName === 'all_block') return;
+    // Проверим что соседняя кнопка ✕ ещё не добавлена (idempotent)
+    if (btn.nextElementSibling && btn.nextElementSibling.classList.contains('remove-preset-btn-' + sectionKey)) return;
+    const cleanBtn = document.createElement('button');
+    cleanBtn.type = 'button';
+    cleanBtn.className = 'btn btn-sm remove-preset-btn-' + sectionKey;
+    cleanBtn.style.cssText = 'margin: 2px 6px 2px -4px; padding: 2px 5px; font-size: 0.75em; background: #eee; color: #c33; border: 1px solid #ddd; cursor: pointer; border-radius: 3px;';
+    cleanBtn.title = 'Удалить все домены пресета "' + presetName + '" (только пресет, ручные домены ✏️ останутся)';
+    cleanBtn.textContent = '🧹';
+    cleanBtn.setAttribute('onclick', removeFnName + "('" + presetName + "')");
+    btn.parentNode.insertBefore(cleanBtn, btn.nextSibling);
+  });
+}
+
+// Auto-match пресетов при первой загрузке (v1.7.2 → v1.7.3).
+// v1.7.3: per-domain matching вместо strict-allPresent. Для каждого домена в textarea
+// ищем в каком пресете он встречается → ставим note первого матча. Это работает даже
+// если у юзера в textarea ТОЛЬКО ЧАСТЬ доменов пресета (например удалил googlevideo.com
+// от youtube — youtube.com / youtu.be всё равно получат note 📦 youtube).
+// Existing notes (📦 или ✏️) — не перезаписываются. Идемпотентно при повторных load'ах.
+function autoMatchPresets(sectionKey) {
+  const sec = readSection(sectionKey);
+  if (!sec.items.length) return;
+  const presetDict = DOMAIN_SECTIONS[sectionKey].getPresets();
+  if (!presetDict || typeof presetDict !== 'object') {
+    console.warn('[domain_notes] autoMatchPresets: no preset dict for ' + sectionKey);
+    return;
+  }
+  // Строим reverse-index: domain → presetName (первый matched, агрегаты all_* скип)
+  const domainToPreset = {};
+  Object.entries(presetDict).forEach(([presetName, presetDomains]) => {
+    if (presetName.startsWith('all_')) return;  // all_ai / all_yt / etc — агрегаты
+    if (!Array.isArray(presetDomains)) return;
+    presetDomains.forEach(d => {
+      if (!domainToPreset[d]) domainToPreset[d] = presetName;
+    });
+  });
+  // Для каждого item без note — попробовать найти пресет
+  let touched = 0;
+  sec.items.forEach(item => {
+    if (item.note) return;  // уже есть note (📦 из sidecar или ✏️ ручное) — не трогаем
+    const presetName = domainToPreset[item.domain];
+    if (presetName) {
+      item.note = '📦 ' + presetName;
+      touched++;
+    }
+  });
+  if (touched > 0) {
+    writeSection(sectionKey, sec.items);
+    console.log('[domain_notes] auto-matched ' + touched + ' domains in ' + sectionKey + ' to presets');
+  }
+}
+
+// v1.7.5: разделить AI+YT layout на 2 row — cards сверху, domains снизу.
+// Иначе align-items:stretch в .row раздувает channel-card.cc-ai пустотой,
+// чтобы выровнять высоту .col с YT-колонкой (у неё больше контента).
+// JS-injection вместо HTML refactor — безопасно к будущим правкам разметки.
+function splitAIYTRowForAlignment() {
+  const aiSection = document.querySelector('.domain-section.ds-ai');
+  const ytSection = document.querySelector('.domain-section.ds-yt');
+  if (!aiSection || !ytSection) return;
+  // Они должны лежать в одной .row через 2 разных .col — проверим
+  const aiCol = aiSection.closest('.col');
+  const ytCol = ytSection.closest('.col');
+  if (!aiCol || !ytCol) return;
+  const oldRow = aiCol.parentNode;
+  if (!oldRow || !oldRow.classList.contains('row')) return;
+  if (ytCol.parentNode !== oldRow) return;  // sanity check — обе в одном row
+  // Idempotent — не перестраивать если уже разделено
+  if (oldRow.nextElementSibling && oldRow.nextElementSibling.dataset.splitDomainsRow === '1') return;
+
+  // Строим новый row с двумя col, переносим в них domain-section
+  const newRow = document.createElement('div');
+  newRow.className = 'row';
+  newRow.style.marginTop = '16px';
+  newRow.dataset.splitDomainsRow = '1';  // маркер для idempotency
+
+  const newAiCol = document.createElement('div');
+  newAiCol.className = 'col';
+  newAiCol.appendChild(aiSection);  // physically move, не клон
+
+  const newYtCol = document.createElement('div');
+  newYtCol.className = 'col';
+  newYtCol.appendChild(ytSection);
+
+  newRow.appendChild(newAiCol);
+  newRow.appendChild(newYtCol);
+  oldRow.parentNode.insertBefore(newRow, oldRow.nextSibling);
+}
+
+// При загрузке страницы — rerender всех 4 секций + инжект UI-controls + первичная подсветка дублей.
+document.addEventListener('DOMContentLoaded', () => {
+  splitAIYTRowForAlignment();  // v1.7.5 — выровнять шапки "Список AI" и "Список YouTube" по одной высоте
+  Object.keys(DOMAIN_SECTIONS).forEach(k => {
+    rerenderSectionFromNotes(k);
+    autoMatchPresets(k);  // v1.7.2 — auto-distinguish известных пресетов для миграции с pre-v1.7.0
+    injectSectionControls(k);
+    highlightDuplicatesBadge(k);
+  });
+});
+
+const WATCHDOG_CURRENT_DEFAULT = {{ watchdog.current_default|tojson }};
+const WATCHDOG_PRIMARY_TAG = {{ targets.primary_tag|tojson }};
+const WATCHDOG_EFFECTIVE_AI = {{ watchdog.effective_ai|tojson }};
+const WATCHDOG_EFFECTIVE_YT = {{ watchdog.effective_yt|tojson }};
+const AI_FAIL_BLOCK = {{ targets.ai_fail_block|tojson }};
+const YT_FAIL_BLOCK = {{ targets.yt_fail_block|tojson }};
+// opts: { showTagInTitle: bool, activeNote: string-html }
+// showTagInTitle=false (default) — заголовок без Matrix-плашки с tag (имя уже видно в dropdown'е),
+//   остаются только бейджи 📦/🛡️/📺 и дата истечения.
+// showTagInTitle=true — крупно tag в Matrix-стиле (для FAILOVER, чтобы видеть текущий активный канал
+//   цепочки, который может отличаться от того что выбран в dropdown'е).
+function renderOutboundInfo(divId, tag, opts) {
+  opts = opts || {};
+  const el = document.getElementById(divId);
+  if (!el) return;
+  const m = VLESS_META[tag];
+  if (!m) { el.innerHTML = '<span class="oi-missing">⚠️ нет данных для tag=' + tag + '</span>'; return; }
+  // Заголовок: бейджи подписки/обхода/даты на фоне цвета группы.
+  // Опционально (showTagInTitle=true) — крупно имя канала в Matrix-стиле.
+  const groupName = m.group_name || '';
+  const groupBg = m.group_bg || '#eee';
+  const badge = m.is_anti_dpi ? ' <span class="oi-badge">🛡️ Обход</span>' : '';
+  // Бейдж даты истечения подписки (если есть). Цветовая шкала:
+  // <0 дней (просрочена) → красный; ≤3 дн (горит) → оранжевый;
+  // ≤30 дн (близко) → светло-серо-зелёный; иначе → серый neutral.
+  let expiresHtml = '';
+  if (m.sub_expires_at) {
+    const d = m.sub_days_left;
+    let style, label;
+    if (d === null || d === undefined) {
+      style = 'background:#eee; color:#666;';
+      label = '⏰ ' + m.sub_expires_at;
+    } else if (d < 0) {
+      style = 'background:#c33; color:#fff;';
+      label = '⚠️ ИСТЕКЛА ' + (-d) + ' дн. назад';
+    } else if (d <= 3) {
+      style = 'background:#fff0d0; color:#a55a18;';
+      label = '⏰ ещё ' + d + ' дн. (' + m.sub_expires_at + ')';
+    } else if (d < 30) {
+      style = 'background:#f0f5e8; color:#5a7c2c;';
+      label = '⏰ ещё ' + d + ' дн. (' + m.sub_expires_at + ')';
+    } else {
+      style = 'background:rgba(255,255,255,0.7); color:#555;';
+      label = '⏰ ' + m.sub_expires_at + ' (~' + d + ' дн.)';
+    }
+    expiresHtml = ' <span class="oi-expires" style="' + style + '">' + label + '</span>';
+  }
+  const titleHtml = opts.showTagInTitle ? ('<span class="oi-title">' + tag + '</span>') : '';
+  const noteHtml = opts.activeNote ? (' <span class="oi-active-note">' + opts.activeNote + '</span>') : '';
+  const headerHtml =
+    '<div class="oi-header" style="background: ' + groupBg + ';">' +
+      titleHtml +
+      (groupName ? ' <span class="oi-sub">📦 ' + groupName + '</span>' : '') +
+      badge +
+      expiresHtml +
+      noteHtml +
+    '</div>';
+  const lines = [];
+  // Единственная строка параметров: protocol · host:port · network / security · sni
+  // target_ip раньше показывался как ' → IP' в строке, но это растягивало params на
+  // 2 строки у каналов где host=домен → информации больше не отображаемой, а info-блоки
+  // у AI и YT начинали разъезжаться по высоте. Сейчас target_ip уехал в tooltip над host.
+  const hostTitle = (m.target_ip && m.target_ip !== m.host)
+    ? ' title="DNS-резолв ' + m.host + ' → ' + m.target_ip + '"'
+    : '';
+  let row1 = '<span class="oi-proto">' + (m.protocol || '—') + '</span>' +
+             ' · <span class="oi-host"' + hostTitle + '>' + m.host + ':' + m.port + '</span>' +
+             ' · <span class="oi-net">' + (m.network || '—') + '</span>' +
+             ' / <span class="oi-sec">' + (m.security || '—') + '</span>';
+  if (m.sni) {
+    row1 += ' · <span class="oi-k">sni:</span> <span class="oi-v">' + m.sni + '</span>';
+  }
+  lines.push(row1);
+  el.innerHTML = headerHtml + '<div class="oi-params">' + lines.join('<br>') + '</div>';
+}
+// Подсветка фона <select> цветом группы выбранной опции — даёт visual indicator
+// какой канал выбран (Provider A=бежевый, Provider B=синий, Provider C=зелёный, и т.д.).
+// Native <select> не всегда применяет background-color из <option>, поэтому форсируем через JS.
+function syncSelectColor(sel) {
+  const m = VLESS_META[sel.value];
+  if (m && m.group_bg) {
+    sel.style.backgroundColor = m.group_bg;
+    sel.style.fontWeight = '600';
+  }
+}
+function bindOutboundInfo(selId, divId) {
+  const sel = document.getElementById(selId);
+  if (!sel) return;
+  renderOutboundInfo(divId, sel.value);
+  syncSelectColor(sel);
+  sel.addEventListener('change', () => {
+    renderOutboundInfo(divId, sel.value);
+    syncSelectColor(sel);
+  });
+}
+// FAILOVER info-блок особенный: показывает ТЕКУЩИЙ активный канал из watchdog state
+// (current_default), а не sel.value. Dropdown показывает head цепочки (FAILOVER_TAGS[0]),
+// а watchdog при падении PRIMARY может уехать дальше по цепочке — это единственное место
+// где видно на каком именно канале сейчас сидит роутинг.
+function refreshFailoverInfo() {
+  const sel = document.getElementById('select-failover');
+  if (!sel) return;
+  const chainHead = sel.value;  // первый в FAILOVER_TAGS
+  let activeTag, note;
+  if (!WATCHDOG_CURRENT_DEFAULT) {
+    activeTag = chainHead;
+    note = '<span style="color:#a55;">⚠️ статус watchdog неизвестен — показан head цепочки</span>';
+  } else if (WATCHDOG_CURRENT_DEFAULT === WATCHDOG_PRIMARY_TAG) {
+    activeTag = chainHead;
+    note = '<span style="color:#2a7;">💤 цепочка спит — PRIMARY работает</span>';
+  } else if (WATCHDOG_CURRENT_DEFAULT === 'block') {
+    activeTag = chainHead;
+    note = '<span style="color:#c33;">🚫 default=block — трафик дропается</span>';
+  } else {
+    activeTag = WATCHDOG_CURRENT_DEFAULT;
+    note = '<span style="background:#ffe28a; color:#7a4d00; padding:1px 6px; border-radius:3px;">⚡ АКТИВЕН СЕЙЧАС (watchdog в failover)</span>';
+  }
+  renderOutboundInfo('info-failover', activeTag, { showTagInTitle: true, activeNote: note });
+  syncSelectColor(sel);
+}
+// Бейдж статуса канала для AI/YT info-блоков. Юзер просил видеть прямо в info-блоке,
+// жив канал или сдох, чтобы не искать причину в другом месте (2026-05-16).
+// Логика: 4 ветки = kill-switch активен / probe прошёл / probe провалил / probe не делался.
+// Синхронизирует свежие статусы из probe-status endpoint обратно в VLESS_META,
+// чтобы info-блоки AI/YT подхватили новые значения (раньше они оставались устаревшими
+// после клика «🔄 Проверить статус» в таблице — баг замечен юзером 2026-05-16).
+function applyStatusesToMeta(statuses) {
+  if (!statuses) return;
+  for (const tag of Object.keys(statuses)) {
+    const st = statuses[tag];
+    if (VLESS_META[tag]) {
+      VLESS_META[tag].status_ok = st.ok;
+      VLESS_META[tag].status_ms = st.ms;
+      VLESS_META[tag].status_kind = st.kind || '';
+    }
+  }
+  if (typeof refreshAIInfo === 'function') refreshAIInfo();
+  if (typeof refreshYTInfo === 'function') refreshYTInfo();
+  if (typeof refreshAIActiveInfo === 'function') refreshAIActiveInfo();
+  if (typeof refreshYTActiveInfo === 'function') refreshYTActiveInfo();
+}
+// Probe канала AI/YT прямо из info-блока (мини-кнопка 🔄 рядом со статус-бейджем).
+// Endpoint probes всех outbound'ов разом — это 1-3 сек, нормально для UX.
+async function probeChannelFromInfo(role) {
+  const btn = document.getElementById('info-probe-' + role);
+  if (!btn) return;
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳';
+  try {
+    const res = await fetch('/api/xkeen/probe-status?force=1', { method: 'POST' });
+    const j = await res.json();
+    if (j.ok && j.statuses) {
+      applyStatusesToMeta(j.statuses);
+    } else {
+      btn.textContent = '❌';
+      setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
+      return;
+    }
+  } catch (e) {
+    btn.textContent = '❌';
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
+  }
+  // refreshAIInfo/refreshYTInfo внутри applyStatusesToMeta перерисуют info-блок,
+  // включая саму кнопку — состояние btn сбросится автоматически.
+}
+function getChannelStatusNote(tag, effective, failBlock, roleLabel) {
+  if (effective === 'block') {
+    return '<span style="background:#c33; color:#fff; padding:1px 6px; border-radius:3px;" title="Канал упал и kill-switch заблокировал ' + roleLabel + '-трафик (защита от засветки RU IP). Восстановится автоматически когда канал оживёт.">🚫 канал упал → kill-switch</span>';
+  }
+  const m = VLESS_META[tag];
+  if (!m) return '';
+  // Watchdog probe возвращает только up/down (без ms). Если есть свежий status_ms
+  // из ручного probe — показываем его как дополнительную info. Иначе просто "жив".
+  const msPart = m.status_ms != null ? ' ' + m.status_ms + 'ms' : '';
+  // FALLBACK состояние (с 2026-05-16): kill-switch ВЫКЛ + канал мёртв → watchdog
+  // подменил EFFECTIVE_*_TAG на DEFAULT_TAG. Это значит трафик AI/YT временно идёт
+  // через PRIMARY/FAILOVER. Показываем явное оранжевое предупреждение.
+  if (effective && effective !== tag && effective !== 'block') {
+    const aiWarn = roleLabel === 'AI' ? ' ⚠️ Anthropic может увидеть текущий IP (если default = RU — риск бана).' : '';
+    return '<span style="background:#fff0d0; color:#a55a18; padding:1px 6px; border-radius:3px;" title="Канал ' + tag + ' упал, kill-switch ВЫКЛ → watchdog временно отправил ' + roleLabel + '-трафик через default-канал ' + effective + '.' + aiWarn + ' Восстановится автоматически когда ' + tag + ' оживёт.">⚠️ fallback → ' + effective + '</span>';
+  }
+  // Если канал назначен и === effective — значит watchdog считает его живым.
+  if (effective === tag) {
+    const title = m.status_ms != null
+      ? 'Watchdog пингует канал каждую минуту — последний probe успешный. ms-значение — от ручного probe (кнопка 🔄).'
+      : 'Watchdog пингует канал каждую минуту — последний probe успешный. Нажми 🔄 чтобы измерить ms.';
+    return '<span style="background:#d8eecc; color:#2a7; padding:1px 6px; border-radius:3px;" title="' + title + '">🟢 жив' + msPart + '</span>';
+  }
+  // Сюда попадаем если effective пустой — watchdog ещё не успел отработать (свежий
+  // рестарт) или канал/домены не сконфигурированы. Падаем на ручной probe из таблицы.
+  if (m.status_kind === 'tcp_nc') {
+    return '<span style="background:#dfe8ff; color:#1a55cc; padding:1px 6px; border-radius:3px;" title="TCP-порт открыт, TLS handshake не пробовали (Reality без фолбэка — норма).">🔌 TCP открыт</span>';
+  }
+  if (m.status_ok === true) {
+    return '<span style="background:#d8eecc; color:#2a7; padding:1px 6px; border-radius:3px;" title="TCP+TLS handshake успешен (ручной probe).">🟢 жив' + msPart + '</span>';
+  }
+  if (m.status_ok === false) {
+    return '<span style="background:#c33; color:#fff; padding:1px 6px; border-radius:3px;" title="Канал не отвечает (ручной probe).">⛔ не отвечает</span>';
+  }
+  return '<span style="background:#eee; color:#777; padding:1px 6px; border-radius:3px;" title="Watchdog ещё не отработал тик после рестарта (≤1 мин) либо канал/домены не сконфигурированы. Нажми 🔄 для probe.">⚪ статус ждём</span>';
+}
+// Мини-кнопка 🔄 рядом со статус-бейджем — probe канала прямо из info-блока,
+// чтобы не лазить в раздел «Все outbounds».
+function makeProbeBtn(role) {
+  return ' <button id="info-probe-' + role + '" class="oi-probe-btn" onclick="probeChannelFromInfo(\'' + role + '\')" title="Проверить статус канала прямо сейчас (force-probe, игнорирует 60s кэш)">🔄</button>';
+}
+function refreshAIInfo() {
+  const sel = document.getElementById('select-ai');
+  if (!sel) return;
+  const note = getChannelStatusNote(sel.value, WATCHDOG_EFFECTIVE_AI, AI_FAIL_BLOCK, 'AI') + makeProbeBtn('ai');
+  renderOutboundInfo('info-ai', sel.value, { activeNote: note });
+  syncSelectColor(sel);
+}
+function refreshYTInfo() {
+  const sel = document.getElementById('select-yt');
+  if (!sel) return;
+  const note = getChannelStatusNote(sel.value, WATCHDOG_EFFECTIVE_YT, YT_FAIL_BLOCK, 'YouTube') + makeProbeBtn('yt');
+  renderOutboundInfo('info-yt', sel.value, { activeNote: note });
+  syncSelectColor(sel);
+}
+// Info-блок «🎯 Сейчас в роутинге для AI/YT» — показывает РЕАЛЬНО работающий канал
+// (effective из watchdog state), а не sel.value. Аналог FAILOVER active-блока:
+// если канал жив — это выбранный канал; если fallback — это default канал;
+// если block — это специальное сообщение про kill-switch. Не реагирует на change
+// в dropdown (статус не меняется до сохранения + следующего тика watchdog).
+function refreshActiveInfo(role, divId, effective, selectedTag, roleLabel) {
+  let activeTag, note;
+  if (!effective) {
+    activeTag = selectedTag;
+    note = '<span style="color:#a55;">⚠️ статус watchdog неизвестен — показан выбранный</span>';
+  } else if (effective === selectedTag) {
+    activeTag = selectedTag;
+    note = '<span style="background:#d8eecc; color:#2a7; padding:1px 6px; border-radius:3px;">✓ выбранный канал работает</span>';
+  } else if (effective === 'block') {
+    activeTag = selectedTag;
+    note = '<span style="background:#c33; color:#fff; padding:1px 6px; border-radius:3px;">🚫 ' + roleLabel + '-трафик заблокирован kill-switch\'ем (канал упал)</span>';
+  } else {
+    activeTag = effective;
+    note = '<span style="background:#ffe28a; color:#7a4d00; padding:1px 6px; border-radius:3px;">⚠️ FALLBACK из ' + selectedTag + '</span>';
+  }
+  renderOutboundInfo(divId, activeTag, { showTagInTitle: true, activeNote: note });
+}
+function refreshAIActiveInfo() {
+  const sel = document.getElementById('select-ai');
+  if (!sel) return;
+  refreshActiveInfo('ai', 'info-ai-active', WATCHDOG_EFFECTIVE_AI, sel.value, 'AI');
+}
+function refreshYTActiveInfo() {
+  const sel = document.getElementById('select-yt');
+  if (!sel) return;
+  refreshActiveInfo('yt', 'info-yt-active', WATCHDOG_EFFECTIVE_YT, sel.value, 'YouTube');
+}
+document.addEventListener('DOMContentLoaded', () => {
+  bindOutboundInfo('select-primary',  'info-primary');
+  refreshFailoverInfo();
+  // При смене dropdown'а FAILOVER — только меняем фон select, info-блок не трогаем
+  // (он показывает текущий активный канал, а не выбор пользователя).
+  const failoverSel = document.getElementById('select-failover');
+  if (failoverSel) failoverSel.addEventListener('change', () => syncSelectColor(failoverSel));
+  refreshAIInfo();
+  refreshAIActiveInfo();
+  const aiSel = document.getElementById('select-ai');
+  if (aiSel) aiSel.addEventListener('change', refreshAIInfo);  // active-блок не обновляем — он показывает реальное состояние
+  refreshYTInfo();
+  refreshYTActiveInfo();
+  const ytSel = document.getElementById('select-yt');
+  if (ytSel) ytSel.addEventListener('change', refreshYTInfo);
+  // Старт самодиагностики панели
+  refreshDashboardHealth();
+  setInterval(refreshDashboardHealth, 15000);
+  // v1.7.19 — xray статус в шапке (60s polling, server-cache 30s)
+  // v1.7.20 — favicon-алерт для pinned tabs + beep повтор каждые 3 мин
+  _prepareFavicons().then(() => {
+    refreshXrayHeaderStatus();
+    setInterval(refreshXrayHeaderStatus, 60000);
+  });
+  // Включаем AudioContext при первом клике юзера (browser autoplay policy)
+  document.addEventListener('click', _ensureAudioCtx, { once: true });
+});
+
+// ============== v1.7.19 — xray header status indicator ==============
+// v1.7.20 — favicon swap для pinned Chrome tabs + beep повтор каждые 3 мин
+let _xrayPrevState = null;            // предыдущий state для детекта переходов
+let _xrayTitleOrig = null;            // оригинальный document.title до мигания
+let _xrayTitleBlinkInterval = null;
+let _xrayAudioCtx = null;
+let _xrayLastBeepTs = 0;              // timestamp последнего beep'а (для повтора)
+const _XRAY_BEEP_REPEAT_MS = 3 * 60 * 1000;  // 3 минуты между повторными beep'ами
+
+// Favicon swap для pinned Chrome tabs (которые не показывают title)
+let _faviconOrigDataUrl = null;
+let _faviconBadDataUrl = null;
+let _faviconLink = null;
+
+async function _prepareFavicons() {
+  // Загружает /favicon.png в canvas и заранее готовит две версии:
+  // - оригинал (когда xray ok/warn)
+  // - с красной точкой и восклицательным знаком в правом нижнем углу (когда bad)
+  // Это позволяет МГНОВЕННО переключать favicon без задержки на загрузку.
+  return new Promise(resolve => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      try {
+        const size = 64;
+        // 1. Оригинал — просто перерисовать в canvas
+        const c1 = document.createElement('canvas');
+        c1.width = c1.height = size;
+        c1.getContext('2d').drawImage(img, 0, 0, size, size);
+        _faviconOrigDataUrl = c1.toDataURL('image/png');
+
+        // 2. С красной точкой (правый нижний угол)
+        const c2 = document.createElement('canvas');
+        c2.width = c2.height = size;
+        const ctx = c2.getContext('2d');
+        ctx.drawImage(img, 0, 0, size, size);
+        const r = 20;
+        const cx = size - r - 2;
+        const cy = size - r - 2;
+        // Белая окантовка
+        ctx.beginPath();
+        ctx.arc(cx, cy, r + 2, 0, 2 * Math.PI);
+        ctx.fillStyle = '#fff';
+        ctx.fill();
+        // Красная заливка
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+        ctx.fillStyle = '#c33';
+        ctx.fill();
+        // Восклицательный знак внутри (палочка + точка)
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(cx - 3, cy - 11, 6, 15);
+        ctx.beginPath();
+        ctx.arc(cx, cy + 9, 3.5, 0, 2 * Math.PI);
+        ctx.fill();
+        _faviconBadDataUrl = c2.toDataURL('image/png');
+      } catch (e) { /* canvas/dataURL fail — favicon swap не сработает, но всё остальное работает */ }
+      resolve();
+    };
+    img.onerror = () => resolve();
+    img.src = '/favicon.png';
+  });
+}
+
+function _setFaviconAlert(isBad) {
+  if (!_faviconOrigDataUrl || !_faviconBadDataUrl) return;
+  if (!_faviconLink) {
+    _faviconLink = document.querySelector("link[rel='icon']");
+    if (!_faviconLink) {
+      _faviconLink = document.createElement('link');
+      _faviconLink.rel = 'icon';
+      document.head.appendChild(_faviconLink);
+    }
+  }
+  _faviconLink.href = isBad ? _faviconBadDataUrl : _faviconOrigDataUrl;
+}
+
+function _ensureAudioCtx() {
+  if (!_xrayAudioCtx) {
+    try { _xrayAudioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    catch (e) { /* AudioContext недоступен */ }
+  }
+}
+
+function _playAlertBeep() {
+  // Web Audio API beep — 2 коротких писка 880Hz по 200ms с паузой.
+  // Не требует MP3-файла, генерится в браузере. Громкость умеренная (0.15).
+  // Если AudioContext suspended (юзер не кликал по странице) — beep не сыграет
+  // (это policy браузера), но title-мигание всё равно сработает.
+  if (!_xrayAudioCtx) _ensureAudioCtx();
+  if (!_xrayAudioCtx) return;
+  try {
+    if (_xrayAudioCtx.state === 'suspended') _xrayAudioCtx.resume();
+    const ctx = _xrayAudioCtx;
+    const playBeep = (delay, freq) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.frequency.value = freq;
+      const t = ctx.currentTime + delay;
+      gain.gain.setValueAtTime(0.18, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+      osc.start(t);
+      osc.stop(t + 0.21);
+    };
+    playBeep(0, 880);
+    playBeep(0.25, 1100);
+  } catch (e) { /* swallow */ }
+}
+
+function _startXrayTitleBlink(alertText) {
+  if (!_xrayTitleOrig) _xrayTitleOrig = document.title;
+  if (_xrayTitleBlinkInterval) clearInterval(_xrayTitleBlinkInterval);
+  let toggle = false;
+  _xrayTitleBlinkInterval = setInterval(() => {
+    toggle = !toggle;
+    document.title = toggle ? alertText : _xrayTitleOrig;
+  }, 800);
+}
+
+function _stopXrayTitleBlink() {
+  if (_xrayTitleBlinkInterval) {
+    clearInterval(_xrayTitleBlinkInterval);
+    _xrayTitleBlinkInterval = null;
+  }
+  if (_xrayTitleOrig) {
+    document.title = _xrayTitleOrig;
+    _xrayTitleOrig = null;
+  }
+}
+
+async function refreshXrayHeaderStatus() {
+  const badge = document.getElementById('xray-status-badge');
+  if (!badge) return;
+  try {
+    const res = await fetch('/api/xkeen/header-status', { credentials: 'same-origin' });
+    if (!res.ok) throw new Error('http ' + res.status);
+    const j = await res.json();
+
+    let emoji, cls;
+    switch (j.state) {
+      case 'ok':          emoji = '🟢'; cls = 'xs-ok'; break;
+      case 'warn':        emoji = '🟡'; cls = 'xs-warn'; break;
+      case 'error':       emoji = '🟠'; cls = 'xs-err'; break;
+      case 'stopped':     emoji = '🔴'; cls = 'xs-bad'; break;
+      case 'unreachable': emoji = '⚪'; cls = 'xs-unk'; break;
+      default:            emoji = '⏳'; cls = 'xs-pending';
+    }
+
+    badge.className = 'health-badge ' + cls;
+    badge.textContent = emoji + ' ' + (j.label || 'xray ?');
+    badge.title = (j.tooltip || '') + '\n\nКлик → перейти к секции 📊 Статус XKeen.';
+    badge.style.cursor = 'pointer';
+    badge.onclick = () => {
+      // Скролл к секции «🛠 Управление XKeen» где есть кнопка status/restart
+      const target = document.querySelector('.sec-xkmgmt');
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+
+    // Алерты при ПЕРЕХОДЕ в плохое состояние + повтор beep каждые 3 мин пока bad.
+    // Favicon swap нужен для pinned Chrome tabs (они не показывают title — только favicon).
+    const isBad = (j.state === 'stopped' || j.state === 'error');
+    const wasGood = (_xrayPrevState === 'ok' || _xrayPrevState === 'warn' || _xrayPrevState === null);
+    const now = Date.now();
+    if (isBad) {
+      _setFaviconAlert(true);
+      if (wasGood) {
+        // ПЕРВЫЙ переход в bad — beep + start title blink + сохранить ts
+        _playAlertBeep();
+        _xrayLastBeepTs = now;
+        _startXrayTitleBlink('🔴 ' + (j.label || 'XRAY УПАЛ'));
+      } else if (_xrayLastBeepTs && (now - _xrayLastBeepTs >= _XRAY_BEEP_REPEAT_MS)) {
+        // ОСТАЁТСЯ в bad — повторить beep каждые 3 минуты
+        _playAlertBeep();
+        _xrayLastBeepTs = now;
+      }
+    } else {
+      // Восстановление good — снять алерты, сбросить beep-timer
+      _setFaviconAlert(false);
+      if (_xrayTitleBlinkInterval) _stopXrayTitleBlink();
+      _xrayLastBeepTs = 0;
+    }
+    _xrayPrevState = j.state;
+  } catch (e) {
+    badge.className = 'health-badge xs-pending';
+    badge.textContent = '⏳ нет связи';
+    badge.title = 'Endpoint /api/xkeen/header-status недоступен: ' + (e.message || e);
+  }
+}
+
+async function refreshDashboardHealth() {
+  const badge = document.getElementById('dashboard-health-badge');
+  if (!badge) return;
+  try {
+    const res = await fetch('/api/xkeen/dashboard-health');
+    if (!res.ok) throw new Error('http ' + res.status);
+    const j = await res.json();
+    badge.className = 'health-badge health-' + (j.status || 'pending');
+    if (j.status === 'ok') {
+      badge.textContent = '✓ панель здорова';
+      badge.onclick = null;
+      badge.style.cursor = 'default';
+    } else if (j.status === 'bad') {
+      badge.textContent = '⚠️ ' + j.count + ' listener на :5000 — клик для рестарта';
+      badge.onclick = showRestartHelp;
+      badge.style.cursor = 'pointer';
+    } else {
+      badge.textContent = '⚠ ' + (j.msg || 'unknown');
+      badge.onclick = showRestartHelp;
+    }
+    const pids = (j.listeners || []).map(p => p.pid + (p.is_me ? ' (я)' : '')).join(', ');
+    badge.title = j.msg + (pids ? '\n\nListener PID(s): ' + pids : '');
+  } catch (e) {
+    badge.className = 'health-badge health-pending';
+    badge.textContent = '? health endpoint недоступен';
+  }
+}
+
+function flash(ok, message, details, options) {
+  const f = document.getElementById('flash');
+  f.className = 'flash ' + (ok ? 'ok' : 'bad');
+  f.style.display = 'block';
+  let html = '<strong>' + (ok ? '✅' : '❌') + '</strong> ' + message;
+  if (details) html += '<pre>' + details.replace(/</g,'&lt;') + '</pre>';
+  f.innerHTML = html;
+  // Скроллим наверх по умолчанию (для важных save/restart-уведомлений), но при noScroll=true
+  // остаёмся на месте — используется в preset/clear/reset где юзер только-только добавил
+  // домены и хочет видеть результат внизу страницы, а не уезжать наверх.
+  if (!options || !options.noScroll) {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  // Auto-dismiss: для transient-сообщений (success после операции) — скрыть через N мс.
+  // По умолчанию off (важные ошибки должны висеть пока юзер сам не уйдёт со страницы).
+  if (window._flashTimer) { clearTimeout(window._flashTimer); window._flashTimer = null; }
+  if (options && options.autoDismiss) {
+    const ms = (typeof options.autoDismiss === 'number') ? options.autoDismiss : 4000;
+    window._flashTimer = setTimeout(() => { f.style.display = 'none'; window._flashTimer = null; }, ms);
+  }
+}
+
+async function apiCall(url, formData) {
+  const res = await fetch(url, { method: 'POST', body: formData });
+  return await res.json();
+}
+
+async function forceMode(mode) {
+  const labels = { primary: 'PRIMARY', failover: 'FAILOVER', auto: 'AUTO (запуск watchdog)' };
+  if (!confirm('Переключить watchdog → ' + labels[mode] + '?')) return;
+  flash(true, 'Переключаю → ' + labels[mode] + '...', null);
+  const res = await apiCall('/api/xkeen/watchdog/' + mode, new FormData());
+  if (res.ok) {
+    flash(true, 'Готово: ' + labels[mode]);
+    setTimeout(() => location.reload(), 1500);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+
+function fillSubUrl(url) {
+  if (!url) return;
+  const input = document.getElementById('sub-url');
+  input.value = url;
+  input.focus();
+  // Подсветим что подставилось
+  input.style.background = '#e8f5e8';
+  setTimeout(() => { input.style.background = ''; }, 1200);
+  // Сбросим select обратно на «— выбрать —» чтобы можно было перевыбрать тот же
+  const picker = document.getElementById('saved-sub-url-picker');
+  if (picker) picker.value = '';
+}
+
+async function previewSubscription() {
+  const url = document.getElementById('sub-url').value.trim();
+  const preview = document.getElementById('sub-preview');
+  if (!url) { flash(false, 'Введи URL подписки'); return; }
+  preview.innerHTML = '<p style="color:#888;">⏳ Скачиваю подписку...</p>';
+  const fd = new FormData();
+  fd.append('url', url);
+  const res = await apiCall('/api/xkeen/subscription-preview', fd);
+  if (!res.ok) {
+    preview.innerHTML = `<p style="color:#c33;">❌ ${res.stderr || 'Ошибка'}</p>`;
+    return;
+  }
+  let html = `<div style="background:#f9f9f4; padding:12px; border-radius:6px; border:1px solid #ddd;">`;
+  html += `<strong>📡 Найдено в подписке: ${res.found_in_sub} vless URLs</strong>`;
+
+  // Имя подписки из Profile-Title header (Provider D шлёт "Provider C")
+  if (res.profile_title) {
+    if (!res.existing_name) {
+      html += `<br><span style="color:#2a7;">🏷 Имя из Profile-Title: <strong>${res.profile_title}</strong> <span style="color:#888; font-size:0.85em;">— подтянется автоматически при sync</span></span>`;
+    } else if (res.existing_name !== res.profile_title) {
+      html += `<br><span style="color:#a55a18;">🏷 В подписке: <strong>${res.profile_title}</strong> · у тебя задано: <strong>${res.existing_name}</strong> <span style="color:#888; font-size:0.85em;">— твоё имя не будет затронуто (очисти поле в ✏️ Подписка чтобы взять имя из подписки)</span></span>`;
+    } else {
+      html += `<br><span style="color:#888; font-size:0.9em;">🏷 Имя совпадает с подпиской: <strong>${res.profile_title}</strong></span>`;
+    }
+  }
+
+  // Дата истечения из заголовка Subscription-Userinfo
+  if (res.sub_expire_at) {
+    const d = res.sub_expire_days_left;
+    let color = '#888', icon = '⏰';
+    if (d != null) {
+      if (d < 0)       { color = '#c33'; icon = '🚨'; }
+      else if (d < 7)  { color = '#a55a18'; icon = '⚠️'; }
+      else if (d < 30) { color = '#5a7c2c'; icon = '📅'; }
+    }
+    html += `<br><span style="color:${color}; font-size:0.95em;">${icon} Дата истечения из подписки: <strong>${res.sub_expire_at}</strong>`;
+    if (d != null) {
+      if (d < 0) html += ` (просрочена ${-d} дн. назад)`;
+      else html += ` (через ${d} дн.)`;
+    }
+    html += `</span>`;
+  }
+  html += `<br><br>`;
+
+  // Конфликты по expires_at — другая дата у уже существующей группы
+  if (res.expire_conflicts && res.expire_conflicts.length > 0) {
+    html += `<div style="background:#fff4d6; border:2px solid #996600; border-radius:6px; padding:10px; margin-bottom:12px;">
+      <strong style="color:#996600;">⚠️ У ${res.expire_conflicts.length} ${res.expire_conflicts.length === 1 ? 'группы' : 'групп'} уже задана дата истечения, и она ОТЛИЧАЕТСЯ от той что в подписке</strong>
+      <table style="margin-top:6px; font-size:0.85em;">
+        <tr><th>pbk</th><th>твоя дата</th><th>в подписке</th></tr>`;
+    res.expire_conflicts.forEach(c => {
+      html += `<tr><td class="mono">${c.pbk_short}</td><td>${c.old_expire}</td><td>${c.new_expire}</td></tr>`;
+    });
+    html += `</table>
+      <p style="color:#996600; font-size:0.85em; margin:6px 0 0;">Если включишь «Автоматически обновлять дату истечения» и подтвердишь — твоя дата будет перетёрта новой. Без подтверждения — твоя сохранится.</p>
+    </div>`;
+  }
+
+  // Подсчёт «другой провайдер» (разный pbk)
+  const collisions = (res.matches || []).filter(m => m.different_provider);
+  if (collisions.length > 0) {
+    html += `<div style="background:#fff0f0; border:2px solid #c33; border-radius:6px; padding:10px; margin-bottom:12px;">
+      <strong style="color:#c33; font-size:1.05em;">🚨 ВНИМАНИЕ: ${collisions.length} ${collisions.length === 1 ? 'tag принадлежит' : 'tags принадлежат'} ДРУГОМУ провайдеру!</strong>
+      <p style="color:#a33; font-size:0.9em; margin:6px 0;">У них меняется <strong>publicKey</strong> Reality — это значит подписка от другого провайдера, а не апдейт твоего текущего. Если применишь sync — твои текущие серверы будут заменены на чужие, и старые перестанут работать.</p>
+      <p style="color:#a33; font-size:0.9em; margin:6px 0;">Что делать:</p>
+      <ul style="color:#a33; font-size:0.9em; margin:4px 0 0 18px;">
+        <li>Если это вправду новый провайдер — переименуй tags при импорте через «➕ Добавить outbound» с явным Tag override</li>
+        <li>Если ты случайно вставил не тот URL — отмени, проверь URL</li>
+        <li>Если хочешь действительно заменить (старая подписка кончилась) — продолжай sync, но осознанно</li>
+      </ul>
+    </div>`;
+  }
+
+  // Совпадения
+  if (res.matches && res.matches.length > 0) {
+    html += `<strong style="color:#2a7;">✅ Будут обновлены (${res.matches.length}):</strong><table style="margin-top:6px; font-size:0.85em;">`;
+    html += `<tr><th>tag</th><th>host:port в подписке</th><th>host:port у тебя</th><th>изменится?</th><th>pbk / SNI</th></tr>`;
+    res.matches.forEach(m => {
+      const chg = m.changed ? '<span style="color:#e80;">⚠️ да</span>' : '<span style="color:#888;">нет</span>';
+      let identity = '';
+      const rowStyle = m.different_provider ? 'background:#fff0f0;' : '';
+      if (m.different_provider) {
+        identity = `<span style="color:#c33;" title="Reality pbk меняется — другой провайдер"><strong>🚨 ДРУГОЙ ПРОВАЙДЕР</strong><br><small>pbk: ${m.old_pbk_short || '—'} → ${m.new_pbk_short || '—'}</small>${m.sni_change ? `<br><small>SNI: ${m.old_sni||'—'} → ${m.new_sni||'—'}</small>` : ''}</span>`;
+      } else if (m.sni_change) {
+        identity = `<span style="color:#e80;" title="SNI меняется, но pbk тот же"><small>SNI: ${m.old_sni||'—'} → ${m.new_sni||'—'}</small></span>`;
+      } else {
+        identity = '<span style="color:#2a7;" title="Тот же провайдер">✓ тот же</span>';
+      }
+      html += `<tr style="${rowStyle}"><td class="mono"><strong>${m.tag}</strong></td><td class="mono">${m.sub_host}</td><td class="mono">${m.local_host}</td><td>${chg}</td><td style="font-size:0.85em;">${identity}</td></tr>`;
+    });
+    html += `</table>`;
+  } else {
+    html += `<p style="color:#e80;">⚠️ <strong>НЕ найдено совпадений по tag</strong> — обновлять нечего. Имена tag в подписке не совпадают с твоими.</p>`;
+  }
+
+  // Новые в подписке — с чекбоксами для выборочного импорта
+  if (res.orphans_in_sub && res.orphans_in_sub.length > 0) {
+    const antiDpiCount = res.orphans_in_sub.filter(o => o.is_anti_dpi).length;
+    html += `<br><strong style="color:#888;">📥 В подписке, но НЕ у тебя</strong>`;
+    html += ` <span style="font-size:0.85em;color:#666;">(${res.orphans_in_sub.length} серверов`;
+    if (antiDpiCount > 0) html += `, ${antiDpiCount} помечены 🛡️ anti-DPI / RU-exit`;
+    html += `)</span>`;
+    const nonAntiCount = res.orphans_in_sub.length - antiDpiCount;
+    html += `<div style="margin:8px 0;">`;
+    html += `<button onclick="selectOrphansAll(true)" class="btn-small" type="button" style="margin-right:6px;">☑️ Все</button>`;
+    if (antiDpiCount > 0 && nonAntiCount > 0) {
+      // «Кроме anti-DPI» — выбрать только обычные exit-точки (для AI/streaming/general).
+      html += `<button onclick="selectOrphansExceptAntiDpi()" class="btn-small" type="button" style="margin-right:6px;background:#d5e8d4;">🌍 Кроме anti-DPI (${nonAntiCount})</button>`;
+    }
+    if (antiDpiCount > 0) {
+      // «Только anti-DPI» — для тестов на сотовом интернете (Билайн/МТС DPI-обход).
+      html += `<button onclick="selectOrphansAntiDpi()" class="btn-small" type="button" style="margin-right:6px;background:#f0e8d0;">🛡️ Только anti-DPI (${antiDpiCount})</button>`;
+    }
+    html += `<button onclick="selectOrphansAll(false)" class="btn-small" type="button" style="margin-right:14px;">⬜ Снять</button>`;
+    html += `<button onclick="importSelectedOrphans()" class="btn-small" type="button" style="background:#2a7;color:#fff;font-weight:bold;">📥 Добавить выбранные</button>`;
+    html += `</div>`;
+    html += `<table style="margin:0 0 0 0;font-size:0.9em;border-collapse:collapse;"><thead><tr style="background:#f5f5f5;"><th style="padding:4px 8px;width:30px;"></th><th style="padding:4px 8px;text-align:left;">tag</th><th style="padding:4px 8px;text-align:left;">host:port</th><th style="padding:4px 8px;text-align:left;">SNI</th><th style="padding:4px 8px;">маскировка</th></tr></thead><tbody>`;
+    res.orphans_in_sub.forEach((o, idx) => {
+      const cb = `<input type="checkbox" class="orphan-checkbox" data-tag="${o.tag.replace(/"/g,'&quot;')}" data-anti-dpi="${o.is_anti_dpi ? '1' : '0'}" id="orphan-cb-${idx}">`;
+      let mask;
+      if (o.is_anti_dpi) {
+        // Уточняем причину — SNI-маскировка (host ≠ SNI) vs keyword в tag.
+        // Разные эмодзи + разные цвета чтобы glance быстро отличать.
+        const hostShort = (o.host || '').split(':')[0];
+        const sniMismatch = o.sni && o.sni !== hostShort && !hostShort.endsWith('.' + o.sni) && !o.sni.endsWith('.' + hostShort);
+        if (sniMismatch) {
+          // 🛡️ синий — настоящая SNI-маскировка под чужой легитимный домен (yandex/x5/google).
+          mask = `<span title="SNI ≠ host — маскируется под чужой домен (${o.sni}). Это «продвинутый» anti-DPI: TLS-handshake выглядит как обращение к легитимному RU-сервису." style="color:#2a6db8;font-weight:600;">🛡️ anti-DPI</span>`;
+        } else {
+          // 🇷🇺 красный — просто RU-exit по имени, без SNI-маскировки.
+          mask = `<span title="Помечен по ключевому слову в названии (обход/lte/россия/мтс/билайн/...). Вероятно RU-exit, но БЕЗ SNI-маскировки — host=SNI." style="color:#c44;font-weight:600;">🇷🇺 RU-exit</span>`;
+        }
+      } else {
+        mask = `<span style="color:#888;">—</span>`;
+      }
+      const sniDisplay = o.sni || '—';
+      html += `<tr><td style="padding:3px 8px;text-align:center;">${cb}</td><td class="mono" style="padding:3px 8px;">${o.tag}</td><td class="mono" style="padding:3px 8px;">${o.host}</td><td class="mono" style="padding:3px 8px;color:#555;">${sniDisplay}</td><td style="padding:3px 8px;text-align:center;font-size:0.85em;">${mask}</td></tr>`;
+    });
+    html += `</tbody></table>`;
+  }
+
+  // Локальные без пары
+  if (res.orphans_local && res.orphans_local.length > 0) {
+    html += `<br><strong style="color:#888;">📋 У тебя, но НЕ в подписке (останутся как есть):</strong><ul style="margin:6px 0 0 18px;">`;
+    res.orphans_local.forEach(o => {
+      html += `<li class="mono">${o.tag} — ${o.host}</li>`;
+    });
+    html += `</ul>`;
+  }
+
+  html += `</div>`;
+  preview.innerHTML = html;
+}
+
+// === Выборочный импорт orphans_in_sub (с чекбоксами) ===
+
+function selectOrphansAll(checked) {
+  document.querySelectorAll('.orphan-checkbox').forEach(cb => { cb.checked = checked; });
+}
+
+function selectOrphansAntiDpi() {
+  // Выбираем только серверы помеченные 🛡️ (anti-DPI или RU-exit). Используем data-atribute
+  // вместо textContent — надёжнее когда меняется текст pometки.
+  document.querySelectorAll('.orphan-checkbox').forEach(cb => {
+    cb.checked = cb.getAttribute('data-anti-dpi') === '1';
+  });
+}
+
+function selectOrphansExceptAntiDpi() {
+  // Инверсия — отмечаем всё КРОМЕ 🛡️ (обычные exit-точки для AI/streaming/general).
+  document.querySelectorAll('.orphan-checkbox').forEach(cb => {
+    cb.checked = cb.getAttribute('data-anti-dpi') !== '1';
+  });
+}
+
+async function importSelectedOrphans() {
+  const selected = Array.from(document.querySelectorAll('.orphan-checkbox'))
+    .filter(cb => cb.checked)
+    .map(cb => cb.getAttribute('data-tag'));
+  if (selected.length === 0) {
+    flash(false, 'Не выбрано ни одного outbound. Поставь галочки или нажми «☑️ Все» / «🛡️ Только anti-DPI».');
+    return;
+  }
+  const url = document.getElementById('sub-url').value.trim();
+  if (!url) { flash(false, 'Поле URL подписки пустое'); return; }
+  if (!confirm(`📥 Импорт ${selected.length} новых outbound из подписки:\n\n  • ${selected.join('\n  • ')}\n\nПродолжить?`)) return;
+  flash(true, `Импортирую ${selected.length} outbound...`);
+  const fd = new FormData();
+  fd.append('url', url);
+  fd.append('add_tags', selected.join('\n'));
+  // явно отключаем массовый add_new и удаление, чтобы не было сюрпризов
+  fd.append('update_expires', '1');
+  const res = await apiCall('/api/xkeen/subscription-sync', fd);
+  if (res.ok) {
+    flash(true, `✅ Добавлено ${(res.added_tags||[]).length} outbound: ${(res.added_tags||[]).join(', ')}`);
+    setTimeout(() => location.reload(), 1500);
+  } else {
+    flash(false, 'Не получилось импортировать', res.stderr || '');
+  }
+}
+
+async function syncSubscription() {
+  const url = document.getElementById('sub-url').value.trim();
+  if (!url) { flash(false, 'Введи URL подписки'); return; }
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    flash(false, 'URL должен начинаться с http(s)://'); return;
+  }
+  const addNew = document.getElementById('sub-add-new').checked;
+  const removeOrphans = document.getElementById('sub-remove-orphans').checked;
+  const updateExpires = (document.getElementById('sub-update-expires') || {}).checked !== false;
+
+  // Сначала всегда делаем preview чтобы проверить нет ли collision с другим провайдером
+  flash(true, '🔍 Проверяю что в подписке...');
+  const previewFd = new FormData();
+  previewFd.append('url', url);
+  const preview = await apiCall('/api/xkeen/subscription-preview', previewFd);
+  if (!preview.ok) {
+    flash(false, 'Не смог скачать подписку для проверки', preview.stderr || '');
+    return;
+  }
+  const collisions = (preview.matches || []).filter(m => m.different_provider);
+  if (collisions.length > 0) {
+    const tagsList = collisions.map(c => `${c.tag} (pbk: ${c.old_pbk_short} → ${c.new_pbk_short})`).join('\n  • ');
+    if (!confirm(
+      `🚨 ВНИМАНИЕ! Sync собирается ПЕРЕЗАПИСАТЬ ${collisions.length} outbound'а(-ов) ДРУГИМ провайдером (Reality pbk меняется):\n\n  • ${tagsList}\n\n` +
+      `Если применишь — твои текущие серверы пропадут, на их месте окажутся новые.\n\n` +
+      `Точно продолжить?`
+    )) {
+      flash(false, '✋ Отменено. Сначала проверь URL или используй «➕ Добавить outbound» с переопределением tag.');
+      return;
+    }
+  }
+
+  // Конфликт по expires_at — у группы уже стоит другая дата, а в подписке другая
+  let overwriteExpires = false;
+  const expireConflicts = preview.expire_conflicts || [];
+  if (updateExpires && expireConflicts.length > 0) {
+    const list = expireConflicts.map(c => `${c.pbk_short}: твоя ${c.old_expire} → в подписке ${c.new_expire}`).join('\n  • ');
+    overwriteExpires = confirm(
+      `⚠️ У ${expireConflicts.length} ${expireConflicts.length === 1 ? 'подписки' : 'подписок'} уже задана своя дата истечения, и она ОТЛИЧАЕТСЯ:\n\n  • ${list}\n\n` +
+      `OK — перетереть на новую дату из подписки (${preview.sub_expire_at}).\n` +
+      `Отмена — оставить твою дату как есть.`
+    );
+  }
+
+  const actions = ['🔄 Обновить совпадающие'];
+  if (addNew) actions.push('➕ Добавить новые');
+  if (removeOrphans) actions.push('🗑 Удалить отсутствующие (только не-активные)');
+  if (!confirm(
+    `Скачать подписку и применить:\n\n  • ${actions.join('\n  • ')}\n\n` +
+    `URL: ${url}\n\n` +
+    `Бэкап будет сохранён автоматически.`
+  )) return;
+  flash(true, '📡 Скачиваю и применяю...');
+  const fd = new FormData();
+  fd.append('url', url);
+  if (addNew) fd.append('add_new', '1');
+  if (removeOrphans) fd.append('remove_orphans', '1');
+  fd.append('update_expires', updateExpires ? '1' : '0');
+  if (overwriteExpires) fd.append('overwrite_expires', '1');
+  const res = await apiCall('/api/xkeen/subscription-sync', fd);
+  if (res.ok) {
+    flash(true, res.stdout || 'Обновлено');
+    setTimeout(() => location.reload(), 3000);
+  } else {
+    flash(false, 'Ошибка', res.stderr);
+  }
+}
+
+function prepareUpdateOutbound(tag) {
+  // Открываем модал прямо здесь — никаких scroll и поиска формы
+  // Удаляем старый если был
+  const old = document.getElementById('update-modal');
+  if (old) old.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'update-modal';
+  overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:9999; display:flex; align-items:center; justify-content:center; padding:20px;';
+
+  const box = document.createElement('div');
+  box.style.cssText = 'background:white; border-radius:8px; padding:24px; max-width:700px; width:100%; box-shadow:0 10px 40px rgba(0,0,0,0.3);';
+  box.innerHTML = `
+    <h3 style="margin:0 0 12px; color:#2a7;">🔄 Обновить outbound <code>${tag}</code></h3>
+    <p style="color:#555; margin:0 0 12px; line-height:1.5;">
+      Вставь <strong>новый</strong> vless:// URL или JSON-конфиг для этого outbound.
+      Будут обновлены: <code>uuid</code>, <code>host</code>, <code>port</code>,
+      <code>network</code>, <code>security</code>, <code>sni</code>, <code>publicKey</code>,
+      <code>shortId</code>, <code>fingerprint</code>, <code>flow</code>, <code>path</code>, <code>mode</code>.
+      Tag и роль (PRIMARY/FAILOVER/AI) сохранятся.
+    </p>
+    <textarea id="update-payload" style="width:100%; min-height:120px; font-family:Consolas,monospace; font-size:13px; padding:8px; border:1px solid #ccc; border-radius:4px;" placeholder="vless://uuid@host:port?type=...&security=reality&...#${tag}
+
+ИЛИ полный xray-config JSON"></textarea>
+    <div style="margin-top:14px; display:flex; gap:10px; justify-content:flex-end;">
+      <button type="button" id="update-cancel" class="btn btn-secondary">Отмена</button>
+      <button type="button" id="update-apply" class="btn">💾 Обновить и применить</button>
+    </div>
+  `;
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  const ta = document.getElementById('update-payload');
+  const cancelBtn = document.getElementById('update-cancel');
+  const applyBtn = document.getElementById('update-apply');
+
+  function close() { overlay.remove(); }
+  cancelBtn.addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+  applyBtn.addEventListener('click', async () => {
+    const payload = ta.value.trim();
+    if (!payload) { alert('Пусто. Вставь vless URL или JSON-конфиг.'); return; }
+    applyBtn.disabled = true;
+    applyBtn.textContent = '⏳ Применяю...';
+    const fd = new FormData();
+    fd.append('payload', payload);
+    fd.append('tag', tag);
+    fd.append('overwrite', '1');
+    try {
+      const res = await fetch('/api/xkeen/add', { method: 'POST', body: fd }).then(r => r.json());
+      if (res.ok) {
+        close();
+        flash(true, `✅ outbound «${tag}» обновлён.`, res.stdout);
+        setTimeout(() => location.reload(), 2000);
+      } else {
+        applyBtn.disabled = false;
+        applyBtn.textContent = '💾 Обновить и применить';
+        alert('Ошибка: ' + (res.stderr || JSON.stringify(res)));
+      }
+    } catch (e) {
+      applyBtn.disabled = false;
+      applyBtn.textContent = '💾 Обновить и применить';
+      alert('Сетевая ошибка: ' + e);
+    }
+  });
+
+  setTimeout(() => ta.focus(), 50);
+}
+
+async function removeOutbound(tag) {
+  if (!confirm('Удалить outbound «' + tag + '» из 04_outbounds.json?\n\nБэкап на роутере сохранится автоматически.')) return;
+  const fd = new FormData();
+  fd.append('tag', tag);
+  flash(true, 'Удаляю «' + tag + '»...', null);
+  const res = await apiCall('/api/xkeen/remove', fd);
+  if (res.ok) {
+    flash(true, res.stdout || 'Удалено');
+    setTimeout(() => location.reload(), 1500);
+  } else {
+    flash(false, 'Ошибка удаления', res.stderr || JSON.stringify(res));
+  }
+}
+
+// ===== Массовое выделение и удаление outbound'ов в группе =====
+function _groupRoot(btn) {
+  return btn.closest('details[data-group-key]');
+}
+
+function _updateBulkCounter(groupRoot) {
+  const cbs = groupRoot.querySelectorAll('.bulk-cb:checked');
+  const count = cbs.length;
+  const btn = groupRoot.querySelector('.bulk-remove-btn');
+  if (!btn) return;
+  const counterSpan = btn.querySelector('.bulk-count');
+  if (counterSpan) counterSpan.textContent = count;
+  if (count > 0) {
+    btn.disabled = false;
+    btn.style.opacity = '1';
+    btn.style.cursor = 'pointer';
+  } else {
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+    btn.style.cursor = 'not-allowed';
+  }
+}
+
+function bulkOnChange(cb) {
+  _updateBulkCounter(_groupRoot(cb));
+}
+
+function bulkSelectInactive(btn) {
+  const root = _groupRoot(btn);
+  root.querySelectorAll('.bulk-cb').forEach(cb => {
+    cb.checked = (cb.dataset.inactive === '1');
+  });
+  _updateBulkCounter(root);
+}
+
+function bulkSelectAll(btn) {
+  const root = _groupRoot(btn);
+  root.querySelectorAll('.bulk-cb').forEach(cb => { cb.checked = true; });
+  _updateBulkCounter(root);
+}
+
+function bulkClearSelection(btn) {
+  const root = _groupRoot(btn);
+  root.querySelectorAll('.bulk-cb').forEach(cb => { cb.checked = false; });
+  _updateBulkCounter(root);
+}
+
+async function bulkRemoveSelected(btn) {
+  const root = _groupRoot(btn);
+  const groupName = btn.dataset.groupName || '?';
+  const tags = Array.from(root.querySelectorAll('.bulk-cb:checked')).map(cb => cb.dataset.tag);
+  if (!tags.length) return;
+  const preview = tags.slice(0, 15).map(t => '  • ' + t).join('\n');
+  const more = tags.length > 15 ? `\n  … и ещё ${tags.length - 15}` : '';
+  if (!confirm(
+    `Удалить ${tags.length} outbound(ов) из подписки «${groupName}»?\n\n${preview}${more}\n\n` +
+    `Активные в watchdog (PRIMARY / FAILOVER / AI / в цепочке) будут автоматически пропущены.\n\n` +
+    `Бэкап 04_outbounds.json сохранится на роутере.`
+  )) return;
+  flash(true, `🗑 Удаляю ${tags.length} outbound(ов)...`);
+  const fd = new FormData();
+  fd.append('tags', tags.join('\n'));
+  const res = await apiCall('/api/xkeen/remove-bulk', fd);
+  if (res.ok) {
+    let msg = res.stdout || `Удалено ${(res.removed || []).length}`;
+    const skipped = res.skipped || {};
+    const skippedList = Object.entries(skipped);
+    if (skippedList.length) {
+      msg += `\n\nПропущено ${skippedList.length}:\n` + skippedList.map(([t, r]) => `  • ${t} — ${r}`).join('\n');
+    }
+    flash(true, `Удалено: ${(res.removed || []).length}`, msg);
+    setTimeout(() => location.reload(), 1800);
+  } else {
+    flash(false, 'Ошибка bulk-удаления', res.stderr || JSON.stringify(res));
+  }
+}
+
+async function saveSnapshotToDisk() {
+  flash(true, '💾 Скачиваю с роутера, сохраняю на диск...');
+  try {
+    const res = await fetch('/api/xkeen/backup-to-disk', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      flash(true, data.stdout, `Файл: ${data.path}\nРазмер: ${data.size_kb} КБ`);
+    } else {
+      flash(false, 'Ошибка сохранения', data.stderr || JSON.stringify(data));
+    }
+  } catch (e) {
+    flash(false, 'Сетевая ошибка', String(e));
+  }
+}
+
+async function createMigrationBackup(btn) {
+  if (!confirm('Создать полный архив миграции?\n\nЭто запустит на роутере:\n  tar czf /opt/entware_backup.tar.gz -C /opt .\n\nЗатем scp скачает архив на этот PC (~50-100 МБ).\nВся операция займёт 1-3 минуты в зависимости от размера /opt/ и скорости сети.\n\nПо завершении файл будет в C:\\xray-dashboard\\backups\\entware_backup_<ts>.tar.gz.')) return;
+
+  btn.disabled = true;
+  const origText = btn.textContent;
+  btn.textContent = '⏳ Создаю архив (~1-3 мин, не закрывай)...';
+  flash(true, '⏳ Создаю tar.gz на роутере + скачиваю на PC. Это займёт 1-3 минуты — не закрывай страницу.', null, { autoDismiss: false });
+
+  try {
+    const res = await fetch('/api/xkeen/migration-backup', { method: 'POST', credentials: 'same-origin' });
+    const j = await res.json();
+    if (j.ok) {
+      flash(true,
+        '✅ Архив миграции создан: <code>' + escapeHtml(j.filename) + '</code> (' + j.size_mb + ' МБ).<br>' +
+        'Путь: <code>' + escapeHtml(j.path) + '</code><br>' +
+        'Следующий шаг — переименуй в <code>entware_backup.tar.gz</code>, положи на USB в папку <code>install/</code> вместе с <code>mipsel-installer.tar.gz</code>. Детали в свёрнутом блоке ниже кнопки.',
+        null, { autoDismiss: 15000 }
+      );
+    } else {
+      flash(false,
+        '❌ Не удалось создать архив миграции (этап: ' + escapeHtml(j.stage || '?') + ')',
+        (j.error || '') + (j.stderr ? '\n\nstderr:\n' + j.stderr : '') + (j.stdout ? '\n\nstdout:\n' + j.stdout : '')
+      );
+    }
+  } catch (e) {
+    flash(false, '❌ Сеть/JS', String(e.message || e));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function restoreSnapshot() {
+  const fileInput = document.getElementById('restore-file');
+  if (!fileInput.files || fileInput.files.length === 0) {
+    flash(false, 'Сначала выбери файл .json');
+    return;
+  }
+  const f = fileInput.files[0];
+  if (!f.name.endsWith('.json')) {
+    flash(false, 'Нужен .json файл (snapshot)');
+    return;
+  }
+  if (!confirm(`Восстановить XKeen из файла "${f.name}" (${(f.size/1024).toFixed(1)} KB)?\n\n⚠️ Это перепишет текущие конфиги. Предыдущие версии сохранятся как *.bak-pre-restore-<timestamp> на роутере (можно вернуть через ssh).\n\nПродолжить?`)) return;
+  flash(true, '🔄 Восстанавливаю...');
+  const fd = new FormData();
+  fd.append('snapshot', f);
+  try {
+    const res = await fetch('/api/xkeen/restore', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (data.ok) {
+      flash(true, data.stdout || 'Восстановлено');
+      setTimeout(() => location.reload(), 2500);
+    } else {
+      flash(false, 'Ошибка восстановления', data.stderr || JSON.stringify(data));
+    }
+  } catch (e) {
+    flash(false, 'Сетевая ошибка', String(e));
+  }
+}
+
+async function restartDashboard() {
+  if (!confirm('Перезапустить xray-dashboard?\n\nПанель отключится на 5-7 сек. Обнови страницу когда снова откроется.')) return;
+  flash(true, '🔄 Перезапускаю панель... обнови страницу через 5-7 секунд (Ctrl+F5).');
+  try {
+    await fetch('/api/xkeen/restart-dashboard', { method: 'POST' });
+  } catch (e) {}
+}
+
+// Активный рестарт панели — кнопка «🔄 рестарт панели» в шапке.
+// Шлёт POST /api/xkeen/restart-dashboard, показывает modal с прогрессом, polling /health
+// каждые 1.5 сек до возврата 200. После 30 сек — fallback на showRestartHelp().
+async function restartDashboard() {
+  if (!confirm('Перезапустить панель?\n\n• Текущая страница оборвётся, попытаюсь подхватить как только панель оживёт (~8 сек)\n• Если не получится за 30 сек — покажу help с альтернативными способами\n\nПродолжить?')) return;
+
+  // Показываем оверлей
+  const overlay = document.createElement('div');
+  overlay.id = 'restart-overlay';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;';
+  overlay.innerHTML = `
+    <div style="background:#fff;border-radius:8px;padding:24px 32px;max-width:480px;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+      <div style="font-size:2em;margin-bottom:12px;">🔄</div>
+      <h3 style="margin:0 0 8px;color:#2a7;">Перезапуск панели</h3>
+      <p id="restart-msg" style="color:#555;margin:8px 0;">Отправляю команду рестарта...</p>
+      <p id="restart-elapsed" style="color:#888;font-size:0.85em;margin:0;">прошло: 0 сек</p>
+      <progress id="restart-progress" max="30" value="0" style="width:100%;margin-top:12px;height:10px;"></progress>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const msg = document.getElementById('restart-msg');
+  const elapsed = document.getElementById('restart-elapsed');
+  const progress = document.getElementById('restart-progress');
+
+  // Шаг 1: запрос на рестарт
+  try {
+    const res = await fetch('/api/xkeen/restart-dashboard', { method: 'POST' });
+    const data = await res.json();
+    if (!data.ok) {
+      msg.innerHTML = '<span style="color:#c33;">⚠️ Endpoint вернул ошибку: ' + (data.stderr || '?') + '</span>';
+      setTimeout(() => { document.body.removeChild(overlay); showRestartHelp(); }, 2500);
+      return;
+    }
+  } catch (e) {
+    // Это ожидаемо — процесс убит, AJAX оборвался
+    msg.textContent = 'Команда отправлена, ожидаю старта новой панели...';
+  }
+
+  // Шаг 2: polling /api/xkeen/dashboard-health каждые 1.5 сек
+  const startTime = Date.now();
+  const pollInterval = setInterval(async () => {
+    const sec = Math.floor((Date.now() - startTime) / 1000);
+    elapsed.textContent = 'прошло: ' + sec + ' сек';
+    progress.value = sec;
+    if (sec >= 30) {
+      clearInterval(pollInterval);
+      msg.innerHTML = '<span style="color:#c33;">⏰ Не дождался за 30 сек. Открываю help с альтернативами...</span>';
+      setTimeout(() => { document.body.removeChild(overlay); showRestartHelp(); }, 2000);
+      return;
+    }
+    try {
+      const r = await fetch('/api/xkeen/dashboard-health', { cache: 'no-store' });
+      if (r.ok) {
+        const j = await r.json();
+        if (j.status === 'ok' || j.status === 'warn') {
+          clearInterval(pollInterval);
+          const pid = (j.listeners && j.listeners[0]) ? j.listeners[0].pid : '?';
+          msg.innerHTML = '<span style="color:#2a7;">✓ Панель ожила (PID ' + pid + ') — обновляю страницу...</span>';
+          setTimeout(() => location.reload(), 1000);
+        }
+      }
+    } catch (e) {
+      // Ещё не отвечает — ждём дальше
+    }
+  }, 1500);
+}
+
+function showRestartHelp() {
+  const old = document.getElementById('restart-help-modal');
+  if (old) old.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'restart-help-modal';
+  overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:9999; display:flex; align-items:center; justify-content:center; padding:20px;';
+
+  const psCmd = `Stop-ScheduledTask -TaskName XrayDashboard
+Start-Sleep 3
+Start-ScheduledTask -TaskName XrayDashboard
+Start-Sleep 3
+Get-NetTCPConnection -LocalPort 5000 -State Listen | Select OwningProcess`;
+
+  const box = document.createElement('div');
+  box.style.cssText = 'background:white; border-radius:8px; padding:24px; max-width:750px; width:100%; box-shadow:0 10px 40px rgba(0,0,0,0.3);';
+  box.innerHTML = `
+    <h3 style="margin:0 0 12px; color:#c63;">🆘 Чистый рестарт панели вручную</h3>
+    <p style="color:#555; margin:0 0 8px; line-height:1.5;">
+      Если кнопка «🔄 рестарт панели» не помогает (бэйдж сверху показывает «⚠️ N listener на :5000»
+      или панель просто не отвечает) — есть два варианта:
+    </p>
+
+    <h4 style="margin:14px 0 6px; color:#444;">Вариант 1 (проще): <code>.bat</code> с автоэлевацией</h4>
+    <p style="color:#555; margin:0 0 6px;">Двойной клик в Explorer → UAC → готово.</p>
+    <div style="display:flex; gap:8px; align-items:center;">
+      <code id="bat-path" style="flex:1; padding:8px; background:#f5f5f0; border:1px solid #ddd; border-radius:4px; font-size:13px;">C:\\xray-dashboard\\Restart-Clean.bat</code>
+      <button class="btn btn-sm" onclick="copyText('C:\\\\xray-dashboard\\\\Restart-Clean.bat', this)">📋 Копировать путь</button>
+    </div>
+
+    <h4 style="margin:18px 0 6px; color:#444;">Вариант 2: PowerShell от админа</h4>
+    <p style="color:#555; margin:0 0 6px;">Открой PowerShell <strong>от админа</strong> (Win+X → «Терминал (Администратор)») и вставь:</p>
+    <pre id="ps-cmd" style="background:#1e1e1e; color:#dcdcdc; padding:12px; border-radius:4px; font-size:12px; line-height:1.5; overflow-x:auto; margin:0;">${psCmd.replace(/</g,'&lt;')}</pre>
+    <button class="btn btn-sm" style="margin-top:6px;" onclick="copyText(document.getElementById('ps-cmd').textContent, this)">📋 Копировать команды</button>
+
+    <p style="color:#888; font-size:0.85em; margin:16px 0 0; line-height:1.5;">
+      <strong>Когда нужно:</strong> после правки <code>dashboard.py</code> если кнопка «🔄 рестарт панели» не подхватила изменения,
+      либо если бэйдж сверху мигает красным.
+      <strong>Зачем sleep между Stop и Start:</strong> Windows отпускает порт 5000 не мгновенно — без паузы
+      следующий старт может упасть с «address already in use».
+      <br><br>
+      <strong>Норма после старта:</strong> 1 listener на :5000 + 2 процесса pythonw (launcher из <code>.venv\\Scripts\\</code>
+      + системный python-интерпретатор как его child). Бэйдж в toolbar считает именно listener'ов.
+    </p>
+
+    <div style="margin-top:16px; text-align:right;">
+      <button class="btn btn-secondary" onclick="document.getElementById('restart-help-modal').remove()">Закрыть</button>
+    </div>
+  `;
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+}
+
+function copyText(text, btn) {
+  const fallback = () => {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch(e) {}
+    document.body.removeChild(ta);
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).catch(fallback);
+  } else {
+    fallback();
+  }
+  if (btn) {
+    const old = btn.textContent;
+    btn.textContent = '✓ Скопировано';
+    setTimeout(() => { btn.textContent = old; }, 1500);
+  }
+}
+
+// Drag-drop для строк #failover-chain. После drop пересчитывает значения "Порядок"
+// в input'ах в соответствии с новым визуальным порядком (отмеченные галкой → 1, 2, 3...; снятые → 0).
+(function initFailoverDragDrop() {
+  let dragSrc = null;
+  function rebuildOrders() {
+    const table = document.getElementById('failover-chain');
+    if (!table) return;
+    let n = 0;
+    table.querySelectorAll('tr.draggable').forEach(tr => {
+      const chk = tr.querySelector('.fc-check');
+      const ord = tr.querySelector('.fc-order');
+      if (chk && chk.checked) { n++; ord.value = n; }
+      else { ord.value = 0; }
+    });
+  }
+  function attach() {
+    const table = document.getElementById('failover-chain');
+    if (!table) return;
+    table.querySelectorAll('tr.draggable').forEach(tr => {
+      tr.addEventListener('dragstart', (e) => {
+        dragSrc = tr;
+        tr.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+      });
+      tr.addEventListener('dragend', () => {
+        tr.classList.remove('dragging');
+        table.querySelectorAll('tr').forEach(r => r.classList.remove('drop-target-above', 'drop-target-below'));
+      });
+      tr.addEventListener('dragover', (e) => {
+        if (!dragSrc || tr === dragSrc) return;
+        e.preventDefault();
+        const rect = tr.getBoundingClientRect();
+        const above = (e.clientY - rect.top) < rect.height / 2;
+        table.querySelectorAll('tr').forEach(r => r.classList.remove('drop-target-above', 'drop-target-below'));
+        tr.classList.add(above ? 'drop-target-above' : 'drop-target-below');
+      });
+      tr.addEventListener('drop', (e) => {
+        if (!dragSrc || tr === dragSrc) return;
+        e.preventDefault();
+        const rect = tr.getBoundingClientRect();
+        const above = (e.clientY - rect.top) < rect.height / 2;
+        if (above) tr.parentNode.insertBefore(dragSrc, tr);
+        else tr.parentNode.insertBefore(dragSrc, tr.nextSibling);
+        rebuildOrders();
+      });
+    });
+    // Также пересчитываем порядок когда юзер меняет чекбокс
+    table.querySelectorAll('.fc-check').forEach(chk => {
+      chk.addEventListener('change', rebuildOrders);
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', attach);
+  } else {
+    attach();
+  }
+})();
+
+async function saveFailoverChain() {
+  // Собираем все строки таблицы failover-chain, фильтруем checked + order>0, сортируем по order
+  const rows = document.querySelectorAll('#failover-chain tr');
+  const items = [];
+  rows.forEach(tr => {
+    const chk = tr.querySelector('.fc-check');
+    const ord = tr.querySelector('.fc-order');
+    if (chk && ord && chk.checked) {
+      const order = parseInt(ord.value) || 0;
+      if (order > 0) items.push({ tag: chk.dataset.tag, order: order });
+    }
+  });
+  if (items.length === 0) {
+    flash(false, 'Нужно отметить хотя бы один outbound + поставить порядок > 0');
+    return;
+  }
+  items.sort((a, b) => a.order - b.order);
+  const tags = items.map(i => i.tag).join(',');
+  if (!confirm('Сохранить цепочку FAILOVER:\n\n' + items.map((i,idx) => `  ${idx+1}. ${i.tag}`).join('\n'))) return;
+  const fd = new FormData();
+  fd.append('tags', tags);
+  flash(true, 'Сохраняю цепочку...');
+  const res = await apiCall('/api/xkeen/set-failover-chain', fd);
+  if (res.ok) {
+    flash(true, res.stdout || 'Цепочка обновлена');
+    setTimeout(() => location.reload(), 1500);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+
+// AI domain presets — наборы доменов для популярных AI-сервисов.
+// ⚡ См. также `memory/presets_xray_dashboard.md` (для Claude в будущих сессиях):
+//    полный справочник по 4 типам пресетов (AI/YT/DIRECT/BLOCK),
+//    их актуальный состав, процедура обновления и триггер-фразы юзера.
+const AI_PRESETS = {
+  claude:      ['claude.ai', 'anthropic.com', 'claudeusercontent.com'],
+  openai:      ['openai.com', 'chatgpt.com', 'oaiusercontent.com', 'oaistatic.com'],
+  gemini:      ['gemini.google.com', 'generativelanguage.googleapis.com', 'ai.google.dev', 'aistudio.google.com'],
+  copilot:     ['copilot.microsoft.com', 'copilot.cloud.microsoft', 'designer.microsoft.com'],
+  perplexity:  ['perplexity.ai', 'pplx.ai'],
+  mistral:     ['mistral.ai', 'chat.mistral.ai'],
+  grok:        ['grok.com', 'x.ai', 'grok.x.ai'],
+  deepseek:    ['deepseek.com', 'chat.deepseek.com'],
+  huggingface: ['huggingface.co', 'hf.co'],
+};
+AI_PRESETS.all_ai = [].concat(
+  AI_PRESETS.claude, AI_PRESETS.openai, AI_PRESETS.gemini, AI_PRESETS.copilot,
+  AI_PRESETS.perplexity, AI_PRESETS.mistral, AI_PRESETS.grok, AI_PRESETS.deepseek,
+  AI_PRESETS.huggingface
+);
+
+function getAIDomainsArray() {
+  // v1.7.0: парсим через readSection — игнорирует inline-комментарии "# note"
+  return readSection('ai').domains;
+}
+function setAIDomainsArray(arr) {
+  // v1.7.0: сохраняет notes (если домен уже был с note — note остаётся)
+  const oldItems = readSection('ai').items;
+  const oldNotesMap = {};
+  oldItems.forEach(it => { if (it.note) oldNotesMap[it.domain] = it.note; });
+  const items = arr.map(d => ({ domain: d, note: oldNotesMap[d] || WINDOW_DOMAIN_NOTES.ai[d] || '' }));
+  writeSection('ai', items);
+}
+function addPreset(name) {
+  const preset = AI_PRESETS[name];
+  if (!preset) return;
+  // v1.7.0: используем универсальный addPresetGeneric — он пишет note "📦 <name>"
+  addPresetGeneric('ai', name, preset);
+}
+function removePreset(name) { removePresetGeneric('ai', name); }
+// Универсальная функция «Добавить ВСЕ пресеты» — обходит все ключи в presetDict и добавляет
+// каждый уникальный домен в textarea. Не дублирует то что уже есть. Используется в AI/YT/DIRECT/BLOCK.
+function addAllPresets(presetDict, getter, setter, labelForFlash) {
+  if (!confirm(`Добавить ВСЕ пресеты "${labelForFlash}"?\n\nЭто добавит все домены из всех известных пресетов (только уникальные — то что уже есть не задублируется).`)) return;
+  const current = new Set(getter());
+  let added = 0;
+  let totalInPresets = 0;
+  Object.values(presetDict).forEach(preset => {
+    preset.forEach(d => {
+      totalInPresets++;
+      if (!current.has(d)) { current.add(d); added++; }
+    });
+  });
+  setter(Array.from(current).sort());
+  flash(true, `Добавлено ${added} новых из ${totalInPresets} в пресетах (${labelForFlash}). Не забудь нажать «Сохранить».`, null, {noScroll: true});
+}
+function addAllAIPresets()     { addAllPresets(AI_PRESETS,     getAIDomainsArray,     setAIDomainsArray,     'все AI'); }
+function addAllYTPresets()     { addAllPresets(YT_PRESETS,     getYTDomainsArray,     setYTDomainsArray,     'все YT/IG/Discord'); }
+function addAllDirectPresets() { addAllPresets(DIRECT_PRESETS, getDirectDomainsArray, setDirectDomainsArray, 'все DIRECT'); }
+function addAllBlockPresets()  { addAllPresets(BLOCK_PRESETS,  getBlockDomainsArray,  setBlockDomainsArray,  'все BLOCK'); }
+function clearAIDomains() {
+  if (!confirm('Очистить весь список AI-доменов?\n\nПосле сохранения AI-sticky правило исчезнет, claude/openai пойдут через PRIMARY.')) return;
+  setAIDomainsArray([]);
+  flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
+}
+function resetAIDefaults() {
+  if (!confirm('Сбросить список к дефолтному (только Claude + ChatGPT)?')) return;
+  setAIDomainsArray([...AI_PRESETS.claude, ...AI_PRESETS.openai].sort());
+  flash(true, 'Сброшено к дефолту. Нажми «Сохранить».', null, {noScroll: true});
+}
+// DIRECT domain presets — НАПРЯМУЮ без VPN.
+// Большинство .ru-доменов и так покрыто базовыми правилами в template (regex *.ru/*.su/*.рф
+// + geosite yandex/vk/category-gov-ru/steam). Пресеты добавляют их в текстовый список для
+// ПРОЗРАЧНОСТИ (видишь что точно идёт direct) + добавляют .com / .net / .tv / .cloud
+// варианты которые regex не ловит.
+const DIRECT_PRESETS = {
+  mailru:       ['mail.ru', 'mailru.ru', 'my.com', 'mycdn.me', 'cdn.mail.ru', 'disk-o.cloud'],
+  // VK сервисы (VK Group: ВКонтакте + Одноклассники). Большинство уже покрыто regex *.ru +
+  // geosite:vk, но через явный список ловятся .com/.cc/.me/.net домены и CDN которые
+  // геосайтом не покрыты.
+  vk:           [
+    'vk.com', 'vk.ru', 'vk.me', 'vk.cc',
+    'vk-cdn.net', 'vkuser.net', 'vk-portal.net',
+    'userapi.com',          // VK API
+    'vkvideo.ru',           // VK Видео
+    'vkmusic.io',           // VK Музыка
+    'vkadnet.ru',           // VK Реклама
+    'ok.ru', 'odnoklassniki.ru',  // Одноклассники (тоже VK Group)
+  ],
+  // MAX — российский мессенджер (VK Group). Web + мобильные клиенты + CDN.
+  // Зачем direct: MAX блокирует connection с не-RU IP, через VPN не работает.
+  max:          ['max.ru', 'web.max.ru', 'oneme.ru', 'cdn.max.ru', 'static.max.ru', 'api.max.ru'],
+  okko:         ['okko.tv', 'okko.sh', 'okko-cdn.com', 'okkocdn.com', 'okko-tech.com'],
+  kinopoisk:    ['kinopoisk.ru', 'hd.kinopoisk.ru', 'yastatic.net'],
+  gov:          ['gosuslugi.ru', 'nalog.ru', 'mos.ru', 'pfr.gov.ru', 'roskazna.gov.ru'],
+  banks:        ['sberbank.ru', 'sberbank.com', 'vtb.ru', 'alfabank.ru', 'tinkoff.ru', 'raiffeisen.ru', 'gazprombank.ru', 'rshb.ru'],
+  marketplaces: ['ozon.ru', 'wildberries.ru', 'wbstatic.net', 'lamoda.ru', 'market.yandex.ru'],
+  // Yandex (все сервисы). Большинство уже покрыто regex *.ru + geosite:yandex,
+  // но добавление в список даёт прозрачность («вижу что точно идёт direct»)
+  // и покрывает .com-варианты которые regex не ловит.
+  yandex:       [
+    // Основные домены / CDN (.com и .net вне regex *.ru)
+    'yandex.ru', 'ya.ru', 'yandex.com', 'yastatic.net', 'yandex.net',
+    // Аналитика / реклама (.ru покрыты regex, .com — нет)
+    'mc.yandex.ru', 'mc.yandex.com', 'adfox.ru', 'adriver.ru',
+    // Сервисы .ru (все покрыты regex *.ru, добавлены для прозрачности)
+    'music.yandex.ru', 'kino.yandex.ru', 'plus.yandex.ru', 'afisha.yandex.ru',
+    'maps.yandex.ru', 'taxi.yandex.ru', 'eda.yandex.ru', 'lavka.yandex.ru',
+    'disk.yandex.ru', 'mail.yandex.ru', 'translate.yandex.ru', 'weather.yandex.ru',
+    'news.yandex.ru', 'realty.yandex.ru', 'pogoda.yandex.ru',
+    'alice.yandex.ru', '360.yandex.ru',
+    // Международные .com (НЕ покрыты regex — важно явно)
+    'taxi.yandex.com', 'maps.yandex.com', 'translate.yandex.com',
+    'cloud.yandex.com', '360.yandex.com', 'disk.yandex.com',
+    // Дзен
+    'dzen.ru', 'zen.yandex.ru',
+  ],
+};
+
+function getDirectDomainsArray() {
+  return readSection('direct').domains;
+}
+function setDirectDomainsArray(arr) {
+  const oldItems = readSection('direct').items;
+  const oldNotesMap = {};
+  oldItems.forEach(it => { if (it.note) oldNotesMap[it.domain] = it.note; });
+  const items = arr.map(d => ({ domain: d, note: oldNotesMap[d] || WINDOW_DOMAIN_NOTES.direct[d] || '' }));
+  writeSection('direct', items);
+}
+function addDirectPreset(name) {
+  const preset = DIRECT_PRESETS[name];
+  if (!preset) return;
+  addPresetGeneric('direct', name, preset);
+}
+function removeDirectPreset(name) { removePresetGeneric('direct', name); }
+function clearDirectDomains() {
+  if (!confirm('Очистить весь список DIRECT-доменов?\n\nБазовые правила *.ru/*.su/*.рф/geosite останутся.')) return;
+  setDirectDomainsArray([]);
+  flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
+}
+function resetDirectDefaults() {
+  if (!confirm('Сбросить к дефолтному (VK + Mail.ru + Okko)?\n\nВсё что было в списке — заменится. Если хочешь свой VPN-домен — впиши его в textarea вручную после сброса.')) return;
+  setDirectDomainsArray([...DIRECT_PRESETS.vk, ...DIRECT_PRESETS.mailru, ...DIRECT_PRESETS.okko].sort());
+  flash(true, 'Сброшено к дефолту. Нажми «Сохранить».', null, {noScroll: true});
+}
+async function saveDirectDomains() {
+  const domains = getDirectDomainsArray();
+  if (domains.length === 0) {
+    if (!confirm('Список DIRECT-доменов пустой. После сохранения только базовые правила *.ru/*.su/*.рф/geosite будут работать (это и так покрывает большинство). Продолжить?')) return;
+  } else {
+    const preview = domains.slice(0, 5).join('\n  • ');
+    const more = domains.length > 5 ? `\n  ... и ещё ${domains.length - 5}` : '';
+    if (!confirm(`Сохранить ${domains.length} DIRECT-доменов?\n\n  • ${preview}${more}\n\nЭти домены пойдут НАПРЯМУЮ без VPN. Watchdog перегенерит routing на следующем тике.`)) return;
+  }
+  const fd = new FormData();
+  fd.append('domains', domains.join(' '));
+  flash(true, `Сохраняю ${domains.length} DIRECT-доменов...`);
+  const res = await apiCall('/api/xkeen/set-direct-domains', fd);
+  if (res.ok) {
+    // v1.7.0: после успешной записи доменов в watchdog.config — sync notes в sidecar JSON
+    await saveDomainNotesSidecar();
+    flash(true, res.stdout || 'Сохранено. Watchdog подхватит при следующем тике.');
+    setTimeout(() => location.reload(), 1800);
+  } else {
+    flash(false, 'Ошибка', res.stderr);
+  }
+}
+
+// BLOCK domain presets — полная блокировка (outbound `block`/blackhole).
+// Источники: hosts-листы Pi-Hole/AdGuard для отключения Windows-update/телеметрии
+// и общеизвестные домены Adobe Genuine для крякнутых Photoshop/Illustrator.
+const BLOCK_PRESETS = {
+  'windows-update': [
+    'windowsupdate.com',
+    'update.microsoft.com',
+    'download.windowsupdate.com',
+    'ntservicepack.microsoft.com',
+    'wustat.windows.com',
+    'fe2.update.microsoft.com',
+    'sls.update.microsoft.com',
+    'au.download.windowsupdate.com',
+    'ds.download.windowsupdate.com',
+    'tlu.dl.delivery.mp.microsoft.com',
+  ],
+  'windows-telemetry': [
+    'vortex.data.microsoft.com',
+    'vortex-win.data.microsoft.com',
+    'settings-win.data.microsoft.com',
+    'watson.telemetry.microsoft.com',
+    'telemetry.microsoft.com',
+    'oca.telemetry.microsoft.com',
+    'sqm.telemetry.microsoft.com',
+    'telecommand.telemetry.microsoft.com',
+    'diagnostics.support.microsoft.com',
+    'feedback.microsoft.com',
+    'feedback.windows.com',
+    'feedback.search.microsoft.com',
+    'reports.wes.df.telemetry.microsoft.com',
+    'wes.df.telemetry.microsoft.com',
+    'services.wes.df.telemetry.microsoft.com',
+  ],
+  'adobe': [
+    'activate.adobe.com',
+    'practivate.adobe.com',
+    'practivate.adobe.io',
+    'lm.licenses.adobe.com',
+    'lmlicenses.wip4.adobe.com',
+    'na1r.services.adobe.com',
+    'hlrcv.stage.adobe.com',
+    'genuine.adobe.com',
+    'validate.adobe.com',
+    'genuine.adobe.io',
+    'prod.adobegenuine.com',
+    'adobe-dns.adobe.com',
+    'ic.adobe.io',
+    'wip1.adobe.com',
+    'wip2.adobe.com',
+    'wip3.adobe.com',
+    'wip4.adobe.com',
+    'activate-sea.adobe.com',
+    'activate-sjc0.adobe.com',
+    'activate.wip.adobe.com',
+    'activate.wip1.adobe.com',
+    'activate.wip3.adobe.com',
+    'activate.wip4.adobe.com',
+    'crl.verisign.com',
+    'ood.opsource.net',
+    'adobeereg.com',
+    '3dns.adobe.com',
+    '3dns-1.adobe.com',
+    '3dns-2.adobe.com',
+    '3dns-3.adobe.com',
+    '3dns-4.adobe.com',
+  ],
+  'office-telemetry': [
+    'office.com.evyatk.com',
+    'oca.microsoft.com',
+    'redir.metaservices.microsoft.com',
+    'choice.microsoft.com',
+    'choice.microsoft.com.nsatc.net',
+    'df.telemetry.microsoft.com',
+    'reports.wes.df.telemetry.microsoft.com',
+    'telemetry.appex.bing.net',
+    'telemetry.urs.microsoft.com',
+    'cs1.wpc.v0cdn.net',
+    'statsfe1.ws.microsoft.com',
+    'corpext.msitadfs.glbdns2.microsoft.com',
+    'compatexchange.cloudapp.net',
+  ],
+};
+
+function getBlockDomainsArray() {
+  return readSection('block').domains;
+}
+function setBlockDomainsArray(arr) {
+  const oldItems = readSection('block').items;
+  const oldNotesMap = {};
+  oldItems.forEach(it => { if (it.note) oldNotesMap[it.domain] = it.note; });
+  const items = arr.map(d => ({ domain: d, note: oldNotesMap[d] || WINDOW_DOMAIN_NOTES.block[d] || '' }));
+  writeSection('block', items);
+}
+function addBlockPreset(name) {
+  const preset = BLOCK_PRESETS[name];
+  if (!preset) return;
+  addPresetGeneric('block', name, preset);
+}
+function removeBlockPreset(name) { removePresetGeneric('block', name); }
+function clearBlockDomains() {
+  if (!confirm('Очистить весь список BLOCK-доменов?\n\nПосле сохранения ничего не будет блокироваться.')) return;
+  setBlockDomainsArray([]);
+  flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
+}
+async function saveBlockDomains() {
+  const domains = getBlockDomainsArray();
+  if (domains.length === 0) {
+    if (!confirm('Список BLOCK-доменов пустой. После сохранения ничего не будет блокироваться (правило BLOCK исчезнет из routing). Продолжить?')) return;
+  } else {
+    const preview = domains.slice(0, 5).join('\n  • ');
+    const more = domains.length > 5 ? `\n  ... и ещё ${domains.length - 5}` : '';
+    if (!confirm(`Сохранить ${domains.length} BLOCK-доменов?\n\n  • ${preview}${more}\n\nЭти домены будут ПОЛНОСТЬЮ заблокированы на всех устройствах в LAN. Watchdog перегенерит routing на следующем тике.`)) return;
+  }
+  const fd = new FormData();
+  fd.append('domains', domains.join(' '));
+  flash(true, `Сохраняю ${domains.length} BLOCK-доменов...`);
+  const res = await apiCall('/api/xkeen/set-block-domains', fd);
+  if (res.ok) {
+    // v1.7.0: после успешной записи доменов в watchdog.config — sync notes в sidecar JSON
+    await saveDomainNotesSidecar();
+    flash(true, res.stdout || 'Сохранено. Watchdog подхватит при следующем тике.');
+    setTimeout(() => location.reload(), 1800);
+  } else {
+    flash(false, 'Ошибка', res.stderr);
+  }
+}
+
+// ============== v1.7.6 — POLICY CLIENTS (read-only) ==============
+// escapeHtml() уже определён ниже в файле — JS hoisting гарантирует видимость.
+
+function _formatBytes(b) {
+  if (!b) return '0';
+  const n = parseFloat(b);
+  if (!isFinite(n) || n === 0) return '0';
+  const units = ['B','KB','MB','GB','TB'];
+  let i = 0; let v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 10 ? 0 : 1) + ' ' + units[i];
+}
+
+async function loadRoutingTemplateRules() {
+  const out = document.getElementById('routing-template-rules-output');
+  if (!out) return;
+  out.innerHTML = '<p class="subtitle" style="color:#888;">⏳ Читаю /opt/etc/xray/configs.bak/05_routing.template.json с роутера...</p>';
+  try {
+    const r = await fetch('/api/xkeen/routing-template-rules', { credentials: 'same-origin' });
+    const j = await r.json();
+    if (!j.ok) {
+      out.innerHTML = '<p style="color:#c33;">❌ ' + escapeHtml(j.error || 'Не удалось прочитать template') + '</p>';
+      return;
+    }
+    renderRoutingTemplateRules(j);
+  } catch (e) {
+    out.innerHTML = '<p style="color:#c33;">❌ Сеть/JS: ' + escapeHtml(String(e.message || e)) + '</p>';
+  }
+}
+
+function renderRoutingTemplateRules(j) {
+  const out = document.getElementById('routing-template-rules-output');
+  if (!out) return;
+  let html = '<p class="subtitle" style="font-size:0.86em; color:#666;">';
+  html += 'Источник: <code>' + escapeHtml(j.template_path) + '</code>. ';
+  html += 'Всего правил в template: <strong>' + j.total_rules + '</strong>, из них показано (исключая placeholder\'ы для пользовательских доменов): <strong>' + j.shown_rules + '</strong>.';
+  html += '</p>';
+
+  if (!j.rules || j.rules.length === 0) {
+    html += '<p style="color:#888;">Правила не нашлись.</p>';
+    out.innerHTML = html;
+    return;
+  }
+
+  for (const rule of j.rules) {
+    const outboundClass = rule.outbound === 'direct' ? 'rt-direct' : (rule.outbound === 'block' ? 'rt-block' : '');
+    const outboundBadgeClass = rule.outbound === 'direct' ? 'rt-out-direct' : (rule.outbound === 'block' ? 'rt-out-block' : '');
+    let typeLabel = '';
+    let itemsHtml = '';
+    switch (rule.type) {
+      case 'domain-regex':
+        typeLabel = '🌐 Domain regex';
+        itemsHtml = '<ul class="rt-items">' + rule.patterns.map(p => '<li>' + escapeHtml(p) + '</li>').join('') + '</ul>';
+        break;
+      case 'geosite-ext':
+        typeLabel = '📚 Geosite ext';
+        itemsHtml = '<ul class="rt-items">' + rule.ext_categories.map(e => '<li>' + escapeHtml(e.file) + ':<strong>' + escapeHtml(e.category) + '</strong></li>').join('') + '</ul>';
+        break;
+      case 'geosite-builtin':
+        typeLabel = '📚 Geosite builtin';
+        itemsHtml = '<ul class="rt-items">' + rule.categories.map(c => '<li>' + escapeHtml(c) + '</li>').join('') + '</ul>';
+        break;
+      case 'domain-direct':
+        typeLabel = '🌐 Domain список';
+        itemsHtml = '<ul class="rt-items">' + rule.domains.map(d => '<li>' + escapeHtml(d) + '</li>').join('') + '</ul>';
+        break;
+      case 'ip-list':
+        typeLabel = '🔢 IP список';
+        itemsHtml = '<ul class="rt-items">' + rule.ips.map(i => '<li>' + escapeHtml(i) + '</li>').join('') + '</ul>';
+        break;
+      case 'geoip':
+        typeLabel = '🌍 GeoIP';
+        itemsHtml = '<ul class="rt-items">' + rule.categories.map(c => '<li>geoip:<strong>' + escapeHtml(c) + '</strong></li>').join('') + '</ul>';
+        break;
+      case 'protocol':
+        typeLabel = '📦 Protocol';
+        itemsHtml = '<ul class="rt-items">' + rule.protocol.map(p => '<li>' + escapeHtml(p) + '</li>').join('') + '</ul>';
+        break;
+      case 'udp-block':
+      case 'network':
+        typeLabel = '🚫 Network';
+        itemsHtml = '<ul class="rt-items"><li>' + escapeHtml(rule.network) + '</li>' + rule.ports.map(p => '<li>порт ' + escapeHtml(p) + '</li>').join('') + '</ul>';
+        break;
+      case 'inbound-default':
+        typeLabel = '🎯 Catch-all';
+        itemsHtml = '<ul class="rt-items">' + (rule.inboundTag || []).map(i => '<li>inbound: ' + escapeHtml(i) + '</li>').join('') + '</ul>';
+        break;
+      default:
+        typeLabel = escapeHtml(rule.type);
+    }
+    html += '<div class="rt-rule ' + outboundClass + '">';
+    html += '<span class="rt-type-badge">' + typeLabel + '</span>';
+    html += '<span class="rt-out-badge ' + outboundBadgeClass + '">→ ' + escapeHtml(rule.outbound) + '</span>';
+    if (rule.description) html += '<div class="rt-desc">' + escapeHtml(rule.description) + '</div>';
+    html += itemsHtml;
+    html += '</div>';
+  }
+
+  html += '<p class="subtitle" style="margin-top:10px; color:#888; font-size:0.85em;">';
+  html += '💡 Эти правила работают <strong>в дополнение</strong> к твоим DIRECT/BLOCK/AI/YT доменам (в textarea выше). Приоритет: <strong>BLOCK → DIRECT → AI → YT → catch-all</strong>. Чтобы изменить template — SSH на роутер, редактировать <code>' + escapeHtml(j.template_path) + '</code>, потом <code>xkeen -restart</code>. ⚠ Bootstrap-команда в дашборде ПЕРЕЗАПИСЫВАЕТ template (с галочкой «Перезаписать») — не делай этого если кастомизировал руками.';
+  html += '</p>';
+
+  out.innerHTML = html;
+}
+
+async function installConntrackTools(btn) {
+  if (!confirm('Установить пакет conntrack на роутер через opkg?\n\n' +
+               'Команды на роутере:\n' +
+               '  opkg update\n' +
+               '  opkg install conntrack\n\n' +
+               '(В Entware/OpenWrt-репо пакет называется просто `conntrack`, не `conntrack-tools` как в Debian.)\n\n' +
+               'Установка займёт 30-60 сек. После этого кнопка 🔄 в таблице заработает.\n\n' +
+               'Размер: ~50KB сам пакет + ~150KB libnetfilter-conntrack/cttimeout/cthelper зависимости.')) return;
+
+  btn.disabled = true;
+  const origText = btn.textContent;
+  btn.textContent = '⏳ Устанавливаю (~60 сек)...';
+  flash(true, '⏳ Запускаю opkg update && opkg install conntrack на роутере (это займёт ~30-60 сек, не закрывай страницу)...');
+
+  try {
+    const r = await fetch('/api/xkeen/install-conntrack-tools', { method: 'POST', credentials: 'same-origin' });
+    const j = await r.json();
+    if (j.ok) {
+      if (j.already_installed) {
+        flash(true, 'ℹ️ Пакет conntrack уже был установлен. Обновляю таблицу...', null, { autoDismiss: 4000 });
+      } else {
+        flash(true, 'Пакет conntrack установлен! Кнопка 🔄 теперь работает. Обновляю таблицу...', null, { autoDismiss: 5000 });
+      }
+      setTimeout(() => loadPolicyClients(), 1500);
+    } else {
+      btn.disabled = false;
+      btn.textContent = '📦 Установить (повторить)';
+      const details = (j.hint ? '💡 ' + j.hint + '\n\n' : '') + 'stdout:\n' + (j.stdout || '(пусто)') + (j.stderr ? '\n\nstderr:\n' + j.stderr : '');
+      flash(false, 'Не удалось установить пакет conntrack', details);
+    }
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = origText;
+    flash(false, '❌ Сеть/JS (возможно timeout — endpoint ждёт до 120 сек)', String(e.message || e));
+  }
+}
+
+async function flushConntrack(btn) {
+  const ip = btn.dataset.ip;
+  const name = btn.dataset.name;
+
+  // Warn если IP совпадает с самим dashboard'ом (LAN_HOST из config_local) —
+  // сброс conntrack для самого себя обрубит текущую сессию dashboard-роутер
+  // (и потенциально redirect'ы юзера если он на том же PC).
+  const isSelf = (ip === window.PC_LAN_HOST);
+  const selfWarn = isSelf
+    ? '\n\n⚠ ЭТО ТЫ САМ (' + ip + ' = этот PC, dashboard). SSH-сессия dashboard→роутер прервётся, страница может зависнуть на 1-2 сек. Перезагрузи страницу после.'
+    : '';
+
+  if (!confirm('Сбросить conntrack для «' + name + '» (' + ip + ')?\n\nВсе существующие TCP/UDP-соединения этого клиента будут разорваны и пересозданы заново — новая политика применится сразу.' + selfWarn)) return;
+
+  btn.disabled = true;
+  const origText = btn.textContent;
+  btn.textContent = '⏳';
+  const fd = new FormData();
+  fd.append('ip', ip);
+  flash(true, '⏳ Сбрасываю conntrack для ' + name + ' (' + ip + ')...');
+  try {
+    const r = await fetch('/api/xkeen/flush-conntrack', { method: 'POST', credentials: 'same-origin', body: fd });
+    const j = await r.json();
+    if (j.ok) {
+      const msg = name + ': conntrack сброшен (' + (j.method || '?') + '). ' + (j.summary || '');
+      flash(true, msg, null, { autoDismiss: 4000 });
+    } else {
+      if (j.can_auto_install_conntrack_tools) {
+        // Спец-сообщение с inline-кнопкой авто-установки
+        const msgHtml =
+          'Не удалось сбросить conntrack для <strong>' + escapeHtml(name) + '</strong>: ' +
+          '<em>пакет conntrack не установлен на роутере</em>. ' +
+          'Без него Keenetic не умеет точечно сбрасывать сессии. ' +
+          '<button class="btn btn-sm" style="background:#3498db; color:#fff; margin-left:8px;" onclick="installConntrackTools(this)">📦 Установить через дашборд</button> ' +
+          '<span style="color:#666; font-size:0.9em;">или вручную: <code>ssh root@192.168.15.1 -p 222 "opkg update &amp;&amp; opkg install conntrack"</code></span>';
+        flash(false, msgHtml);
+      } else {
+        const details = (j.error || '') + (j.hint ? '\n\n💡 ' + j.hint : '') + (j.stdout ? '\n\nstdout:\n' + j.stdout : '') + (j.stderr ? '\n\nstderr:\n' + j.stderr : '');
+        flash(false, '❌ Не удалось сбросить conntrack для ' + name, details);
+      }
+    }
+  } catch (e) {
+    flash(false, '❌ Сеть/JS', String(e.message || e));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function changeClientPolicy(selectEl) {
+  const mac = selectEl.dataset.mac;
+  const name = selectEl.dataset.name;
+  const prev = selectEl.dataset.prev;
+  const next = selectEl.value;
+  if (next === prev) return; // no change
+
+  // Подтверждение — особенно важно при смене на «напрямую» (клиент выйдет из VPN)
+  const nextLabel = selectEl.options[selectEl.selectedIndex].text;
+  const prevOpt = Array.from(selectEl.options).find(o => o.value === prev);
+  const prevLabel = prevOpt ? prevOpt.text : prev;
+  if (!confirm('Сменить политику для «' + name + '» (' + mac + ')?\n\n  ' + prevLabel + '  →  ' + nextLabel + '\n\nКоманда: ndmc → host MAC policy ... → system configuration save.\nУстройство может потребовать переподключение/reboot чтобы новый маршрут вступил в силу.')) {
+    // Откатить визуально
+    selectEl.value = prev;
+    return;
+  }
+
+  selectEl.disabled = true;
+  const fd = new FormData();
+  fd.append('mac', mac);
+  fd.append('policy', next);
+  flash(true, '⏳ Меняю политику «' + name + '» на ' + nextLabel + '...');
+  try {
+    const r = await fetch('/api/xkeen/set-client-policy', { method: 'POST', credentials: 'same-origin', body: fd });
+    const j = await r.json();
+    if (j.ok) {
+      flash(true, name + ': ' + (j.action || 'политика изменена') + '. Через ~3 сек обновлю список.', null, { autoDismiss: 4500 });
+      selectEl.dataset.prev = next;
+      // Перезагрузить список через 2 сек чтобы Keenetic успел применить
+      setTimeout(() => loadPolicyClients(), 2500);
+    } else {
+      flash(false, 'Не удалось сменить политику для ' + name, (j.error || '') + (j.stderr ? '\n\nstderr:\n' + j.stderr : '') + (j.stdout ? '\n\nstdout:\n' + j.stdout : ''));
+      selectEl.value = prev; // откатить
+      selectEl.disabled = false;
+    }
+  } catch (e) {
+    flash(false, '❌ Сеть/JS', String(e.message || e));
+    selectEl.value = prev;
+    selectEl.disabled = false;
+  }
+}
+
+async function loadPolicyClients() {
+  const out = document.getElementById('policy-clients-output');
+  if (!out) return;
+  out.innerHTML = '<p class="subtitle" style="color:#888;">⏳ Запрашиваю состояние политики через ndmc... (5-15 сек)</p>';
+  try {
+    const r = await fetch('/api/xkeen/policy-clients', { credentials: 'same-origin' });
+    const j = await r.json();
+    if (!j.ok) {
+      out.innerHTML = '<p style="color:#c33;">❌ Ошибка: ' + escapeHtml(j.error || 'не удалось получить данные') + (j.stderr ? '<br><code style="font-size:0.85em;">' + escapeHtml(j.stderr) + '</code>' : '') + '</p>';
+      return;
+    }
+    renderPolicyClients(j);
+  } catch (e) {
+    out.innerHTML = '<p style="color:#c33;">❌ Сеть/JS: ' + escapeHtml(e.message || e) + '</p>';
+  }
+}
+
+function renderPolicyClients(j) {
+  const out = document.getElementById('policy-clients-output');
+  if (!out) return;
+  let html = '';
+
+  if (!j.policy_found) {
+    html += '<div style="background:#fff3cd; border-left:3px solid #f0c200; padding:8px 12px; border-radius:3px; margin-bottom:10px;">';
+    html += '⚠️ <strong>Политика с description=«XKeen» не найдена на роутере!</strong> Создай её через Keenetic Web UI (см. Шаг 8 в Помощи). Без неё XKeen-iptables не сработает.';
+    if (Object.keys(j.all_policies || {}).length > 0) {
+      html += '<br><small>Существующие политики на роутере: ';
+      html += Object.keys(j.all_policies).map(d => '<code>' + escapeHtml(d) + '</code>').join(', ');
+      html += '</small>';
+    }
+    html += '</div>';
+  } else {
+    html += '<div class="pc-stats">';
+    html += 'Политика <strong>«XKeen»</strong> найдена (внутренний ID <code>' + escapeHtml(j.policy_id_internal) + '</code>';
+    if (j.policy_fwmark) html += ', fwmark <code>0x' + escapeHtml(j.policy_fwmark) + '</code>';
+    html += '). ';
+    html += 'В LAN всего <strong>' + j.stats.total_hosts + '</strong> устройств, из них ';
+    html += '<strong>' + j.stats.in_xkeen + '</strong> идут через xray, ';
+    html += '<strong>' + j.stats.in_no_policy + '</strong> мимо xray (на политике по умолчанию)';
+    if (j.stats.in_other_policy) {
+      html += ', <strong>' + j.stats.in_other_policy + '</strong> в других политиках';
+    }
+    html += '.';
+    if (j.stats.in_xkeen >= 20) {
+      html += '<br>🚦 <span style="color:#c33;">У тебя <strong>' + j.stats.in_xkeen + ' клиентов</strong> в XKeen — это много для MT7621-класса роутера. Каждый клиент в политике даёт нагрузку на CPU (xray-TPROXY перехват). Если кому-то VPN не нужен — поменяй ему политику на «🌐 напрямую» через dropdown.</span>';
+    }
+    html += '</div>';
+  }
+
+  // Легенда (объясняет иконки в таблице)
+  html += '<div class="pc-legend">';
+  html += '<strong>📖 Легенда:</strong> ';
+  html += '<span class="pc-leg-item">🔒 <strong>XKeen</strong> — через xray (фон строки светло-синий)</span>';
+  html += '<span class="pc-leg-item">🔵 <strong>другая политика</strong> (Amnezia/hidemy/…) — через свой WG/Proxy, не xray (фон серый)</span>';
+  html += '<span class="pc-leg-item">🌐 <strong>напрямую</strong> — через провайдера, минуя xray</span>';
+  html += '<span class="pc-leg-item">📶 WiFi <small>(SSID)</small></span>';
+  html += '<span class="pc-leg-item">🔌 Ethernet</span>';
+  html += '<span class="pc-leg-item"><em style="color:#aaa;">offline</em> — italic-строка, IP=0.0.0.0, link не «up»</span>';
+  html += '</div>';
+
+  // Таблица хостов с dropdown'ами для смены политики
+  if (j.hosts && j.hosts.length > 0) {
+    // Сортировка опций dropdown: XKeen первым (наиболее частый выбор), потом остальные политики по алфавиту, потом 'напрямую'
+    const policyOptions = [];
+    const allPolicies = j.all_policies || {};
+    if (allPolicies['XKeen']) policyOptions.push({ id: allPolicies['XKeen'], label: '🔒 XKeen' });
+    Object.keys(allPolicies).filter(d => d !== 'XKeen').sort().forEach(d => {
+      policyOptions.push({ id: allPolicies[d], label: '🔵 ' + d });
+    });
+    policyOptions.push({ id: 'none', label: '🌐 напрямую' });
+
+    html += '<table class="pc-table">';
+    html += '<thead><tr><th>Имя</th><th>IP</th><th>MAC</th><th>Соединение</th><th>Трафик RX/TX</th><th>Политика</th></tr></thead><tbody>';
+    const sorted = [...j.hosts].sort((a, b) => {
+      const score = h => (h.in_xkeen ? 0 : h.in_other_policy ? 1 : 2);
+      return score(a) - score(b);
+    });
+    for (const h of sorted) {
+      let cls = '';
+      if (h.in_xkeen) cls = 'pc-xkeen';
+      else if (h.in_other_policy) cls = 'pc-other';
+      if (!h.active) cls += ' pc-inactive';
+
+      const conn = h.ssid ? ('📶 WiFi <small>(' + escapeHtml(h.ssid) + ')</small>') : (h.link === 'up' ? '🔌 Ethernet' : '⚫ offline');
+      const traf = _formatBytes(h.rxbytes) + ' / ' + _formatBytes(h.txbytes);
+
+      // Текущее значение dropdown'а
+      let currentValue = 'none';
+      if (h.in_xkeen) currentValue = allPolicies['XKeen'];
+      else if (h.in_other_policy) {
+        // Найти PolicyN по description
+        currentValue = allPolicies[h.other_policy_desc] || 'none';
+      }
+
+      // Dropdown
+      let dropdown = '<select class="pc-policy-select" data-mac="' + escapeHtml(h.mac) + '" data-name="' + escapeHtml(h.name) + '" data-prev="' + escapeHtml(currentValue) + '" onchange="changeClientPolicy(this)">';
+      for (const opt of policyOptions) {
+        const selected = (opt.id === currentValue) ? ' selected' : '';
+        dropdown += '<option value="' + escapeHtml(opt.id) + '"' + selected + '>' + escapeHtml(opt.label) + '</option>';
+      }
+      dropdown += '</select>';
+      // Кнопка сброса conntrack: активна если у клиента есть валидный IP,
+      // disabled placeholder иначе (для визуальной consistency — чтобы последняя
+      // колонка не прыгала по ширине между строками).
+      const hasValidIP = h.ip && h.ip !== '0.0.0.0' && h.ip !== '';
+      if (hasValidIP) {
+        dropdown += '<button class="pc-flush-btn" data-ip="' + escapeHtml(h.ip) + '" data-name="' + escapeHtml(h.name) + '" onclick="flushConntrack(this)" title="Сбросить conntrack для этого клиента — все его существующие соединения переоткроются и новая политика применится сразу (без переподключения устройства).">🔄</button>';
+      } else {
+        dropdown += '<button class="pc-flush-btn" disabled title="Клиент offline (IP=0.0.0.0). У него нет активных соединений в conntrack — сбрасывать нечего. Будет доступно когда клиент подключится.">🔄</button>';
+      }
+
+      html += '<tr class="' + cls + '">';
+      html += '<td><strong>' + escapeHtml(h.name) + '</strong></td>';
+      html += '<td>' + escapeHtml(h.ip) + '</td>';
+      html += '<td><span class="pc-mac">' + escapeHtml(h.mac) + '</span></td>';
+      html += '<td>' + conn + '</td>';
+      html += '<td style="white-space:nowrap;">' + traf + '</td>';
+      html += '<td>' + dropdown + '</td>';
+      html += '</tr>';
+    }
+    html += '</tbody></table>';
+    html += '<p class="subtitle" style="margin-top:6px; font-size:0.85em; color:#666;">💡 Смена политики применяется мгновенно и автоматически сохраняется (<code>system configuration save</code>). Устройству может потребоваться <strong>переподключение/reboot</strong> чтобы новый маршрут вступил в силу — Keenetic применяет fwmark только на новые соединения.</p>';
+  } else {
+    html += '<p style="color:#888;">Не удалось получить список хостов. Возможно <code>ndmc -c "show ip hotspot"</code> не отдал ничего.</p>';
+  }
+
+  // Технические детали свёрнуто
+  html += '<details style="margin-top:14px; font-size:0.88em;">';
+  html += '<summary style="cursor:pointer; color:#555;">🔧 Технические детали (порты XKeen, conntrack-tools, конфиги /opt/etc/xkeen/)</summary>';
+  html += '<div style="padding:8px 10px; background:#f7f7f7; border-radius:3px; margin-top:6px;">';
+  // conntrack-tools status / install кнопка
+  if (j.conntrack_tools_installed === false) {
+    html += '<div style="background:#fff3cd; border-left:3px solid #f0c200; padding:8px 12px; margin:0 0 10px; border-radius:3px;">';
+    html += '⚠ <strong>Пакет conntrack не установлен</strong> на роутере. ';
+    html += 'Кнопка <strong>🔄</strong> в таблице не сработает (KeeneticOS не имеет нативной команды для сброса conntrack по фильтру). ';
+    html += 'Установи одним кликом (~50KB + зависимости, ~30-60 сек):<br>';
+    html += '<button class="btn btn-sm" style="background:#3498db; color:#fff; margin-top:6px;" onclick="installConntrackTools(this)">📦 Установить пакет conntrack на роутер</button>';
+    html += '</div>';
+  } else if (j.conntrack_tools_installed === true) {
+    html += '<p style="color:#2a7; font-size:0.92em; margin:0 0 8px;">✅ <strong>Пакет conntrack установлен</strong> — кнопка 🔄 в таблице работает.</p>';
+  }
+  if (j.xkeen_ports) {
+    html += '<p><strong>Порты проксирования (xkeen -cp)</strong>: ';
+    html += j.xkeen_ports.proxy.length ? '<code>' + j.xkeen_ports.proxy.join(', ') + '</code>' : '<em>(не настроены)</em>';
+    html += '</p>';
+    html += '<p><strong>Исключённые порты (xkeen -cpe)</strong>: ';
+    html += j.xkeen_ports.exclude.length ? '<code>' + j.xkeen_ports.exclude.join(', ') + '</code>' : '<em>(нет — не нужны при настроенных портах проксирования)</em>';
+    html += '</p>';
+    if (j.xkeen_ports.proxy.length === 0 && j.xkeen_ports.exclude.length === 0) {
+      html += '<p style="color:#c33;">⚠ XKeen перехватывает <strong>все порты TCP/UDP</strong> — это сильно грузит CPU. Рекомендуется ограничить через <code>xkeen -ap 443,80</code> (см. <a href="https://github.com/Corvus-Malus/XKeen" target="_blank">README XKeen</a>).</p>';
+    }
+  }
+  if (j.config_lists) {
+    html += '<p><strong>/opt/etc/xkeen/ip_exclude.lst</strong>: ';
+    html += j.config_lists.ip_exclude.length ? j.config_lists.ip_exclude.map(x => '<code>' + escapeHtml(x) + '</code>').join(' ') : '<em>(пусто — исключений нет)</em>';
+    html += '</p>';
+    html += '<p><strong>port_proxying.lst</strong>: ';
+    html += j.config_lists.port_proxying.length ? j.config_lists.port_proxying.map(x => '<code>' + escapeHtml(x) + '</code>').join(' ') : '<em>(пусто)</em>';
+    html += '</p>';
+    html += '<p><strong>port_exclude.lst</strong>: ';
+    html += j.config_lists.port_exclude.length ? j.config_lists.port_exclude.map(x => '<code>' + escapeHtml(x) + '</code>').join(' ') : '<em>(пусто)</em>';
+    html += '</p>';
+  }
+  if (j.all_policies) {
+    const others = Object.keys(j.all_policies).filter(d => d !== 'XKeen');
+    if (others.length > 0) {
+      html += '<p><strong>Другие политики на роутере</strong>: ';
+      html += others.map(d => '<code>' + escapeHtml(d) + '</code> (=' + escapeHtml(j.all_policies[d]) + ')').join(', ');
+      html += '</p>';
+    }
+  }
+  html += '</div></details>';
+
+  out.innerHTML = html;
+}
+
+async function toggleAIFailBlock(enabled) {
+  const fd = new FormData();
+  fd.append('enabled', enabled ? '1' : '0');
+  flash(true, enabled ? '🛡️ Включаю kill-switch...' : '⚠️ Отключаю kill-switch...');
+  const res = await apiCall('/api/xkeen/set-ai-fail-block', fd);
+  if (res.ok) {
+    flash(true, res.stdout || (enabled ? '🛡️ Kill-switch включён' : '⚠️ Kill-switch выключен'));
+    setTimeout(() => location.reload(), 1500);
+  } else {
+    flash(false, 'Ошибка', res.stderr);
+  }
+}
+
+// YouTube domain presets — для sticky-маршрутизации YT/IG/Discord через RU-exit без рекламы.
+// Включаются опционально (см. чекбокс рядом с YT-выбором), список доменов — этот же ввод.
+const YT_PRESETS = {
+  // YouTube (web + mobile + CDN). googlevideo.com — это видеостриминг, без него реклама будет
+  // через geo google_ads (видеостриминг — на googlevideo.com → если он через RU exit, реклама не покажется).
+  youtube: [
+    'youtube.com', 'youtu.be', 'youtube-nocookie.com',
+    'googlevideo.com', 'ytimg.com', 'ggpht.com',
+    'youtubei.googleapis.com', 'yt3.ggpht.com', 'yt4.ggpht.com',
+  ],
+  instagram: [
+    'instagram.com', 'cdninstagram.com',
+    'fbcdn.net', 'fbsbx.com',
+  ],
+  discord: [
+    'discord.com', 'discordapp.com', 'discord.gg',
+    'discordapp.net', 'discord.media',
+  ],
+  tiktok: [
+    'tiktok.com', 'tiktokcdn.com', 'tiktokv.com',
+    'musical.ly', 'byteoversea.com', 'ibyteimg.com',
+  ],
+  twitch: [
+    'twitch.tv', 'ttvnw.net', 'jtvnw.net',
+    'twitchcdn.net', 'live-video.net',
+  ],
+  twitter: [
+    'twitter.com', 'x.com', 'twimg.com',
+    't.co', 'twitterstat.us',
+  ],
+  reddit: [
+    'reddit.com', 'redd.it', 'redditstatic.com',
+    'redditmedia.com',
+  ],
+  telegram: [
+    // Базовые
+    'telegram.org', 't.me', 'telegram.me', 'telegram.dog',
+    'web.telegram.org', 'api.telegram.org',
+    // WebRTC servers (КРИТИЧНО для голосовых звонков — без них звонки молчат!)
+    'venus.web.telegram.org', 'pluto.web.telegram.org',
+    'aurora.web.telegram.org', 'vesta.web.telegram.org', 'flora.web.telegram.org',
+    // CDN (фото / видео / документы)
+    'cdn1.telegram-cdn.org', 'cdn2.telegram-cdn.org', 'cdn3.telegram-cdn.org',
+    'cdn4.telegram-cdn.org', 'cdn5.telegram-cdn.org',
+    'cdn-telegram.org', 'telesco.pe',
+  ],
+  whatsapp: [
+    // Web + основные домены (заблокирован DPI в РФ с 2025-08 — нужен VPN).
+    // Примечание: 'whatsapp.com' и 'whatsapp.net' в xray-routing записываются как
+    // domain:whatsapp.com — это subdomain-match, автоматически ловит api.whatsapp.com,
+    // web.whatsapp.com, e1.whatsapp.net..e16.whatsapp.net (Edge), dit.whatsapp.net,
+    // crashlogs.whatsapp.net, v.whatsapp.net, signal.whatsapp.net и т.д.
+    'whatsapp.com', 'whatsapp.net',
+    'web.whatsapp.com',     // явно для надёжности
+    'wa.me',                // короткие ссылки wa.me/+номер — отдельный TLD!
+    // Messaging / signalling (group chat, push notifications, sync)
+    'g.whatsapp.net', 'pps.whatsapp.net',
+    // Media (фото / видео / голосовые / документы)
+    'mmg.whatsapp.net', 'media.whatsapp.net',
+    'static.whatsapp.net', 'cdn.whatsapp.net',
+    // Meta backend используется WhatsApp клиентом для аутентификации/messaging.
+    // Эти конкретные эндпоинты — только для WhatsApp, не пересекаются с FB/IG,
+    // так что включение пресета не зацепит Facebook/Instagram трафик.
+    'mqtt-mini.facebook.com', 'chatd.facebook.com',
+    'mqtt.facebook.com',    // новые версии WhatsApp клиента — MQTT через Meta
+    'latest.facebook.com',  // version-check endpoint, иногда участвует в linking
+  ],
+  spotify: [
+    'spotify.com', 'scdn.co', 'spotifycdn.com',
+    'spotifycdn.net', 'pscdn.co',
+  ],
+};
+YT_PRESETS.all_yt = [].concat(
+  YT_PRESETS.youtube, YT_PRESETS.instagram, YT_PRESETS.discord, YT_PRESETS.tiktok,
+  YT_PRESETS.twitch, YT_PRESETS.twitter, YT_PRESETS.reddit, YT_PRESETS.telegram,
+  YT_PRESETS.whatsapp, YT_PRESETS.spotify
+);
+
+function getYTDomainsArray() {
+  return readSection('yt').domains;
+}
+function setYTDomainsArray(arr) {
+  const oldItems = readSection('yt').items;
+  const oldNotesMap = {};
+  oldItems.forEach(it => { if (it.note) oldNotesMap[it.domain] = it.note; });
+  const items = arr.map(d => ({ domain: d, note: oldNotesMap[d] || WINDOW_DOMAIN_NOTES.yt[d] || '' }));
+  writeSection('yt', items);
+}
+function addYTPreset(name) {
+  const preset = YT_PRESETS[name];
+  if (!preset) return;
+  addPresetGeneric('yt', name, preset);
+}
+function removeYTPreset(name) { removePresetGeneric('yt', name); }
+function clearYTDomains() {
+  if (!confirm('Очистить весь список YouTube-доменов?\n\nПосле сохранения YT-sticky правило исчезнет, YouTube/IG/Discord пойдут через PRIMARY.')) return;
+  setYTDomainsArray([]);
+  flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
+}
+function resetYTDefaults() {
+  if (!confirm('Сбросить к дефолтному (только YouTube)?')) return;
+  setYTDomainsArray([...YT_PRESETS.youtube].sort());
+  flash(true, 'Сброшено к дефолту (YouTube). Нажми «Сохранить».', null, {noScroll: true});
+}
+async function saveYTDomains() {
+  const domains = getYTDomainsArray();
+  if (domains.length === 0) {
+    if (!confirm('Список YT-доменов пустой. После сохранения YT-sticky правило исчезнет, YouTube/IG/Discord пойдут через PRIMARY (с рекламой). Продолжить?')) return;
+  } else {
+    const preview = domains.slice(0, 5).join('\n  • ');
+    const more = domains.length > 5 ? `\n  ... и ещё ${domains.length - 5}` : '';
+    if (!confirm(`Сохранить ${domains.length} YouTube-доменов?\n\n  • ${preview}${more}\n\nЭти домены пойдут через YT-sticky outbound. Watchdog перегенерит routing на следующем тике.`)) return;
+  }
+  const fd = new FormData();
+  fd.append('domains', domains.join(' '));
+  flash(true, `Сохраняю ${domains.length} YT-доменов...`);
+  const res = await apiCall('/api/xkeen/set-yt-domains', fd);
+  if (res.ok) {
+    // v1.7.0: после успешной записи doменов в watchdog.config — sync notes в sidecar JSON
+    await saveDomainNotesSidecar();
+    flash(true, res.stdout || 'Сохранено. Watchdog подхватит при следующем тике (≤1 мин).');
+    setTimeout(() => location.reload(), 1800);
+  } else {
+    flash(false, 'Ошибка', res.stderr);
+  }
+}
+async function toggleYTFailBlock(enabled) {
+  const fd = new FormData();
+  fd.append('enabled', enabled ? '1' : '0');
+  flash(true, enabled ? '🛡️ Включаю YT kill-switch...' : '⚠️ Отключаю YT kill-switch...');
+  const res = await apiCall('/api/xkeen/set-yt-fail-block', fd);
+  if (res.ok) {
+    flash(true, res.stdout || (enabled ? '🛡️ YT Kill-switch включён' : '⚠️ YT Kill-switch выключен'));
+    setTimeout(() => location.reload(), 1500);
+  } else {
+    flash(false, 'Ошибка', res.stderr);
+  }
+}
+
+async function saveAIDomains() {
+  const domains = getAIDomainsArray();
+  if (domains.length === 0) {
+    if (!confirm('Список пустой. После сохранения AI-sticky правило исчезнет, claude/openai пойдут через PRIMARY. Продолжить?')) return;
+  } else {
+    // Показываем сводку: сколько доменов, первые 5 для предпросмотра
+    const preview = domains.slice(0, 5).join('\n  • ');
+    const more = domains.length > 5 ? `\n  ... и ещё ${domains.length - 5}` : '';
+    if (!confirm(`Сохранить ${domains.length} AI-доменов?\n\n  • ${preview}${more}\n\nWatchdog перегенерит routing.json и сделает xkeen -restart на следующем тике (≤1 мин).`)) return;
+  }
+  const fd = new FormData();
+  fd.append('domains', domains.join(' '));
+  flash(true, `Сохраняю ${domains.length} доменов...`);
+  const res = await apiCall('/api/xkeen/set-ai-domains', fd);
+  if (res.ok) {
+    // v1.7.0: после успешной записи доменов в watchdog.config — sync notes в sidecar JSON
+    await saveDomainNotesSidecar();
+    flash(true, res.stdout || 'Сохранено. Watchdog подхватит при следующем тике (≤1 мин).');
+    setTimeout(() => location.reload(), 1800);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+
+// ============== v8: v2fly ext-категории для AI/YT ==============
+// Дополняют ручные списки доменов. После xkeen -ug новые поддомены сервиса
+// автоматически попадают в routing-правило без правок watchdog.config.
+function _extCatGetArray(inputId) {
+  return (document.getElementById(inputId).value || '').split(/[\s,]+/).filter(x => x.length > 0);
+}
+function _extCatSetArray(inputId, arr) {
+  // sort + uniq для аккуратности
+  const uniq = Array.from(new Set(arr)).sort();
+  document.getElementById(inputId).value = uniq.join(' ');
+}
+function _extCatAdd(inputId, name) {
+  const arr = _extCatGetArray(inputId);
+  if (arr.includes(name)) {
+    flash(true, `Категория "${name}" уже в списке.`, null, {noScroll: true});
+    return;
+  }
+  arr.push(name);
+  _extCatSetArray(inputId, arr);
+  flash(true, `Добавлена категория "${name}". Не забудь нажать «Сохранить».`, null, {noScroll: true});
+}
+function addAIExtCat(name) { _extCatAdd('ai-ext-categories', name); }
+function addYTExtCat(name) { _extCatAdd('yt-ext-categories', name); }
+function clearAIExtCats() {
+  if (!confirm('Очистить все v2fly категории для AI? Останутся только ручные домены.')) return;
+  document.getElementById('ai-ext-categories').value = '';
+  flash(true, 'Категории очищены. Нажми «Сохранить».', null, {noScroll: true});
+}
+function clearYTExtCats() {
+  if (!confirm('Очистить все v2fly категории для YT? Останутся только ручные домены.')) return;
+  document.getElementById('yt-ext-categories').value = '';
+  flash(true, 'Категории очищены. Нажми «Сохранить».', null, {noScroll: true});
+}
+async function _saveExtCategories(endpoint, inputId, label) {
+  const cats = _extCatGetArray(inputId);
+  // Валидация — только [a-z0-9_-]+ имена
+  const bad = cats.filter(c => !/^[a-z0-9_-]+$/.test(c));
+  if (bad.length > 0) {
+    flash(false, `Некорректные имена категорий: ${bad.join(', ')}. Допустимы только [a-z0-9_-]+`);
+    return;
+  }
+  const msg = cats.length === 0
+    ? `Очистить v2fly-категории для ${label}? Останутся только ручные домены.`
+    : `Сохранить ${cats.length} категорий для ${label}?\n\n  • ${cats.join('\n  • ')}\n\nWatchdog перегенерит routing на следующем тике (≤1 мин).`;
+  if (!confirm(msg)) return;
+  const fd = new FormData();
+  fd.append('categories', cats.join(' '));
+  flash(true, `Сохраняю ${cats.length} категорий...`);
+  const res = await apiCall(endpoint, fd);
+  if (res.ok) {
+    flash(true, res.stdout || `${label}: сохранено. Watchdog подхватит при следующем тике.`);
+    setTimeout(() => location.reload(), 1800);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+async function saveAIExtCategories() { await _saveExtCategories('/api/xkeen/set-ai-ext-categories', 'ai-ext-categories', 'AI'); }
+async function saveYTExtCategories() { await _saveExtCategories('/api/xkeen/set-yt-ext-categories', 'yt-ext-categories', 'YT'); }
+
+// ============== v1.6.0: YT GeoIP-категории ==============
+// Для IP-only приложений (Telegram Desktop, Discord native) — матчат по IP-диапазонам
+// из geoip.dat. Отдельное правило {"ip": ["geoip:NAME"]} с outboundTag = YT_TAG.
+function addYTGeoipCat(name) { _extCatAdd('yt-geoip-categories', name); }
+function clearYTGeoipCats() {
+  if (!confirm('Очистить все GeoIP-категории для YT? IP-only приложения снова пойдут через PRIMARY.')) return;
+  document.getElementById('yt-geoip-categories').value = '';
+  flash(true, 'GeoIP-категории очищены. Нажми «Сохранить».', null, {noScroll: true});
+}
+async function saveYTGeoipCategories() { await _saveExtCategories('/api/xkeen/set-yt-geoip-categories', 'yt-geoip-categories', 'YT GeoIP'); }
+
+// v1.6.4: переход в подсекцию ❓ Помощи из любого места страницы.
+// Открывает все родительские <details> над target-якорем (включая большую
+// секцию ❓ Помощь и саму подсекцию), потом скроллит к ней.
+function openHelpAnchor(anchorId) {
+  const target = document.getElementById(anchorId);
+  if (!target) {
+    console.warn('openHelpAnchor: anchor not found:', anchorId);
+    return;
+  }
+  // Раскрыть все родительские <details>
+  let el = target;
+  while (el && el !== document.body) {
+    if (el.tagName === 'DETAILS') el.open = true;
+    el = el.parentElement;
+  }
+  // Скролл к якорю — через setTimeout чтобы успел отрендериться раскрытый <details>
+  setTimeout(() => {
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    // Подсветить на 2 секунды — чтобы юзер увидел куда его кинуло
+    const originalBg = target.style.background;
+    target.style.transition = 'background 0.4s';
+    target.style.background = '#fff3cd';
+    setTimeout(() => { target.style.background = originalBg; }, 2000);
+  }, 100);
+}
+
+// v1.6.1: установка расширенного geoip.dat (Loyalsoldier) одной кнопкой.
+// Скачивает на роутер ~18MB файл с GitHub + xkeen -restart. Один раз на каждый роутер.
+async function installExtendedGeoip() {
+  if (!confirm(
+    'Установить расширенный geoip.dat от Loyalsoldier (~18MB)?\n\n' +
+    'Это нужно один раз. После установки категории `telegram`, `discord` и другие сервисы начнут работать в правилах с "geoip:NAME".\n\n' +
+    'Текущий geoip.dat (если есть) будет сохранён как geoip.dat.bak-<timestamp>. xkeen перезапустится автоматически.\n\n' +
+    'Скачивание может занять 30-60 секунд.'
+  )) return;
+  const fd = new FormData();
+  fd.append('fix_id', 'install_extended_geoip');
+  flash(true, 'Скачиваю расширенный geoip.dat — это 30-60 секунд...');
+  try {
+    const res = await fetch('/api/xkeen/auto-fix', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (data.ok) {
+      flash(true, '✅ Установлено. xkeen перезапущен. GeoIP-категории должны работать.', data.log || '');
+      setTimeout(() => location.reload(), 3500);
+    } else {
+      flash(false, '❌ Не получилось — смотри лог ниже', data.log || JSON.stringify(data));
+    }
+  } catch (e) {
+    flash(false, '❌ Ошибка запроса', String(e));
+  }
+}
+
+async function setTarget(role) {
+  const sel = document.getElementById('select-' + role);
+  const tag = sel.value;
+  const labels = { primary: 'PRIMARY (основной)', failover: 'FAILOVER (резервный)', ai: 'AI-sticky', yt: 'YouTube-sticky' };
+  // Подробное описание что произойдёт
+  let msg = 'Применить изменение?\n\n';
+  msg += 'Новый ' + labels[role] + ' = ' + tag + '\n';
+  if (role === 'primary') {
+    // Получаем текущий PRIMARY из dropdown'а (текстовое значение)
+    const curOpt = sel.querySelector('option[selected]');
+    const curTag = curOpt ? curOpt.value : '?';
+    msg += '\nАвтоматически произойдёт:\n';
+    msg += '• Старый PRIMARY (' + curTag + ') → попадёт на 1-ю позицию FAILOVER_TAGS\n';
+    msg += '• Новый PRIMARY (' + tag + ') → уберётся из FAILOVER_TAGS если был\n';
+    msg += '• PRIMARY_PROBE_URL переключится: ' + (tag === 'vless-reality' ? 'HTTPS curl' : 'TCP-probe');
+    msg += '\n• Watchdog перегенерит routing и сделает xkeen -restart (~3 сек)';
+  } else if (role === 'failover') {
+    msg += '\nСтарый порядок FAILOVER_TAGS сохранится, ' + tag + ' встанет первым.';
+    msg += '\nWatchdog перегенерит routing если сейчас в failover-режиме.';
+  } else if (role === 'ai') {
+    msg += '\nAI-домены (claude.ai, openai.com, etc) будут идти через ' + tag;
+    msg += '\nWatchdog перегенерит routing на следующем тике.';
+  } else if (role === 'yt') {
+    msg += '\nYouTube-домены (youtube.com, instagram.com, discord.com) будут идти через ' + tag;
+    msg += '\nWatchdog перегенерит routing на следующем тике.';
+  }
+  // Доп-предупреждение: anti-DPI / whitelist outbound в роли AI — почти наверняка RU exit-IP,
+  // AI-сервисы (Anthropic/OpenAI/etc.) геоблокируют РФ → 403.
+  if (role === 'ai' && ANTI_DPI_TAGS.has(tag)) {
+    if (!confirm(
+      '🚨 ВНИМАНИЕ: «' + tag + '» помечен как anti-DPI / whitelist!\n\n' +
+      'Такие outbound\'ы обычно имеют РОССИЙСКИЙ exit-IP (Yandex Cloud / X5 / RU LTE).\n\n' +
+      'AI-сервисы (Anthropic Claude, OpenAI, Gemini) ГЕОБЛОКИРУЮТ российские IP — ' +
+      'получишь 403 / region-denied вместо ответов.\n\n' +
+      'Для AI нужен EU-exit (например 🇳🇱_Netherlands, 🇩🇪_Germany, 🇫🇮_FInland).\n\n' +
+      'Точно ставить «' + tag + '» как AI-канал?'
+    )) return;
+  }
+  if (!confirm(msg)) return;
+  const fd = new FormData();
+  fd.append('tag', tag);
+  flash(true, 'Обновляю шаблон watchdog → ' + labels[role] + ' = ' + tag + '...');
+  const res = await apiCall('/api/xkeen/set-target/' + role, fd);
+  if (res.ok) {
+    flash(true, res.stdout || ('Обновлено: ' + tag));
+    setTimeout(() => location.reload(), 1800);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+
+async function setRole(tag, role, isAntiDpi) {
+  const labels = {
+    primary:  { name: 'PRIMARY (основной канал)',
+                warn: 'Текущий PRIMARY уйдёт в начало FAILOVER-цепочки как приоритетный резерв. PRIMARY_PROBE_URL автоматически перенастроится (vless-reality → HTTPS curl до {{ cfg.EXTERNAL_DOMAIN or "&lt;your-vpn-domain&gt;" }}:8444, иначе → TCP-probe).' },
+    failover: { name: 'FAILOVER (первый резерв)',
+                warn: 'Этот outbound встанет в начало FAILOVER_TAGS — watchdog переключится сюда первым при падении PRIMARY.' },
+    ai:       { name: 'AI-sticky (claude/openai)',
+                warn: 'AI-трафик пойдёт через этот сервер sticky. ⚠️ Если сменишь страну — Anthropic может зафлажить аккаунт за geo-jump.' },
+  };
+  const l = labels[role];
+  if (!l) { alert('Неизвестная роль: ' + role); return; }
+  // Доп-предупреждение: anti-DPI / whitelist outbound в роли AI = вероятно RU exit-IP,
+  // на нём AI-сервисы (Anthropic/OpenAI/etc.) геоблокируют РФ → 403/region-denied.
+  if (role === 'ai' && isAntiDpi) {
+    if (!confirm(
+      `🚨 ВНИМАНИЕ: «${tag}» помечен как anti-DPI / whitelist!\n\n` +
+      `Такие outbound'ы обычно имеют РОССИЙСКИЙ exit-IP (Yandex Cloud / X5 / RU LTE).\n\n` +
+      `AI-сервисы (Anthropic Claude, OpenAI, Gemini) ГЕОБЛОКИРУЮТ российские IP — `+
+      `получишь 403 / region-denied вместо ответов.\n\n` +
+      `Для AI нужен EU-exit (например 🇳🇱_Netherlands, 🇩🇪_Germany, 🇫🇮_FInland).\n\n` +
+      `Точно ставить «${tag}» как AI-канал?`
+    )) return;
+  }
+  if (!confirm(`Сделать «${tag}» → ${l.name}?\n\n${l.warn}`)) return;
+  flash(true, `Применяю «${tag}» → ${l.name}...`);
+  const fd = new FormData();
+  fd.append('tag', tag);
+  const res = await apiCall('/api/xkeen/set-target/' + role, fd);
+  if (res.ok) {
+    flash(true, `✅ «${tag}» → ${l.name}`, res.stdout);
+    setTimeout(() => location.reload(), 1500);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+
+async function refreshStatuses() {
+  const btn = document.getElementById('status-refresh-btn');
+  const info = document.getElementById('status-refresh-info');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ Probe...';
+  info.textContent = '';
+  try {
+    const res = await fetch('/api/xkeen/probe-status?force=1', { method: 'POST' });
+    const j = await res.json();
+    if (!j.ok) {
+      info.textContent = '❌ ошибка';
+      return;
+    }
+    const statuses = j.statuses || {};
+    let onCount = 0, offCount = 0;
+    for (const [tag, st] of Object.entries(statuses)) {
+      // Несколько таблиц могут иметь tr[data-tag] (главная + цепочка FAILOVER).
+      // Обновляем ВСЕ ячейки .status-cell в строках с этим tag.
+      const rows = document.querySelectorAll(`tr[data-tag="${CSS.escape(tag)}"]`);
+      let countedThisTag = false;
+      for (const row of rows) {
+        const cell = row.querySelector('.status-cell');
+        if (!cell) continue;
+        if (st.kind === 'local') {
+          cell.innerHTML = '<span class="badge badge-dim" title="служебный outbound">—</span>';
+        } else if (st.kind === 'tcp_nc') {
+          cell.innerHTML = '<span class="badge" style="background:#dfe8ff; color:#1a55cc;" title="TCP-порт открыт · TLS не отвечает (Reality без фолбэка — норма, VPN работает)">🔌 TCP</span>';
+          if (!countedThisTag) { onCount++; countedThisTag = true; }
+        } else if (st.ok) {
+          const ms = st.ms;
+          if (ms == null) {
+            cell.innerHTML = '<span class="badge badge-ok" title="handshake успешен">🟢</span>';
+          } else {
+            let bg, fg, dot;
+            if (ms < 300)       { bg=''; fg=''; dot='🟢'; }
+            else if (ms < 500)  { bg='#e9f5d8'; fg='#5a7c2c'; dot='🟡'; }
+            else if (ms < 800)  { bg='#fff0d0'; fg='#a55a18'; dot='🟠'; }
+            else                { bg='#ffe0e0'; fg='#a33';    dot='🔴'; }
+            if (bg) {
+              cell.innerHTML = `<span class="badge" style="background:${bg}; color:${fg};" title="TCP+TLS handshake"><strong>${dot} ${ms} ms</strong></span>`;
+            } else {
+              cell.innerHTML = `<span class="badge badge-ok" title="TCP+TLS handshake"><strong>${dot} ${ms} ms</strong></span>`;
+            }
+          }
+          if (!countedThisTag) { onCount++; countedThisTag = true; }
+        } else {
+          const why = st.kind === 'noaddr' ? 'нет адреса' : 'TCP fail';
+          cell.innerHTML = `<span class="badge" style="background:#333; color:#fff;" title="TCP+TLS handshake не прошёл — ${why}"><strong>⛔ не отвечает</strong></span>`;
+          if (!countedThisTag) { offCount++; countedThisTag = true; }
+        }
+      }
+    }
+    const now = new Date().toLocaleTimeString('ru-RU');
+    info.textContent = `${now}: 🟢 ${onCount} / 🔴 ${offCount}`;
+    // Синхронизируем VLESS_META и перерисуем AI/YT info-блоки чтобы они тоже подхватили
+    // свежие статусы (раньше оставались устаревшие — баг замечен 2026-05-16).
+    if (typeof applyStatusesToMeta === 'function') applyStatusesToMeta(statuses);
+  } catch (e) {
+    info.textContent = '❌ ' + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
+function editMetaFromBtn(btn) {
+  editMeta(btn.dataset.tag, btn.dataset.note);
+}
+
+function editSubMetaFromBtn(btn) {
+  editSubMeta(btn.dataset.pbk, btn.dataset.name, btn.dataset.note, btn.dataset.expires, btn.dataset.subUrl, btn.dataset.customName);
+}
+
+function editSubMeta(pbk, groupName, curNote, curExpires, curSubUrl, curCustomName) {
+  const old = document.getElementById('sub-meta-modal');
+  if (old) old.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'sub-meta-modal';
+  overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:9999; display:flex; align-items:center; justify-content:center; padding:20px;';
+  const box = document.createElement('div');
+  box.style.cssText = 'background:white; border-radius:8px; padding:20px; max-width:560px; width:100%; box-shadow:0 10px 40px rgba(0,0,0,0.3);';
+  const esc = s => (s || '').replace(/"/g, '&quot;');
+  const autoName = (curCustomName && curCustomName.length) ? '' : groupName;
+  box.innerHTML = `
+    <h3 style="margin:0 0 6px; color:#2a7;">📦 Подписка: ${esc(groupName)}</h3>
+    <p style="color:#666; font-size:0.85em; margin:0 0 12px;">
+      <code style="font-size:0.85em;">pbk=${esc(pbk.substring(0,16))}…</code> · все серверы этой подписки получат эти настройки
+    </p>
+
+    <div style="border:1px solid #cfd8e8; background:#f6f8fb; border-radius:6px; padding:12px; margin-bottom:10px;">
+      <label style="font-size:0.9em; color:#444; display:block; margin-bottom:6px;">🏷 Название подписки:</label>
+      <input type="text" id="sub-meta-name" value="${esc(curCustomName || '')}" placeholder="${esc(autoName ? 'авто: ' + autoName : 'например Provider C, Provider A, Provider B')}" style="width:100%; padding:6px 8px; font-size:0.95em; border:1px solid #b8c5d8; border-radius:4px; background:#fff;">
+      <span class="subtitle" style="font-size:0.82em;">пусто = авто-имя по hostname/pbk; иначе твоё название (как у провайдера в боте/Happ)</span>
+    </div>
+
+    <div style="border:1px solid #d8eecc; background:#f7fbf3; border-radius:6px; padding:12px; margin-bottom:10px;">
+      <label style="font-size:0.9em; color:#444; display:block; margin-bottom:6px;">📝 Примечание (что за подписка, оплата, итд):</label>
+      <textarea id="sub-meta-note" placeholder="Например: Provider A Premium 6мес, оплачено $30, мама использует на телефоне" style="width:100%; min-height:70px; padding:8px; font-size:0.95em; border:1px solid #b8d5b8; border-radius:4px; font-family:inherit; background:#fff;">${esc(curNote)}</textarea>
+    </div>
+
+    <div style="border:1px solid #e0e0e0; border-radius:6px; padding:12px; margin-bottom:10px;">
+      <label style="font-size:0.9em; color:#444; display:block; margin-bottom:6px;">⏰ Дата истечения (опц.):</label>
+      <input type="date" id="sub-meta-expires" value="${esc(curExpires)}" style="padding:6px; font-size:0.95em; border:1px solid #ccc; border-radius:4px;">
+      <span class="subtitle" style="font-size:0.82em; margin-left:6px;">countdown появится в шапке группы + Telegram-алерт за 14 дней</span>
+    </div>
+
+    <div style="border:1px solid #e0e0e0; border-radius:6px; padding:12px; margin-bottom:10px;">
+      <label style="font-size:0.9em; color:#444; display:block; margin-bottom:6px;">🔗 Subscription URL (опц.):</label>
+      <input type="text" id="sub-meta-sub-url" value="${esc(curSubUrl || '')}" placeholder="https://provider.com/sub/TOKEN" style="width:100%; padding:6px; font-size:0.95em; border:1px solid #ccc; border-radius:4px;">
+      <span class="subtitle" style="font-size:0.82em;">если заполнен — появится в dropdown «💾 Сохранённый URL» в форме «Обновить из подписки»</span>
+    </div>
+
+    <p style="color:#888; font-size:0.82em; margin:0 0 10px;">Пустое поле = очистить. Сохраняется в <code>subscription_meta.json</code> на роутере (попадает в бэкап).</p>
+    <div style="display:flex; gap:10px; justify-content:flex-end;">
+      <button class="btn btn-secondary" id="sub-meta-cancel">Отмена</button>
+      <button class="btn" id="sub-meta-save">💾 Сохранить</button>
+    </div>
+  `;
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  function close() { overlay.remove(); }
+  document.getElementById('sub-meta-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  document.getElementById('sub-meta-save').addEventListener('click', async () => {
+    const fd = new FormData();
+    fd.append('pbk', pbk);
+    fd.append('name', document.getElementById('sub-meta-name').value.trim());
+    fd.append('note', document.getElementById('sub-meta-note').value);
+    fd.append('expires_at', document.getElementById('sub-meta-expires').value);
+    fd.append('sub_url', document.getElementById('sub-meta-sub-url').value);
+    const res = await apiCall('/api/xkeen/sub-meta', fd);
+    if (res.ok) {
+      close();
+      flash(true, `Подписка «${groupName}» сохранена.`);
+      setTimeout(() => location.reload(), 800);
+    } else {
+      alert('Ошибка: ' + (res.stderr || JSON.stringify(res)));
+    }
+  });
+  setTimeout(() => document.getElementById('sub-meta-note').focus(), 50);
+}
+
+function editMeta(tag, curNote) {
+  const old = document.getElementById('meta-modal');
+  if (old) old.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'meta-modal';
+  overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:9999; display:flex; align-items:center; justify-content:center; padding:20px;';
+  const box = document.createElement('div');
+  box.style.cssText = 'background:white; border-radius:8px; padding:20px; max-width:520px; width:100%; box-shadow:0 10px 40px rgba(0,0,0,0.3);';
+  const esc = s => (s || '').replace(/"/g, '&quot;');
+  box.innerHTML = `
+    <h3 style="margin:0 0 12px; color:#2a7;">📝 Примечание для <code>${tag}</code></h3>
+    <p style="color:#666; font-size:0.85em; margin:0 0 12px;">
+      Твоя личная заметка про <strong>этот конкретный сервер</strong>. Subscription URL и срок истечения подписки настраиваются у группы целиком — нажми <strong>✏️ Подписка</strong> в её шапке.
+    </p>
+
+    <div style="border:1px solid #d8eecc; background:#f7fbf3; border-radius:6px; padding:12px; margin-bottom:12px;">
+      <label style="font-size:0.9em; color:#444; display:block; margin-bottom:6px;">Твоя заметка:</label>
+      <textarea id="meta-note" placeholder="Например: лучший пинг для Германии, мама использует, и т.п." style="width:100%; min-height:80px; padding:8px; font-size:0.95em; border:1px solid #b8d5b8; border-radius:4px; font-family:inherit; background:#fff;">${esc(curNote)}</textarea>
+    </div>
+
+    <p style="color:#888; font-size:0.82em; margin:0 0 10px;">Пустое поле = очистить.</p>
+    <div style="display:flex; gap:10px; justify-content:flex-end;">
+      <button class="btn btn-secondary" id="meta-cancel">Отмена</button>
+      <button class="btn" id="meta-save">💾 Сохранить</button>
+    </div>
+  `;
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  function close() { overlay.remove(); }
+  document.getElementById('meta-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  document.getElementById('meta-save').addEventListener('click', async () => {
+    const fd = new FormData();
+    fd.append('tag', tag);
+    fd.append('note', document.getElementById('meta-note').value);
+    // Очищаем устаревшие поля (теперь UI их не использует)
+    fd.append('provider', '');
+    fd.append('sub_name', '');
+    fd.append('sub_url', '');
+    const res = await apiCall('/api/xkeen/meta', fd);
+    if (res.ok) {
+      close();
+      flash(true, `Примечание для «${tag}» сохранено.`);
+      setTimeout(() => location.reload(), 800);
+    } else {
+      alert('Ошибка: ' + (res.stderr || JSON.stringify(res)));
+    }
+  });
+  setTimeout(() => document.getElementById('meta-note').focus(), 50);
+}
+
+async function addOutbound() {
+  const payload = document.getElementById('payload').value.trim();
+  const tag = document.getElementById('tag').value.trim();
+  const overwrite = document.getElementById('overwrite').checked;
+  const note     = (document.getElementById('add-note') || {}).value || '';
+  if (!payload) { flash(false, 'Пустой payload'); return; }
+  const fd = new FormData();
+  fd.append('payload', payload);
+  if (tag) fd.append('tag', tag);
+  if (overwrite) fd.append('overwrite', '1');
+  if (note.trim()) fd.append('note', note.trim());
+  flash(true, 'Добавляю и применяю...', null);
+  const res = await apiCall('/api/xkeen/add', fd);
+  if (res.ok) {
+    flash(true, 'Готово! Outbound добавлен и xray перезапущен.', res.stdout);
+    setTimeout(() => location.reload(), 2500);
+  } else {
+    flash(false, 'Ошибка', (res.stderr || '') + '\n\nSTDOUT:\n' + (res.stdout || ''));
+  }
+}
+
+// ============== KEENETIC CONNECTION SETTINGS ==============
+function keeneticFormData() {
+  const f = document.getElementById('keenetic-settings-form');
+  const fd = new FormData(f);
+  const out = {};
+  fd.forEach((v, k) => { out[k] = (v ?? '').toString().trim(); });
+  return out;
+}
+
+function showTestResult(j) {
+  const box = document.getElementById('keenetic-test-result');
+  if (!box) return;
+  const cls = j.ok ? 'ok' : 'bad';
+  const title = j.ok
+    ? '✅ Связь есть. Роутер ответил:'
+    : `❌ Не удалось подключиться (этап: ${j.stage || '?'})`;
+  const hint = (!j.ok && j.hint) ? `<span class="hint">💡 ${escapeHtml(j.hint)}</span>` : '';
+  const body = j.ok
+    ? escapeHtml(j.stdout || '(пусто)')
+    : escapeHtml((j.error || '') + (j.stderr ? ('\n\n[stderr]\n' + j.stderr) : '') + (j.stdout ? ('\n\n[stdout]\n' + j.stdout) : ''));
+  box.innerHTML = `<div class="test-result-box ${cls}"><strong>${title}</strong>${hint}\n${body}</div>`;
+}
+
+function escapeHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+async function keeneticTest() {
+  const status = document.getElementById('keenetic-settings-status');
+  const btn = document.getElementById('btn-test-keenetic');
+  status.textContent = '🔄 проверяю...';
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/keenetic/test-connection', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(keeneticFormData())
+    });
+    const j = await res.json();
+    status.textContent = j.ok ? '✅ ок' : `❌ ${j.stage || 'fail'}`;
+    showTestResult(j);
+  } catch (e) {
+    status.textContent = '❌ ' + e.message;
+    showTestResult({ok: false, stage: 'fetch', error: e.message});
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function keeneticSave() {
+  const status = document.getElementById('keenetic-settings-status');
+  const btn = document.getElementById('btn-save-keenetic');
+  status.textContent = '💾 сохраняю...';
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/keenetic/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(keeneticFormData())
+    });
+    const j = await res.json();
+    if (j.ok) {
+      status.textContent = '✅ сохранено · перезагружаю страницу...';
+      setTimeout(() => location.reload(), 1200);
+    } else {
+      status.textContent = '❌ ' + (j.error || 'fail');
+    }
+  } catch (e) {
+    status.textContent = '❌ ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function keeneticReset() {
+  if (!confirm('Сбросить все runtime override и вернуться к значениям из config_local.py?')) return;
+  const status = document.getElementById('keenetic-settings-status');
+  status.textContent = '↺ сбрасываю...';
+  try {
+    // отправляем все ключи с пустыми значениями → backend удалит override
+    const blanks = {host: '', port: '', user: '', ssh_key: '',
+                    xray_configs: '', xray_bak_dir: '', watchdog_state: '', watchdog_log: ''};
+    const res = await fetch('/api/keenetic/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(blanks)
+    });
+    const j = await res.json();
+    if (j.ok) {
+      status.textContent = '✅ override сброшен · перезагружаю...';
+      setTimeout(() => location.reload(), 1200);
+    } else {
+      status.textContent = '❌ ' + (j.error || 'fail');
+    }
+  } catch (e) {
+    status.textContent = '❌ ' + e.message;
+  }
+}
+
+(function attachKeeneticHandlers(){
+  const t = document.getElementById('btn-test-keenetic');
+  const s = document.getElementById('btn-save-keenetic');
+  const r = document.getElementById('btn-reset-keenetic');
+  if (t) t.addEventListener('click', keeneticTest);
+  if (s) s.addEventListener('click', keeneticSave);
+  if (r) r.addEventListener('click', keeneticReset);
+})();
+
+// ============== BOOTSTRAP CLEAN XKEEN ==============
+function actionBadge(action) {
+  const map = {
+    create:    {label: 'СОЗДАТЬ',       bg: '#e8f5e8', col: '#2a7'},
+    overwrite: {label: 'ПЕРЕЗАПИСАТЬ',  bg: '#fbeee5', col: '#c63'},
+    keep:      {label: 'УЖЕ ЕСТЬ',      bg: '#eee',    col: '#666'},
+  };
+  const m = map[action] || {label: action, bg: '#eee', col: '#333'};
+  return `<span style="display:inline-block; padding:2px 8px; border-radius:10px; background:${m.bg}; color:${m.col}; font-size:0.78em; font-weight:700;">${m.label}</span>`;
+}
+
+function fmtBytes(n) {
+  if (n === null || n === undefined) return '—';
+  if (n < 1024) return n + ' B';
+  return (n / 1024).toFixed(1) + ' KB';
+}
+
+function renderBootstrapPlan(state) {
+  // Pre-checks
+  const pcHtml = (state.pre_checks || []).map(pc => {
+    const cls = pc.ok ? 'ok' : 'bad';
+    const icon = pc.ok ? '✅' : '❌';
+    return `<div class="test-result-box ${cls}" style="margin:4px 0; padding:8px 12px;">${icon} ${escapeHtml(pc.msg)}</div>`;
+  }).join('');
+  document.getElementById('bootstrap-prechecks').innerHTML = pcHtml;
+
+  // Items table
+  if (!state.ok) {
+    document.getElementById('bootstrap-items').innerHTML = '<p style="color:#c33; font-weight:600;">Развёртывание невозможно — устрани проблемы выше и нажми «📋 Показать план» снова.</p>';
+    document.getElementById('btn-bootstrap-apply').disabled = true;
+    document.getElementById('btn-bootstrap-apply').style.opacity = '0.5';
+    return;
+  }
+  document.getElementById('btn-bootstrap-apply').disabled = false;
+  document.getElementById('btn-bootstrap-apply').style.opacity = '1';
+
+  let html = `<table style="width:100%; border-collapse:collapse; font-size:0.88em;">
+    <thead>
+      <tr style="background:#f5f5f5;">
+        <th style="text-align:left; padding:8px; border-bottom:2px solid #ddd;"><input type="checkbox" id="bootstrap-select-all" checked></th>
+        <th style="text-align:left; padding:8px; border-bottom:2px solid #ddd;">Что заливаем</th>
+        <th style="text-align:left; padding:8px; border-bottom:2px solid #ddd;">Куда</th>
+        <th style="text-align:right; padding:8px; border-bottom:2px solid #ddd;">На роутере</th>
+        <th style="text-align:right; padding:8px; border-bottom:2px solid #ddd;">Залить</th>
+        <th style="text-align:center; padding:8px; border-bottom:2px solid #ddd;">Действие</th>
+      </tr>
+    </thead>
+    <tbody>`;
+  for (const it of (state.items || [])) {
+    const err = it.error ? `<div style="color:#c33; font-size:0.8em;">⚠ ${escapeHtml(it.error)}</div>` : '';
+    const isDisabled = !!it.error;
+    html += `<tr style="border-bottom:1px solid #f0f0f0;">
+      <td style="padding:6px 8px;"><input type="checkbox" class="bootstrap-item-cb" data-key="${escapeHtml(it.key)}" ${isDisabled ? 'disabled' : 'checked'}></td>
+      <td style="padding:6px 8px;"><strong>${escapeHtml(it.label)}</strong>${err}<div style="font-size:0.78em; color:#888;">источник: ${escapeHtml(it.source)}</div></td>
+      <td style="padding:6px 8px; font-family:Consolas,monospace; font-size:0.82em; color:#555;">${escapeHtml(it.remote_path)}</td>
+      <td style="padding:6px 8px; text-align:right; font-family:Consolas,monospace; color:${it.remote_size ? '#333' : '#999'};">${fmtBytes(it.remote_size)}</td>
+      <td style="padding:6px 8px; text-align:right; font-family:Consolas,monospace; color:#333;">${fmtBytes(it.local_size)}</td>
+      <td style="padding:6px 8px; text-align:center;">${actionBadge(it.action)}</td>
+    </tr>`;
+  }
+  html += `</tbody></table>`;
+  const c = state.counters || {};
+  html += `<div style="margin-top:10px; padding:10px; background:#f9f9f9; border-radius:4px; font-size:0.88em;">
+    <strong>Итого:</strong>
+    <span style="color:#2a7; font-weight:600; margin-left:8px;">🆕 создать: ${c.will_create || 0}</span>
+    <span style="color:#c63; font-weight:600; margin-left:12px;">📝 перезаписать: ${c.will_overwrite || 0}</span>
+    <span style="color:#666; margin-left:12px;">⏭ пропустить (уже есть): ${c.will_skip || 0}</span>
+  </div>`;
+  document.getElementById('bootstrap-items').innerHTML = html;
+
+  // Select-all handler
+  const sa = document.getElementById('bootstrap-select-all');
+  if (sa) sa.addEventListener('change', () => {
+    document.querySelectorAll('.bootstrap-item-cb').forEach(cb => { if (!cb.disabled) cb.checked = sa.checked; });
+  });
+}
+
+async function bootstrapPreview() {
+  const status = document.getElementById('bootstrap-status');
+  status.textContent = '🔄 опрашиваю роутер...';
+  document.getElementById('bootstrap-log').innerHTML = '';
+  try {
+    const res = await fetch('/api/keenetic/bootstrap-preview');
+    const state = await res.json();
+    status.textContent = state.ok ? '✅ план готов' : '❌ pre-check fail';
+    document.getElementById('bootstrap-modal').style.display = 'flex';
+    renderBootstrapPlan(state);
+  } catch (e) {
+    status.textContent = '❌ ' + e.message;
+  }
+}
+
+async function bootstrapApply() {
+  const btn = document.getElementById('btn-bootstrap-apply');
+  // Если предыдущий запуск завершился — кнопка теперь «Готово», работает как закрытие.
+  // Иначе клик «Готово» запускал бы развёртывание заново (handler не менялся).
+  if (btn.dataset.done === '1') {
+    document.getElementById('bootstrap-modal').style.display = 'none';
+    btn.dataset.done = '';
+    btn.textContent = '✅ Применить выбранное';
+    btn.disabled = false;
+    return;
+  }
+  const keys = [...document.querySelectorAll('.bootstrap-item-cb:checked')].map(cb => cb.dataset.key);
+  if (keys.length === 0) {
+    alert('Не выбрано ни одного компонента для развёртывания.');
+    return;
+  }
+  const overwrite = document.getElementById('bootstrap-overwrite').checked;
+  const overwriteCount = [...document.querySelectorAll('.bootstrap-item-cb:checked')]
+    .filter(cb => cb.closest('tr').textContent.includes('УЖЕ ЕСТЬ')).length;
+  let confirmMsg = `Развернуть ${keys.length} компонент(ов) на роутере?`;
+  if (overwrite && overwriteCount > 0) {
+    confirmMsg += `\n\n⚠ Будет перезаписано ${overwriteCount} существующих файлов (бэкапы создадутся автоматически с суффиксом .bak-bootstrap-YYYYMMDD-HHMMSS).`;
+  }
+  if (!confirm(confirmMsg)) return;
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Применяю...';
+  const logBox = document.getElementById('bootstrap-log');
+  logBox.innerHTML = '<div style="padding:10px; background:#f9f9f9; border-radius:4px; font-style:italic; color:#666;">Заливаю на роутер, подожди ~10-30 сек...</div>';
+  try {
+    const res = await fetch('/api/keenetic/bootstrap-apply', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({keys, overwrite_existing: overwrite})
+    });
+    const j = await res.json();
+    const lines = (j.log || []).map(l => {
+      const icon = l.ok ? '✅' : '❌';
+      const color = l.ok ? '#1a5a1a' : '#6a1a1a';
+      const bg = l.ok ? '#e8f5e8' : '#fde8e8';
+      return `<div style="padding:6px 10px; margin:3px 0; background:${bg}; color:${color}; border-radius:4px; font-size:0.88em;">${icon} <strong>${escapeHtml(l.label || l.key)}</strong> — ${escapeHtml(l.msg || '')}</div>`;
+    }).join('');
+    const summary = j.ok
+      ? `<div style="padding:10px; background:#d4eedd; border:1px solid #2a7; border-radius:4px; margin-top:8px; color:#1a5a1a; font-weight:600;">🎉 Развёртывание завершено успешно! Watchdog запущен. Теперь иди в раздел «🎯 Основное и резервное подключение» наверху и настрой PRIMARY/FAILOVER/AI/YT каналы.</div>`
+      : `<div style="padding:10px; background:#fbd7d7; border:1px solid #c33; border-radius:4px; margin-top:8px; color:#6a1a1a; font-weight:600;">⚠ Развёртывание завершено с ошибками — см. лог выше.</div>`;
+    logBox.innerHTML = lines + summary;
+    btn.textContent = '✅ Готово (можно закрыть)';
+    btn.disabled = false;  // снять disabled чтобы клик работал
+    btn.dataset.done = '1';  // флаг для bootstrapApply — следующий клик закроет модалку
+  } catch (e) {
+    logBox.innerHTML = `<div style="padding:10px; background:#fbd7d7; color:#6a1a1a; border-radius:4px;">❌ Ошибка: ${escapeHtml(e.message)}</div>`;
+    btn.disabled = false;
+    btn.textContent = '✅ Применить выбранное';
+  }
+}
+
+(function attachBootstrapHandlers(){
+  const p = document.getElementById('btn-bootstrap-preview');
+  const c = document.getElementById('btn-bootstrap-close');
+  const a = document.getElementById('btn-bootstrap-apply');
+  if (p) p.addEventListener('click', bootstrapPreview);
+  if (c) c.addEventListener('click', () => {
+    document.getElementById('bootstrap-modal').style.display = 'none';
+    const btn = document.getElementById('btn-bootstrap-apply');
+    btn.disabled = false;
+    btn.textContent = '✅ Применить выбранное';
+  });
+  if (a) a.addEventListener('click', bootstrapApply);
+})();
+
+// ============== TG-BOT SETTINGS ==============
+async function tgLoad() {
+  try {
+    const res = await fetch('/api/keenetic/tg-settings');
+    const j = await res.json();
+    if (j.ok) {
+      document.getElementById('tg-token').value   = j.token   || '';
+      document.getElementById('tg-chat-id').value = j.chat_id || '';
+    }
+  } catch (e) { /* silent — может первый раз нет связи с роутером */ }
+}
+
+async function tgSave() {
+  const status = document.getElementById('tg-settings-status');
+  const btn = document.getElementById('btn-tg-save');
+  status.textContent = '💾 сохраняю...';
+  btn.disabled = true;
+  try {
+    const body = {
+      token:   document.getElementById('tg-token').value.trim(),
+      chat_id: document.getElementById('tg-chat-id').value.trim(),
+    };
+    const res = await fetch('/api/keenetic/tg-settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    const j = await res.json();
+    if (j.ok) {
+      status.textContent = '✅ сохранено · watchdog подхватит за минуту';
+    } else {
+      status.textContent = '❌ ' + (j.error || j.stderr || 'fail');
+    }
+  } catch (e) {
+    status.textContent = '❌ ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function tgTest() {
+  const status = document.getElementById('tg-settings-status');
+  const result = document.getElementById('tg-test-result');
+  const btn = document.getElementById('btn-tg-test');
+  status.textContent = '📨 шлю...';
+  btn.disabled = true;
+  result.innerHTML = '';
+  try {
+    const body = {
+      token:   document.getElementById('tg-token').value.trim(),
+      chat_id: document.getElementById('tg-chat-id').value.trim(),
+    };
+    const res = await fetch('/api/keenetic/tg-test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    const j = await res.json();
+    if (j.ok) {
+      status.textContent = '✅ доставлено';
+      result.innerHTML = `<div class="test-result-box ok"><strong>✅ Сообщение доставлено в Telegram</strong>\n${escapeHtml(j.info || '')}${j.message_id ? '\nmessage_id: ' + j.message_id : ''}</div>`;
+    } else {
+      status.textContent = '❌ не доставлено';
+      const hint = j.hint ? `<span class="hint">${escapeHtml(j.hint)}</span>` : '';
+      result.innerHTML = `<div class="test-result-box bad"><strong>❌ Не доставлено</strong>${hint}\n${escapeHtml(j.error || '')}</div>`;
+    }
+  } catch (e) {
+    status.textContent = '❌ ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function tgClear() {
+  if (!confirm('Очистить TG_BOT_TOKEN и TG_CHAT_ID? Алерты watchdog перестанут отправляться (watchdog продолжит работать, просто молча).')) return;
+  document.getElementById('tg-token').value = '';
+  document.getElementById('tg-chat-id').value = '';
+  await tgSave();
+}
+
+(function attachTgHandlers(){
+  const s = document.getElementById('btn-tg-save');
+  const t = document.getElementById('btn-tg-test');
+  const c = document.getElementById('btn-tg-clear');
+  const tg = document.getElementById('btn-tg-toggle');
+  if (s) s.addEventListener('click', tgSave);
+  if (t) t.addEventListener('click', tgTest);
+  if (c) c.addEventListener('click', tgClear);
+  if (tg) tg.addEventListener('click', () => {
+    const f = document.getElementById('tg-token');
+    f.type = f.type === 'password' ? 'text' : 'password';
+  });
+  // подгружаем текущее
+  if (document.getElementById('tg-token')) tgLoad();
+})();
+
+// ============== 🚑 RECOVERY / DIAGNOSE / AUTO-REPAIR (v1.5.1) ==============
+// Self-healing fix через UI без SSH. Юзер жмёт «🔬 Диагностика» → видит
+// таблицу 8 проверок с ✅/❌ → для каждой failed предлагается «🔧 Применить fix».
+
+async function runDiagnose() {
+  const btn = document.getElementById('btn-diagnose');
+  const out = document.getElementById('diagnose-output');
+  btn.disabled = true;
+  btn.textContent = '⏳ Проверяю...';
+  out.innerHTML = '<p style="color:#888; font-style:italic;">Запускаю 8 проверок через SSH (xray version, xkeen-status, config test, watchdog.config, JSON syntax, cron, errors)...</p>';
+  try {
+    const res = await fetch('/api/xkeen/diagnose');
+    const j = await res.json();
+    renderDiagnose(j);
+  } catch (e) {
+    out.innerHTML = `<div style="padding: 10px; background: #fbd7d7; border-radius: 4px; color: #6a1a1a;">❌ Ошибка диагностики: ${escapeHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🔬 Диагностика XKeen';
+  }
+}
+
+function renderDiagnose(j) {
+  const out = document.getElementById('diagnose-output');
+  if (!j.checks) {
+    out.innerHTML = '<p style="color:#c33;">❌ Нет данных от диагностики</p>';
+    return;
+  }
+  const s = j.summary || {};
+  const overall = j.ok ? 'green' : 'red';
+  const overallText = j.ok
+    ? `✅ Всё в норме (${s.passed}/${s.total} проверок прошли)`
+    : `❌ Найдены проблемы: ${s.failed_critical} critical, ${s.failed_warning} warning (${s.passed}/${s.total} прошли)`;
+
+  let html = `<div style="padding: 10px 14px; background: ${j.ok ? '#d4eedd' : '#fde8e8'}; color: ${j.ok ? '#1a5a1a' : '#6a1a1a'}; border-left: 4px solid ${overall === 'green' ? '#2a7' : '#c33'}; margin-bottom: 12px; font-weight: 600;">${overallText}</div>`;
+
+  html += '<table style="border-collapse: collapse; font-size: 0.9em; width: 100%; max-width: 900px;">';
+  html += '<thead><tr style="background: #f5f5f5;"><th style="padding: 6px 10px; text-align: center; border-bottom: 2px solid #ccc; width: 50px;"></th><th style="padding: 6px 10px; text-align: left; border-bottom: 2px solid #ccc;">Проверка</th><th style="padding: 6px 10px; text-align: left; border-bottom: 2px solid #ccc;">Auto-fix</th></tr></thead><tbody>';
+
+  for (const c of j.checks) {
+    const icon = c.ok ? '✅' : (c.severity === 'critical' ? '❌' : '⚠️');
+    const rowBg = c.ok ? '#f0f8f0' : (c.severity === 'critical' ? '#fde8e8' : '#fff8e1');
+    const fixBtn = c.fix_id
+      ? `<button class="btn btn-sm" type="button" style="background:#c33; color:#fff; padding: 4px 10px;" onclick="applyFix('${c.fix_id}', '${(c.fix_label || '').replace(/'/g, '&#39;')}', '${(c.fix_explain || '').replace(/'/g, '&#39;').replace(/\n/g, ' ')}')">${escapeHtml(c.fix_label || '🔧 Применить fix')}</button>`
+      : (c.fix_explain ? `<span style="font-size:0.85em; color:#888; font-style: italic;">⚠ Auto-fix недоступен</span>` : '');
+    html += `<tr style="background: ${rowBg}; border-bottom: 1px solid #eee;">`;
+    html += `<td style="padding: 6px 10px; text-align: center; font-size: 1.2em;">${icon}</td>`;
+    html += `<td style="padding: 6px 10px;"><strong>${escapeHtml(c.label)}</strong>`;
+    if (!c.ok || c.detail !== 'OK') {
+      const detailShort = (c.detail || '').slice(0, 150);
+      html += `<details style="margin-top: 4px;"><summary style="cursor: pointer; font-size: 0.85em; color: #555;">подробнее</summary>`;
+      html += `<pre style="font-size: 0.78em; background: #1e1e1e; color: #ddd; padding: 8px; border-radius: 4px; margin: 6px 0 0; max-height: 200px; overflow-y: auto; white-space: pre-wrap;">${escapeHtml(c.detail || '(empty)')}</pre>`;
+      if (c.fix_explain) {
+        html += `<p style="margin: 6px 0 0; font-size: 0.85em; color: #5a3a1c; background: #fff3cd; padding: 6px 10px; border-radius: 4px;">💡 ${escapeHtml(c.fix_explain)}</p>`;
+      }
+      html += `</details>`;
+    }
+    html += `</td>`;
+    html += `<td style="padding: 6px 10px;">${fixBtn}</td>`;
+    html += `</tr>`;
+  }
+
+  html += '</tbody></table>';
+  html += `<p style="margin-top: 12px; font-size: 0.85em; color: #888;">Совет: после применения fix'а — нажми «🔬 Диагностика XKeen» снова чтобы проверить что проблема решена.</p>`;
+
+  out.innerHTML = html;
+}
+
+async function applyFix(fixId, label, explain) {
+  const msg = `Применить auto-fix: «${label}»?\n\n${explain}\n\nЭто внесёт изменения на роутере (бэкапы создадутся автоматически). Продолжить?`;
+  if (!confirm(msg)) return;
+
+  const out = document.getElementById('diagnose-output');
+  out.insertAdjacentHTML('beforeend', `<div id="fix-log" style="margin-top: 14px; padding: 10px; background: #fff8e1; border-left: 4px solid #f0c200; border-radius: 4px;"><strong>⏳ Применяю fix...</strong></div>`);
+
+  try {
+    const fd = new FormData();
+    fd.append('fix_id', fixId);
+    const res = await fetch('/api/xkeen/auto-fix', { method: 'POST', body: fd });
+    const j = await res.json();
+    const logBox = document.getElementById('fix-log');
+    if (j.ok) {
+      logBox.innerHTML = `<strong style="color: #1a5a1a;">✅ Fix применён: ${escapeHtml(j.label)}</strong><pre style="font-size: 0.82em; background: #1e1e1e; color: #ddd; padding: 8px; border-radius: 4px; margin: 8px 0 0; max-height: 300px; overflow-y: auto; white-space: pre-wrap;">${escapeHtml(j.log || '(нет лога)')}</pre><button class="btn btn-sm" style="margin-top: 8px; background: #c33; color: #fff;" onclick="runDiagnose()">🔬 Запустить диагностику снова</button>`;
+      logBox.style.background = '#d4eedd';
+      logBox.style.borderColor = '#2a7';
+    } else {
+      logBox.innerHTML = `<strong style="color: #6a1a1a;">❌ Fix не применился</strong><pre style="font-size: 0.82em; background: #1e1e1e; color: #ddd; padding: 8px; border-radius: 4px; margin: 8px 0 0; max-height: 300px; overflow-y: auto; white-space: pre-wrap;">${escapeHtml(j.log || j.error || '(нет деталей)')}</pre>`;
+      logBox.style.background = '#fde8e8';
+      logBox.style.borderColor = '#c33';
+    }
+  } catch (e) {
+    document.getElementById('fix-log').innerHTML = `<strong style="color: #6a1a1a;">❌ Ошибка: ${escapeHtml(e.message)}</strong>`;
+  }
+}
+
+(function attachRescueHandlers(){
+  const btn = document.getElementById('btn-diagnose');
+  if (btn) btn.addEventListener('click', runDiagnose);
+})();
+
+// ============== UNSAVED DROPDOWN INDICATOR (v1.5.2 #8) ==============
+// Юзер сегодня словил баг: выбрал в YT-dropdown «BravaVLESS», но не нажал
+// «Сохранить YouTube outbound» → в watchdog.config остался прежний канал →
+// 30 мин путаницы. Теперь dropdown подсвечивается оранжевой рамкой если
+// значение НЕ равно текущему сохранённому. После Save indicator снимается.
+(function attachUnsavedDropdownIndicator(){
+  const roles = ['primary', 'failover', 'ai', 'yt'];
+  // Запоминаем исходные (сохранённые) значения при загрузке страницы
+  const initialValues = {};
+  roles.forEach(role => {
+    const sel = document.getElementById('select-' + role);
+    if (sel) {
+      initialValues[role] = sel.value;
+      // На изменение dropdown — проверяем не отличается ли от сохранённого
+      sel.addEventListener('change', () => {
+        updateUnsavedState(role);
+      });
+    }
+  });
+
+  function updateUnsavedState(role) {
+    const sel = document.getElementById('select-' + role);
+    if (!sel) return;
+    const isUnsaved = sel.value !== initialValues[role];
+    if (isUnsaved) {
+      sel.style.borderColor = '#f0c200';
+      sel.style.borderWidth = '2px';
+      sel.style.boxShadow = '0 0 0 2px rgba(240, 194, 0, 0.2)';
+      // Добавляем бейдж «⚠ не сохранено» рядом, если ещё нет
+      if (!document.getElementById('unsaved-badge-' + role)) {
+        const badge = document.createElement('span');
+        badge.id = 'unsaved-badge-' + role;
+        badge.textContent = '⚠ не сохранено';
+        badge.style.cssText = 'display: inline-block; margin-left: 8px; padding: 2px 8px; background: #fff3cd; color: #6a4900; border-radius: 4px; font-size: 0.82em; font-weight: 600;';
+        sel.parentNode.insertBefore(badge, sel.nextSibling);
+      }
+    } else {
+      sel.style.borderColor = '#ccc';
+      sel.style.borderWidth = '1px';
+      sel.style.boxShadow = 'none';
+      const badge = document.getElementById('unsaved-badge-' + role);
+      if (badge) badge.remove();
+    }
+  }
+
+  // Экспортируем функцию для вызова из setTarget() после успешного сохранения
+  // (там обновляем initialValues[role] и снимаем подсветку)
+  window._unsavedDropdownConfirmSaved = function(role) {
+    const sel = document.getElementById('select-' + role);
+    if (sel) {
+      initialValues[role] = sel.value;
+      updateUnsavedState(role);  // снимет подсветку (теперь value === initial)
+    }
+  };
+})();
+
+// ============== УПРАВЛЕНИЕ XKEEN (status/restart/update buttons) ==============
+async function xkeenCmd(cmd) {
+  const status = document.getElementById('xkmgmt-status');
+  const outBox = document.getElementById('xkmgmt-output-box');
+  const outPre = document.getElementById('xkmgmt-output');
+  const buttons = document.querySelectorAll('[onclick^="xkeenCmd("]');
+  // Подтверждение для долгих/инвазивных команд
+  const confirms = {
+    'restart':        'Restart XKeen ~2 секунды (трафик прервётся на момент рестарта). Продолжить?',
+    'update-xray':    'Обновить Xray-core до latest версии?\n\nБудет выбрана ПЕРВАЯ версия из списка релизов (может быть pre-release/бета!). Скачается ~30 MB, xray перезапустится (трафик прервётся ~5 сек).\n\nЕсли хочешь именно stable — используй TTY-SSH с ручным выбором номера версии.',
+    'update-geofile': 'Обновить GeoFile (geosite.dat + geoip.dat)?\n\nЗагрузит свежие списки доменов от v2fly community. Безопасно — только списки, бинари не меняются. ~30-60 сек.',
+    'update-xkeen':   'Обновить XKeen (bash-обёртку)?\n\nБудет выбрана первая (latest) версия. Сам xray не трогается, обновляется только менеджер.',
+  };
+  if (confirms[cmd] && !confirm(confirms[cmd])) return;
+
+  buttons.forEach(b => b.disabled = true);
+  status.textContent = `🔄 выполняю "${cmd}"... (может занять до 3 минут)`;
+  outBox.style.display = 'block';
+  outPre.textContent = '...ждём ответа от роутера...';
+
+  const fd = new FormData();
+  fd.append('cmd', cmd);
+  try {
+    const res = await fetch('/api/xkeen/cmd', { method: 'POST', body: fd });
+    const j = await res.json();
+    if (j.ok) {
+      status.textContent = `✅ "${cmd}" завершено (exit code ${j.code})`;
+      outPre.textContent = (j.stdout || '(пусто)') + (j.stderr ? '\n\n[stderr]\n' + j.stderr : '');
+      // После update-geofile сразу подгружаем «где применяются» — чтобы юзер не искал руками.
+      if (cmd === 'update-geofile') {
+        const sec = document.getElementById('dat-categories-section');
+        if (sec) { sec.open = true; scanDatCategories(); }
+      }
+    } else {
+      status.textContent = `❌ "${cmd}" failed (exit ${j.code !== undefined ? j.code : '?'})`;
+      outPre.textContent = (j.error || j.stderr || '(no output)') + (j.stdout ? '\n\n[stdout]\n' + j.stdout : '');
+    }
+  } catch (e) {
+    status.textContent = `❌ ${e.message}`;
+    outPre.textContent = e.toString();
+  } finally {
+    buttons.forEach(b => b.disabled = false);
+  }
+}
+
+// Цвет бейджа outboundTag по семантике (block=красный, direct=оранжевый, остальное=зелёный VPN).
+function outboundBadgeColor(tag) {
+  const t = (tag || '').toLowerCase();
+  if (t === 'block') return { bg: '#fde8e8', fg: '#c33', label: '⛔ блок' };
+  if (t === 'direct') return { bg: '#fff3e0', fg: '#e67e22', label: '↪️ напрямую (без VPN)' };
+  if (t === '(default)') return { bg: '#f0f0f0', fg: '#666', label: '🌐 default' };
+  return { bg: '#e8f5e9', fg: '#2e7d32', label: '🔒 ' + tag };
+}
+
+async function scanDatCategories() {
+  const out = document.getElementById('dat-categories-output');
+  out.innerHTML = '<p style="color:#888; font-style:italic;">🔄 Сканирую роутер...</p>';
+  try {
+    const res = await fetch('/api/xkeen/dat-categories');
+    const j = await res.json();
+    if (!j.ok) {
+      out.innerHTML = '<p style="color:#c33;">❌ Ошибка: ' + escapeHtml(j.error || 'unknown') + '</p>';
+      return;
+    }
+
+    let html = '';
+
+    // === Блок 1: КУДА применяются ===  (главное что юзер хочет увидеть)
+    if (j.usage && j.usage.length > 0) {
+      // Группируем по outbound_tag → [usage]
+      const byOutbound = {};
+      for (const u of j.usage) {
+        const tag = u.outbound_tag || '(default)';
+        if (!byOutbound[tag]) byOutbound[tag] = [];
+        byOutbound[tag].push(u);
+      }
+      const tags = Object.keys(byOutbound).sort();
+
+      html += '<h4 style="margin: 10px 0 8px; color: #2e7d32;">📍 Где применяются эти базы у тебя сейчас</h4>';
+      html += '<p style="font-size: 0.88em; color: #555; margin: 0 0 10px;">Категории из <code>.dat</code> файлов используются в правилах роутинга (<code>05_routing.json</code>). Колонка «Куда» — что Xray делает с трафиком матчнутым на эту категорию.</p>';
+      html += '<table style="border-collapse: collapse; font-size: 0.88em; width: 100%; max-width: 900px;">';
+      html += '<tr style="background: #f5f5f5;"><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Категория</th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Файл базы</th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Куда направляется</th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Что это</th></tr>';
+      for (const tag of tags) {
+        const items = byOutbound[tag];
+        const badge = outboundBadgeColor(tag);
+        for (const u of items) {
+          html += '<tr style="border-bottom: 1px solid #eee;">';
+          html += `<td style="padding: 5px 10px; font-family: monospace; color: #74c; white-space: nowrap;">${escapeHtml(u.category)}</td>`;
+          html += `<td style="padding: 5px 10px; font-family: monospace; color: #888; font-size: 0.92em;">${escapeHtml(u.dat)}</td>`;
+          html += `<td style="padding: 5px 10px;"><span style="background:${badge.bg}; color:${badge.fg}; padding: 2px 8px; border-radius: 4px; font-size: 0.92em; white-space: nowrap;">${escapeHtml(badge.label)}</span></td>`;
+          html += `<td style="padding: 5px 10px; color: #555;">${escapeHtml(u.desc || '—')}</td>`;
+          html += '</tr>';
+        }
+      }
+      html += '</table>';
+      html += '<p style="font-size: 0.82em; color: #888; margin: 6px 0 14px;">Источник: <code>' + escapeHtml((j.usage[0] && j.usage[0].source) || '?') + '</code>. Правила редактируются в шаблоне <code>05_routing.template.json</code> на роутере — watchdog их подставляет.</p>';
+    } else {
+      html += '<p style="color:#888; padding: 10px 14px; background: #fffae6; border-left: 3px solid #f0c200; margin: 10px 0;">⚠️ Не нашёл использований <code>ext:geosite*.dat:...</code> / <code>ext:geoip*.dat:...</code> в твоём routing. Значит .dat базы скачиваются но фактически не применяются — добавь правило в шаблон <code>05_routing.template.json</code> с <code>"domain": ["ext:geosite_v2fly.dat:yandex"]</code> или подобное.</p>';
+    }
+
+    // === Блок 2: .dat файлы на роутере ===
+    if (j.dat_files && j.dat_files.length > 0) {
+      html += '<h4 style="margin: 14px 0 6px;">📁 Базы на роутере (<code>/opt/etc/xray/dat/</code>)</h4>';
+      html += '<table style="border-collapse: collapse; font-size: 0.88em;"><tr style="background: #f5f5f5;"><th style="padding: 5px 12px; text-align:left; border-bottom: 1px solid #ddd;">Файл</th><th style="padding: 5px 12px; text-align:right; border-bottom: 1px solid #ddd;">Размер</th><th style="padding: 5px 12px; text-align:left; border-bottom: 1px solid #ddd;">Обновлён</th></tr>';
+      for (const f of j.dat_files) {
+        html += `<tr><td style="padding: 4px 12px; font-family: monospace;">${escapeHtml(f.name)}</td><td style="padding: 4px 12px; text-align:right; color: #888;">${f.size_mb} MB</td><td style="padding: 4px 12px; color: #888; font-family: monospace;">${escapeHtml(f.mtime || '?')}</td></tr>`;
+      }
+      html += '</table>';
+    }
+
+    // === Блок 3: Известные категории v2fly (для подсказки что ещё можно добавить) ===
+    html += '<details style="margin-top: 14px;"><summary style="cursor: pointer; font-weight: 600; color: #74c;">🌐 Все известные категории v2fly (можно использовать в правилах)</summary>';
+    html += '<p style="font-size: 0.86em; color: #555; margin: 8px 0;">Чтобы добавить новую категорию — пропиши её в <code>05_routing.template.json</code> через <code>ext:geosite_v2fly.dat:&lt;name&gt;</code> в нужном правиле (DIRECT / BLOCK / proxy outboundTag).</p>';
+    html += '<table style="border-collapse: collapse; font-size: 0.86em; width: 100%; max-width: 800px;"><tr style="background: #f5f5f5;"><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Категория</th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Что внутри</th></tr>';
+    const inUseSet = new Set((j.in_use || []).map(u => u.category));
+    for (const c of j.known) {
+      const used = inUseSet.has(c.name);
+      html += `<tr style="border-bottom: 1px solid #eee; ${used ? 'background: #e8f5e9;' : ''}"><td style="padding: 5px 10px; font-family: monospace; color: #74c; white-space: nowrap;">${escapeHtml(c.name)}${used ? ' <span style="color:#2e7d32; font-size:0.85em;">✓ используется</span>' : ''}</td><td style="padding: 5px 10px;">${escapeHtml(c.desc)}</td></tr>`;
+    }
+    html += '</table></details>';
+
+    html += `<p style="margin-top: 12px; font-size: 0.85em; color: #888;">💡 ${escapeHtml(j.note)}</p>`;
+
+    out.innerHTML = html;
+  } catch (e) {
+    out.innerHTML = '<p style="color:#c33;">❌ ' + escapeHtml(e.message) + '</p>';
+  }
+}
+</script>
+
+</body>
+</html>"""
+
+
+if __name__ == "__main__":
+    # Определяем рекомендуемый URL: client-only режим → сразу /xkeen, иначе главная
+    is_client_only = (not getattr(cfg, "MONITORED_PORTS_INFO", None)
+                      and not getattr(cfg, "PROFILES", None))
+    path = "/xkeen" if is_client_only else "/"
+    # Порт берётся из config_local.py (DASHBOARD_PORT). Дефолт 5000.
+    # Для нескольких инстансов панели на одной машине — разные папки с разными DASHBOARD_PORT.
+    port = int(getattr(cfg, "DASHBOARD_PORT", 5000))
+    print(f"  Логин:    {cfg.USERNAME}    Открой: http://localhost:{port}{path}")
+    app.run(host="0.0.0.0", port=port, debug=False)

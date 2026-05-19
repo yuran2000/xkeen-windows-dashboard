@@ -1,0 +1,42 @@
+# Персональные секреты (НЕ коммитить никогда!)
+config_local.py
+runtime_settings.json
+
+# Python venv и кэш
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Бэкапы и логи
+backups/
+*.bak-*
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Сертификаты, ключи (на случай если кто-то положит)
+*.pem
+*.key
+*.crt
+.ssh/
+ssh/
+
+# Локальные эксперименты
+*.local.*
+
+# Runtime state daemon'ов (v1.7.21+)
+xkeen_toast_daemon.state.json
+xkeen_toast_daemon.lock
+
+# Manual restore docs (создаются юзером локально)
+HOW_TO_RESTORE.md

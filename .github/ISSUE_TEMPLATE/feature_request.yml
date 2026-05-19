@@ -1,0 +1,21 @@
+name: 💡 Feature request
+description: Предложение новой фичи
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: Что хочешь добавить?
+      description: Опиши фичу
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Зачем это нужно?
+      description: Какую задачу это решает? Какой use case?
+  - type: textarea
+    id: how
+    attributes:
+      label: Идеи как реализовать (опционально)
+      description: Если у тебя есть мысли про API/UI/архитектуру — расскажи
