@@ -1,0 +1,30 @@
+# Auto-detect text files
+* text=auto
+
+# Shell-скрипты — ВСЕГДА LF (иначе на Linux/BusyBox не запускаются)
+*.sh text eol=lf
+*.sh.cur text eol=lf
+
+# JSON / templates — LF чтобы было одинаково на всех платформах
+*.json text eol=lf
+*.json.cur text eol=lf
+
+# Windows batch / PowerShell — CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Python — LF
+*.py text eol=lf
+
+# Markdown / requirements — LF
+*.md text eol=lf
+requirements.txt text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Бинарники
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
+*.zip binary
