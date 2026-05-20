@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.7"
+_VERSION_FALLBACK = "1.0.8"
 
 
 def get_dashboard_version():
@@ -3269,18 +3269,21 @@ def api_xkeen_migration_backup():
     remote_tar = "/opt/entware_backup.tar.gz"
 
     # 1. Создать tar.gz на роутере.
-    # XKeen-документация рекомендует `tar cvzf ... --exclude=PATH -C /opt .` — но это работает
-    # только с GNU tar (Entware-пакет, /opt/bin/tar). На BusyBox-tar (системный /bin/tar) флаг
-    # `--exclude=` не поддерживается → tar печатает help. Прецедент 2026-05-20.
-    # Решение: пробуем /opt/bin/tar (Entware GNU) первым, фолбэк на BusyBox через `ls | grep -v`.
+    # XKeen-документация: `tar cvzf ... --exclude=PATH -C /opt .` — работает только с GNU tar.
+    # BusyBox-tar не поддерживает `--exclude=` (даже когда /opt/bin/tar существует как симлинк
+    # на /opt/bin/busybox а не настоящий пакет tar — прецедент 2026-05-20). Детект через
+    # `tar --version`: GNU tar отвечает "tar (GNU tar) X.YZ", BusyBox - `unrecognized option`.
+    # Фолбэк: BusyBox tar v1.37+ поддерживает `-X FILE` (file with glob patterns to exclude).
     tar_cmd = (
         f'rm -f {remote_tar} 2>/dev/null; '
-        f'if [ -x /opt/bin/tar ]; then '
-        f'  echo "===TAR===Entware GNU"; '
+        f'if /opt/bin/tar --version 2>/dev/null | grep -qi "GNU tar"; then '
+        f'  echo "===TAR===Entware GNU tar"; '
         f'  /opt/bin/tar cvzf {remote_tar} --exclude={remote_tar} -C /opt . 2>&1 | tail -5; '
         f'else '
-        f'  echo "===TAR===BusyBox fallback"; '
-        f'  cd /opt && tar czf {remote_tar} $(ls -A | grep -v "^entware_backup.tar.gz$") 2>&1 | tail -5; '
+        f'  echo "===TAR===BusyBox tar fallback (-X excludefile)"; '
+        f'  echo "entware_backup.tar.gz" > /tmp/_eb_exc; '
+        f'  tar -czf {remote_tar} -X /tmp/_eb_exc -C /opt . 2>&1 | tail -5; '
+        f'  rm -f /tmp/_eb_exc; '
         f'fi; '
         f'echo "===SIZE==="; '
         f'wc -c < {remote_tar} 2>&1; '
@@ -3307,9 +3310,29 @@ def api_xkeen_migration_backup():
     if remote_size < 100 * 1024:  # <100KB — что-то не так
         # Cleanup
         keenetic_ssh(f"rm -f {remote_tar}", timeout=10)
-        return jsonify({"ok": False, "stage": "tar",
-                        "error": f"tar получился слишком маленький ({remote_size} байт) — возможно ошибка",
-                        "stdout": out[:1000]}), 500
+        # Если вывод tar выглядит как help (он печатает usage при непонятых флагах) —
+        # на роутере BusyBox tar без поддержки --exclude=/-X. Решение — установить
+        # Entware GNU tar. Подкладываем fix_id чтобы UI показал кнопку «Установить».
+        looks_like_tar_help = any(m in out for m in (
+            "Don't replace existing files",
+            "(De)compress using gzip",
+            "(De)compress based on extension",
+            "Extract to stdout",
+        ))
+        resp = {"ok": False, "stage": "tar",
+                "error": f"tar получился слишком маленький ({remote_size} байт) — возможно ошибка",
+                "stdout": out[:1000]}
+        if looks_like_tar_help:
+            resp["fix_id"] = "install_entware_tar"
+            resp["fix_label"] = "📥 Установить Entware GNU tar"
+            resp["fix_explain"] = (
+                "Системный BusyBox tar отказывается архивировать с --exclude= / -X "
+                "(в твоей сборке эти флаги отключены compile-time). Решение — поставить "
+                "полноценный Entware-пакет tar через opkg install. После этого "
+                "/opt/bin/tar становится настоящим GNU tar и миграция работает по "
+                "XKeen-документации."
+            )
+        return jsonify(resp), 500
 
     # 2. Скачать через scp
     backups_dir = r"C:\xray-dashboard\backups"
@@ -3321,8 +3344,12 @@ def api_xkeen_migration_backup():
     local_fname = f"entware_backup_{ts}.tar.gz"
     local_path = os.path.join(backups_dir, local_fname)
 
+    # `-O` форсит legacy SCP-протокол. С OpenSSH 9.0+ scp по умолчанию идёт через SFTP,
+    # которому нужен sftp-server на роутере (`/opt/libexec/sftp-server`). На большинстве
+    # Keenetic он не установлен → "sftp-server: not found". Прецедент 2026-05-20.
     scp_args = [
         "scp",
+        "-O",
         "-i", cfg.KEENETIC_SSH_KEY,
         "-P", str(cfg.KEENETIC_PORT),
         "-o", "StrictHostKeyChecking=no",
@@ -3342,9 +3369,17 @@ def api_xkeen_migration_backup():
     if scp_r.returncode != 0:
         stderr = scp_r.stderr.decode("utf-8", errors="replace")[:500]
         keenetic_ssh(f"rm -f {remote_tar}", timeout=10)
-        return jsonify({"ok": False, "stage": "scp",
-                        "error": f"scp failed: rc={scp_r.returncode}",
-                        "stderr": stderr}), 500
+        # Если scp -O всё равно не помог и сервер просит sftp-server — подсказываем фикс
+        resp = {"ok": False, "stage": "scp",
+                "error": f"scp failed: rc={scp_r.returncode}",
+                "stderr": stderr}
+        if "sftp-server" in stderr.lower():
+            resp["fix_explain"] = (
+                "scp -O должен работать без sftp-server. Если ошибка снова — возможно у тебя "
+                "старый OpenSSH-клиент без -O. Проверь: `ssh -V` (нужна 8.0+). "
+                "Альтернатива — поставить sftp-server на роутер: `opkg install openssh-sftp-server`."
+            )
+        return jsonify(resp), 500
 
     # 3. Cleanup на роутере
     keenetic_ssh(f"rm -f {remote_tar}", timeout=10)
@@ -10450,6 +10485,10 @@ let _xrayTitleBlinkInterval = null;
 let _xrayAudioCtx = null;
 let _xrayLastBeepTs = 0;              // timestamp последнего beep'а (для повтора)
 const _XRAY_BEEP_REPEAT_MS = 3 * 60 * 1000;  // 3 минуты между повторными beep'ами
+// Дебаунс ложных алертов (например когда SSH занят миграцией и xkeen -status возвращает
+// «не запущен», хотя xray работает). Алерт срабатывает только при N подряд «плохих» проверках.
+let _xrayBadCount = 0;
+const _XRAY_BAD_THRESHOLD = 2;        // нужно 2 подряд плохих чека чтобы beepнуть
 
 // Favicon swap для pinned Chrome tabs (которые не показывают title)
 let _faviconOrigDataUrl = null;
@@ -10603,23 +10642,31 @@ async function refreshXrayHeaderStatus() {
 
     // Алерты при ПЕРЕХОДЕ в плохое состояние + повтор beep каждые 3 мин пока bad.
     // Favicon swap нужен для pinned Chrome tabs (они не показывают title — только favicon).
+    // Дебаунс: bad-проверки требуют 2 подряд, чтобы не реагировать на транзиентные
+    // фейлы (SSH занят миграцией → xkeen -status вернул «не запущен» ложно).
     const isBad = (j.state === 'stopped' || j.state === 'error');
-    const wasGood = (_xrayPrevState === 'ok' || _xrayPrevState === 'warn' || _xrayPrevState === null);
     const now = Date.now();
     if (isBad) {
-      _setFaviconAlert(true);
-      if (wasGood) {
-        // ПЕРВЫЙ переход в bad — beep + start title blink + сохранить ts
-        _playAlertBeep();
-        _xrayLastBeepTs = now;
-        _startXrayTitleBlink('🔴 ' + (j.label || 'XRAY УПАЛ'));
-      } else if (_xrayLastBeepTs && (now - _xrayLastBeepTs >= _XRAY_BEEP_REPEAT_MS)) {
-        // ОСТАЁТСЯ в bad — повторить beep каждые 3 минуты
-        _playAlertBeep();
-        _xrayLastBeepTs = now;
+      _xrayBadCount++;
+      if (_xrayBadCount < _XRAY_BAD_THRESHOLD) {
+        // Первая плохая проверка — пока молчим, ждём подтверждения. Бейдж покажет красный
+        // (это уже сделано выше через cls), но beep/favicon/title-blink не трогаем.
+      } else {
+        _setFaviconAlert(true);
+        if (_xrayBadCount === _XRAY_BAD_THRESHOLD) {
+          // ПЕРВЫЙ подтверждённый переход (порог достигнут) — beep + start title blink
+          _playAlertBeep();
+          _xrayLastBeepTs = now;
+          _startXrayTitleBlink('🔴 ' + (j.label || 'XRAY УПАЛ'));
+        } else if (_xrayLastBeepTs && (now - _xrayLastBeepTs >= _XRAY_BEEP_REPEAT_MS)) {
+          // ОСТАЁТСЯ в bad — повторить beep каждые 3 минуты
+          _playAlertBeep();
+          _xrayLastBeepTs = now;
+        }
       }
     } else {
-      // Восстановление good — снять алерты, сбросить beep-timer
+      // Восстановление good (или unreachable / unknown) — снять алерты, сбросить счётчик
+      _xrayBadCount = 0;
       _setFaviconAlert(false);
       if (_xrayTitleBlinkInterval) _stopXrayTitleBlink();
       _xrayLastBeepTs = 0;
@@ -11170,17 +11217,62 @@ async function createMigrationBackup(btn) {
     const res = await fetch('/api/xkeen/migration-backup', { method: 'POST', credentials: 'same-origin' });
     const j = await res.json();
     if (j.ok) {
+      // Persistent flash + кнопка «Открыть папку» через копирование пути в clipboard
+      // (браузеры блокируют file:// из http-страницы напрямую — отдаём пользователю в clipboard).
+      const folderPath = (j.path || '').replace(/\\[^\\]+$/, '');  // dir = path без последнего сегмента
       flash(true,
-        '✅ Архив миграции создан: <code>' + escapeHtml(j.filename) + '</code> (' + j.size_mb + ' МБ).<br>' +
-        'Путь: <code>' + escapeHtml(j.path) + '</code><br>' +
-        'Следующий шаг — переименуй в <code>entware_backup.tar.gz</code>, положи на USB в папку <code>install/</code> вместе с <code>mipsel-installer.tar.gz</code>. Детали в свёрнутом блоке ниже кнопки.',
-        null, { autoDismiss: 15000 }
+        '✅ Архив миграции создан!<br>' +
+        '📦 Файл: <code>' + escapeHtml(j.filename) + '</code> (' + j.size_mb + ' МБ)<br>' +
+        '📂 Путь: <code style="user-select:all; background:#f5f5f5; padding:2px 6px; border-radius:3px;">' + escapeHtml(j.path) + '</code><br><br>' +
+        '<button type="button" class="btn btn-sm" style="background:#17a2b8; color:#fff;" onclick="navigator.clipboard.writeText(\'' + folderPath.replace(/\\/g, '\\\\').replace(/\'/g, "\\\'") + '\').then(()=>{this.textContent=\'✓ Путь к папке скопирован\'})">📋 Скопировать путь к папке</button><br><br>' +
+        '👉 <strong>Следующий шаг</strong>: переименуй в <code>entware_backup.tar.gz</code>, положи на USB в папку <code>install/</code> рядом с <code>mipsel-installer.tar.gz</code>. Детали в свёрнутом блоке ниже кнопки.',
+        null, { autoDismiss: false }
       );
     } else {
+      const details = (j.error || '') + (j.stderr ? '\n\nstderr:\n' + j.stderr : '') + (j.stdout ? '\n\nstdout:\n' + j.stdout : '');
       flash(false,
         '❌ Не удалось создать архив миграции (этап: ' + escapeHtml(j.stage || '?') + ')',
-        (j.error || '') + (j.stderr ? '\n\nstderr:\n' + j.stderr : '') + (j.stdout ? '\n\nstdout:\n' + j.stdout : '')
+        details
       );
+      // Если сервер подсказал auto-fix (например install_entware_tar) — встроим кнопку прямо в флэш.
+      if (j.fix_id) {
+        setTimeout(() => {
+          const f = document.querySelector('.flash.is-error') || document.querySelector('.flash');
+          if (!f) return;
+          const wrap = document.createElement('div');
+          wrap.style.marginTop = '10px';
+          if (j.fix_explain) {
+            const ex = document.createElement('p');
+            ex.style.cssText = 'font-size:0.88em; color:#555; margin:0 0 8px 0;';
+            ex.textContent = j.fix_explain;
+            wrap.appendChild(ex);
+          }
+          const b = document.createElement('button');
+          b.className = 'btn btn-sm';
+          b.style.cssText = 'background:#17a2b8; color:#fff;';
+          b.textContent = j.fix_label || '🔧 Применить авто-фикс';
+          b.onclick = async () => {
+            b.disabled = true; b.textContent = '⏳ Устанавливаю…';
+            const fd = new FormData();
+            fd.append('fix_id', j.fix_id);
+            try {
+              const r = await fetch('/api/xkeen/auto-fix', { method: 'POST', body: fd, credentials: 'same-origin' });
+              const d = await r.json();
+              if (d.ok) {
+                flash(true, '✅ ' + (d.label || 'Фикс применён') + '. Теперь жми «Создать архив миграции» снова.', d.log || '', { autoDismiss: 12000 });
+              } else {
+                flash(false, '❌ Не получилось установить', d.log || JSON.stringify(d));
+              }
+            } catch (e) {
+              flash(false, '❌ Ошибка запроса', String(e));
+            } finally {
+              b.disabled = false; b.textContent = j.fix_label || '🔧 Применить авто-фикс';
+            }
+          };
+          wrap.appendChild(b);
+          f.appendChild(wrap);
+        }, 80);  // даём flash сначала отрендериться
+      }
     }
   } catch (e) {
     flash(false, '❌ Сеть/JS', String(e.message || e));
