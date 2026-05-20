@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.1"
+_VERSION_FALLBACK = "1.0.2"
 
 
 def get_dashboard_version():
@@ -3855,8 +3855,13 @@ def api_xkeen_routing_template_rules():
     if not raw:
         return jsonify({"ok": False, "error": "Не удалось прочитать template с роутера"}), 502
 
-    # Strip // comments (template их содержит для документации)
+    # Strip // comments (template их содержит для документации) +
+    # snippet-плейсхолдеры на отдельных строках (__BLOCK_RULE_BLOCK__, __DIRECT_RULE_BLOCK__,
+    # __AI_RULE_BLOCK__, __YT_RULE_BLOCK__, __YT_RULE_GEOIP__) — watchdog их подменяет
+    # на JSON-объекты или пустоту. Для парсинга самого template убираем строки целиком.
+    # NB: "__DEFAULT_TAG__" внутри кавычек как string-value остаётся — это валидный JSON.
     clean = _strip_json_comments(raw)
+    clean = re.sub(r'^\s*__[A-Z_]+__\s*$', '', clean, flags=re.MULTILINE)
     try:
         tmpl = json.loads(clean)
     except Exception as ex:
