@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.4"
+_VERSION_FALLBACK = "1.0.5"
 
 
 def get_dashboard_version():
@@ -3268,18 +3268,18 @@ def api_xkeen_migration_backup():
     ts = _time.strftime("%Y%m%d-%H%M%S")
     remote_tar = "/opt/entware_backup.tar.gz"
 
-    # 1. Создать tar.gz на роутере
-    # Используем czf (compressed) — для GeoIP-баз сжатие минимальное, но для скриптов/конфигов ощутимое.
-    # NB: BusyBox-tar на части роутеров НЕ поддерживает `--exclude=PATH` (печатает help и не создаёт архив).
-    # Используем универсальный `-X excludefile` (один путь относительно -C dir).
-    # Прецедент 2026-05-20 на работе — `--exclude` валил всю миграцию.
+    # 1. Создать tar.gz на роутере.
+    # BusyBox-tar на некоторых сборках НЕ поддерживает НИ `--exclude=PATH`, НИ `-X excludefile`
+    # (печатает help вместо архивации). Прецеденты 2026-05-20 на работе и дома.
+    # Третий подход — НЕ использовать exclude вообще: перечисляем top-level entries в /opt
+    # явно через `ls -A | grep -v <self>` и передаём их аргументами tar. Это работает с любым tar.
     tar_cmd = (
         f'rm -f {remote_tar} 2>/dev/null; '
-        f'echo "entware_backup.tar.gz" > /tmp/_eb_exc; '
-        f'tar czf {remote_tar} -X /tmp/_eb_exc -C /opt . 2>&1 | tail -3; '
-        f'rm -f /tmp/_eb_exc; '
+        f'cd /opt && tar czf {remote_tar} $(ls -A | grep -v "^entware_backup.tar.gz$") 2>&1 | tail -5; '
         f'echo "===SIZE==="; '
-        f'wc -c < {remote_tar} 2>&1'
+        f'wc -c < {remote_tar} 2>&1; '
+        f'echo "===TAR_VERSION==="; '
+        f'tar 2>&1 | head -2'
     )
     r_tar = keenetic_ssh(tar_cmd, timeout=300)  # tar /opt = до 5 минут на медленных роутерах
     if not r_tar["ok"]:
