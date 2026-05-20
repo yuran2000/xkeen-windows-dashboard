@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.2"
+_VERSION_FALLBACK = "1.0.3"
 
 
 def get_dashboard_version():
@@ -2037,6 +2037,10 @@ def api_xkeen_add():
                 effective_tag = mm.group(1)
         if effective_tag:
             keenetic_set_meta(effective_tag, sub_url=sub_url, note=note)
+    if result.get("ok"):
+        sync = _auto_sync_template_ips_silent()
+        if sync.get("changed"):
+            result["auto_sync"] = f"🔁 Template auto-sync: +{len(sync.get('added', []))} / −{len(sync.get('removed', []))} IP (watchdog подхватит ≤1 мин)"
     return jsonify(result)
 
 
@@ -2052,6 +2056,9 @@ def api_xkeen_remove():
         keenetic_remove_meta_entry(tag)
         # Чистим кэш probe-статуса чтобы не утекала память за месяцы работы
         _OUTBOUND_STATUS_CACHE.pop(tag, None)
+        sync = _auto_sync_template_ips_silent()
+        if sync.get("changed"):
+            result["auto_sync"] = f"🔁 Template auto-sync: +{len(sync.get('added', []))} / −{len(sync.get('removed', []))} IP (watchdog подхватит ≤1 мин)"
     return jsonify(result)
 
 
@@ -2068,6 +2075,10 @@ def api_xkeen_remove_bulk():
     for t in result.get("removed", []) or []:
         keenetic_remove_meta_entry(t)
         _OUTBOUND_STATUS_CACHE.pop(t, None)
+    if result.get("removed"):
+        sync = _auto_sync_template_ips_silent()
+        if sync.get("changed"):
+            result["auto_sync"] = f"🔁 Template auto-sync: +{len(sync.get('added', []))} / −{len(sync.get('removed', []))} IP (watchdog подхватит ≤1 мин)"
     return jsonify(result)
 
 
@@ -3128,14 +3139,20 @@ def api_xkeen_subscription_sync():
             parts.append(f"🏷 Название подписки из Profile-Title: «{u['new']}»")
         elif u["action"] == "skip":
             parts.append(f"⚠️ У подписки {u['pbk_short']} стояла дата {u['old']}, в URL — {u['new']}. Оставил твою (включи 'Обновить дату истечения' чтобы перетереть)")
-    return jsonify({
+    response_payload = {
         "ok": True,
         "stdout": "✅ Sync завершён.\n" + "\n".join(parts) + f"\n\nБэкап: 04_outbounds.json.bak-pre-sync-{ts}",
         "sub_meta_updates": sub_meta_updates,
         "added_tags": added_tags,
         "updated_tags": updated_tags,
         "removed_tags": removed_tags,
-    })
+    }
+    if added_tags or removed_tags:
+        sync = _auto_sync_template_ips_silent()
+        if sync.get("changed"):
+            response_payload["auto_sync"] = f"🔁 Template auto-sync: +{len(sync.get('added', []))} / −{len(sync.get('removed', []))} IP (watchdog подхватит ≤1 мин)"
+            response_payload["stdout"] += f"\n{response_payload['auto_sync']}"
+    return jsonify(response_payload)
 
 
 @app.route("/api/xkeen/backup", methods=["GET"])
@@ -3722,8 +3739,8 @@ def api_xkeen_policy_clients():
         config_lists: { ip_exclude: [...], port_proxying: [...], port_exclude: [...] },
       }
     """
-    # 1. Политики (для description'ов)
-    r_pol = keenetic_ssh('ndmc -c "show ip policy"', timeout=12)
+    # 1. Политики (для description'ов). Bumped 12→30 (та же причина что и для running-config).
+    r_pol = keenetic_ssh('ndmc -c "show ip policy"', timeout=30)
     if not r_pol["ok"]:
         return jsonify({
             "ok": False,
@@ -3732,11 +3749,25 @@ def api_xkeen_policy_clients():
             "stderr": r_pol.get("stderr", "")[:500],
         })
 
-    # 2. Running-config (для привязок host MAC → policy)
-    r_rc = keenetic_ssh('ndmc -c "show running-config" 2>&1 | grep -E "^[[:space:]]*host [0-9a-fA-F:]+ policy"', timeout=15)
+    # 2. Running-config (для привязок host MAC → policy).
+    # Прецедент 2026-05-20 на работе (3276 строк config) — 15с не хватало → SSH-таймаут →
+    # пустой stdout → host_policy_mapping={} → ВСЕ хосты помечались как «Напрямую»
+    # хотя в running-config привязки есть. Bumped 15→45.
+    # Fallback на RCI (если curl рабочий) если ndmc медленный или пустой — см. ниже.
+    r_rc = keenetic_ssh('ndmc -c "show running-config" 2>&1 | grep -E "^[[:space:]]*host [0-9a-fA-F:]+ policy"', timeout=45)
+    rc_text = r_rc.get("stdout") or ""
+    if not rc_text.strip():
+        # Fallback: RCI быстрее чем ndmc-CLI. Возвращает JSON, парсим сами.
+        r_rci = keenetic_ssh('curl -kfsS "localhost:79/rci/show/running-config" 2>&1', timeout=30)
+        try:
+            rci_json = json.loads(r_rci.get("stdout") or "{}")
+            # RCI возвращает {"message": ["! ...", "ip policy ...", "    host MAC policy PolicyN", ...]}
+            rc_text = "\n".join(rci_json.get("message", []))
+        except Exception:
+            pass  # fallback не сработал — оставляем пустую rc_text, диагностика покажет 0 привязок
 
     # 3. Хосты hotspot (для имён + статуса)
-    r_hosts = keenetic_ssh('ndmc -c "show ip hotspot"', timeout=15)
+    r_hosts = keenetic_ssh('ndmc -c "show ip hotspot"', timeout=30)
 
     # 4. XKeen-порты
     r_ports = keenetic_ssh('echo "===CP==="; xkeen -cp 2>&1; echo "===CPE==="; xkeen -cpe 2>&1', timeout=10)
@@ -3766,7 +3797,7 @@ def api_xkeen_policy_clients():
             if m:
                 fwmark = m.group(1)
 
-    host_policy_mapping = _parse_host_policies(r_rc.get("stdout", ""))
+    host_policy_mapping = _parse_host_policies(rc_text)
     hosts = _parse_ndmc_hosts(r_hosts.get("stdout", ""))
 
     # Маппинг хостов к политикам
@@ -3832,6 +3863,11 @@ def api_xkeen_policy_clients():
             "port_exclude": _parse_lst_file(port_excl_text),
         },
         "conntrack_tools_installed": conntrack_tools_installed,
+        "_debug": {
+            "host_policy_mappings_count": len(host_policy_mapping),
+            "rc_text_len": len(rc_text),
+            "rc_source": "ndmc-cli" if (r_rc.get("stdout") or "").strip() else ("rci-fallback" if rc_text.strip() else "empty"),
+        },
     })
 
 
@@ -4003,6 +4039,190 @@ def _describe_network_rule(network, port, outbound):
             return "UDP 443 (QUIC) — блокировка, потому что QUIC обходит TPROXY-перехват (xray работает поверх TCP). Без блока браузеры пытаются Quic, не идут через VPN."
         return f"UDP порты {port} → {outbound}"
     return f"{network} порты {port} → {outbound}"
+
+
+@app.route("/api/xkeen/sync-template-ips", methods=["POST"])
+@requires_auth
+def api_xkeen_sync_template_ips():
+    """Синхронизировать IP-список в template direct-rule с реальными IPv4 из outbounds.
+
+    Базовое правило direct в 05_routing.template.json содержит whitelist IP VPN-эндпоинтов,
+    которые НЕ должны идти через xray (петля). При смене подписки список устаревает —
+    появляются «дыры» (новые IP не покрыты → потенциальный loop) или мёртвый мусор
+    (старые IP уже не используются).
+
+    Endpoint: berёт все IPv4 из outbounds (vless.vnext + trojan/ss.servers), сравнивает
+    с массивом в template, при apply=1 пишет новый template + xkeen -restart.
+
+    Body: apply=1 → реально пишет; иначе только preview (diff).
+    """
+    apply = request.form.get("apply", "0") == "1"
+
+    # 1. Outbounds
+    ob_path = f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json"
+    ob_raw = keenetic_read_file(ob_path, timeout=10)
+    if not ob_raw:
+        return jsonify({"ok": False, "error": f"Не удалось прочитать {ob_path} с роутера"}), 502
+    try:
+        ob_data = json.loads(_strip_json_comments(ob_raw))
+    except Exception as ex:
+        return jsonify({"ok": False, "error": f"Не удалось распарсить outbounds: {ex}"}), 500
+
+    ipv4_re = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+    found_ips = set()
+    for ob in ob_data.get("outbounds", []) or []:
+        settings = ob.get("settings") or {}
+        for v in settings.get("vnext") or []:
+            addr = (v or {}).get("address", "")
+            if ipv4_re.match(addr):
+                found_ips.add(addr)
+        for s in settings.get("servers") or []:
+            addr = (s or {}).get("address", "")
+            if ipv4_re.match(addr):
+                found_ips.add(addr)
+
+    # 2. Template
+    tmpl_path = f"{cfg.KEENETIC_XRAY_BAK_DIR}/05_routing.template.json"
+    tmpl_raw = keenetic_read_file(tmpl_path, timeout=10)
+    if not tmpl_raw:
+        return jsonify({"ok": False, "error": f"Не удалось прочитать {tmpl_path} с роутера"}), 502
+
+    # Surgical regex: единственное "ip": [ ... ] в template. Сохраняем все остальные строки,
+    # placeholder'ы (__XXX_BLOCK__) и комментарии — НЕ трогаем.
+    ip_array_re = re.compile(r'("ip"\s*:\s*\[)([\s\S]*?)(\s*\])')
+    m = ip_array_re.search(tmpl_raw)
+    if not m:
+        return jsonify({"ok": False, "error": 'В template не найден IP-массив "ip": [...]. Возможно template был сильно изменён.'}), 500
+
+    current_ips = set(re.findall(r'"((?:\d{1,3}\.){3}\d{1,3})"', m.group(2)))
+    to_add = sorted(found_ips - current_ips)
+    to_remove = sorted(current_ips - found_ips)
+    final_ips = sorted(found_ips)
+
+    result = {
+        "ok": True,
+        "current_ips": sorted(current_ips),
+        "outbounds_ips": final_ips,
+        "to_add": to_add,
+        "to_remove": to_remove,
+        "final_ips": final_ips,
+        "no_changes": (not to_add and not to_remove),
+        "applied": False,
+        "template_path": tmpl_path,
+    }
+
+    if not apply or result["no_changes"]:
+        return jsonify(result)
+
+    # 3. Surgical replace + бэкап + write
+    new_ips_block = ",\n          ".join(f'"{ip}"' for ip in final_ips)
+    new_array_text = f'{m.group(1)}\n          {new_ips_block}\n        ]'
+    new_tmpl = tmpl_raw[:m.start()] + new_array_text + tmpl_raw[m.end():]
+
+    import time as _time
+    ts = _time.strftime('%Y%m%d-%H%M%S')
+    bak = f"{tmpl_path}.bak-{ts}"
+    bak_r = keenetic_ssh(f"cp {tmpl_path} {bak}", timeout=10)
+    if not bak_r.get("ok"):
+        return jsonify({"ok": False, "error": f"Не удалось создать бэкап: {bak_r.get('stderr')}"}), 500
+
+    write_r = keenetic_ssh(f"cat > {tmpl_path}", stdin_data=new_tmpl, timeout=15)
+    if not write_r.get("ok"):
+        return jsonify({"ok": False, "error": f"Не удалось записать template: {write_r.get('stderr')}"}), 500
+
+    result["applied"] = True
+    result["backup_path"] = bak
+
+    # Restart опционален. По умолчанию пропускаем — watchdog подхватит за ≤1 мин,
+    # это безопаснее: `xkeen -restart` может обнажить скрытые поломки роутера
+    # (см. [[xkeen-libnghttp2-pitfall]] — прецедент 2026-05-20).
+    do_restart = request.form.get("restart", "0") == "1"
+    if do_restart:
+        # Pre-check: curl + RCI должны работать. Иначе xkeen -restart упадёт с
+        # «политика XKeen не найдена» → fallback на 80/443 → конфликт с Keenetic UI → xray умрёт.
+        r_curl = keenetic_ssh("curl --version 2>&1 | head -1", timeout=8)
+        curl_out = (r_curl.get("stdout") or "") + (r_curl.get("stderr") or "")
+        if "shared libraries" in curl_out or "cannot open shared object" in curl_out:
+            result["restart_skipped"] = True
+            result["restart_skipped_reason"] = (
+                "Не запускаю xkeen -restart — curl сломан (отсутствует библиотека). "
+                "Template УЖЕ записан, watchdog подхватит за ≤1 мин. "
+                "Чтобы починить restart — открой «🚑 Восстановление и диагностика», запусти проверку и нажми «🔧 Переустановить libnghttp2»."
+            )
+            return jsonify(result)
+        restart_r = keenetic_ssh("xkeen -restart 2>&1 | tail -20", timeout=90)
+        ansi_re = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+        result["restart_ok"] = restart_r.get("ok", False)
+        result["restart_output"] = ansi_re.sub('', restart_r.get("stdout") or "")[:1500]
+    else:
+        result["restart_skipped"] = True
+        result["restart_skipped_reason"] = "Template записан. Watchdog подхватит за ≤1 мин (без рестарта xkeen). Чтобы применить немедленно — пометь чекбокс «С рестартом xkeen» и попробуй снова."
+    return jsonify(result)
+
+
+def _auto_sync_template_ips_silent():
+    """Тихая авто-синхронизация IP-листа в template direct-rule после mutations outbounds.
+
+    Без xkeen -restart — watchdog подхватит template за ≤1 мин на следующем тике.
+    Безопасно для каскадных операций: избегает обнажения скрытых поломок типа libnghttp2
+    (см. [[xkeen-libnghttp2-pitfall]] — `xkeen -restart` может убить xray если libnghttp2 missing).
+
+    Вызывается из endpoints мутирующих outbounds (add/remove/remove-bulk/subscription-sync).
+
+    Возвращает: {ok: bool, changed: bool, added: [ips], removed: [ips], error?: str, backup?: path}
+    """
+    try:
+        ob_raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json", timeout=10)
+        if not ob_raw:
+            return {"ok": False, "changed": False, "error": "не прочитал outbounds"}
+        ob_data = json.loads(_strip_json_comments(ob_raw))
+    except Exception as ex:
+        return {"ok": False, "changed": False, "error": f"parse outbounds: {ex}"}
+
+    ipv4_re = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+    found_ips = set()
+    for ob in ob_data.get("outbounds", []) or []:
+        settings = ob.get("settings") or {}
+        for v in settings.get("vnext") or []:
+            addr = (v or {}).get("address", "")
+            if ipv4_re.match(addr):
+                found_ips.add(addr)
+        for s in settings.get("servers") or []:
+            addr = (s or {}).get("address", "")
+            if ipv4_re.match(addr):
+                found_ips.add(addr)
+
+    tmpl_path = f"{cfg.KEENETIC_XRAY_BAK_DIR}/05_routing.template.json"
+    tmpl_raw = keenetic_read_file(tmpl_path, timeout=10)
+    if not tmpl_raw:
+        return {"ok": False, "changed": False, "error": "не прочитал template"}
+
+    ip_array_re = re.compile(r'("ip"\s*:\s*\[)([\s\S]*?)(\s*\])')
+    m = ip_array_re.search(tmpl_raw)
+    if not m:
+        return {"ok": False, "changed": False, "error": "IP-массив не найден в template"}
+
+    current_ips = set(re.findall(r'"((?:\d{1,3}\.){3}\d{1,3})"', m.group(2)))
+    to_add = sorted(found_ips - current_ips)
+    to_remove = sorted(current_ips - found_ips)
+
+    if not to_add and not to_remove:
+        return {"ok": True, "changed": False, "added": [], "removed": []}
+
+    final_ips = sorted(found_ips)
+    new_ips_block = ",\n          ".join(f'"{ip}"' for ip in final_ips)
+    new_array_text = f'{m.group(1)}\n          {new_ips_block}\n        ]'
+    new_tmpl = tmpl_raw[:m.start()] + new_array_text + tmpl_raw[m.end():]
+
+    import time as _time
+    ts = _time.strftime('%Y%m%d-%H%M%S')
+    bak = f"{tmpl_path}.bak-autosync-{ts}"
+    keenetic_ssh(f"cp {tmpl_path} {bak}", timeout=10)  # silent — best-effort
+    write_r = keenetic_ssh(f"cat > {tmpl_path}", stdin_data=new_tmpl, timeout=15)
+    if not write_r.get("ok"):
+        return {"ok": False, "changed": False, "error": f"write failed: {write_r.get('stderr', '')[:200]}"}
+
+    return {"ok": True, "changed": True, "added": to_add, "removed": to_remove, "backup": bak}
 
 
 @app.route("/api/xkeen/set-client-policy", methods=["POST"])
@@ -5284,6 +5504,45 @@ def api_xkeen_diagnose():
             ) if has_missing else None,
         )
 
+    # ---- curl + RCI работают (нужно xkeen-installer для проверки политики) ----
+    # Прецедент 2026-05-20: на роутере пропал libnghttp2.so.14 → curl сломан →
+    # xkeen -restart падал с «политика не найдена», xray не поднимался.
+    # Xray продолжает работать пока его не рестартят — это скрытый баг до первой попытки restart.
+    r_curl = keenetic_ssh("curl --version 2>&1 | head -3", timeout=10)
+    curl_out = (r_curl.get("stdout") or "") + (r_curl.get("stderr") or "")
+    curl_broken = "shared libraries" in curl_out or "cannot open shared object" in curl_out or not r_curl["ok"]
+    missing_lib = None
+    if curl_broken:
+        m = re.search(r"(lib[\w\-\.]+\.so\.\d+)", curl_out)
+        if m:
+            missing_lib = m.group(1)
+    if curl_broken:
+        _add(
+            "curl_rci_works", "curl + RCI Keenetic работают", False, "critical",
+            f"curl сломан или отсутствует библиотека.\nВывод:\n{curl_out[:600]}",
+            fix_id="install_libnghttp2",
+            fix_label=f"🔧 Переустановить {missing_lib or 'libnghttp2'}",
+            fix_explain=(
+                "xkeen-installer проверяет политику XKeen через RCI Keenetic "
+                "(curl localhost:79/rci/show/ip/policy). Без рабочего curl xkeen думает что "
+                "политики нет и пытается работать в fallback-режиме (все клиенты через 80/443), "
+                "что конфликтует с Keenetic UI на 443. xray НЕ ЗАПУСКАЕТСЯ при рестарте. "
+                "Fix: opkg update + opkg install libnghttp2 --force-reinstall."
+            ),
+        )
+    else:
+        # curl работает — проверим что RCI отвечает валидным JSON
+        r_rci = keenetic_ssh('curl -kfsS "localhost:79/rci/show/ip/policy" 2>&1 | head -c 200', timeout=8)
+        rci_out = r_rci.get("stdout") or ""
+        rci_ok = r_rci["ok"] and (rci_out.lstrip().startswith("{") or rci_out.lstrip().startswith("["))
+        _add(
+            "curl_rci_works", "curl + RCI Keenetic работают", rci_ok,
+            "warning" if not rci_ok else "info",
+            (curl_out.splitlines()[0] if curl_out else "(curl OK)") + "\nRCI: " +
+            (rci_out[:200] if rci_ok else f"⚠ не вернул JSON: {rci_out[:300]}"),
+            fix_id=None, fix_label=None, fix_explain=None,
+        )
+
     # Общий статус — ok если все critical-проверки прошли
     overall_ok = all(c["ok"] or c["severity"] != "critical" for c in checks)
     failed_critical = [c for c in checks if not c["ok"] and c["severity"] == "critical"]
@@ -5337,6 +5596,14 @@ XKEEN_AUTO_FIXES = {
             "Стандартный v2fly geoip.dat и XKeen-installer ставят только страны — этого недостаточно "
             "для геоблокировки конкретных сервисов. Текущий файл (если есть) будет сохранён как "
             "geoip.dat.bak-<timestamp>. После скачивания xkeen перезапустится автоматически."
+        ),
+    },
+    "install_libnghttp2": {
+        "label": "Переустановить libnghttp2 (фикс curl)",
+        "explain": (
+            "opkg update + opkg install libnghttp2 --force-reinstall. Чинит сломанный curl "
+            "из-за отсутствия libnghttp2.so.14. После фикса xkeen-installer снова сможет проверять "
+            "политику XKeen через RCI и xkeen -restart будет работать корректно."
         ),
     },
 }
@@ -5486,6 +5753,25 @@ def api_xkeen_auto_fix():
             else:
                 log_lines.append("❌ xray не запустился после установки. Проверь /opt/var/log/xray/error.log на роутере.")
                 ok = False
+
+    elif fix_id == "install_libnghttp2":
+        ansi_re = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+        # opkg update + force-reinstall libnghttp2 — может потребоваться ~30 сек на скачивание Packages.gz
+        r1 = keenetic_ssh("opkg update 2>&1 | tail -5", timeout=60)
+        log_lines.append(ansi_re.sub('', r1.get("stdout") or "") or "(opkg update тих)")
+        log_lines.append("---")
+        r2 = keenetic_ssh("opkg install libnghttp2 --force-reinstall 2>&1 | tail -10", timeout=60)
+        log_lines.append(ansi_re.sub('', r2.get("stdout") or "") or "(opkg install тих)")
+        log_lines.append("---")
+        # Проверка что curl снова работает
+        r3 = keenetic_ssh("curl --version 2>&1 | head -1", timeout=10)
+        curl_ok_now = r3["ok"] and "curl" in (r3.get("stdout") or "") and "shared libraries" not in (r3.get("stdout") or "") + (r3.get("stderr") or "")
+        log_lines.append(f"curl --version: {r3.get('stdout', '').strip()[:120] or r3.get('stderr', '')[:120]}")
+        if curl_ok_now:
+            log_lines.append("✅ curl восстановлен. xkeen-installer теперь сможет проверить политику через RCI.")
+        else:
+            log_lines.append("⚠ curl всё ещё не работает — возможно сломаны ещё библиотеки (libcurl, libssl). Попробуй вручную: opkg install curl --force-reinstall")
+        ok = curl_ok_now
 
     else:
         ok = False
@@ -6966,9 +7252,11 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         Это правила которые применяются <strong>ко всем клиентам в политике XKeen</strong> — независимо от того, что ты добавляешь в DIRECT/BLOCK секции. Например, <code>regexp:^*.ru$</code> отправляет ВСЕ .ru домены через провайдера (мимо VPN), даже если тебя нет в DIRECT-списке. Эти правила <strong>невозможно поменять через дашборд</strong> — они в template на роутере (<code>/opt/etc/xray/configs.bak/05_routing.template.json</code>), редактировать нужно через SSH.
       </p>
       <button class="btn btn-sm" style="background:#6c757d; color:#fff;" onclick="loadRoutingTemplateRules()">🔄 Загрузить правила</button>
+      <button class="btn btn-sm" style="background:#17a2b8; color:#fff; margin-left: 6px;" onclick="syncTemplateIps()" title="Синхронизирует IP-список в direct-правиле template с реальными IPv4 из outbounds. Защита от петель когда подписка обновилась.">🔁 Синхронизировать IP с подпиской</button>
       <div id="routing-template-rules-output" style="margin-top: 12px;">
         <p class="subtitle" style="color:#888;">Нажми «Загрузить правила» чтобы прочитать актуальный template с роутера.</p>
       </div>
+      <div id="sync-template-ips-output" style="margin-top: 12px;"></div>
     </div>
   </details>
 
@@ -11511,6 +11799,98 @@ function renderRoutingTemplateRules(j) {
   html += '</p>';
 
   out.innerHTML = html;
+}
+
+async function syncTemplateIps(applyForce) {
+  const out = document.getElementById('sync-template-ips-output');
+  if (!out) return;
+  out.innerHTML = '<p class="subtitle" style="color:#888;">⏳ Читаю outbounds и template с роутера…</p>';
+  try {
+    const fd = new FormData();
+    fd.append('apply', '0');
+    const r = await fetch('/api/xkeen/sync-template-ips', { method: 'POST', body: fd, credentials: 'same-origin' });
+    const j = await r.json();
+    if (!j.ok) {
+      out.innerHTML = '<div style="padding:10px 12px; background:#fee; border-left:3px solid #c33; color:#700;">❌ ' + escapeHtml(j.error || 'Ошибка') + '</div>';
+      return;
+    }
+    if (j.no_changes) {
+      out.innerHTML = '<div style="padding:10px 12px; background:#e8f5e9; border-left:3px solid #4caf50; color:#1b5e20;">✅ IP-список в template уже синхронизирован с outbounds (' + j.final_ips.length + ' IP). Делать нечего.</div>';
+      return;
+    }
+
+    // Превью diff'а с кнопкой Применить
+    let html = '<div style="padding:12px 14px; background:#fff8e1; border-left:3px solid #ffa000; border-radius:3px;">';
+    html += '<p style="margin:0 0 8px; font-weight:600;">📋 Превью изменений в template (<code>' + escapeHtml(j.template_path) + '</code>):</p>';
+    html += '<div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin:8px 0;">';
+
+    html += '<div><strong style="color:#2e7d32;">+ Добавить (' + j.to_add.length + '):</strong>';
+    if (j.to_add.length) {
+      html += '<ul style="margin:4px 0 0 16px; padding:0;">';
+      for (const ip of j.to_add) html += '<li style="font-family:monospace;">' + escapeHtml(ip) + '</li>';
+      html += '</ul>';
+    } else {
+      html += '<p style="color:#888; margin:4px 0;">— ничего</p>';
+    }
+    html += '</div>';
+
+    html += '<div><strong style="color:#c62828;">− Удалить (' + j.to_remove.length + '):</strong>';
+    if (j.to_remove.length) {
+      html += '<ul style="margin:4px 0 0 16px; padding:0;">';
+      for (const ip of j.to_remove) html += '<li style="font-family:monospace;">' + escapeHtml(ip) + '</li>';
+      html += '</ul>';
+    } else {
+      html += '<p style="color:#888; margin:4px 0;">— ничего</p>';
+    }
+    html += '</div>';
+    html += '</div>';
+
+    html += '<p style="margin:8px 0; font-size:0.85em; color:#666;">Итого после применения: <strong>' + j.final_ips.length + '</strong> IPv4 (все из outbounds). Бэкап template создаётся автоматически.</p>';
+    html += '<label style="display:block; margin:8px 0; font-size:0.88em;"><input type="checkbox" id="sync-with-restart" style="margin-right:6px;"> С рестартом xkeen (немедленно) — иначе watchdog подхватит за ≤1 мин (рекомендуется)</label>';
+    html += '<button class="btn btn-sm" style="background:#28a745; color:#fff;" onclick="applySyncTemplateIps()">✅ Применить</button>';
+    html += '<button class="btn btn-sm" style="background:#6c757d; color:#fff; margin-left:6px;" onclick="document.getElementById(\'sync-template-ips-output\').innerHTML=\'\'">Отмена</button>';
+    html += '</div>';
+    out.innerHTML = html;
+  } catch (e) {
+    out.innerHTML = '<div style="padding:10px 12px; background:#fee; border-left:3px solid #c33;">❌ Сеть/JS: ' + escapeHtml(String(e.message || e)) + '</div>';
+  }
+}
+
+async function applySyncTemplateIps() {
+  const out = document.getElementById('sync-template-ips-output');
+  if (!out) return;
+  const cb = document.getElementById('sync-with-restart');
+  const withRestart = cb && cb.checked;
+  const msg = withRestart ? '⏳ Записываю template + xkeen -restart (до 90 секунд)…' : '⏳ Записываю template (без рестарта — watchdog подхватит ≤1 мин)…';
+  out.innerHTML = '<p class="subtitle" style="color:#888;">' + msg + '</p>';
+  try {
+    const fd = new FormData();
+    fd.append('apply', '1');
+    if (withRestart) fd.append('restart', '1');
+    const r = await fetch('/api/xkeen/sync-template-ips', { method: 'POST', body: fd, credentials: 'same-origin' });
+    const j = await r.json();
+    if (!j.ok || !j.applied) {
+      out.innerHTML = '<div style="padding:10px 12px; background:#fee; border-left:3px solid #c33; color:#700;">❌ ' + escapeHtml(j.error || 'Не удалось применить') + '</div>';
+      return;
+    }
+    let html = '<div style="padding:12px 14px; background:#e8f5e9; border-left:3px solid #4caf50; border-radius:3px;">';
+    html += '<p style="margin:0 0 6px;"><strong>✅ Готово.</strong> Template обновлён, бэкап: <code style="font-size:0.85em;">' + escapeHtml(j.backup_path) + '</code></p>';
+    html += '<p style="margin:6px 0; font-size:0.9em;">Финальный IP-список: <strong>' + j.final_ips.length + '</strong> адресов.</p>';
+    if (j.restart_skipped) {
+      html += '<p style="margin:6px 0; font-size:0.86em; color:#555;">ℹ️ ' + escapeHtml(j.restart_skipped_reason || '') + '</p>';
+    } else if (j.restart_output) {
+      html += '<details style="margin-top:8px;"><summary style="cursor:pointer; font-size:0.88em; color:#444;">📜 Вывод xkeen -restart</summary>';
+      html += '<pre style="background:#1e1e1e; color:#ddd; padding:8px 10px; margin-top:6px; border-radius:3px; font-size:0.82em; overflow-x:auto; max-height:300px;">' + escapeHtml(j.restart_output) + '</pre>';
+      html += '</details>';
+    }
+    html += '</div>';
+    out.innerHTML = html;
+    // Перечитать правила чтобы увидеть обновлённый IP-список (если был рестарт — сразу,
+    // иначе подождать чуть дольше — watchdog должен пробежать)
+    setTimeout(() => loadRoutingTemplateRules(), withRestart ? 1500 : 5000);
+  } catch (e) {
+    out.innerHTML = '<div style="padding:10px 12px; background:#fee; border-left:3px solid #c33;">❌ Сеть/JS: ' + escapeHtml(String(e.message || e)) + '</div>';
+  }
 }
 
 async function installConntrackTools(btn) {
