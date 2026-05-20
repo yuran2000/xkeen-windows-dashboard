@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.5"
+_VERSION_FALLBACK = "1.0.6"
 
 
 def get_dashboard_version():
@@ -3269,17 +3269,24 @@ def api_xkeen_migration_backup():
     remote_tar = "/opt/entware_backup.tar.gz"
 
     # 1. Создать tar.gz на роутере.
-    # BusyBox-tar на некоторых сборках НЕ поддерживает НИ `--exclude=PATH`, НИ `-X excludefile`
-    # (печатает help вместо архивации). Прецеденты 2026-05-20 на работе и дома.
-    # Третий подход — НЕ использовать exclude вообще: перечисляем top-level entries в /opt
-    # явно через `ls -A | grep -v <self>` и передаём их аргументами tar. Это работает с любым tar.
+    # XKeen-документация рекомендует `tar cvzf ... --exclude=PATH -C /opt .` — но это работает
+    # только с GNU tar (Entware-пакет, /opt/bin/tar). На BusyBox-tar (системный /bin/tar) флаг
+    # `--exclude=` не поддерживается → tar печатает help. Прецедент 2026-05-20.
+    # Решение: пробуем /opt/bin/tar (Entware GNU) первым, фолбэк на BusyBox через `ls | grep -v`.
     tar_cmd = (
         f'rm -f {remote_tar} 2>/dev/null; '
-        f'cd /opt && tar czf {remote_tar} $(ls -A | grep -v "^entware_backup.tar.gz$") 2>&1 | tail -5; '
+        f'if [ -x /opt/bin/tar ]; then '
+        f'  echo "===TAR===Entware GNU"; '
+        f'  /opt/bin/tar cvzf {remote_tar} --exclude={remote_tar} -C /opt . 2>&1 | tail -5; '
+        f'else '
+        f'  echo "===TAR===BusyBox fallback"; '
+        f'  cd /opt && tar czf {remote_tar} $(ls -A | grep -v "^entware_backup.tar.gz$") 2>&1 | tail -5; '
+        f'fi; '
         f'echo "===SIZE==="; '
         f'wc -c < {remote_tar} 2>&1; '
-        f'echo "===TAR_VERSION==="; '
-        f'tar 2>&1 | head -2'
+        f'echo "===TAR_INFO==="; '
+        f'ls -la /opt/bin/tar 2>/dev/null; '
+        f'/opt/bin/tar --version 2>&1 | head -1 || tar 2>&1 | head -1'
     )
     r_tar = keenetic_ssh(tar_cmd, timeout=300)  # tar /opt = до 5 минут на медленных роутерах
     if not r_tar["ok"]:
