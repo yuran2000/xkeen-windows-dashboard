@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.6"
+_VERSION_FALLBACK = "1.0.7"
 
 
 def get_dashboard_version():
@@ -5555,6 +5555,25 @@ def api_xkeen_diagnose():
             fix_id=None, fix_label=None, fix_explain=None,
         )
 
+    # ---- Entware GNU tar для миграции ----
+    # XKeen-документация использует `tar cvzf ... --exclude=PATH -C /opt .` который работает
+    # только с GNU tar. На BusyBox-tar флаг --exclude= не поддержан → миграция через
+    # entware_backup.tar.gz падает с tar-help. Проверяем что /opt/bin/tar (Entware-пакет) есть.
+    r_etar = keenetic_ssh("[ -x /opt/bin/tar ] && /opt/bin/tar --version 2>&1 | head -1 || echo MISSING", timeout=5)
+    etar_out = (r_etar.get("stdout") or "").strip()
+    etar_ok = "tar" in etar_out and "MISSING" not in etar_out
+    _add(
+        "entware_tar", "Entware GNU tar установлен (для миграции)", etar_ok,
+        "warning" if not etar_ok else "info",
+        etar_out[:200] if etar_out else "(empty)",
+        fix_id="install_entware_tar" if not etar_ok else None,
+        fix_label="📥 Установить Entware GNU tar" if not etar_ok else None,
+        fix_explain=(
+            "Без /opt/bin/tar миграция через entware_backup.tar.gz работает на ограниченном "
+            "BusyBox-fallback. Auto-fix поставит полноценный GNU tar через opkg."
+        ) if not etar_ok else None,
+    )
+
     # Общий статус — ok если все critical-проверки прошли
     overall_ok = all(c["ok"] or c["severity"] != "critical" for c in checks)
     failed_critical = [c for c in checks if not c["ok"] and c["severity"] == "critical"]
@@ -5616,6 +5635,14 @@ XKEEN_AUTO_FIXES = {
             "opkg update + opkg install libnghttp2 --force-reinstall. Чинит сломанный curl "
             "из-за отсутствия libnghttp2.so.14. После фикса xkeen-installer снова сможет проверять "
             "политику XKeen через RCI и xkeen -restart будет работать корректно."
+        ),
+    },
+    "install_entware_tar": {
+        "label": "Установить Entware GNU tar (для миграции)",
+        "explain": (
+            "opkg install tar. Системный BusyBox-tar не поддерживает --exclude= и плохо ест списки "
+            "файлов через $(). Entware-пакет ставит полноценный GNU tar в /opt/bin/tar — он совместим "
+            "с XKeen-документацией для миграции через entware_backup.tar.gz."
         ),
     },
 }
@@ -5784,6 +5811,23 @@ def api_xkeen_auto_fix():
         else:
             log_lines.append("⚠ curl всё ещё не работает — возможно сломаны ещё библиотеки (libcurl, libssl). Попробуй вручную: opkg install curl --force-reinstall")
         ok = curl_ok_now
+
+    elif fix_id == "install_entware_tar":
+        ansi_re = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+        r1 = keenetic_ssh("opkg update 2>&1 | tail -3", timeout=60)
+        log_lines.append(ansi_re.sub('', r1.get("stdout") or "") or "(opkg update тих)")
+        log_lines.append("---")
+        r2 = keenetic_ssh("opkg install tar 2>&1 | tail -5", timeout=60)
+        log_lines.append(ansi_re.sub('', r2.get("stdout") or "") or "(opkg install тих)")
+        log_lines.append("---")
+        r3 = keenetic_ssh("/opt/bin/tar --version 2>&1 | head -1", timeout=5)
+        tar_ok = r3["ok"] and "tar" in (r3.get("stdout") or "")
+        log_lines.append(f"/opt/bin/tar --version: {r3.get('stdout', '').strip()[:120] or r3.get('stderr', '')[:120]}")
+        if tar_ok:
+            log_lines.append("✅ Entware GNU tar установлен. Кнопка миграции теперь будет использовать его.")
+        else:
+            log_lines.append("⚠ /opt/bin/tar не появился. Проверь вывод opkg выше — возможно нет интернета на роутере.")
+        ok = tar_ok
 
     else:
         ok = False
