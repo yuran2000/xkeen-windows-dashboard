@@ -3269,10 +3269,15 @@ def api_xkeen_migration_backup():
     remote_tar = "/opt/entware_backup.tar.gz"
 
     # 1. Создать tar.gz на роутере
-    # Используем czf (compressed) — для GeoIP-баз сжатие минимальное, но для скриптов/конфигов ощутимое
+    # Используем czf (compressed) — для GeoIP-баз сжатие минимальное, но для скриптов/конфигов ощутимое.
+    # NB: BusyBox-tar на части роутеров НЕ поддерживает `--exclude=PATH` (печатает help и не создаёт архив).
+    # Используем универсальный `-X excludefile` (один путь относительно -C dir).
+    # Прецедент 2026-05-20 на работе — `--exclude` валил всю миграцию.
     tar_cmd = (
         f'rm -f {remote_tar} 2>/dev/null; '
-        f'tar czf {remote_tar} --exclude={remote_tar} -C /opt . 2>&1 | tail -3; '
+        f'echo "entware_backup.tar.gz" > /tmp/_eb_exc; '
+        f'tar czf {remote_tar} -X /tmp/_eb_exc -C /opt . 2>&1 | tail -3; '
+        f'rm -f /tmp/_eb_exc; '
         f'echo "===SIZE==="; '
         f'wc -c < {remote_tar} 2>&1'
     )
