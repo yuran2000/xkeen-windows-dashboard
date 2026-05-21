@@ -56,14 +56,36 @@ if getattr(sys, "frozen", False):
     _ext_py = os.path.join(_ext_dir, "config_local.py")
     _ext_ini = os.path.join(_ext_dir, "config.ini")
 
-    # Авто-создание config.ini из template (только если template вшит и ini ещё нет)
+    # Авто-создание config.ini из template. Если config_local.py есть рядом с exe —
+    # заполняем ini его реальными значениями (port/ssh/auth) вместо placeholders.
     if not os.path.isfile(_ext_ini):
         _template_path = os.path.join(_resource_dir(), "config.ini.template")
         if os.path.isfile(_template_path):
             try:
-                import shutil as _shutil_mod
-                _shutil_mod.copy2(_template_path, _ext_ini)
-                sys.stderr.write("\n⚙ Создан " + _ext_ini + " — отредактируй и перезапусти.\n\n")
+                with open(_template_path, "r", encoding="utf-8-sig") as _ft:
+                    _tmpl_text = _ft.read()
+                # Если рядом есть config_local.py — снимаем с него snapshot ini-полей
+                if os.path.isfile(_ext_py):
+                    import runpy as _runpy_snap
+                    try:
+                        _local_ns = _runpy_snap.run_path(_ext_py)
+                    except Exception:
+                        _local_ns = {}
+                    _replacements = [
+                        ("port = 5000",                       "port = " + str(_local_ns.get("DASHBOARD_PORT", 5000))),
+                        ("host = 192.168.1.1",                "host = " + str(_local_ns.get("KEENETIC_HOST", "192.168.1.1"))),
+                        ("port = 222",                        "port = " + str(_local_ns.get("KEENETIC_PORT", 222))),
+                        ("user = root",                       "user = " + str(_local_ns.get("KEENETIC_USER", "root"))),
+                        ("key = id_keenetic",                 "key = " + os.path.basename(str(_local_ns.get("KEENETIC_SSH_KEY", "id_keenetic")))),
+                        ("CHANGE_ME_TO_RANDOM_PASSWORD",      str(_local_ns.get("PASSWORD", "CHANGE_ME_TO_RANDOM_PASSWORD"))),
+                        ("CHANGE_ME_TO_RANDOM_32CHAR_STRING", str(_local_ns.get("SECRET_KEY", "CHANGE_ME_TO_RANDOM_32CHAR_STRING"))),
+                        ("CHANGE_ME_TO_RANDOM_TOKEN",         str(_local_ns.get("SUBSCRIPTION_TOKEN", "CHANGE_ME_TO_RANDOM_TOKEN"))),
+                    ]
+                    for _old, _new in _replacements:
+                        _tmpl_text = _tmpl_text.replace(_old, _new)
+                with open(_ext_ini, "w", encoding="utf-8") as _fo:
+                    _fo.write(_tmpl_text)
+                sys.stderr.write("\n⚙ Создан " + _ext_ini + ("" if not os.path.isfile(_ext_py) else " (заполнен из config_local.py)") + "\n\n")
             except Exception as _ex:
                 sys.stderr.write("WARNING: не удалось создать config.ini: " + str(_ex) + "\n")
 
@@ -88,6 +110,22 @@ except ImportError:
         "  - В dev-режиме скопируй config_local.example.py -> config_local.py и заполни.\n\n"
     )
     sys.exit(1)
+
+# Portable: автокопия SSH-ключа в папку рядом с exe (ДО ini overlay, чтобы захватить
+# оригинальный absolute path из config_local.py — после overlay он переписывается на
+# _ext_dir/<basename>).
+if _ext_dir and getattr(cfg, "KEENETIC_SSH_KEY", None):
+    _orig_key = cfg.KEENETIC_SSH_KEY
+    if os.path.isabs(_orig_key) and os.path.isfile(_orig_key):
+        _local_key = os.path.join(_ext_dir, os.path.basename(_orig_key))
+        if os.path.abspath(_orig_key) != os.path.abspath(_local_key) and not os.path.isfile(_local_key):
+            try:
+                import shutil as _shutil_key
+                _shutil_key.copy2(_orig_key, _local_key)
+                sys.stderr.write("\n⚙ SSH-ключ скопирован в " + _local_key + " (для портабл-переноса)\n")
+                cfg.KEENETIC_SSH_KEY = _local_key
+            except Exception as _ex:
+                sys.stderr.write("WARNING: не удалось скопировать SSH-ключ: " + str(_ex) + "\n")
 
 # Frozen + config.ini → overlay простых полей поверх любого config_local.
 # Это позволяет менять port/ssh/auth через ini без правки .py файла.
@@ -117,6 +155,7 @@ if _ext_ini and os.path.isfile(_ext_ini):
             cfg.SECRET_KEY = _cp.get("auth", "secret_key")
         if _cp.has_option("auth", "subscription_token"):
             cfg.SUBSCRIPTION_TOKEN = _cp.get("auth", "subscription_token")
+
 import threading as _threading
 
 # ============== ВЕРСИЯ ПАНЕЛИ ==============
@@ -124,7 +163,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.16"
+_VERSION_FALLBACK = "1.0.17"
 
 
 def get_dashboard_version():
