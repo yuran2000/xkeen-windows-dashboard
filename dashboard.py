@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.10"
+_VERSION_FALLBACK = "1.0.11"
 
 
 def get_dashboard_version():
@@ -7099,7 +7099,22 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('mistral')">⚫ Mistral</button>
             <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('grok')">⬛ Grok</button>
             <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('deepseek')">🔷 DeepSeek</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('cohere')">🟧 Cohere</button>
             <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('huggingface')">🤗 HuggingFace</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('cursor')">🖱 Cursor</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('windsurf')">🏄 Windsurf</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('v0')">🅥 v0</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('bolt')">⚡ Bolt</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('lovable')">💖 Lovable</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('replicate')">🔁 Replicate</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('together')">🤝 Together</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('midjourney')">🎨 Midjourney</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('runway')">🎬 Runway</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('suno')">🎵 Suno</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('elevenlabs')">🎤 ElevenLabs</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('ideogram')">💡 Ideogram</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('leonardo')">🦁 Leonardo</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('krea')">✨ Krea</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background:#4a4; color:#fff;" onclick="addAllAIPresets()">📥 Добавить ВСЕ AI</button>
             <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearAIDomains()">🗑 Очистить</button>
             <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="resetAIDefaults()">↩ Сброс к дефолту (Claude + ChatGPT)</button>
@@ -11554,21 +11569,37 @@ async function saveFailoverChain() {
 //    полный справочник по 4 типам пресетов (AI/YT/DIRECT/BLOCK),
 //    их актуальный состав, процедура обновления и триггер-фразы юзера.
 const AI_PRESETS = {
+  // === Чат-ассистенты ===
   claude:      ['claude.ai', 'anthropic.com', 'claudeusercontent.com', 'statsig.com', 'featureassets.org', 'featuregates.org'],
-  openai:      ['openai.com', 'chatgpt.com', 'oaiusercontent.com', 'oaistatic.com'],
-  gemini:      ['gemini.google.com', 'generativelanguage.googleapis.com', 'ai.google.dev', 'aistudio.google.com'],
-  copilot:     ['copilot.microsoft.com', 'copilot.cloud.microsoft', 'designer.microsoft.com'],
-  perplexity:  ['perplexity.ai', 'pplx.ai'],
-  mistral:     ['mistral.ai', 'chat.mistral.ai'],
-  grok:        ['grok.com', 'x.ai', 'grok.x.ai'],
-  deepseek:    ['deepseek.com', 'chat.deepseek.com'],
+  openai:      ['openai.com', 'chatgpt.com', 'oaiusercontent.com', 'oaistatic.com', 'sora.com'],
+  gemini:      ['gemini.google.com', 'generativelanguage.googleapis.com', 'ai.google.dev', 'aistudio.google.com', 'bard.google.com', 'notebooklm.google.com', 'labs.google', 'deepmind.google'],
+  copilot:     ['copilot.microsoft.com', 'copilot.cloud.microsoft', 'designer.microsoft.com', 'copilot.github.com'],
+  perplexity:  ['perplexity.ai', 'pplx.ai', 'perplexity.com'],
+  mistral:     ['mistral.ai'],
+  grok:        ['grok.com', 'x.ai'],
+  deepseek:    ['deepseek.com'],
+  cohere:      ['cohere.com', 'cohere.ai'],
   huggingface: ['huggingface.co', 'hf.co'],
+  // === AI-IDE / Code-генерация ===
+  cursor:      ['cursor.com', 'cursor.sh'],
+  windsurf:    ['windsurf.com', 'codeium.com'],
+  v0:          ['v0.dev', 'v0.app'],
+  bolt:        ['bolt.new', 'stackblitz.com'],
+  lovable:     ['lovable.dev', 'lovable.app'],
+  // === API / inference платформы ===
+  replicate:   ['replicate.com', 'replicate.delivery'],
+  together:    ['together.ai', 'together.xyz'],
+  // === Генерация изображений / видео / музыки ===
+  midjourney:  ['midjourney.com'],
+  runway:      ['runwayml.com'],
+  suno:        ['suno.com', 'suno.ai'],
+  elevenlabs:  ['elevenlabs.io'],
+  ideogram:    ['ideogram.ai'],
+  leonardo:    ['leonardo.ai'],
+  krea:        ['krea.ai'],
 };
-AI_PRESETS.all_ai = [].concat(
-  AI_PRESETS.claude, AI_PRESETS.openai, AI_PRESETS.gemini, AI_PRESETS.copilot,
-  AI_PRESETS.perplexity, AI_PRESETS.mistral, AI_PRESETS.grok, AI_PRESETS.deepseek,
-  AI_PRESETS.huggingface
-);
+// all_ai — агрегат для autoMatchPresets / служебных целей. Собирается из всех ключей кроме самого all_*.
+AI_PRESETS.all_ai = [].concat(...Object.entries(AI_PRESETS).filter(([k]) => !k.startsWith('all_')).map(([,v]) => v));
 
 function getAIDomainsArray() {
   // v1.7.0: парсим через readSection — игнорирует inline-комментарии "# note"
