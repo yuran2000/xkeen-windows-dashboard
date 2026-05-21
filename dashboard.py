@@ -41,17 +41,34 @@ def _resource_dir():
         return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
     return os.path.dirname(os.path.abspath(__file__))
 
-# Frozen режим: добавляем папку рядом с exe в sys.path, чтобы внешний config_local.py
-# (положенный юзером рядом с exe) перебивал PyInstaller-замороженный stub.
-# Если юзер вместо config_local.py положил только config.ini — собираем sham-модуль из ini.
+# Frozen режим (portable exe):
+#   1. Добавляем папку рядом с exe в sys.path → внешний config_local.py перебивает stub.
+#   2. Авто-создание config.ini из template при первом запуске.
+#   3. Если config_local.py нет рядом с exe → собираем sham-модуль из вшитого example.
+#   4. config.ini ВСЕГДА overlay поверх config_local (даёт быструю настройку port/ssh/auth
+#      без правки .py файла).
+_ext_dir = None
+_ext_ini = None
 if getattr(sys, "frozen", False):
     _ext_dir = _app_base_dir()
     if _ext_dir not in sys.path:
         sys.path.insert(0, _ext_dir)
     _ext_py = os.path.join(_ext_dir, "config_local.py")
     _ext_ini = os.path.join(_ext_dir, "config.ini")
+
+    # Авто-создание config.ini из template (только если template вшит и ini ещё нет)
+    if not os.path.isfile(_ext_ini):
+        _template_path = os.path.join(_resource_dir(), "config.ini.template")
+        if os.path.isfile(_template_path):
+            try:
+                import shutil as _shutil_mod
+                _shutil_mod.copy2(_template_path, _ext_ini)
+                sys.stderr.write("\n⚙ Создан " + _ext_ini + " — отредактируй и перезапусти.\n\n")
+            except Exception as _ex:
+                sys.stderr.write("WARNING: не удалось создать config.ini: " + str(_ex) + "\n")
+
+    # Если config_local.py нет рядом с exe — собираем sham из вшитого example
     if not os.path.isfile(_ext_py):
-        # Загружаем defaults из вшитого config_local.example.py (PyInstaller --add-data)
         import runpy as _runpy
         import types as _types_mod
         _example_path = os.path.join(_resource_dir(), "config_local.example.py")
@@ -60,24 +77,6 @@ if getattr(sys, "frozen", False):
         for _k, _v in _ns.items():
             if not _k.startswith("__"):
                 setattr(_sham, _k, _v)
-        # Overlay overrides из config.ini (если есть)
-        if os.path.isfile(_ext_ini):
-            import configparser as _cp_mod
-            _cp = _cp_mod.ConfigParser()
-            _cp.read(_ext_ini, encoding="utf-8-sig")  # utf-8-sig игнорит BOM
-            if _cp.has_section("server"):
-                _sham.DASHBOARD_PORT = _cp.getint("server", "port", fallback=getattr(_sham, "DASHBOARD_PORT", 5000))
-            if _cp.has_section("ssh"):
-                _sham.KEENETIC_HOST = _cp.get("ssh", "host", fallback=getattr(_sham, "KEENETIC_HOST", "192.168.1.1"))
-                _sham.KEENETIC_PORT = _cp.getint("ssh", "port", fallback=getattr(_sham, "KEENETIC_PORT", 22))
-                _sham.KEENETIC_USER = _cp.get("ssh", "user", fallback=getattr(_sham, "KEENETIC_USER", "root"))
-                _key_name = _cp.get("ssh", "key", fallback="id_keenetic")
-                _sham.KEENETIC_SSH_KEY = _key_name if os.path.isabs(_key_name) else os.path.join(_ext_dir, _key_name)
-            if _cp.has_section("auth"):
-                _sham.USERNAME = _cp.get("auth", "username", fallback=getattr(_sham, "USERNAME", "admin"))
-                _sham.PASSWORD = _cp.get("auth", "password", fallback=getattr(_sham, "PASSWORD", "changeme"))
-                _sham.SECRET_KEY = _cp.get("auth", "secret_key", fallback=getattr(_sham, "SECRET_KEY", "please-change-this-secret-key"))
-                _sham.SUBSCRIPTION_TOKEN = _cp.get("auth", "subscription_token", fallback=getattr(_sham, "SUBSCRIPTION_TOKEN", "please-change-this-token"))
         sys.modules["config_local"] = _sham
 
 try:
@@ -85,10 +84,39 @@ try:
 except ImportError:
     sys.stderr.write(
         "\nERROR: config_local.py не найден.\n"
-        "  - В portable-режиме создай рядом с exe файл config.ini (см. config.ini.template).\n"
-        "  - В dev-режиме скопируй config_local.py.example -> config_local.py и заполни.\n\n"
+        "  - В portable-режиме положи config.ini рядом с exe (template создаётся автоматически).\n"
+        "  - В dev-режиме скопируй config_local.example.py -> config_local.py и заполни.\n\n"
     )
     sys.exit(1)
+
+# Frozen + config.ini → overlay простых полей поверх любого config_local.
+# Это позволяет менять port/ssh/auth через ini без правки .py файла.
+if _ext_ini and os.path.isfile(_ext_ini):
+    import configparser as _cp_mod
+    _cp = _cp_mod.ConfigParser()
+    _cp.read(_ext_ini, encoding="utf-8-sig")  # utf-8-sig игнорит BOM от PowerShell Set-Content
+    if _cp.has_section("server"):
+        if _cp.has_option("server", "port"):
+            cfg.DASHBOARD_PORT = _cp.getint("server", "port")
+    if _cp.has_section("ssh"):
+        if _cp.has_option("ssh", "host"):
+            cfg.KEENETIC_HOST = _cp.get("ssh", "host")
+        if _cp.has_option("ssh", "port"):
+            cfg.KEENETIC_PORT = _cp.getint("ssh", "port")
+        if _cp.has_option("ssh", "user"):
+            cfg.KEENETIC_USER = _cp.get("ssh", "user")
+        if _cp.has_option("ssh", "key"):
+            _kn = _cp.get("ssh", "key")
+            cfg.KEENETIC_SSH_KEY = _kn if os.path.isabs(_kn) else os.path.join(_ext_dir, _kn)
+    if _cp.has_section("auth"):
+        if _cp.has_option("auth", "username"):
+            cfg.USERNAME = _cp.get("auth", "username")
+        if _cp.has_option("auth", "password"):
+            cfg.PASSWORD = _cp.get("auth", "password")
+        if _cp.has_option("auth", "secret_key"):
+            cfg.SECRET_KEY = _cp.get("auth", "secret_key")
+        if _cp.has_option("auth", "subscription_token"):
+            cfg.SUBSCRIPTION_TOKEN = _cp.get("auth", "subscription_token")
 import threading as _threading
 
 # ============== ВЕРСИЯ ПАНЕЛИ ==============
@@ -96,7 +124,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.15"
+_VERSION_FALLBACK = "1.0.16"
 
 
 def get_dashboard_version():
