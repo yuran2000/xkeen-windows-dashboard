@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.13"
+_VERSION_FALLBACK = "1.0.14"
 
 
 def get_dashboard_version():
@@ -7115,9 +7115,11 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('ideogram')">💡 Ideogram</button>
             <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('leonardo')">🦁 Leonardo</button>
             <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addPreset('krea')">✨ Krea</button>
-            <button type="button" class="btn btn-sm" style="margin: 2px; background:#4a4; color:#fff;" onclick="addAllAIPresets()">📥 Добавить ВСЕ AI</button>
-            <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearAIDomains()">🗑 Очистить</button>
-            <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="resetAIDefaults()">↩ Сброс к дефолту (Claude + ChatGPT)</button>
+            <div style="margin-top: 8px; padding-top: 6px; border-top: 1px solid #ddd;">
+              <button type="button" class="btn btn-sm" style="margin: 2px; background:#4a4; color:#fff;" onclick="addAllAIPresets()">📥 Добавить ВСЕ AI</button>
+              <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearAIDomains()">🗑 Очистить</button>
+              <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="resetAIDefaults()">↩ Сброс к дефолту (Claude + ChatGPT)</button>
+            </div>
           </div>
           <textarea id="ai-domains" style="width: 100%; min-height: 100px; font-family: Consolas, monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">{% for d in targets.ai_domains %}{{ d }}
 {% endfor %}</textarea>
@@ -7217,9 +7219,11 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('telegram')">💌 Telegram</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('whatsapp')" title="WhatsApp домены (web + клиент + Meta MQTT backend + wa.me ссылки). Заблокирован DPI в РФ с 2025-08 — нужен VPN. ВАЖНО: для первичного связывания нового устройства (QR-код) пресета может быть мало — клиент при первой авторизации ходит на доп. Edge-серверы по IP. Решение: временно поставь PRIMARY = VPN (вместо direct) → сделай linking → верни PRIMARY обратно. После связывания обычная работа покрывается этим пресетом.">💚 WhatsApp</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('spotify')">🎧 Spotify</button>
-            <button type="button" class="btn btn-sm" style="margin: 2px; background:#4a4; color:#fff;" onclick="addAllYTPresets()">📥 Добавить ВСЕ YT/IG/Discord</button>
-            <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearYTDomains()">🗑 Очистить</button>
-            <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="resetYTDefaults()">↩ Сброс к дефолту (YouTube)</button>
+            <div style="margin-top: 8px; padding-top: 6px; border-top: 1px solid #ddd;">
+              <button type="button" class="btn btn-sm" style="margin: 2px; background:#4a4; color:#fff;" onclick="addAllYTPresets()">📥 Добавить ВСЕ YT/IG/Discord</button>
+              <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearYTDomains()">🗑 Очистить</button>
+              <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="resetYTDefaults()">↩ Сброс к дефолту (YouTube)</button>
+            </div>
           </div>
           <textarea id="yt-domains" style="width: 100%; min-height: 100px; font-family: Consolas, monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">{% for d in targets.yt_domains %}{{ d }}
 {% endfor %}</textarea>
@@ -7307,9 +7311,11 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('banks')">💰 Банки (Сбер/ВТБ/Альфа/Тинькофф)</button>
         <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('marketplaces')">🛒 Маркетплейсы (Ozon/WB)</button>
         <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('yandex')">🟡 Yandex (все сервисы)</button>
-        <button type="button" class="btn btn-sm" style="margin: 3px; background:#4a4; color:#fff;" onclick="addAllDirectPresets()">📥 Добавить ВСЕ DIRECT</button>
-        <button type="button" class="btn btn-sm btn-secondary" style="margin: 3px;" onclick="clearDirectDomains()">🗑 Очистить</button>
-        <button type="button" class="btn btn-sm btn-secondary" style="margin: 3px;" onclick="resetDirectDefaults()">↩ Сброс к дефолту (VK + Mail.ru + Okko)</button>
+        <div style="margin-top: 8px; padding-top: 6px; border-top: 1px solid #ddd;">
+          <button type="button" class="btn btn-sm" style="margin: 3px; background:#4a4; color:#fff;" onclick="addAllDirectPresets()">📥 Добавить ВСЕ DIRECT</button>
+          <button type="button" class="btn btn-sm btn-secondary" style="margin: 3px;" onclick="clearDirectDomains()">🗑 Очистить</button>
+          <button type="button" class="btn btn-sm btn-secondary" style="margin: 3px;" onclick="resetDirectDefaults()">↩ Сброс к дефолту (VK + Mail.ru + Okko)</button>
+        </div>
       </div>
       <textarea id="direct-domains" style="width: 100%; min-height: 100px; font-family: Consolas, monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">{% for d in targets.direct_domains %}{{ d }}
 {% endfor %}</textarea>
@@ -7338,8 +7344,10 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         <button type="button" class="btn btn-sm" style="margin: 3px; background:#555; color:#fff;" onclick="addBlockPreset('windows-telemetry')">📊 Windows Telemetry (отключить слежку)</button>
         <button type="button" class="btn btn-sm" style="margin: 3px; background:#555; color:#fff;" onclick="addBlockPreset('adobe')">🎨 Adobe Genuine (для крякнутого Photoshop)</button>
         <button type="button" class="btn btn-sm" style="margin: 3px; background:#555; color:#fff;" onclick="addBlockPreset('office-telemetry')">📎 Office Telemetry</button>
-        <button type="button" class="btn btn-sm" style="margin: 3px; background:#4a4; color:#fff;" onclick="addAllBlockPresets()">📥 Добавить ВСЕ BLOCK</button>
-        <button type="button" class="btn btn-sm btn-secondary" style="margin: 3px;" onclick="clearBlockDomains()">🗑 Очистить</button>
+        <div style="margin-top: 8px; padding-top: 6px; border-top: 1px solid #ddd;">
+          <button type="button" class="btn btn-sm" style="margin: 3px; background:#4a4; color:#fff;" onclick="addAllBlockPresets()">📥 Добавить ВСЕ BLOCK</button>
+          <button type="button" class="btn btn-sm btn-secondary" style="margin: 3px;" onclick="clearBlockDomains()">🗑 Очистить</button>
+        </div>
       </div>
       <textarea id="block-domains" style="width: 100%; min-height: 100px; font-family: Consolas, monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">{% for d in targets.block_domains %}{{ d }}
 {% endfor %}</textarea>
