@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.9"
+_VERSION_FALLBACK = "1.0.10"
 
 
 def get_dashboard_version():
@@ -11590,25 +11590,36 @@ function addPreset(name) {
 }
 function removePreset(name) { removePresetGeneric('ai', name); }
 // Универсальная функция «Добавить ВСЕ пресеты» — обходит все ключи в presetDict и добавляет
-// каждый уникальный домен в textarea. Не дублирует то что уже есть. Используется в AI/YT/DIRECT/BLOCK.
-function addAllPresets(presetDict, getter, setter, labelForFlash) {
-  if (!confirm(`Добавить ВСЕ пресеты "${labelForFlash}"?\n\nЭто добавит все домены из всех известных пресетов (только уникальные — то что уже есть не задублируется).`)) return;
-  const current = new Set(getter());
-  let added = 0;
+// каждый уникальный домен в textarea с note "📦 <preset>". Пропускает агрегаты all_* (они
+// дублируют индивидуальные пресеты). Используется в AI/YT/DIRECT/BLOCK.
+function addAllPresets(sectionKey, presetDict, labelForFlash) {
+  if (!confirm(`Добавить ВСЕ пресеты "${labelForFlash}"?\n\nЭто добавит все домены из всех известных пресетов с пометкой "📦 <preset>" (уникальные — то что уже есть не задублируется).`)) return;
+  const sec = readSection(sectionKey);
+  const existing = new Set(sec.domains);
+  let totalAdded = 0;
   let totalInPresets = 0;
-  Object.values(presetDict).forEach(preset => {
+  Object.entries(presetDict).forEach(([key, preset]) => {
+    if (key.startsWith('all_')) return;  // пропускаем агрегаты all_ai/all_yt/...
     preset.forEach(d => {
       totalInPresets++;
-      if (!current.has(d)) { current.add(d); added++; }
+      if (!existing.has(d)) {
+        sec.items.push({ domain: d, note: '📦 ' + key });
+        existing.add(d);
+        totalAdded++;
+      } else {
+        // Домен уже есть — если note пустая, проставим (полезно при первом нажатии после upgrade)
+        const found = sec.items.find(it => it.domain === d);
+        if (found && !found.note) found.note = '📦 ' + key;
+      }
     });
   });
-  setter(Array.from(current).sort());
-  flash(true, `Добавлено ${added} новых из ${totalInPresets} в пресетах (${labelForFlash}). Не забудь нажать «Сохранить».`, null, {noScroll: true});
+  writeSection(sectionKey, sec.items);
+  flash(true, `Добавлено ${totalAdded} новых из ${totalInPresets} (${labelForFlash}). Не забудь нажать «Сохранить».`, null, {noScroll: true});
 }
-function addAllAIPresets()     { addAllPresets(AI_PRESETS,     getAIDomainsArray,     setAIDomainsArray,     'все AI'); }
-function addAllYTPresets()     { addAllPresets(YT_PRESETS,     getYTDomainsArray,     setYTDomainsArray,     'все YT/IG/Discord'); }
-function addAllDirectPresets() { addAllPresets(DIRECT_PRESETS, getDirectDomainsArray, setDirectDomainsArray, 'все DIRECT'); }
-function addAllBlockPresets()  { addAllPresets(BLOCK_PRESETS,  getBlockDomainsArray,  setBlockDomainsArray,  'все BLOCK'); }
+function addAllAIPresets()     { addAllPresets('ai',     AI_PRESETS,     'все AI'); }
+function addAllYTPresets()     { addAllPresets('yt',     YT_PRESETS,     'все YT/IG/Discord'); }
+function addAllDirectPresets() { addAllPresets('direct', DIRECT_PRESETS, 'все DIRECT'); }
+function addAllBlockPresets()  { addAllPresets('block',  BLOCK_PRESETS,  'все BLOCK'); }
 function clearAIDomains() {
   if (!confirm('Очистить весь список AI-доменов?\n\nПосле сохранения AI-sticky правило исчезнет, claude/openai пойдут через PRIMARY.')) return;
   setAIDomainsArray([]);
