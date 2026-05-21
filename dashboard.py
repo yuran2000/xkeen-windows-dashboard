@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.12"
+_VERSION_FALLBACK = "1.0.13"
 
 
 def get_dashboard_version():
@@ -10097,10 +10097,13 @@ function injectSectionControls(sectionKey) {
     ta.dataset.autoFormatBound = '1';
   }
 
-  // === 2. Кнопки 🧹 рядом с каждой кнопкой-пресетом этой секции
+  // === 2. Кнопки 🧹 рядом с каждой кнопкой-пресетом этой секции.
+  // Обёртываем пару [btn, cleanBtn] в <span> с white-space:nowrap чтобы при переносе
+  // строки (flex-wrap родителя) пара не разрывалась — иначе 🧹 уезжает в новую строку
+  // отдельно от своей кнопки-пресета.
   const addFnName = _SECTION_FN_MAP[sectionKey].add;
   const removeFnName = _SECTION_FN_MAP[sectionKey].remove;
-  // Ищем все кнопки с onclick содержащим имя add-функции
+  const pairClass = 'preset-pair-' + sectionKey;
   const allBtns = document.querySelectorAll('button[onclick]');
   allBtns.forEach(btn => {
     const oc = btn.getAttribute('onclick') || '';
@@ -10111,16 +10114,26 @@ function injectSectionControls(sectionKey) {
     const presetName = m[1];
     // Не добавлять для all_ai / all_yt / addAllXPresets (групповых)
     if (presetName === 'all_ai' || presetName === 'all_yt' || presetName === 'all_direct' || presetName === 'all_block') return;
-    // Проверим что соседняя кнопка ✕ ещё не добавлена (idempotent)
-    if (btn.nextElementSibling && btn.nextElementSibling.classList.contains('remove-preset-btn-' + sectionKey)) return;
+    // Idempotent: если btn уже в нашем wrapper'е — skip
+    if (btn.parentNode && btn.parentNode.classList && btn.parentNode.classList.contains(pairClass)) return;
+    // Подчистить старую sibling-кнопку 🧹 (legacy с pre-v1.0.13 вёрстки, когда wrapper'а не было)
+    if (btn.nextElementSibling && btn.nextElementSibling.classList.contains('remove-preset-btn-' + sectionKey)) {
+      btn.nextElementSibling.remove();
+    }
     const cleanBtn = document.createElement('button');
     cleanBtn.type = 'button';
     cleanBtn.className = 'btn btn-sm remove-preset-btn-' + sectionKey;
-    cleanBtn.style.cssText = 'margin: 2px 6px 2px -4px; padding: 2px 5px; font-size: 0.75em; background: #eee; color: #c33; border: 1px solid #ddd; cursor: pointer; border-radius: 3px;';
+    cleanBtn.style.cssText = 'margin: 2px 2px 2px -4px; padding: 2px 5px; font-size: 0.75em; background: #eee; color: #c33; border: 1px solid #ddd; cursor: pointer; border-radius: 3px;';
     cleanBtn.title = 'Удалить все домены пресета "' + presetName + '" (только пресет, ручные домены ✏️ останутся)';
     cleanBtn.textContent = '🧹';
     cleanBtn.setAttribute('onclick', removeFnName + "('" + presetName + "')");
-    btn.parentNode.insertBefore(cleanBtn, btn.nextSibling);
+    // Обернуть пару в inline-span чтобы не разрывалась при wrap
+    const wrapper = document.createElement('span');
+    wrapper.className = pairClass;
+    wrapper.style.cssText = 'display:inline-block; white-space:nowrap;';
+    btn.parentNode.insertBefore(wrapper, btn);
+    wrapper.appendChild(btn);
+    wrapper.appendChild(cleanBtn);
   });
 }
 
