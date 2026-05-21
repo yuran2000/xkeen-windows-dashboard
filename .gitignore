@@ -40,3 +40,6 @@ xkeen_toast_daemon.lock
 
 # Manual restore docs (создаются юзером локально)
 HOW_TO_RESTORE.md
+
+# Portable build (юзер просил «не для гитхаба») — всё локально
+portable/

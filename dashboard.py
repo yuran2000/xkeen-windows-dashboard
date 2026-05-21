@@ -21,9 +21,74 @@ import tempfile
 
 import qrcode
 import socket
+import sys
 import time as _time_mod
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import config_local as cfg
+
+# ============== БАЗОВЫЕ ПАПКИ ПРИЛОЖЕНИЯ (portable-aware) ==============
+# _app_base_dir() — папка для EXTERNAL данных (config_local.py / config.ini, runtime_settings.json,
+#                   backups/, .ssh/). В dev-режиме = папка с dashboard.py. В portable-режиме
+#                   (PyInstaller frozen) = папка с exe. Юзер кладёт config_local.py рядом с exe.
+# _resource_dir() — папка для INTERNAL bundled-ресурсов (favicon, bootstrap-скрипты).
+#                   В dev = папка с dashboard.py. В frozen-onefile = sys._MEIPASS (temp extract).
+def _app_base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+def _resource_dir():
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+    return os.path.dirname(os.path.abspath(__file__))
+
+# Frozen режим: добавляем папку рядом с exe в sys.path, чтобы внешний config_local.py
+# (положенный юзером рядом с exe) перебивал PyInstaller-замороженный stub.
+# Если юзер вместо config_local.py положил только config.ini — собираем sham-модуль из ini.
+if getattr(sys, "frozen", False):
+    _ext_dir = _app_base_dir()
+    if _ext_dir not in sys.path:
+        sys.path.insert(0, _ext_dir)
+    _ext_py = os.path.join(_ext_dir, "config_local.py")
+    _ext_ini = os.path.join(_ext_dir, "config.ini")
+    if not os.path.isfile(_ext_py):
+        # Загружаем defaults из вшитого config_local.example.py (PyInstaller --add-data)
+        import runpy as _runpy
+        import types as _types_mod
+        _example_path = os.path.join(_resource_dir(), "config_local.example.py")
+        _ns = _runpy.run_path(_example_path) if os.path.isfile(_example_path) else {}
+        _sham = _types_mod.ModuleType("config_local")
+        for _k, _v in _ns.items():
+            if not _k.startswith("__"):
+                setattr(_sham, _k, _v)
+        # Overlay overrides из config.ini (если есть)
+        if os.path.isfile(_ext_ini):
+            import configparser as _cp_mod
+            _cp = _cp_mod.ConfigParser()
+            _cp.read(_ext_ini, encoding="utf-8-sig")  # utf-8-sig игнорит BOM
+            if _cp.has_section("server"):
+                _sham.DASHBOARD_PORT = _cp.getint("server", "port", fallback=getattr(_sham, "DASHBOARD_PORT", 5000))
+            if _cp.has_section("ssh"):
+                _sham.KEENETIC_HOST = _cp.get("ssh", "host", fallback=getattr(_sham, "KEENETIC_HOST", "192.168.1.1"))
+                _sham.KEENETIC_PORT = _cp.getint("ssh", "port", fallback=getattr(_sham, "KEENETIC_PORT", 22))
+                _sham.KEENETIC_USER = _cp.get("ssh", "user", fallback=getattr(_sham, "KEENETIC_USER", "root"))
+                _key_name = _cp.get("ssh", "key", fallback="id_keenetic")
+                _sham.KEENETIC_SSH_KEY = _key_name if os.path.isabs(_key_name) else os.path.join(_ext_dir, _key_name)
+            if _cp.has_section("auth"):
+                _sham.USERNAME = _cp.get("auth", "username", fallback=getattr(_sham, "USERNAME", "admin"))
+                _sham.PASSWORD = _cp.get("auth", "password", fallback=getattr(_sham, "PASSWORD", "changeme"))
+                _sham.SECRET_KEY = _cp.get("auth", "secret_key", fallback=getattr(_sham, "SECRET_KEY", "please-change-this-secret-key"))
+                _sham.SUBSCRIPTION_TOKEN = _cp.get("auth", "subscription_token", fallback=getattr(_sham, "SUBSCRIPTION_TOKEN", "please-change-this-token"))
+        sys.modules["config_local"] = _sham
+
+try:
+    import config_local as cfg
+except ImportError:
+    sys.stderr.write(
+        "\nERROR: config_local.py не найден.\n"
+        "  - В portable-режиме создай рядом с exe файл config.ini (см. config.ini.template).\n"
+        "  - В dev-режиме скопируй config_local.py.example -> config_local.py и заполни.\n\n"
+    )
+    sys.exit(1)
 import threading as _threading
 
 # ============== ВЕРСИЯ ПАНЕЛИ ==============
@@ -31,7 +96,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.14"
+_VERSION_FALLBACK = "1.0.15"
 
 
 def get_dashboard_version():
@@ -45,7 +110,7 @@ def get_dashboard_version():
     try:
         result = subprocess.run(
             ["git", "describe", "--tags", "--abbrev=0"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
+            cwd=_resource_dir(),
             capture_output=True, text=True, timeout=2,
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -59,7 +124,7 @@ def get_dashboard_version():
 # ============== RUNTIME SETTINGS (overrides поверх config_local.py) ==============
 # Хранятся отдельным JSON чтобы при обновлении dashboard.py не сбрасывались.
 # Перезаписывают атрибуты cfg-модуля → существующий код cfg.KEENETIC_* работает без правок.
-RUNTIME_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_settings.json")
+RUNTIME_SETTINGS_FILE = os.path.join(_app_base_dir(), "runtime_settings.json")
 _RUNTIME_LOCK = _threading.Lock()
 
 # key в runtime.keenetic → attr в cfg-модуле. KEENETIC_PORT — int, остальные str.
@@ -3202,7 +3267,7 @@ def api_xkeen_backup_to_disk():
     if not r["ok"]:
         return jsonify({"ok": False, "stderr": r["stderr"][:500]})
 
-    backups_dir = r"C:\xray-dashboard\backups"
+    backups_dir = os.path.join(_app_base_dir(), "backups")
     try:
         os.makedirs(backups_dir, exist_ok=True)
     except Exception as ex:
@@ -3335,7 +3400,7 @@ def api_xkeen_migration_backup():
         return jsonify(resp), 500
 
     # 2. Скачать через scp
-    backups_dir = r"C:\xray-dashboard\backups"
+    backups_dir = os.path.join(_app_base_dir(), "backups")
     try:
         os.makedirs(backups_dir, exist_ok=True)
     except Exception as ex:
@@ -4616,7 +4681,7 @@ def api_keenetic_test_connection():
 # Файлы-шаблоны (watchdog.sh, 05_routing.template.json) лежат рядом с dashboard.py
 # в подкаталоге bootstrap/ либо в <scripts-path>\ (живые копии).
 BOOTSTRAP_SEARCH_DIRS = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "bootstrap"),
+    os.path.join(_resource_dir(), "bootstrap"),
     r"<scripts-path>",
 ]
 
@@ -5990,7 +6055,7 @@ def logout():
 def favicon():
     """Иконка вкладки. Файл лежит рядом с dashboard.py."""
     return send_from_directory(
-        os.path.dirname(os.path.abspath(__file__)),
+        _resource_dir(),
         "icons8-favicon-64.png",
         mimetype="image/png",
     )
