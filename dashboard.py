@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.11"
+_VERSION_FALLBACK = "1.0.12"
 
 
 def get_dashboard_version():
@@ -4635,7 +4635,7 @@ DEFAULT_WATCHDOG_CONFIG = '''# /opt/etc/xray/watchdog.config — управля�
 PRIMARY_TAG=""
 FAILOVER_TAGS=""
 AI_TAG=""
-AI_DOMAINS="ai.google.dev aistudio.google.com anthropic.com chat.deepseek.com chat.mistral.ai chatgpt.com claude.ai claudeusercontent.com copilot.cloud.microsoft copilot.microsoft.com deepseek.com designer.microsoft.com gemini.google.com generativelanguage.googleapis.com grok.com grok.x.ai hf.co huggingface.co mistral.ai oaistatic.com oaiusercontent.com openai.com perplexity.ai pplx.ai x.ai status.claude.com"
+AI_DOMAINS="anthropic.com chatgpt.com claude.ai claudeusercontent.com featureassets.org featuregates.org oaistatic.com oaiusercontent.com openai.com sora.com statsig.com"
 AI_FAIL_BLOCK="1"
 YT_TAG=""
 YT_DOMAINS="ggpht.com googlevideo.com youtu.be youtube-nocookie.com youtube.com youtubei.googleapis.com yt3.ggpht.com yt4.ggpht.com ytimg.com"
@@ -11598,7 +11598,8 @@ const AI_PRESETS = {
   leonardo:    ['leonardo.ai'],
   krea:        ['krea.ai'],
 };
-// all_ai — агрегат для autoMatchPresets / служебных целей. Собирается из всех ключей кроме самого all_*.
+// all_ai — агрегат всех AI-пресетов (extension-hook). Автоформула устойчива к добавлению
+// новых ключей (не нужно вручную перечислять при расширении AI_PRESETS).
 AI_PRESETS.all_ai = [].concat(...Object.entries(AI_PRESETS).filter(([k]) => !k.startsWith('all_')).map(([,v]) => v));
 
 function getAIDomainsArray() {
@@ -12472,11 +12473,9 @@ const YT_PRESETS = {
     'spotifycdn.net', 'pscdn.co',
   ],
 };
-YT_PRESETS.all_yt = [].concat(
-  YT_PRESETS.youtube, YT_PRESETS.instagram, YT_PRESETS.discord, YT_PRESETS.tiktok,
-  YT_PRESETS.twitch, YT_PRESETS.twitter, YT_PRESETS.reddit, YT_PRESETS.telegram,
-  YT_PRESETS.whatsapp, YT_PRESETS.spotify
-);
+// all_yt — агрегат всех YT-пресетов. Автоформула устойчива к добавлению новых ключей
+// (не нужно вручную перечислять при расширении YT_PRESETS).
+YT_PRESETS.all_yt = [].concat(...Object.entries(YT_PRESETS).filter(([k]) => !k.startsWith('all_')).map(([,v]) => v));
 
 function getYTDomainsArray() {
   return readSection('yt').domains;
