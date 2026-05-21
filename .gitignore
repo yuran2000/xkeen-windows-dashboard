@@ -41,5 +41,10 @@ xkeen_toast_daemon.lock
 # Manual restore docs (создаются юзером локально)
 HOW_TO_RESTORE.md
 
-# Portable build (юзер просил «не для гитхаба») — всё локально
-portable/
+# Portable build — публикуем только build.bat + config.ini.template
+# (чтобы клонировавший репо мог собрать exe), артефакты сборки и личные
+# wrapper'ы — локально.
+portable/build/
+portable/dist/
+portable/*.spec
+portable/update-portable.bat

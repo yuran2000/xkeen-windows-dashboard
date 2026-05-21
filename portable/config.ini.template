@@ -1,0 +1,26 @@
+# xray-dashboard portable — config.ini
+# Скопируй этот файл как config.ini в папку рядом с xray-dashboard.exe
+# и заполни значения. Файл должен находиться рядом с exe.
+# Не коммить config.ini с реальными секретами в git.
+
+[server]
+# Порт на котором панель слушает HTTP. Default: 5000.
+port = 5000
+
+[ssh]
+# Параметры подключения к Keenetic-роутеру.
+host = 192.168.1.1
+port = 222
+user = root
+# Имя файла с приватным ключом — должен лежать рядом с exe.
+# Можно указать абсолютный путь (например C:\Keys\id_keenetic) если ключ в другом месте.
+key = id_keenetic
+
+[auth]
+# Пароль для входа в панель — обязательно смени на свой.
+password = CHANGE_ME_TO_RANDOM_PASSWORD
+# Secret key для Flask-сессий — случайная строка 32+ символов.
+# Быстрая генерация в PowerShell: -join ((48..57)+(97..122) | Get-Random -Count 48 | %{[char]$_})
+secret_key = CHANGE_ME_TO_RANDOM_32CHAR_STRING
+# Токен для subscription URL — случайная строка.
+subscription_token = CHANGE_ME_TO_RANDOM_TOKEN
