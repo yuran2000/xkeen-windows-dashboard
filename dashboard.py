@@ -31,7 +31,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.8"
+_VERSION_FALLBACK = "1.0.9"
 
 
 def get_dashboard_version():
@@ -11554,7 +11554,7 @@ async function saveFailoverChain() {
 //    полный справочник по 4 типам пресетов (AI/YT/DIRECT/BLOCK),
 //    их актуальный состав, процедура обновления и триггер-фразы юзера.
 const AI_PRESETS = {
-  claude:      ['claude.ai', 'anthropic.com', 'claudeusercontent.com'],
+  claude:      ['claude.ai', 'anthropic.com', 'claudeusercontent.com', 'statsig.com', 'featureassets.org', 'featuregates.org'],
   openai:      ['openai.com', 'chatgpt.com', 'oaiusercontent.com', 'oaistatic.com'],
   gemini:      ['gemini.google.com', 'generativelanguage.googleapis.com', 'ai.google.dev', 'aistudio.google.com'],
   copilot:     ['copilot.microsoft.com', 'copilot.cloud.microsoft', 'designer.microsoft.com'],
