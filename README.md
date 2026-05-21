@@ -86,6 +86,47 @@ cd C:\xray-dashboard
 
 Зарегистрирует daemon `xkeen_toast_daemon.py` который раз в минуту проверяет статус xray через панель. При падении xray — Windows toast в правом нижнем углу (виден даже когда браузер закрыт).
 
+## 📦 Portable EXE-режим
+
+Альтернатива service-установке — собрать одиночный `xray-dashboard.exe` (~35 MB вместе с runtime), который запускается с любой папки или флешки **без admin-прав** и хранит все настройки рядом с собой в `config.ini`. Удобно для: запуска с флешки на чужом PC, multi-instance под разные роутеры без отдельных venv, переноса между машинами.
+
+### Собрать exe
+
+После `install.bat` (один раз) запусти build-скрипт:
+
+```powershell
+cd C:\xray-dashboard
+portable\build.bat
+```
+
+Через ~50 секунд готовая папка `portable\dist\xray-dashboard\` содержит `xray-dashboard.exe` + `_internal\` (Python runtime и зависимости — НЕ удалять, без неё exe не работает).
+
+### Запустить
+
+1. **Скопируй** папку `portable\dist\xray-dashboard\` в пользовательское место (например `C:\Users\<name>\xray-portable\`). **Не** в `Program Files` / корень `C:\` — там потребуется admin для записи `config.ini`.
+2. **Положи свой `config_local.py`** рядом с `xray-dashboard.exe`. Можно скопировать существующий от service-установки.
+3. **Запусти `xray-dashboard.exe`**. При первом старте автоматически:
+   - **создаётся `config.ini`** заполненный реальными значениями из `config_local.py` (port, ssh.host/port/user/key, password, secret_key — без `CHANGE_ME` placeholder'ов)
+   - **копируется SSH-ключ** в эту же папку из абсолютного пути в `config_local.py`
+4. Открой `http://localhost:<port>` — UI на месте.
+
+После первого запуска папку можно безболезненно перенести на флешку или другую машину — все настройки и ключ внутри.
+
+### Изменить порт / SSH / пароль без правки `.py`
+
+Открой `config.ini` рядом с exe, поменяй нужное значение, сохрани, перезапусти exe. `config.ini` переопределяет `config_local.py` для простых полей (port, ssh.*, auth.*). Удобно для второго инстанса на 5001 под другой роутер — скопировал папку, поправил ini, не трогая `.py`.
+
+### Цепочка приоритетов конфига
+
+```
+config_local.example.py (defaults, embedded в exe)
+  → config_local.py (если есть рядом с exe)
+    → config.ini (overlay простых полей)
+      → runtime_settings.json (UI overrides через панель)
+```
+
+Только явно указанные в `config.ini` опции переопределяют — неуказанные секции/опции не трогают существующие значения.
+
 ## Что управляет
 
 - xray-конфиги на роутере (`/opt/etc/xray/configs/01..07*.json`) — outbounds / routing / inbounds
