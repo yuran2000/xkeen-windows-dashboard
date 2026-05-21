@@ -176,7 +176,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.19"
+_VERSION_FALLBACK = "1.0.20"
 
 
 def get_dashboard_version():
@@ -7138,7 +7138,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <div class="row" style="margin-top: 16px;">
     <div class="col">
       <div class="channel-card cc-primary">
-        <label class="col-header col-primary">🟢 Основное (PRIMARY)</label>
+        <label class="col-header col-primary">🟢 Основное (PRIMARY) <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии настройки» в Помощи — там пошаговые рецепты для PRIMARY">❓ помощь</a></label>
         <div class="channel-card-body">
           <select id="select-primary" style="width: 100%; padding: 7px; font-size: 0.95em; border: 1px solid #ccc; border-radius: 4px;">
             {% for grp in vless_option_groups %}
@@ -7180,7 +7180,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <div class="row" style="margin-top: 16px;">
     <div class="col">
       <div class="channel-card cc-ai">
-        <label class="col-header col-ai">🤖 AI-sticky outbound</label>
+        <label class="col-header col-ai">🤖 AI-sticky outbound <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — рекомендации по AI-каналу (Claude/ChatGPT не работают с RU-IP, нужен EU/US с kill-switch)">❓ помощь</a></label>
         <div class="channel-card-body">
           <select id="select-ai" style="width: 100%; padding: 7px; font-size: 0.95em; border: 1px solid #ccc; border-radius: 4px;">
             {% for grp in vless_option_groups %}
@@ -7297,7 +7297,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     </div>
     <div class="col">
       <div class="channel-card cc-yt">
-        <label class="col-header col-yt">📺 YouTube-sticky outbound</label>
+        <label class="col-header col-yt">📺 YouTube-sticky outbound <a href="#help-yt-recaptcha" onclick="openHelpAnchor('help-yt-recaptcha'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Если YouTube показывает reCAPTCHA «подозрительный трафик» — открой Сценарий 2 в Помощи. Там полный комплекс настроек: 🇷🇺 Рецепт A для RU-канала + 🇳🇱 Рецепт B для EU/US-канала.">❓ помощь</a></label>
         <div class="channel-card-body">
           <select id="select-yt" style="width: 100%; padding: 7px; font-size: 0.95em; border: 1px solid #ccc; border-radius: 4px;">
             {% for grp in vless_option_groups %}
@@ -7355,6 +7355,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           <div style="margin-bottom: 8px;">
             <strong style="font-size: 0.85em; color: #555;">Готовые пресеты:</strong><br>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('youtube')">📺 YouTube</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('google_for_yt')" title="🌐 Google-домены которые подгружает YouTube-страница (gstatic.com, googleapis.com, googleusercontent.com). Без них YT-страница собирается с РАЗНЫХ outbound'ов → Google видит запросы с двух IP → reCAPTCHA 'подозрительный трафик'. ⚠ ВНИМАНИЕ: добавляет ВСЕ Google-сервисы (Gmail, Drive, Photos, Search, Maps) в YT-канал — они тоже пойдут через RU-exit если YT-tag = RU. Альтернатива: v2fly категория geosite:google в AI-канале (для EU/US-выхода).">🌐 Google для YT</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('instagram')">📷 Instagram</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('discord')">💬 Discord</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('tiktok')">🎵 TikTok</button>
@@ -7375,6 +7376,30 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           <button class="btn" style="margin-top: 6px; background: #c33;" onclick="saveYTDomains()">💾 Сохранить YT-домены</button>
           <p class="subtitle" style="margin: 4px 0 0; font-size: 0.85em;">Watchdog подхватит при следующем тике (≤1 мин).</p>
 
+          <!-- ❓ YouTube reCAPTCHA — частая проблема смешанного outbound (open by default to be visible) -->
+          <details style="margin-top: 14px; background: #fef3e2; border: 1px solid #f0c200; border-radius: 4px; padding: 8px 12px;">
+            <summary style="cursor: pointer; font-weight: 600; color: #6a4900; font-size: 0.92em;">❓ YouTube показывает «Мы зарегистрировали подозрительный трафик»? — как починить</summary>
+            <div style="margin-top: 8px; font-size: 0.86em; color: #4a3300; line-height: 1.5;">
+              <p style="margin: 0 0 6px;">YouTube-страница загружает контент с <strong>множества Google-доменов</strong>:</p>
+              <ul style="margin: 0 0 8px 18px; padding: 0;">
+                <li><code>youtube.com</code>, <code>youtu.be</code> — видео-страница (покрыто пресетом 📺 YouTube)</li>
+                <li><code>googlevideo.com</code>, <code>ytimg.com</code> — видеостримы и thumbnails (покрыто)</li>
+                <li>🔴 <code>googleusercontent.com</code>, <code>1e100.net</code> — Google CDN backbone (НЕ покрыто стандартным пресетом)</li>
+                <li>🔴 <code>googleapis.com</code>, <code>gstatic.com</code> — Google APIs и static-ресурсы (НЕ покрыто)</li>
+              </ul>
+              <p style="margin: 0 0 6px;">Если YT-tag покрывает только узкие youtube-домены — <strong>остальные Google-запросы идут через PRIMARY</strong> → Google видит один сессионный токен с двух разных IP → <strong>reCAPTCHA «подозрительный трафик»</strong>.</p>
+              <p style="margin: 0 0 6px;"><strong>Как починить:</strong></p>
+              <ul style="margin: 0 0 8px 18px; padding: 0;">
+                <li><strong>YT-канал = EU/US</strong> (Нидерланды, Германия, США): добавь v2fly категорию <strong>🌐 google</strong> ниже — покрывает все Google-домены включая Gmail/Drive. Они тоже пойдут через EU/US — это OK.</li>
+                <li><strong>YT-канал = RU</strong> (Россия_YouTube, СПб_YouTube — для DPI-обхода рекламы): <strong>НЕ добавляй <code>google</code></strong> — Gmail/Drive через РФ-IP может пометить аккаунт как подозрительный регион. Вместо этого допиши в YT-домены (textarea выше) <strong>4 точечных домена</strong>:<br>
+                <code style="background: #fff; padding: 2px 6px; border: 1px solid #d0a000;">1e100.net&nbsp; googleusercontent.com&nbsp; gstatic.com&nbsp; googleapis.com</code><br>
+                Это узко — без Gmail (<code>mail.google.com</code>) и Drive (<code>drive.google.com</code>), которые не под <code>googleapis.com</code>.</li>
+              </ul>
+              <p style="margin: 0;">Диагностика: открой Chrome DevTools (F12) → Network → отсортируй по Domain → увидишь от скольких доменов YouTube тянет ресурсы. Сравни какие из них в твоём YT-tag.</p>
+              <p style="margin: 8px 0 0;"><a href="#help-yt-recaptcha" onclick="openHelpAnchor('help-yt-recaptcha'); return false;" style="font-weight: 600; color: #6a4900;">📖 Подробнее в Помощи: Сценарий 2 «YouTube reCAPTCHA — полный комплекс» →</a></p>
+            </div>
+          </details>
+
           <!-- v8: v2fly geosite-категории для YT — автоподхват новых поддоменов YouTube/TikTok -->
           <details style="margin-top: 14px; border-top: 1px dashed #ccc; padding-top: 10px;" {% if targets.yt_ext_categories %}open{% endif %}>
             <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">🩻 v2fly категории <span style="color: #888; font-weight: 400; font-size: 0.88em;">— автообновляются с GeoFile</span> <a href="#help-v2fly-geoip" onclick="openHelpAnchor('help-v2fly-geoip'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; margin-left: 6px;" title="Открыть подробное описание v2fly категорий в разделе «Помощь»">❓ что это?</a></summary>
@@ -7385,6 +7410,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
               </div>
               <div style="margin-bottom: 6px;">
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('youtube')" title="Добавить категорию youtube (все домены YouTube из geosite_v2fly.dat). Безопасно через любой канал. Автоподхват новых поддоменов после xkeen -ug.">📺 youtube</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('google')" title="🌐 Добавить категорию google — ВСЕ Google-домены (gstatic.com, googleapis.com, googleusercontent.com, 1e100.net, gmail.com, drive.google.com, и т.д.). ⚠ ВНИМАНИЕ: ВКЛЮЧАЕТ Gmail/Drive/Photos/Search/Maps — все они пойдут через YT-канал. Используй ТОЛЬКО если YT-канал = EU/US (Нидерланды, Германия и т.п.). На RU-канале (Россия_YouTube) — Google может пометить твой аккаунт как 'подозрительный регион' для Gmail/Drive. КОГДА НУЖНО: если YouTube показывает reCAPTCHA «Мы зарегистрировали подозрительный трафик» с двумя разными IP — это значит YT-страница использует gstatic/googleapis/googleusercontent (не покрытые категорией youtube) → они идут через PRIMARY вместо YT-канала → Google видит mismatch. Альтернатива для RU-канала: вместо google добавь в YT-домены руками: 1e100.net, googleusercontent.com, gstatic.com, googleapis.com (узко, без Gmail/Drive).">🌐 google</button>
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('tiktok')" title="Добавить категорию tiktok (все домены TikTok). Безопасно через любой канал.">🎵 tiktok</button>
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('discord')" title="Добавить категорию discord (все домены Discord). Безопасно через любой канал.">💬 discord</button>
                 <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearYTExtCats()" title="Очистить все v2fly-категории YT. Ручные домены в textarea выше не трогаются.">🗑 Очистить</button>
@@ -7434,7 +7460,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <div class="col" style="flex: 1 1 460px; min-width: 0;">
   <!-- DIRECT домены — сайты идут напрямую без VPN -->
   <div class="domain-section ds-direct">
-    <h3 class="domain-section-header">🚫 Сайты НАПРЯМУЮ без VPN <span class="subsec-hint">(DIRECT — пойдут через провайдера, без VPN)</span></h3>
+    <h3 class="domain-section-header">🚫 Сайты НАПРЯМУЮ без VPN <span class="subsec-hint">(DIRECT — пойдут через провайдера, без VPN)</span> <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.7em; color: #468; text-decoration: none; margin-left: 8px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — там объяснение когда нужны DIRECT-домены (банки, Госуслуги, российские сервисы которые блокируют не-RU IP)">❓ помощь</a></h3>
     <div class="domain-section-body">
       <p class="subtitle">
         Эти домены пойдут через твоего обычного провайдера (без VPN). Полезно: банки/Госуслуги (требуют RU IP),
@@ -7473,7 +7499,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <div class="col" style="flex: 1 1 460px; min-width: 0;">
   <!-- BLOCK домены — полностью заблокировать (outbound `block` / blackhole) -->
   <div class="domain-section ds-block">
-    <h3 class="domain-section-header">⛔ Заблокированные сайты <span class="subsec-hint">(BLOCK — outbound `block`/blackhole, пакеты дропаются)</span></h3>
+    <h3 class="domain-section-header">⛔ Заблокированные сайты <span class="subsec-hint">(BLOCK — outbound `block`/blackhole, пакеты дропаются)</span> <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.7em; color: #468; text-decoration: none; margin-left: 8px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — там пресеты BLOCK для Windows Update / Telemetry / Adobe Genuine / Office Telemetry">❓ помощь</a></h3>
     <div class="domain-section-body">
       <p class="subtitle">
         Эти домены полностью <strong>заблокированы</strong> на роутере — приложения которые к ним обращаются получат «нет ответа».
@@ -9022,6 +9048,90 @@ Use this token to access the HTTP API:
             <li><strong>DIRECT-домены</strong> необязательны — там собираются домены которые «всегда напрямую». В нашем сценарии PRIMARY=direct, поэтому ВСЁ кроме YT уже идёт напрямую. Список используй только если хочешь явно зафиксировать что определённые сайты будут через провайдера даже если когда-то поменяешь PRIMARY.</li>
             <li><strong>BLOCK-домены</strong> отдельная задача — выкл. Windows Update / Adobe Genuine / телеметрию. К этому сценарию не относится.</li>
           </ul>
+        </div>
+      </details>
+
+      <details id="help-yt-recaptcha" open style="margin: 10px 0; padding: 10px 14px; background: #fef3e2; border-left: 4px solid #f0c200; border-radius: 4px;">
+        <summary style="cursor: pointer; font-weight: 700; color: #6a4900;">❓ Сценарий 2: YouTube показывает «подозрительный трафик» (reCAPTCHA) — полный комплекс настроек</summary>
+        <div style="margin-top: 8px;">
+          <p><strong>Симптом</strong>: YouTube в браузере показывает страницу <em>«Мы зарегистрировали подозрительный трафик, исходящий из вашей сети»</em> с указанием <strong>двух разных IP</strong> (например IPv4 твоего PRIMARY + IPv6 какой-то ещё). Видео не открывается, требуется reCAPTCHA.</p>
+
+          <p><strong>Причина</strong>: YouTube-страница тянет ресурсы с <strong>множества Google-доменов</strong>. Часть покрывается пресетом <code>📺 YouTube</code> (<code>youtube.com</code>, <code>googlevideo.com</code>, <code>ytimg.com</code>) → идёт через YT-tag. <strong>Остальная часть</strong> (<code>googleusercontent.com</code>, <code>1e100.net</code>, <code>googleapis.com</code>, <code>gstatic.com</code>) — НЕ в стандартном пресете → идёт через PRIMARY (catch-all). Google видит запросы одного сессионного токена <strong>с двух разных IP</strong> → anti-abuse → reCAPTCHA.</p>
+
+          <p><strong>Решение зависит от твоего YT-канала</strong>. Открой секцию <strong>«🎯 Основное и резервное подключение»</strong> → посмотри dropdown <strong>«📺 YouTube-sticky outbound»</strong>:</p>
+
+          <h4 style="margin: 14px 0 6px; color: #c0392b;">🇷🇺 Рецепт A — если YT-канал = RU (Россия_YouTube, СПб_YouTube — для DPI-обхода рекламы)</h4>
+          <p>Главное правило для RU: <strong>НЕ тащить через RU-выход чувствительные Google-сервисы</strong> (Gmail / Drive / Calendar / Photos / Search). Google может пометить аккаунт как подозрительный регион. Поэтому используем <strong>узкие точечные пресеты</strong>, не широкую категорию <code>google</code>.</p>
+          <ol>
+            <li>В секции <strong>«📺 Список YouTube-доменов»</strong>:
+              <ul>
+                <li>Нажми <strong>📺 YouTube</strong> (если ещё не добавлен)</li>
+                <li>Нажми <strong>🌐 Google для YT</strong> ← добавит 4 точечных домена: <code>gstatic.com</code>, <code>googleapis.com</code>, <code>googleusercontent.com</code>, <code>1e100.net</code>. <em>Gmail/Drive не задевает — они под <code>mail.google.com</code> / <code>drive.google.com</code>.</em></li>
+                <li>Нажми <strong>«💾 Сохранить YT-домены»</strong></li>
+              </ul>
+            </li>
+            <li>В свёрнутом блоке <strong>«🩻 v2fly категории»</strong>:
+              <ul>
+                <li>Нажми <strong>📺 youtube</strong> ← авто-обновление новых поддоменов YouTube через <code>xkeen -ug</code></li>
+                <li><strong>НЕ нажимай</strong> <code>🌐 google</code> — потянет за собой Gmail/Drive (см. выше)</li>
+                <li><strong>НЕ нажимай</strong> <code>facebook</code> / <code>instagram</code> / <code>twitter</code> — РКН блокирует Meta/X, через RU-канал не пробьёшь</li>
+                <li>Нажми <strong>«💾 Сохранить категории»</strong></li>
+              </ul>
+            </li>
+            <li>(Опционально) для Telegram Desktop — в <strong>«🌍 GeoIP-категории»</strong> добавь <code>telegram</code>.</li>
+          </ol>
+
+          <h4 style="margin: 14px 0 6px; color: #2e7d32;">🇳🇱 🇩🇪 🇺🇸 Рецепт B — если YT-канал = EU/US (Нидерланды, Германия, США, и т.п.)</h4>
+          <p>Для EU/US можно использовать <strong>широкую категорию</strong> <code>google</code> — Gmail/Drive через EU/US безопасны. Меньше точечных правок, всё покрыто одной категорией.</p>
+          <ol>
+            <li>В секции <strong>«📺 Список YouTube-доменов»</strong>:
+              <ul>
+                <li>Нажми <strong>📺 YouTube</strong></li>
+                <li>(Можно дополнительно нажать <strong>🌐 Google для YT</strong> — но это уже избыточно с категорией <code>google</code> в шаге 2)</li>
+                <li>Нажми <strong>«💾 Сохранить YT-домены»</strong></li>
+              </ul>
+            </li>
+            <li>В <strong>«🩻 v2fly категории»</strong>:
+              <ul>
+                <li>Нажми <strong>🌐 google</strong> ← покрывает ВСЕ Google-домены (включая Gmail/Drive/Photos). Через EU/US — без проблем.</li>
+                <li>Опционально: <code>youtube</code>, <code>tiktok</code>, <code>discord</code>, <code>instagram</code> — нужные тебе</li>
+                <li>Нажми <strong>«💾 Сохранить категории»</strong></li>
+              </ul>
+            </li>
+            <li>YouTube будет <strong>с рекламой</strong> (Google по geo-IP видит EU/US → показывает обычные ads). Это плата за рабочий Instagram и отсутствие reCAPTCHA.</li>
+          </ol>
+
+          <h4 style="margin: 14px 0 6px;">📊 Сравнение рецептов</h4>
+          <table style="border-collapse: collapse; margin: 8px 0; width: 100%;">
+            <thead><tr style="background:#f0f0f0;">
+              <th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">Аспект</th>
+              <th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">🇷🇺 Рецепт A (RU-канал)</th>
+              <th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">🇳🇱 Рецепт B (EU/US-канал)</th>
+            </tr></thead>
+            <tbody>
+              <tr><td style="border:1px solid #ccc; padding:6px 10px;">YouTube</td><td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ без рекламы (DPI-обход)</td><td style="border:1px solid #ccc; padding:6px 10px;">⚠ с рекламой</td></tr>
+              <tr><td style="border:1px solid #ccc; padding:6px 10px;">reCAPTCHA</td><td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ решается 4 узкими доменами</td><td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ решается категорией <code>google</code></td></tr>
+              <tr><td style="border:1px solid #ccc; padding:6px 10px;">Gmail / Drive</td><td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ через PRIMARY (не задеты)</td><td style="border:1px solid #ccc; padding:6px 10px;">⚠ через YT-канал (EU/US, безопасно)</td></tr>
+              <tr><td style="border:1px solid #ccc; padding:6px 10px;">Instagram</td><td style="border:1px solid #ccc; padding:6px 10px; color:#c33;">❌ сломан (РКН блокирует Meta)</td><td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ работает</td></tr>
+              <tr><td style="border:1px solid #ccc; padding:6px 10px;">Сколько кликов</td><td style="border:1px solid #ccc; padding:6px 10px;">2 кнопки в YT-доменах + 1 в v2fly = 3 клика + 2 сохранки</td><td style="border:1px solid #ccc; padding:6px 10px;">1 кнопка в YT-доменах + 1 в v2fly = 2 клика + 2 сохранки</td></tr>
+            </tbody>
+          </table>
+
+          <h4 style="margin: 14px 0 6px;">🔍 Проверка</h4>
+          <ol>
+            <li>Подожди <strong>≤1 минуту</strong> — watchdog подхватит, xray перегенерирует <code>routing.json</code></li>
+            <li>Закрой <strong>все</strong> YouTube-вкладки в браузере (даже сворачивание не считается — нужно закрыть, либо рестарт Chrome полностью)</li>
+            <li>Открой YouTube <strong>в новом инкогнито-окне</strong> — старые cookies и connection pool не путают</li>
+            <li>Если reCAPTCHA <strong>не уйдёт сразу</strong> — подожди <strong>10-15 минут</strong> (Google anti-abuse session со старым fingerprint истечёт по таймауту)</li>
+          </ol>
+
+          <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #1a5276;">
+            💡 <strong>Бонус — IPv6 leak</strong>: если у тебя домашний провайдер выдаёт IPv6 (например Ростелеком fiber) — IPv6-трафик уходит мимо xray (TPROXY ловит только IPv4). YouTube может увидеть твой реальный домашний IPv6 — это тоже триггерит reCAPTCHA. Лечится в Web UI Keenetic → подключение → <strong>«Параметры IPv6» → «Не используется»</strong>. После этого Chrome не получит AAAA-записи и пойдёт только по IPv4.
+          </div>
+
+          <div style="background: #fee; border-left: 3px solid #c33; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #6a1010;">
+            ⚠ <strong>Опасное QUIC поведение</strong>: Chrome агрессивно использует QUIC (HTTP/3 over UDP) для YouTube. xray sniffing для UDP может не сработать → пакет видится только по dest IP → правило <code>domain:youtube.com</code> не матчится → fallback на PRIMARY. Если рецепты A/B не помогли — попробуй отключить QUIC: <code>chrome://flags/#enable-quic</code> → Disabled → перезапусти Chrome.
+          </div>
         </div>
       </details>
 
@@ -12576,6 +12686,23 @@ const YT_PRESETS = {
     'youtube.com', 'youtu.be', 'youtube-nocookie.com',
     'googlevideo.com', 'ytimg.com', 'ggpht.com',
     'youtubei.googleapis.com', 'yt3.ggpht.com', 'yt4.ggpht.com',
+  ],
+  // 🌐 Google-домены которые подгружает YouTube-страница (шрифты, статика, API авторизации).
+  // Без них YT-страница собирается с РАЗНЫХ outbound'ов (часть через YT-tag по domain:youtube.com,
+  // часть через PRIMARY по google-доменам через catch-all) → Google reCAPTCHA "подозрительный
+  // трафик из двух IP". Этот пресет переводит ВСЕ google-домены через YT-tag — один IP, один источник.
+  //
+  // ⚠ ВНИМАНИЕ: gstatic/googleapis/googleusercontent — это Google-wide CDN. Через этот пресет
+  // ВСЕ Google-сервисы (Gmail, Drive, Calendar, Photos, Search, Maps) пойдут через YT-канал.
+  // Если YT-канал = RU-exit (например 🇷🇺_Санкт-Петербург_⚡️_YouTube_Instagram_Discord) —
+  // Gmail/Drive/Search будут с RU-IP. Для большинства задач это OK, но если важно сохранить
+  // EU/US-выход для Google-сервисов — НЕ добавляй этот пресет, а вместо него используй
+  // v2fly категорию `geosite:google` в AI-канале (раздел v2fly категории под AI-textarea).
+  google_for_yt: [
+    'gstatic.com',          // Google static (шрифты, CSS, JS) — YT player их загружает
+    'googleapis.com',       // Google APIs (YT iframe, account auth, comments API)
+    'googleusercontent.com',// Cached user content (avatars, thumbnails — *.bc.googleusercontent.com)
+    '1e100.net',            // Google main backbone (lf-in-fXX.1e100.net = Google PoP)
   ],
   instagram: [
     'instagram.com', 'cdninstagram.com',
