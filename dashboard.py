@@ -124,6 +124,19 @@ if _ext_dir and getattr(cfg, "KEENETIC_SSH_KEY", None):
                 _shutil_key.copy2(_orig_key, _local_key)
                 sys.stderr.write("\n⚙ SSH-ключ скопирован в " + _local_key + " (для портабл-переноса)\n")
                 cfg.KEENETIC_SSH_KEY = _local_key
+                # OpenSSH под Windows отказывается работать с ключом если ACL слишком открыты
+                # ("UNPROTECTED PRIVATE KEY FILE"). Ужесточаем: только текущий пользователь — read.
+                # Если icacls недоступен или fail — юзер увидит warning при попытке коннекта.
+                if sys.platform == "win32":
+                    try:
+                        import subprocess as _sp_acl
+                        import getpass as _gp_acl
+                        _sp_acl.run(
+                            ["icacls", _local_key, "/inheritance:r", "/grant:r", _gp_acl.getuser() + ":R"],
+                            capture_output=True, timeout=10, check=False,
+                        )
+                    except Exception:
+                        pass
             except Exception as _ex:
                 sys.stderr.write("WARNING: не удалось скопировать SSH-ключ: " + str(_ex) + "\n")
 
@@ -163,7 +176,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.18"
+_VERSION_FALLBACK = "1.0.19"
 
 
 def get_dashboard_version():
