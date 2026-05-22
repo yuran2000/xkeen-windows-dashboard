@@ -15,9 +15,9 @@ if not '%errorlevel%' == '0' (
     exit /b
 )
 
-REM IMPORTANT: After UAC-elevation %USERNAME% = same user (yuran), not Administrator.
-REM Elevation changes TOKEN only, not IDENTITY. So task is created under yuran correctly,
-REM which is critical for toast - daemon must run in interactive yuran session.
+REM IMPORTANT: After UAC-elevation %USERNAME% = same logged-in user, not Administrator.
+REM Elevation changes TOKEN only, not IDENTITY. So task is created under that user correctly,
+REM which is critical for toast - daemon must run in interactive user session.
 
 REM Task name depends on dashboard port (for multi-instance support)
 set DPORT=5000

@@ -4,7 +4,7 @@ name: Attach source archives to release
 # GitHub автоматически генерит «Source code (zip)» и «Source code (tar.gz)» для
 # каждого тэга, НО эти автоматические assets НЕ имеют downloads-counter в API
 # (известное ограничение GitHub). Чтобы видеть точную статистику скачиваний
-# через https://github.com/yuran2000/xray-dashboard/releases — нужно attach
+# через https://github.com/yuran2000/xkeen-windows-dashboard/releases — нужно attach
 # зеркала этих архивов как реальные release-assets.
 #
 # Триггер: при создании (или редактировании) релиза → workflow генерит
