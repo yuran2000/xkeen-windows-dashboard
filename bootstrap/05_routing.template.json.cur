@@ -1,4 +1,4 @@
-// Watchdog template v8 (2026-05-18): подменяются 6 placeholder'ов через watchdog.sh:
+// Watchdog template v11 (2026-05-23): подменяются 8 placeholder'ов через watchdog.sh:
 //   __DEFAULT_TAG__       — основной outbound для всего обычного трафика
 //   __BLOCK_RULE_BLOCK__  — block-правило с пользовательскими доменами (BLOCK_DOMAINS) — ПЕРВЫМ по приоритету
 //   __DIRECT_RULE_BLOCK__ — direct-правило с пользовательскими доменами (DIRECT_DOMAINS)
@@ -8,7 +8,9 @@
 //                           Нужно для IP-only приложений типа Telegram Desktop, которые
 //                           коннектятся напрямую к датацентрам минуя DNS — доменные
 //                           правила их не ловят.
-// Все списки (BLOCK_DOMAINS, DIRECT_DOMAINS, AI_DOMAINS, AI_TAG, YT_DOMAINS, YT_TAG, YT_GEOIP_CATEGORIES) редактируются через дашборд /xkeen.
+//   FOREIGN_RULE_BLOCK / FOREIGN_RULE_GEOIP — канал «Заблокированные в РФ» (Meta/Telegram/
+//                           Twitter/Discord) по доменам и по geoip; через FOREIGN_TAG (загран-выход).
+// Все списки (BLOCK_DOMAINS, DIRECT_DOMAINS, AI_DOMAINS, AI_TAG, YT_DOMAINS, YT_TAG, YT_GEOIP_CATEGORIES, FOREIGN_*) редактируются через дашборд /xkeen.
 {
   "routing": {
     "rules": [
@@ -48,6 +50,8 @@ __DIRECT_RULE_BLOCK__
 __AI_RULE_BLOCK__
 __YT_RULE_BLOCK__
 __YT_RULE_GEOIP__
+__FOREIGN_RULE_BLOCK__
+__FOREIGN_RULE_GEOIP__
 { "inboundTag": ["socks-local"], "outboundTag": "vless-reality", "type": "field" },
 { "inboundTag": ["redirect","tproxy"], "outboundTag": "__DEFAULT_TAG__", "type": "field" }
 ]
