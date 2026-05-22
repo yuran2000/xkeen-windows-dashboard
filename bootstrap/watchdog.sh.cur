@@ -98,7 +98,7 @@ tg_alert() {
 # Если AI_DOMAINS пуст ИЛИ только из пробелов → AI-sticky выключен: блок заменяется на пустую
 # строку, AI-сайты идут через PRIMARY как обычный трафик.
 generate_routing() {
-  local default_tag="$1" ai_tag="$2" yt_tag="$3"
+  local default_tag="$1" ai_tag="$2" yt_tag="$3" foreign_tag="$4"
   [ -f "$TEMPL" ] || { log "ERROR: template $TEMPL not found"; return 1; }
 
   # v9 defensive: если default_tag пустой — fallback на 'direct' если есть в outbounds.
@@ -192,6 +192,42 @@ generate_routing() {
     log "WARN: YT_GEOIP_CATEGORIES задан, но YT_TAG пуст — GeoIP правило не генерируем"
   fi
 
+  # ---- FOREIGN rule block (канал «Заблокированные в РФ»: Meta/Telegram/Twitter/Discord) ----
+  # FOREIGN_DOMAINS + FOREIGN_EXT_CATEGORIES → через FOREIGN_TAG (ЗАГРАН-выход). Вынесено из YT:
+  # эти сервисы заблокированы РКН, RU-выход блокировку не обходит. Kill-switch — FOREIGN_FAIL_BLOCK.
+  local clean_foreign_combined
+  clean_foreign_combined=$(echo "$FOREIGN_DOMAINS$FOREIGN_EXT_CATEGORIES" | tr -d ' ,\t\n\r')
+  local foreign_rule_block=""
+  if [ -n "$clean_foreign_combined" ] && [ -n "$foreign_tag" ]; then
+    local foreign_domains_json
+    foreign_domains_json=$(
+      {
+        echo "$FOREIGN_DOMAINS" | tr ' ,' '\n' | grep -v '^$' | sed 's/^/domain:/'
+        echo "$FOREIGN_EXT_CATEGORIES" | tr ' ,' '\n' | grep -v '^$' | sed 's|^|ext:geosite_v2fly.dat:|'
+      } | jq -R -s -c 'split("\n") | map(select(length>0))' 2>/dev/null
+    )
+    if [ -n "$foreign_domains_json" ] && [ "$foreign_domains_json" != "[]" ]; then
+      foreign_rule_block='      { "inboundTag": ["redirect","tproxy"], "outboundTag": "'"$foreign_tag"'", "type": "field", "domain": '"$foreign_domains_json"' },'
+    fi
+  elif [ -n "$clean_foreign_combined" ] && [ -z "$foreign_tag" ]; then
+    log "WARN: FOREIGN_DOMAINS/FOREIGN_EXT_CATEGORIES заданы, но FOREIGN_TAG пуст — правило не генерируем"
+  fi
+
+  # ---- FOREIGN GeoIP rule block (Telegram Desktop и др. IP-only через FOREIGN_TAG) ----
+  local clean_foreign_geoip
+  clean_foreign_geoip=$(echo "$FOREIGN_GEOIP_CATEGORIES" | tr -d ' ,\t\n\r')
+  local foreign_geoip_rule_block=""
+  if [ -n "$clean_foreign_geoip" ] && [ -n "$foreign_tag" ]; then
+    local foreign_geoip_json
+    foreign_geoip_json=$(echo "$FOREIGN_GEOIP_CATEGORIES" | tr ' ,' '\n' | grep -v '^$' | \
+      jq -R -s -c 'split("\n") | map(select(length>0)) | map("geoip:" + .)' 2>/dev/null)
+    if [ -n "$foreign_geoip_json" ] && [ "$foreign_geoip_json" != "[]" ]; then
+      foreign_geoip_rule_block='      { "inboundTag": ["redirect","tproxy"], "outboundTag": "'"$foreign_tag"'", "type": "field", "ip": '"$foreign_geoip_json"' },'
+    fi
+  elif [ -n "$clean_foreign_geoip" ] && [ -z "$foreign_tag" ]; then
+    log "WARN: FOREIGN_GEOIP_CATEGORIES задан, но FOREIGN_TAG пуст — GeoIP правило не генерируем"
+  fi
+
   # ---- BLOCK rule block ----
   # BLOCK_DOMAINS — список сайтов которые ПОЛНОСТЬЮ заблокированы (outbound `block`/blackhole).
   # Кейс: Windows Update, Adobe Genuine, телеметрия — отрезка на уровне роутера.
@@ -208,7 +244,7 @@ generate_routing() {
     fi
   fi
 
-  awk -v dt="$default_tag" -v ai_rule="$ai_rule_block" -v direct_rule="$direct_rule_block" -v yt_rule="$yt_rule_block" -v yt_geoip_rule="$yt_geoip_rule_block" -v block_rule="$block_rule_block" '
+  awk -v dt="$default_tag" -v ai_rule="$ai_rule_block" -v direct_rule="$direct_rule_block" -v yt_rule="$yt_rule_block" -v yt_geoip_rule="$yt_geoip_rule_block" -v foreign_rule="$foreign_rule_block" -v foreign_geoip_rule="$foreign_geoip_rule_block" -v block_rule="$block_rule_block" '
     /__AI_RULE_BLOCK__/ {
       if (ai_rule == "") next
       else { gsub(/__AI_RULE_BLOCK__/, ai_rule); print; next }
@@ -220,6 +256,14 @@ generate_routing() {
     /__YT_RULE_GEOIP__/ {
       if (yt_geoip_rule == "") next
       else { gsub(/__YT_RULE_GEOIP__/, yt_geoip_rule); print; next }
+    }
+    /__FOREIGN_RULE_BLOCK__/ {
+      if (foreign_rule == "") next
+      else { gsub(/__FOREIGN_RULE_BLOCK__/, foreign_rule); print; next }
+    }
+    /__FOREIGN_RULE_GEOIP__/ {
+      if (foreign_geoip_rule == "") next
+      else { gsub(/__FOREIGN_RULE_GEOIP__/, foreign_geoip_rule); print; next }
     }
     /__DIRECT_RULE_BLOCK__/ {
       if (direct_rule == "") next
@@ -435,17 +479,37 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ]; then
   fi
 fi
 
-# Запомнить предыдущий effective_ai/effective_yt чтобы логировать смену
+# ---------- FOREIGN kill-switch (канал «Заблокированные в РФ», default ВЫКЛ) ----------
+# Если FOREIGN_TAG мёртв И FOREIGN_FAIL_BLOCK=1 → effective FOREIGN = 'block'.
+# Зачем: сервисы заблокированы в РФ. Если загран-канал упал и трафик пойдёт через PRIMARY
+# (RU-выход) — сервисы всё равно не откроются (блок РКН), а реальный IP засветится.
+# Лучше заблокировать до восстановления канала.
+EFFECTIVE_FOREIGN_TAG="$FOREIGN_TAG"
+FOREIGN_PROBE_CODE=""
+if [ -n "$FOREIGN_DOMAINS$FOREIGN_EXT_CATEGORIES$FOREIGN_GEOIP_CATEGORIES" ] && [ -n "$FOREIGN_TAG" ] && [ "$FOREIGN_TAG" != "block" ]; then
+  if [ "${FOREIGN_FAIL_BLOCK:-0}" = "1" ]; then
+    if probe_tag "$FOREIGN_TAG" ""; then
+      FOREIGN_PROBE_CODE="up"
+    else
+      FOREIGN_PROBE_CODE="down"
+      EFFECTIVE_FOREIGN_TAG="block"
+    fi
+  fi
+fi
+
+# Запомнить предыдущий effective_ai/effective_yt/effective_foreign чтобы логировать смену
 PREV_AI=$(grep -o 'EFFECTIVE_AI=\S*' "$STATE_FILE" 2>/dev/null | cut -d= -f2)
 [ -z "$PREV_AI" ] && PREV_AI="$AI_TAG"
 PREV_YT=$(grep -o 'EFFECTIVE_YT=\S*' "$STATE_FILE" 2>/dev/null | cut -d= -f2)
 [ -z "$PREV_YT" ] && PREV_YT="$YT_TAG"
+PREV_FOREIGN=$(grep -o 'EFFECTIVE_FOREIGN=\S*' "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+[ -z "$PREV_FOREIGN" ] && PREV_FOREIGN="$FOREIGN_TAG"
 
 # ---------- Apply changes ----------
 # Всегда генерим новый routing.json и сравниваем с текущим через md5.
 # Это позволяет триггерить пересборку не только при смене default_tag, но и при изменении
 # AI_DOMAINS / AI_TAG / YT_DOMAINS / YT_TAG / шаблона (юзер правит из дашборда).
-if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG"; then
+if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFFECTIVE_FOREIGN_TAG"; then
   if routing_changed; then
     if mv "$CONFIG_DIR/05_routing.json.new" "$CONFIG_DIR/05_routing.json"; then
       /opt/sbin/xkeen -restart >/dev/null 2>&1
@@ -473,6 +537,16 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG"; then
         else
           log "YT-KILL-SWITCH-CLEAR: $YT_TAG восстановился — YouTube-трафик пошёл через него"
           tg_alert "✅ <b>XKeen YT kill-switch</b>: канал <code>$YT_TAG</code> восстановился, YouTube/IG/Discord снова работают через него."
+        fi
+      fi
+      # FOREIGN kill-switch event log + TG-уведомление
+      if [ "$EFFECTIVE_FOREIGN_TAG" != "$PREV_FOREIGN" ]; then
+        if [ "$EFFECTIVE_FOREIGN_TAG" = "block" ]; then
+          log "FOREIGN-KILL-SWITCH: FOREIGN_TAG=$FOREIGN_TAG мёртв — трафик «Заблокированные в РФ» заблокирован (FOREIGN_FAIL_BLOCK=1)"
+          tg_alert "🛡️ <b>XKeen FOREIGN kill-switch</b>: канал <code>$FOREIGN_TAG</code> недоступен → Meta/Telegram/Twitter ВРЕМЕННО заблокированы (чтобы не светить реальный IP). Восстановится когда $FOREIGN_TAG оживёт."
+        else
+          log "FOREIGN-KILL-SWITCH-CLEAR: $FOREIGN_TAG восстановился — трафик пошёл через него"
+          tg_alert "✅ <b>XKeen FOREIGN kill-switch</b>: канал <code>$FOREIGN_TAG</code> восстановился, Meta/Telegram/Twitter снова работают через него."
         fi
       fi
     else
@@ -519,4 +593,4 @@ fi
 
 # ---------- Save state ----------
 # Формат: "<state> <counter> <default_tag> EFFECTIVE_AI=<tag> EFFECTIVE_YT=<tag> LAST_FULL_PROBE=<epoch> PREV_ALIVE=<n>"
-echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER" > "$STATE_FILE"
+echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER" > "$STATE_FILE"

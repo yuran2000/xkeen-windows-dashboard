@@ -40,6 +40,8 @@ set "ROOT=%CD%"
     --collect-all flask ^
     --collect-all jinja2 ^
     --hidden-import psutil ^
+    --hidden-import requests ^
+    --hidden-import socks ^
     --workpath "%ROOT%\portable\build" ^
     --distpath "%ROOT%\portable\dist" ^
     --specpath "%ROOT%\portable" ^

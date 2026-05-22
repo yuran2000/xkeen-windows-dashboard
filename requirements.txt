@@ -1,3 +1,8 @@
 flask>=3.0
 psutil>=5.9
 qrcode[pil]>=7.4
+# rkn_checker (диагностика блокировок «🔎 Проверка сайта»): requests — HTTP/DoH/TCP-проба;
+# PySocks — режим «через outbound» (SOCKS5-прокси). Без них секция диагностики деградирует,
+# а в portable-EXE фича не соберётся (PyInstaller бандлит только то, что стоит в venv).
+requests>=2.31
+PySocks>=1.7

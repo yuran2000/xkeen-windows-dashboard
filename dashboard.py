@@ -836,7 +836,7 @@ def keenetic_read_domain_notes():
     Формат: {"ai": {"claude.ai": "📦 claude"}, "yt": {...}, "direct": {...}, "block": {...}}
     Если файла нет — возвращает пустую структуру (4 пустых namespace).
     """
-    empty = {"ai": {}, "yt": {}, "direct": {}, "block": {}}
+    empty = {"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}}
     raw = keenetic_read_file(KEENETIC_DOMAIN_NOTES_FILE)
     if not raw:
         return empty
@@ -859,7 +859,7 @@ def keenetic_write_domain_notes(notes_dict):
     """
     import time as _time
     # Нормализуем
-    safe = {"ai": {}, "yt": {}, "direct": {}, "block": {}}
+    safe = {"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}}
     for k in safe:
         v = notes_dict.get(k, {}) if isinstance(notes_dict, dict) else {}
         if isinstance(v, dict):
@@ -1240,6 +1240,7 @@ def keenetic_get_watchdog():
     current_default = None
     effective_ai = None
     effective_yt = None
+    effective_foreign = None
     if state_raw:
         parts = state_raw.strip().split()
         if len(parts) >= 1:
@@ -1256,12 +1257,15 @@ def keenetic_get_watchdog():
                     effective_ai = p.split("=", 1)[1]
                 elif p.startswith("EFFECTIVE_YT="):
                     effective_yt = p.split("=", 1)[1]
+                elif p.startswith("EFFECTIVE_FOREIGN="):
+                    effective_foreign = p.split("=", 1)[1]
     log_lines = keenetic_tail_log(cfg.KEENETIC_WATCHDOG_LOG, n=30)
     return {
         "state": state, "counter": counter,
         "current_default": current_default,
         "effective_ai": effective_ai,
         "effective_yt": effective_yt,
+        "effective_foreign": effective_foreign,
         "log": log_lines,
     }
 
@@ -1296,6 +1300,8 @@ def keenetic_get_watchdog_targets():
     ai_domains_list = [d.strip() for d in re.split(r"[\s,]+", ai_domains_str) if d.strip()]
     yt_domains_str = cfg_d.get("YT_DOMAINS", "")
     yt_domains_list = [d.strip() for d in re.split(r"[\s,]+", yt_domains_str) if d.strip()]
+    foreign_domains_str = cfg_d.get("FOREIGN_DOMAINS", "")
+    foreign_domains_list = [d.strip() for d in re.split(r"[\s,]+", foreign_domains_str) if d.strip()]
     direct_domains_str = cfg_d.get("DIRECT_DOMAINS", "")
     direct_domains_list = [d.strip() for d in re.split(r"[\s,]+", direct_domains_str) if d.strip()]
     block_domains_str = cfg_d.get("BLOCK_DOMAINS", "")
@@ -1313,6 +1319,11 @@ def keenetic_get_watchdog_targets():
         "yt_ext_categories": cfg_d.get("YT_EXT_CATEGORIES", "").strip(),
         "yt_geoip_categories": cfg_d.get("YT_GEOIP_CATEGORIES", "").strip(),
         "yt_fail_block": cfg_d.get("YT_FAIL_BLOCK", "1") == "1",
+        "foreign_tag":       cfg_d.get("FOREIGN_TAG"),
+        "foreign_domains":   foreign_domains_list,
+        "foreign_ext_categories": cfg_d.get("FOREIGN_EXT_CATEGORIES", "").strip(),
+        "foreign_geoip_categories": cfg_d.get("FOREIGN_GEOIP_CATEGORIES", "").strip(),
+        "foreign_fail_block": cfg_d.get("FOREIGN_FAIL_BLOCK", "0") == "1",
         "direct_domains": direct_domains_list,
         "block_domains":  block_domains_list,
         "force_mode":   cfg_d.get("FORCE_MODE", "auto"),
@@ -1327,6 +1338,7 @@ def _build_watchdog_config(d):
         "PRIMARY_TAG", "FAILOVER_TAGS",
         "AI_TAG", "AI_DOMAINS", "AI_EXT_CATEGORIES", "AI_FAIL_BLOCK",
         "YT_TAG", "YT_DOMAINS", "YT_EXT_CATEGORIES", "YT_GEOIP_CATEGORIES", "YT_FAIL_BLOCK",
+        "FOREIGN_TAG", "FOREIGN_DOMAINS", "FOREIGN_EXT_CATEGORIES", "FOREIGN_GEOIP_CATEGORIES", "FOREIGN_FAIL_BLOCK",
         "DIRECT_DOMAINS",
         "BLOCK_DOMAINS",
         "PRIMARY_PROBE_URL", "FAIL_THRESHOLD", "PASS_THRESHOLD",
@@ -1366,6 +1378,14 @@ def keenetic_write_watchdog_config(updates):
     # Когда юзер добавляет "telegram" — watchdog v10 сгенерит отдельное правило
     # {"ip": ["geoip:telegram"], "outboundTag": YT_TAG} в 05_routing.json.
     if "YT_GEOIP_CATEGORIES" not in cur: cur["YT_GEOIP_CATEGORIES"] = ""
+    # «📱 Заблокированные в РФ» канал (FOREIGN_*): Meta/IG/Telegram/Twitter/Discord — сервисы,
+    # заблокированные в РФ, требуют ЗАРУБЕЖНОГО exit (RU-выход блок НЕ обходит). Вынесены из YT.
+    # Структура 1:1 как YT. Дефолты пустые — юзер выбирает домены/outbound в UI.
+    if "FOREIGN_TAG" not in cur: cur["FOREIGN_TAG"] = ""
+    if "FOREIGN_DOMAINS" not in cur: cur["FOREIGN_DOMAINS"] = ""
+    if "FOREIGN_EXT_CATEGORIES" not in cur: cur["FOREIGN_EXT_CATEGORIES"] = ""
+    if "FOREIGN_GEOIP_CATEGORIES" not in cur: cur["FOREIGN_GEOIP_CATEGORIES"] = ""
+    if "FOREIGN_FAIL_BLOCK" not in cur: cur["FOREIGN_FAIL_BLOCK"] = "0"
     if "PRIMARY_PROBE_URL" not in cur: cur["PRIMARY_PROBE_URL"] = f"https://{getattr(cfg, 'EXTERNAL_DOMAIN', None) or 'your-vpn-domain.example'}:8444/"
     if "FAIL_THRESHOLD" not in cur: cur["FAIL_THRESHOLD"] = "2"
     if "PASS_THRESHOLD" not in cur: cur["PASS_THRESHOLD"] = "3"
@@ -1395,7 +1415,7 @@ def keenetic_set_watchdog_target(role, new_tag):
     - Новый PRIMARY убирается из FAILOVER_TAGS (если был)
     - PRIMARY_PROBE_URL переключается: vless-reality → HTTPS curl, остальные → TCP-probe (пусто)
     """
-    if role not in ("primary", "failover", "ai", "yt"):
+    if role not in ("primary", "failover", "ai", "yt", "foreign"):
         return {"ok": False, "stderr": "invalid role"}
     cur = keenetic_read_watchdog_config()
     failover_str = cur.get("FAILOVER_TAGS", "")
@@ -1420,8 +1440,13 @@ def keenetic_set_watchdog_target(role, new_tag):
         return keenetic_write_watchdog_config({"AI_TAG": new_tag})
 
     if role == "yt":
-        # YT_TAG — sticky outbound для YouTube/Instagram/Discord (RU exit без рекламы).
+        # YT_TAG — sticky outbound для YouTube/Google (RU exit лечит троттлинг YouTube).
         return keenetic_write_watchdog_config({"YT_TAG": new_tag})
+
+    if role == "foreign":
+        # FOREIGN_TAG — sticky outbound для заблокированных в РФ (Meta/Telegram/Twitter/Discord).
+        # Должен быть ЗАРУБЕЖНЫМ exit — RU-выход блокировку НЕ обходит.
+        return keenetic_write_watchdog_config({"FOREIGN_TAG": new_tag})
 
     # role == "failover": ставим new_tag первым в FAILOVER_TAGS, остальные сохраняем
     failover_list = [t for t in failover_list if t != new_tag]
@@ -2136,7 +2161,7 @@ def xkeen_page():
     try:
         domain_notes = keenetic_read_domain_notes()
     except Exception:
-        domain_notes = {"ai": {}, "yt": {}, "direct": {}, "block": {}}
+        domain_notes = {"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}}
     return render_template_string(
         XKEEN_TEMPLATE,
         outbounds=outbounds,
@@ -3787,6 +3812,56 @@ def api_xkeen_set_yt_geoip_categories():
     return jsonify(keenetic_write_watchdog_config({"YT_GEOIP_CATEGORIES": " ".join(categories)}))
 
 
+@app.route("/api/xkeen/set-foreign-domains", methods=["POST"])
+@requires_auth
+def api_xkeen_set_foreign_domains():
+    """Обновить домены канала «📱 Заблокированные в РФ» (Meta/Telegram/Twitter/...).
+    Пустой список — правило выключено, эти домены идут через PRIMARY."""
+    raw = request.form.get("domains", "").strip()
+    domains = [d.strip() for d in re.split(r"[\s,]+", raw) if d.strip()]
+    return jsonify(keenetic_write_watchdog_config({"FOREIGN_DOMAINS": " ".join(domains)}))
+
+
+@app.route("/api/xkeen/set-foreign-fail-block", methods=["POST"])
+@requires_auth
+def api_xkeen_set_foreign_fail_block():
+    """Включить/выключить kill-switch канала «Заблокированные в РФ».
+    Если ВКЛ и канал упал — трафик блокируется (не утекает через RU-выход, где он всё равно заблокирован).
+    Body: enabled=1|0"""
+    enabled = request.form.get("enabled", "0") == "1"
+    return jsonify(keenetic_write_watchdog_config({"FOREIGN_FAIL_BLOCK": "1" if enabled else "0"}))
+
+
+@app.route("/api/xkeen/set-foreign-ext-categories", methods=["POST"])
+@requires_auth
+def api_xkeen_set_foreign_ext_categories():
+    """v2fly geosite-категории для канала «Заблокированные в РФ» (meta, twitter, ...).
+    Body: categories=<строка через пробел/запятую>."""
+    raw = request.form.get("categories", "").strip()
+    categories = []
+    for c in re.split(r"[\s,]+", raw):
+        c = c.strip().lower()
+        if c and re.match(r"^[a-z0-9_-]+$", c):
+            categories.append(c)
+    return jsonify(keenetic_write_watchdog_config({"FOREIGN_EXT_CATEGORIES": " ".join(categories)}))
+
+
+@app.route("/api/xkeen/set-foreign-geoip-categories", methods=["POST"])
+@requires_auth
+def api_xkeen_set_foreign_geoip_categories():
+    """geoip-категории для канала «Заблокированные в РФ» (telegram, discord, facebook, twitter).
+    Для IP-only приложений (Telegram Desktop коннектится к IP датацентров минуя DNS).
+    Watchdog сгенерит ОТДЕЛЬНОЕ правило {"ip": ["geoip:NAME"], "outboundTag": FOREIGN_TAG}.
+    Body: categories=<строка через пробел/запятую>, например "telegram"."""
+    raw = request.form.get("categories", "").strip()
+    categories = []
+    for c in re.split(r"[\s,]+", raw):
+        c = c.strip().lower()
+        if c and re.match(r"^[a-z0-9_-]+$", c):
+            categories.append(c)
+    return jsonify(keenetic_write_watchdog_config({"FOREIGN_GEOIP_CATEGORIES": " ".join(categories)}))
+
+
 @app.route("/api/xkeen/set-failover-chain", methods=["POST"])
 @requires_auth
 def api_xkeen_set_failover_chain():
@@ -4811,7 +4886,7 @@ FORCE_MODE="auto"
 # Минимальные пустые meta-файлы (если ещё нет — создаём пустыми)
 EMPTY_OUTBOUND_META = "{}\n"
 EMPTY_SUBSCRIPTION_META = "{}\n"
-EMPTY_DOMAIN_NOTES = '{"ai": {}, "yt": {}, "direct": {}, "block": {}}\n'  # v1.7.0
+EMPTY_DOMAIN_NOTES = '{"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}}\n'  # v1.7.0
 
 # Минимальный 04_outbounds.json с двумя стандартными outbound'ами:
 # - "direct" (freedom) — для виртуального канала «🌐 Напрямую без VPN» в PRIMARY/FAILOVER/AI/YT
@@ -7248,20 +7323,26 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 </head>
 <body>
 
-<h1>🚦 XKeen — управление Кинетиком
-  <span class="nav">
-    {% if not is_client_only %}<a href="/" title="Локальный мониторинг xray/Caddy/портов на этом PC">← дашборд</a>{% endif %}
-    <a href="javascript:restartDashboard()" title="Перезапустить панель прямо отсюда — кнопка отправит запрос на /api/xkeen/restart-dashboard, подождёт ~8 сек и обновит страницу. Если не сработает — откроется help с альтернативами.">🔄 рестарт панели</a>
-    <a href="https://github.com/yuran2000/xray-dashboard/releases/latest" target="_blank" class="health-badge" style="background:#f0e6ff; color:#5a3a99; border:1px solid #c9b3e0; text-decoration:none;" title="Версия панели. Клик → страница последнего релиза на GitHub. Сравни с тем что у тебя — если есть свежее, обнови через update.bat.">v{{ dashboard_version }}</a>
-    <span id="xray-status-badge" class="health-badge xs-pending" title="Состояние xray на роутере — обновляется каждые 60 сек. Клик → перейти к секции 📊 Статус XKeen.">⏳ xray ...</span>
-    <span id="dashboard-health-badge" class="health-badge health-pending" title="Проверка состояния процесса панели — обновляется автоматически каждые 15 сек">⏳ проверка...</span>
-    {% if is_first_run %}
-    <a href="#section-router-config" class="health-badge" style="background:#fde8c8; color:#7a5500; border:1px solid #e0c878; text-decoration:none; cursor:pointer; animation: blink 1.8s infinite;" title="Роутер не подключён — настрой SSH в разделе внизу страницы">⚠ роутер не подключён</a>
-    {% endif %}
-    <a href="/logout">выход ({{ username }})</a>
+<style>
+  .topbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px 14px;padding:4px 0 9px;border-bottom:1px solid #e8e8e8;margin-bottom:8px;}
+  .topbar h1{font-size:1.3em;margin:0;font-weight:700;line-height:1.2;letter-spacing:-0.01em;}
+  .topbar h1 .tb-host{font-size:0.6em;font-weight:500;color:#8a8f98;letter-spacing:0;cursor:help;}
+  .topbar-actions{margin-left:auto;display:flex;align-items:center;flex-wrap:wrap;gap:6px 9px;font-size:0.9em;}
+  .topbar-actions a.tb-link{color:#3a6ea5;text-decoration:none;white-space:nowrap;}
+  .topbar-actions a.tb-link:hover{text-decoration:underline;}
+</style>
+<div class="topbar">
+  <h1>🚦 XKeen <span class="tb-host" title="Управление XKeen на роутере через SSH · перед каждым изменением создаётся бэкап на роутере">· Keenetic {{ keenetic_settings.current.host }}:{{ keenetic_settings.current.port }}</span></h1>
+  <span class="topbar-actions">
+    {% if not is_client_only %}<a href="/" class="tb-link" title="Локальный мониторинг xray/Caddy/портов на этом PC">← дашборд</a>{% endif %}
+    <a href="javascript:restartDashboard()" class="tb-link" title="Перезапустить панель прямо отсюда — запрос на /api/xkeen/restart-dashboard, ~8 сек и обновление страницы. Если не сработает — откроется help с альтернативами.">🔄 рестарт</a>
+    <span id="xray-status-badge" class="health-badge xs-pending" title="Состояние xray на роутере — обновляется каждые 60 сек. Клик → секция 📊 Статус XKeen.">⏳ xray ...</span>
+    <span id="dashboard-health-badge" class="health-badge health-pending" title="Проверка процесса панели — каждые 15 сек">⏳ проверка...</span>
+    {% if is_first_run %}<a href="#section-router-config" class="health-badge" style="background:#fde8c8; color:#7a5500; border:1px solid #e0c878; text-decoration:none; cursor:pointer; animation: blink 1.8s infinite;" title="Роутер не подключён — настрой SSH в разделе внизу страницы">⚠ роутер не подключён</a>{% endif %}
+    <a href="https://github.com/yuran2000/xray-dashboard/releases/latest" target="_blank" class="health-badge" style="background:#f0e6ff; color:#5a3a99; border:1px solid #c9b3e0; text-decoration:none;" title="Версия панели. Клик → последний релиз на GitHub. Сравни с тем что у тебя — если есть свежее, обнови через update.bat.">v{{ dashboard_version }}</a>
+    <a href="/logout" class="tb-link" title="Выход из аккаунта {{ username }}">⎋ выход</a>
   </span>
-</h1>
-<p class="subtitle">Веб-панель управления XKeen на роутере <span class="mono">{{ keenetic_settings.current.host }}:{{ keenetic_settings.current.port }}</span> через SSH · перед каждым изменением создаётся бэкап на роутере</p>
+</div>
 
 <div id="flash" class="flash"></div>
 
@@ -7343,7 +7424,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   </div>
 
   <div class="row" style="margin-top: 16px;">
-    <div class="col" data-xk-sub="🤖 AI">
+    <div class="col" data-xk-sub="🤖 AI" data-xk-group="🧭 Куда идёт трафик">
       <div class="channel-card cc-ai">
         <label class="col-header col-ai">🤖 AI-sticky outbound <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — рекомендации по AI-каналу (Claude/ChatGPT не работают с RU-IP, нужен EU/US с kill-switch)">❓ помощь</a></label>
         <div class="channel-card-body">
@@ -7460,7 +7541,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         </div>
       </div>
     </div>
-    <div class="col" data-xk-sub="📺 YouTube">
+    <div class="col" data-xk-sub="📺 YouTube" data-xk-group="🧭 Куда идёт трафик">
       <div class="channel-card cc-yt">
         <label class="col-header col-yt">📺 YouTube-sticky outbound <a href="#help-yt-recaptcha" onclick="openHelpAnchor('help-yt-recaptcha'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Если YouTube показывает reCAPTCHA «подозрительный трафик» — открой Сценарий 2 в Помощи. Там полный комплекс настроек: 🇷🇺 Рецепт A для RU-канала + 🇳🇱 Рецепт B для EU/US-канала.">❓ помощь</a></label>
         <div class="channel-card-body">
@@ -7475,7 +7556,12 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           </select>
           <button class="btn btn-sm" style="margin-top: 6px; background: #c33;" onclick="setTarget('yt')">Сохранить YouTube outbound</button>
           <div id="info-yt" class="outbound-info"></div>
-          <p class="subtitle">Через какой канал идёт трафик к YouTube/Instagram/Discord. Полезно: RU-exit с DPI-обходом → YouTube БЕЗ рекламы (РФ-IP не ловит google_ads).</p>
+          <p class="subtitle">Через какой канал идёт трафик к YouTube.</p>
+          <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 11px; margin: 8px 0; font-size: 0.85em; color: #1a5276; border-radius: 4px;">
+            <strong>❓ Почему YouTube — отдельный канал, а не вместе с «📱 Заблокированными в РФ»?</strong><br>
+            YouTube в РФ <strong>не заблокирован</strong> — его только <strong>замедляют</strong>. Это лечится <strong>российским VPN</strong>: RU-сервер с хорошим пирингом до Google убирает троттлинг. Бонус — с РФ-IP YouTube крутит <strong>меньше рекламы</strong> (рекламная выдача гео-таргетится, google_ads на РФ-адрес почти не идёт). Поэтому сюда ставь <strong>🇷🇺 RU-выход</strong> (тег вида <code>..._YouTube</code>) — и быстро, и без рекламы.<br><br>
+            А <strong>Instagram/Meta, Telegram, Twitter/X, Discord</strong> — <strong>заблокированы РКН</strong>. Через российский выход их пускать бессмысленно: блокировку он не обходит, DPI режет TLS-handshake. Поэтому они вынесены в отдельный канал <strong>«📱 Заблокированные в РФ»</strong> с <strong>зарубежным</strong> выходом и собственными настройками (домены, пресеты, GeoIP для Telegram Desktop, свой kill-switch).
+          </div>
           <div class="failover-active-label">🎯 Сейчас в роутинге для YouTube:</div>
           <div id="info-yt-active" class="outbound-info"></div>
 
@@ -7521,17 +7607,12 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             <strong style="font-size: 0.85em; color: #555;">Готовые пресеты:</strong><br>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('youtube')">📺 YouTube</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('google_for_yt')" title="🌐 Google-домены которые подгружает YouTube-страница (gstatic.com, googleapis.com, googleusercontent.com). Без них YT-страница собирается с РАЗНЫХ outbound'ов → Google видит запросы с двух IP → reCAPTCHA 'подозрительный трафик'. ⚠ ВНИМАНИЕ: добавляет ВСЕ Google-сервисы (Gmail, Drive, Photos, Search, Maps) в YT-канал — они тоже пойдут через RU-exit если YT-tag = RU. Альтернатива: v2fly категория geosite:google в AI-канале (для EU/US-выхода).">🌐 Google для YT</button>
-            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('instagram')">📷 Instagram</button>
-            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('discord')">💬 Discord</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('tiktok')">🎵 TikTok</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('twitch')">🎮 Twitch</button>
-            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('twitter')">🐦 Twitter/X</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('reddit')">🔴 Reddit</button>
-            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('telegram')">💌 Telegram</button>
-            <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('whatsapp')" title="WhatsApp домены (web + клиент + Meta MQTT backend + wa.me ссылки). Заблокирован DPI в РФ с 2025-08 — нужен VPN. ВАЖНО: для первичного связывания нового устройства (QR-код) пресета может быть мало — клиент при первой авторизации ходит на доп. Edge-серверы по IP. Решение: временно поставь PRIMARY = VPN (вместо direct) → сделай linking → верни PRIMARY обратно. После связывания обычная работа покрывается этим пресетом.">💚 WhatsApp</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #c33;" onclick="addYTPreset('spotify')">🎧 Spotify</button>
             <div style="margin-top: 8px; padding-top: 6px; border-top: 1px solid #ddd;">
-              <button type="button" class="btn btn-sm" style="margin: 2px; background:#4a4; color:#fff;" onclick="addAllYTPresets()">📥 Добавить ВСЕ YT/IG/Discord</button>
+              <button type="button" class="btn btn-sm" style="margin: 2px; background:#4a4; color:#fff;" onclick="addAllYTPresets()">📥 Добавить ВСЕ YT</button>
               <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearYTDomains()">🗑 Очистить</button>
               <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="resetYTDefaults()">↩ Сброс к дефолту (YouTube)</button>
             </div>
@@ -7620,11 +7701,135 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     </div>
   </div>
 
+  <!-- ===== «📱 Заблокированные в РФ» канал (FOREIGN_*) — Meta/Telegram/Twitter/Discord через ЗАГРАН-exit ===== -->
+  <div class="row" style="margin-top: 16px;">
+    <div class="col" data-xk-sub="📱 Заблокированные в РФ" data-xk-group="🧭 Куда идёт трафик">
+      <div class="channel-card">
+        <label class="col-header" style="color:#8e44ad;">📱 «Заблокированные в РФ» — sticky outbound</label>
+        <div class="channel-card-body">
+          <select id="select-foreign" style="width: 100%; padding: 7px; font-size: 0.95em; border: 1px solid #ccc; border-radius: 4px;">
+            {% for grp in vless_option_groups %}
+            <optgroup label="📦 {{ grp.name }}">
+              {% for opt in grp.options %}
+              <option value="{{ opt.tag }}" {% if opt.tag == targets.foreign_tag %}selected{% endif %} style="background-color: {{ grp.bg }};">{% if opt.is_direct %}🌐 Напрямую без VPN (НЕ годится — РФ-блок не обойдёт){% else %}{{ grp.name }} · {{ opt.tag }}{% if opt.is_anti_dpi %} · 🛡️ Обход{% elif opt.is_ru %} · 🇷🇺 RU (НЕ годится){% endif %}{% endif %}</option>
+              {% endfor %}
+            </optgroup>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm" style="margin-top: 6px; background: #8e44ad;" onclick="setTarget('foreign')">Сохранить outbound</button>
+          <div id="info-foreign" class="outbound-info"></div>
+          <p class="subtitle">Канал для сервисов, <strong>заблокированных в РФ</strong> (Meta/IG, Telegram, Twitter/X, Discord). ⚠️ Выбирай <strong>ЗАРУБЕЖНЫЙ</strong> выход (🇳🇱 Нидерланды и т.п.) — российский exit блокировку РКН <strong>не обходит</strong> (DPI режет TLS даже через RU-IP).</p>
+          <div class="failover-active-label">🎯 Сейчас в роутинге:</div>
+          <div id="info-foreign-active" class="outbound-info"></div>
+
+          <div class="kill-switch-box" style="background: {% if watchdog.effective_foreign == 'block' %}#fbd7d7{% else %}#f6f0fb{% endif %};">
+            <div style="font-weight: 600; font-size: 0.9em;">
+              🛡️ Kill-switch:
+              {% if watchdog.effective_foreign == 'block' %}
+                <span style="color: #c33;">🚨 АКТИВЕН — трафик заблокирован</span>
+              {% elif watchdog.effective_foreign == targets.foreign_tag %}
+                <span style="color: #2a7;">✓ канал {{ watchdog.effective_foreign }} жив</span>
+              {% elif watchdog.effective_foreign %}
+                <span style="color: #e80;">⚠️ FALLBACK — идёт через {{ watchdog.effective_foreign }}</span>
+              {% else %}
+                <span style="color: #888;">не активен (канал выключен)</span>
+              {% endif %}
+            </div>
+            <label style="font-size: 0.85em; margin-top: 6px; display: block; cursor: pointer;">
+              <input type="checkbox" id="foreign-fail-block-toggle" {% if targets.foreign_fail_block %}checked{% endif %} onchange="toggleForeignFailBlock(this.checked)">
+              Блокировать трафик если канал упал
+              <span class="subtitle" style="font-weight: normal;">— рекомендуется ВКЛ: если загран-канал умер, выпускать Meta/Telegram через RU-выход бессмысленно (всё равно заблокировано) и опасно (утечка реального IP)</span>
+            </label>
+            <p class="subtitle" style="margin: 4px 0 0;">
+              {% if targets.foreign_fail_block %}
+                ВКЛ: если <code>{{ targets.foreign_tag }}</code> не отвечает — эти сервисы идут в <code>block</code> (drop), не утекают через RU.
+              {% else %}
+                ВЫКЛ: при падении <code>{{ targets.foreign_tag }}</code> трафик пойдёт через default (PRIMARY/FAILOVER) — если это RU-выход, Meta/Telegram всё равно не откроются.
+              {% endif %}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Домены канала «Заблокированные в РФ» -->
+      <div class="domain-section">
+        <h3 class="domain-section-header">📱 Список доменов «Заблокированные в РФ» <span class="subsec-hint">(через outbound выше)</span></h3>
+        <div class="domain-section-body">
+          <p class="subtitle">Через пробел или с новой строки. Поддомены подхватываются автоматически (<code>domain:instagram.com</code> покрывает <code>www.instagram.com</code>). Пустой список = правило выключено, идут через PRIMARY.</p>
+          <div style="margin-bottom: 8px;">
+            <strong style="font-size: 0.85em; color: #555;">Готовые пресеты:</strong><br>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('instagram')">📷 Instagram</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('facebook')">📘 Facebook</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('whatsapp')" title="WhatsApp домены (web + клиент + Meta MQTT backend + wa.me ссылки). Для первичного связывания нового устройства (QR) клиент может ходить на доп. Edge-серверы по IP — временно поставь PRIMARY=VPN, свяжи, верни обратно.">💚 WhatsApp</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('threads')">🧵 Threads</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('telegram')">💌 Telegram</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('twitter')">🐦 Twitter/X</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('discord')">💬 Discord</button>
+            <div style="margin-top: 8px; padding-top: 6px; border-top: 1px solid #ddd;">
+              <button type="button" class="btn btn-sm" style="margin: 2px; background:#4a4; color:#fff;" onclick="addAllForeignPresets()">📥 Добавить ВСЕ</button>
+              <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearForeignDomains()">🗑 Очистить</button>
+              <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="resetForeignDefaults()">↩ Сброс (Instagram+Telegram)</button>
+            </div>
+          </div>
+          <textarea id="foreign-domains" style="width: 100%; min-height: 100px; font-family: Consolas, monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">{% for d in targets.foreign_domains %}{{ d }}
+{% endfor %}</textarea>
+          <button class="btn" style="margin-top: 6px; background: #8e44ad;" onclick="saveForeignDomains()">💾 Сохранить домены</button>
+          <p class="subtitle" style="margin: 4px 0 0; font-size: 0.85em;">Watchdog подхватит при следующем тике (≤1 мин).</p>
+
+          <!-- v2fly geosite-категории для канала «Заблокированные в РФ» -->
+          <details style="margin-top: 14px; border-top: 1px dashed #ccc; padding-top: 10px;" {% if targets.foreign_ext_categories %}open{% endif %}>
+            <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">🩻 v2fly категории <span style="color: #888; font-weight: 400; font-size: 0.88em;">— автообновляются с GeoFile</span> <a href="#help-v2fly-geoip" onclick="openHelpAnchor('help-v2fly-geoip'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; margin-left: 6px;" title="Открыть описание v2fly категорий в Помощи">❓ что это?</a></summary>
+            <div style="margin-top: 8px;">
+              <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">Дополнительно к ручному списку. Здесь категории Meta/X <strong>безопасны</strong> — канал заведомо зарубежный.</p>
+              <div style="margin-bottom: 6px;">
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignExtCat('facebook')">📘 facebook</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignExtCat('instagram')">📷 instagram</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignExtCat('twitter')">🐦 twitter</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignExtCat('telegram')">💌 telegram</button>
+                <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearForeignExtCats()">🗑 Очистить</button>
+              </div>
+              <input id="foreign-ext-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.foreign_ext_categories or '' }}" placeholder="через пробел: facebook instagram twitter" />
+              <button class="btn" style="margin-top: 6px; background: #8e44ad;" onclick="saveForeignExtCategories()">💾 Сохранить категории</button>
+              <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Без префиксов — только имя категории. Полный список: <a href="https://github.com/v2fly/domain-list-community/tree/master/data" target="_blank">v2fly community</a>.</p>
+            </div>
+          </details>
+
+          <!-- GeoIP-категории (IP-only приложения: Telegram Desktop, Discord) -->
+          <details style="margin-top: 14px; border-top: 1px dashed #ccc; padding-top: 10px;" {% if targets.foreign_geoip_categories %}open{% endif %}>
+            <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">🌍 GeoIP-категории <span style="color: #888; font-weight: 400; font-size: 0.88em;">— для IP-only приложений типа Telegram Desktop</span> <a href="#help-v2fly-geoip" onclick="openHelpAnchor('help-v2fly-geoip'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; margin-left: 6px;" title="Открыть описание GeoIP-категорий в Помощи">❓ что это?</a></summary>
+            <div style="margin-top: 8px;">
+              <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">
+                Доменные правила не ловят приложения, которые коннектятся напрямую к IP датацентров минуя DNS — Telegram Desktop, Discord native client.
+                Матч по IP-диапазонам из <code>geoip.dat</code>. Генерируется как <strong>отдельное правило</strong> <code>"ip": ["geoip:NAME"]</code>, outbound = этот канал.
+              </p>
+              <div style="background: #fff3cd; border-left: 3px solid #f0c200; padding: 8px 10px; margin: 0 0 10px; font-size: 0.85em; color: #6a4900;">
+                ⚠️ <strong>Требует расширенный <code>geoip.dat</code></strong> (Loyalsoldier) — в базовых XKeen-базах категорий сервисов (telegram, discord) нет.
+                <div style="margin-top: 8px;">
+                  <button type="button" class="btn btn-sm" style="background:#4a4; color:#fff; margin: 2px;" onclick="installExtendedGeoip()" title="Скачать расширенный geoip.dat (~18MB) от Loyalsoldier — содержит страны и сервисы. Делается один раз на роутер. Текущий файл сохранится в .bak.">📥 Установить расширенный geoip.dat (Loyalsoldier)</button>
+                </div>
+              </div>
+              <div style="margin-bottom: 6px;">
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignGeoipCat('telegram')" title="IP-диапазоны датацентров Telegram (149.154.x.x, 91.108.x.x). Нужно для Telegram Desktop — он коннектится по IP минуя DNS.">📱 telegram</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignGeoipCat('discord')">💬 discord</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignGeoipCat('facebook')">📘 facebook</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignGeoipCat('twitter')">🐦 twitter</button>
+                <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearForeignGeoipCats()">🗑 Очистить</button>
+              </div>
+              <input id="foreign-geoip-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.foreign_geoip_categories or '' }}" placeholder="через пробел: telegram discord" />
+              <button class="btn" style="margin-top: 6px; background: #8e44ad;" onclick="saveForeignGeoipCategories()">💾 Сохранить GeoIP-категории</button>
+              <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Требует расширенный geoip.dat (см. кнопку выше).</p>
+            </div>
+          </details>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- DIRECT + BLOCK в одну строку (parallel: один разрешает через провайдера, второй полностью блокирует) -->
   <div class="row" style="gap: 16px; margin-top: 16px;">
   <div class="col" style="flex: 1 1 460px; min-width: 0;">
   <!-- DIRECT домены — сайты идут напрямую без VPN -->
-  <div class="domain-section ds-direct" data-xk-sub="🚫 Напрямую">
+  <div class="domain-section ds-direct" data-xk-sub="🚫 Напрямую" data-xk-group="🧭 Куда идёт трафик">
     <h3 class="domain-section-header">🚫 Сайты НАПРЯМУЮ без VPN <span class="subsec-hint">(DIRECT — пойдут через провайдера, без VPN)</span> <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.7em; color: #468; text-decoration: none; margin-left: 8px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — там объяснение когда нужны DIRECT-домены (банки, Госуслуги, российские сервисы которые блокируют не-RU IP)">❓ помощь</a></h3>
     <div class="domain-section-body">
       <p class="subtitle">
@@ -7663,7 +7868,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 
   <div class="col" style="flex: 1 1 460px; min-width: 0;">
   <!-- BLOCK домены — полностью заблокировать (outbound `block` / blackhole) -->
-  <div class="domain-section ds-block" data-xk-sub="⛔ Блокировать">
+  <div class="domain-section ds-block" data-xk-sub="⛔ Блокировать" data-xk-group="🧭 Куда идёт трафик">
     <h3 class="domain-section-header">⛔ Заблокированные сайты <span class="subsec-hint">(BLOCK — outbound `block`/blackhole, пакеты дропаются)</span> <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.7em; color: #468; text-decoration: none; margin-left: 8px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — там пресеты BLOCK для Windows Update / Telemetry / Adobe Genuine / Office Telemetry">❓ помощь</a></h3>
     <div class="domain-section-body">
       <p class="subtitle">
@@ -7970,8 +8175,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
       </td>
       <td style="vertical-align: top;">
         {% set has_current = o.is_default or o.is_primary or o.is_failover or o.in_failover_chain or o.is_ai or o.tag in ('direct','block') %}
-        <div style="background: #f0f5f0; border-left: 3px solid #6a9; padding: 4px 8px; border-radius: 3px; margin-bottom: 6px; min-height: 42px;">
-          <span style="color:#3a6; font-size:0.72em; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px;">▼ сейчас:</span><br>
+        <div style="background: #f0f5f0; border-left: 3px solid #6a9; padding: 2px 8px; border-radius: 3px; margin-bottom: 4px;">
+          <span style="color:#3a6; font-size:0.72em; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px; margin-right:5px;">▼ сейчас:</span>
           {% if has_current %}
             {% if o.is_default %}<span class="badge badge-active">⚡ default сейчас</span>{% endif %}
             {% if o.is_primary %}<span class="badge badge-ok">🟢 primary</span>{% endif %}
@@ -7984,9 +8189,9 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           {% endif %}
         </div>
         {% if o.protocol == 'vless' and not (o.is_primary and o.is_failover and o.is_ai) %}
-          <div style="opacity: 0.85; padding: 2px 4px;">
+          <div style="opacity: 0.85; padding: 1px 4px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
             <span style="color:#aaa; font-size:0.7em; text-transform:uppercase; letter-spacing:0.3px;">сделать:</span>
-            <div style="margin-top: 2px; display: flex; gap: 3px; flex-wrap: wrap;">
+            <div style="display: flex; gap: 3px; flex-wrap: wrap;">
               {% if not o.is_primary %}
                 <button class="btn btn-sm role-btn" style="background:#fafafa; color:#2a5; border:1px dashed #2a5; padding:1px 6px; font-size:0.72em;"
                   onclick="setRole('{{ o.tag }}', 'primary')"
@@ -9313,7 +9518,7 @@ Use this token to access the HTTP API:
           </ol>
 
           <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #1a5276;">
-            💡 <strong>Бонус — IPv6 leak</strong>: если у тебя домашний провайдер выдаёт IPv6 (например Ростелеком fiber) — IPv6-трафик уходит мимо xray (TPROXY ловит только IPv4). YouTube может увидеть твой реальный домашний IPv6 — это тоже триггерит reCAPTCHA. Лечится в Web UI Keenetic → подключение → <strong>«Параметры IPv6» → «Не используется»</strong>. После этого Chrome не получит AAAA-записи и пойдёт только по IPv4.
+            💡 <strong>Бонус — IPv6 leak</strong>: если у тебя домашний провайдер выдаёт IPv6 (например Ростелеком fiber) — IPv6-трафик уходит мимо xray (TPROXY ловит только IPv4). YouTube может увидеть твой реальный домашний IPv6 — это тоже триггерит reCAPTCHA. Лечится в Web UI Keenetic → подключение → <strong>«Параметры IPv6» → «Не используется»</strong>. После этого Chrome не получит AAAA-записи и пойдёт только по IPv4. <a href="#help-ipv6-leak" onclick="openHelpAnchor('help-ipv6-leak'); return false;">Подробнее → отдельная тема «🌐 Утечка IPv6»</a>.
           </div>
 
           <div style="background: #fee; border-left: 3px solid #c33; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #6a1010;">
@@ -9323,6 +9528,35 @@ Use this token to access the HTTP API:
       </details>
 
       <p style="margin-top: 12px;" class="muted">Хочешь больше сценариев — например «полный VPN для всего» или «AI + банки направления» — напиши, добавим.</p>
+    </div>
+  </details>
+
+  <details class="help-section" id="help-ipv6-leak">
+    <summary>🌐 Утечка IPv6 — реальный IP светится мимо VPN</summary>
+    <div class="help-body">
+      <p><strong>Симптом</strong>: VPN включён и сайты открываются, но сервис всё равно видит твой <strong>реальный домашний IP</strong> — YouTube/Google показывают reCAPTCHA «подозрительный трафик» (с двумя разными IP), AI-сервисы (Claude/OpenAI) ловят geo-mismatch и просят верификацию, Instagram/Meta периодически не пускают. На <a href="https://test-ipv6.com" target="_blank">test-ipv6.com</a> или <a href="https://browserleaks.com/ip" target="_blank">browserleaks.com/ip</a> виден IPv6-адрес твоего провайдера.</p>
+
+      <h4>Причина</h4>
+      <p>XKeen перехватывает трафик через <code>redirect</code>/<code>tproxy</code> — но <strong>только IPv4</strong>. Если домашний провайдер выдаёт ещё и <strong>IPv6</strong> (Ростелеком fiber, МГТС GPON и т.п.), браузер/приложение, получив <code>AAAA</code>-запись, идёт по IPv6 <strong>напрямую, мимо xray</strong>. Туннель не задействован → сервис видит реальный домашний IPv6.</p>
+      <div style="background:#fff3cd; border-left:3px solid #f0c200; padding:8px 11px; margin:8px 0; font-size:0.92em; color:#6a4900;">
+        ⚠️ Бьёт по <strong>всем</strong> каналам, не только YouTube: <strong>AI</strong> (geo-jump → верификация/бан аккаунта), <strong>«Заблокированные в РФ»</strong> (Meta видит RU-IPv6), основной трафик. Поэтому это общесетевая проблема, а не «про ютуб».
+      </div>
+
+      <h4>Проверка</h4>
+      <ol>
+        <li>Открой <a href="https://test-ipv6.com" target="_blank">test-ipv6.com</a> — если «Your IPv6 address» показывает адрес (не «no IPv6») и он НЕ совпадает с твоим VPN-выходом → есть утечка.</li>
+        <li>В консоли PC: <code>ping -6 google.com</code> — если отвечает (а не «could not find host» / «General failure») → IPv6 активен на устройстве.</li>
+        <li>На роутере по SSH: <code>ip -6 route show default</code> — если есть default-маршрут v6 → провайдер раздаёт IPv6.</li>
+      </ol>
+
+      <h4>Фикс — отключить IPv6 на роутере (рекомендуется)</h4>
+      <ol>
+        <li>Web UI Keenetic → <strong>Интернет → Подключения</strong> → твоё WAN-подключение.</li>
+        <li>Найди <strong>«Параметры IPv6»</strong> (или «Настройка IPv6») → поставь <strong>«Не используется» / «Отключен»</strong>.</li>
+        <li>Сохрани, переподключись. Роутер перестаёт раздавать IPv6, браузер не получает <code>AAAA</code>-записи → весь трафик идёт по IPv4 через xray.</li>
+      </ol>
+      <p class="muted">💡 Если IPv6 нужен для других задач — можно не трогать роутер, а отключить IPv6 только на нужном PC: Windows → Свойства сетевого подключения → снять галку <strong>«IP версии 6 (TCP/IPv6)»</strong>. Тогда этот PC пойдёт по IPv4, остальные устройства не затронуты.</p>
+      <p class="muted">Связанная тема: <a href="#help-yt-recaptcha" onclick="openHelpAnchor('help-yt-recaptcha'); return false;">Сценарий 2 «YouTube reCAPTCHA»</a> — там IPv6-leak это одна из причин mixed-IP.</p>
     </div>
   </details>
 
@@ -10292,7 +10526,7 @@ window.PC_LAN_HOST = "{{ cfg.LAN_HOST or '' }}";
 // При save — JS парсит строки, домены идут в watchdog.config, notes в sidecar JSON.
 let WINDOW_DOMAIN_NOTES = {{ domain_notes_json|safe }};
 // Гарантируем что все 4 namespace есть (если backend вернул битую структуру)
-['ai', 'yt', 'direct', 'block'].forEach(k => {
+['ai', 'yt', 'foreign', 'direct', 'block'].forEach(k => {
   if (!WINDOW_DOMAIN_NOTES[k] || typeof WINDOW_DOMAIN_NOTES[k] !== 'object') {
     WINDOW_DOMAIN_NOTES[k] = {};
   }
@@ -10304,6 +10538,7 @@ let WINDOW_DOMAIN_NOTES = {{ domain_notes_json|safe }};
 const DOMAIN_SECTIONS = {
   ai:     { taId: 'ai-domains',     getPresets: () => (typeof AI_PRESETS     !== 'undefined') ? AI_PRESETS     : null, label: 'AI'      },
   yt:     { taId: 'yt-domains',     getPresets: () => (typeof YT_PRESETS     !== 'undefined') ? YT_PRESETS     : null, label: 'YT'      },
+  foreign:{ taId: 'foreign-domains',getPresets: () => (typeof FOREIGN_PRESETS !== 'undefined') ? FOREIGN_PRESETS : null, label: 'Заблок. в РФ' },
   direct: { taId: 'direct-domains', getPresets: () => (typeof DIRECT_PRESETS !== 'undefined') ? DIRECT_PRESETS : null, label: 'DIRECT'  },
   block:  { taId: 'block-domains',  getPresets: () => (typeof BLOCK_PRESETS  !== 'undefined') ? BLOCK_PRESETS  : null, label: 'BLOCK'   },
 };
@@ -12159,7 +12394,8 @@ function addAllPresets(sectionKey, presetDict, labelForFlash) {
   flash(true, `Добавлено ${totalAdded} новых из ${totalInPresets} (${labelForFlash}). Не забудь нажать «Сохранить».`, null, {noScroll: true});
 }
 function addAllAIPresets()     { addAllPresets('ai',     AI_PRESETS,     'все AI'); }
-function addAllYTPresets()     { addAllPresets('yt',     YT_PRESETS,     'все YT/IG/Discord'); }
+function addAllYTPresets()     { addAllPresets('yt',     YT_PRESETS,     'все YT'); }
+function addAllForeignPresets() { addAllPresets('foreign', FOREIGN_PRESETS, 'все заблок. в РФ'); }
 function addAllDirectPresets() { addAllPresets('direct', DIRECT_PRESETS, 'все DIRECT'); }
 function addAllBlockPresets()  { addAllPresets('block',  BLOCK_PRESETS,  'все BLOCK'); }
 function clearAIDomains() {
@@ -12938,14 +13174,6 @@ const YT_PRESETS = {
     'googleusercontent.com',// Cached user content (avatars, thumbnails — *.bc.googleusercontent.com)
     '1e100.net',            // Google main backbone (lf-in-fXX.1e100.net = Google PoP)
   ],
-  instagram: [
-    'instagram.com', 'cdninstagram.com',
-    'fbcdn.net', 'fbsbx.com',
-  ],
-  discord: [
-    'discord.com', 'discordapp.com', 'discord.gg',
-    'discordapp.net', 'discord.media',
-  ],
   tiktok: [
     'tiktok.com', 'tiktokcdn.com', 'tiktokv.com',
     'musical.ly', 'byteoversea.com', 'ibyteimg.com',
@@ -12954,46 +13182,9 @@ const YT_PRESETS = {
     'twitch.tv', 'ttvnw.net', 'jtvnw.net',
     'twitchcdn.net', 'live-video.net',
   ],
-  twitter: [
-    'twitter.com', 'x.com', 'twimg.com',
-    't.co', 'twitterstat.us',
-  ],
   reddit: [
     'reddit.com', 'redd.it', 'redditstatic.com',
     'redditmedia.com',
-  ],
-  telegram: [
-    // Базовые
-    'telegram.org', 't.me', 'telegram.me', 'telegram.dog',
-    'web.telegram.org', 'api.telegram.org',
-    // WebRTC servers (КРИТИЧНО для голосовых звонков — без них звонки молчат!)
-    'venus.web.telegram.org', 'pluto.web.telegram.org',
-    'aurora.web.telegram.org', 'vesta.web.telegram.org', 'flora.web.telegram.org',
-    // CDN (фото / видео / документы)
-    'cdn1.telegram-cdn.org', 'cdn2.telegram-cdn.org', 'cdn3.telegram-cdn.org',
-    'cdn4.telegram-cdn.org', 'cdn5.telegram-cdn.org',
-    'cdn-telegram.org', 'telesco.pe',
-  ],
-  whatsapp: [
-    // Web + основные домены (заблокирован DPI в РФ с 2025-08 — нужен VPN).
-    // Примечание: 'whatsapp.com' и 'whatsapp.net' в xray-routing записываются как
-    // domain:whatsapp.com — это subdomain-match, автоматически ловит api.whatsapp.com,
-    // web.whatsapp.com, e1.whatsapp.net..e16.whatsapp.net (Edge), dit.whatsapp.net,
-    // crashlogs.whatsapp.net, v.whatsapp.net, signal.whatsapp.net и т.д.
-    'whatsapp.com', 'whatsapp.net',
-    'web.whatsapp.com',     // явно для надёжности
-    'wa.me',                // короткие ссылки wa.me/+номер — отдельный TLD!
-    // Messaging / signalling (group chat, push notifications, sync)
-    'g.whatsapp.net', 'pps.whatsapp.net',
-    // Media (фото / видео / голосовые / документы)
-    'mmg.whatsapp.net', 'media.whatsapp.net',
-    'static.whatsapp.net', 'cdn.whatsapp.net',
-    // Meta backend используется WhatsApp клиентом для аутентификации/messaging.
-    // Эти конкретные эндпоинты — только для WhatsApp, не пересекаются с FB/IG,
-    // так что включение пресета не зацепит Facebook/Instagram трафик.
-    'mqtt-mini.facebook.com', 'chatd.facebook.com',
-    'mqtt.facebook.com',    // новые версии WhatsApp клиента — MQTT через Meta
-    'latest.facebook.com',  // version-check endpoint, иногда участвует в linking
   ],
   spotify: [
     'spotify.com', 'scdn.co', 'spotifycdn.com',
@@ -13159,6 +13350,102 @@ function clearYTGeoipCats() {
 }
 async function saveYTGeoipCategories() { await _saveExtCategories('/api/xkeen/set-yt-geoip-categories', 'yt-geoip-categories', 'YT GeoIP'); }
 
+// ============== «📱 Заблокированные в РФ» (FOREIGN) — Meta/Telegram/Twitter/Discord через ЗАГРАН-exit ==============
+// Вынесено из YT: эти сервисы заблокированы в РФ, RU-выход блокировку НЕ обходит. Структура 1:1 как YT.
+const FOREIGN_PRESETS = {
+  instagram: ['instagram.com', 'cdninstagram.com', 'fbcdn.net', 'fbsbx.com'],
+  facebook:  ['facebook.com', 'fb.com', 'fb.watch', 'facebook.net', 'fbcdn.net', 'fbsbx.com'],
+  whatsapp:  [
+    'whatsapp.com', 'whatsapp.net', 'web.whatsapp.com', 'wa.me',
+    'g.whatsapp.net', 'pps.whatsapp.net', 'mmg.whatsapp.net', 'media.whatsapp.net',
+    'static.whatsapp.net', 'cdn.whatsapp.net',
+    'mqtt-mini.facebook.com', 'chatd.facebook.com', 'mqtt.facebook.com', 'latest.facebook.com',
+  ],
+  threads:   ['threads.net', 'threads.com'],
+  telegram:  [
+    'telegram.org', 't.me', 'telegram.me', 'telegram.dog', 'web.telegram.org', 'api.telegram.org',
+    'venus.web.telegram.org', 'pluto.web.telegram.org', 'aurora.web.telegram.org',
+    'vesta.web.telegram.org', 'flora.web.telegram.org',
+    'cdn1.telegram-cdn.org', 'cdn2.telegram-cdn.org', 'cdn3.telegram-cdn.org',
+    'cdn4.telegram-cdn.org', 'cdn5.telegram-cdn.org', 'cdn-telegram.org', 'telesco.pe',
+  ],
+  twitter:   ['twitter.com', 'x.com', 'twimg.com', 't.co', 'twitterstat.us'],
+  discord:   ['discord.com', 'discordapp.com', 'discord.gg', 'discordapp.net', 'discord.media'],
+};
+FOREIGN_PRESETS.all_foreign = [].concat(...Object.entries(FOREIGN_PRESETS).filter(([k]) => !k.startsWith('all_')).map(([,v]) => v));
+
+function getForeignDomainsArray() { return readSection('foreign').domains; }
+function setForeignDomainsArray(arr) {
+  const oldItems = readSection('foreign').items;
+  const oldNotesMap = {};
+  oldItems.forEach(it => { if (it.note) oldNotesMap[it.domain] = it.note; });
+  const items = arr.map(d => ({ domain: d, note: oldNotesMap[d] || WINDOW_DOMAIN_NOTES.foreign[d] || '' }));
+  writeSection('foreign', items);
+}
+function addForeignPreset(name) {
+  const preset = FOREIGN_PRESETS[name];
+  if (!preset) return;
+  addPresetGeneric('foreign', name, preset);
+}
+function removeForeignPreset(name) { removePresetGeneric('foreign', name); }
+function clearForeignDomains() {
+  if (!confirm('Очистить весь список «Заблокированные в РФ»?\n\nПосле сохранения правило исчезнет, эти домены пойдут через PRIMARY.')) return;
+  setForeignDomainsArray([]);
+  flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
+}
+function resetForeignDefaults() {
+  if (!confirm('Сбросить к дефолту (Instagram + Telegram)?')) return;
+  setForeignDomainsArray([...FOREIGN_PRESETS.instagram, ...FOREIGN_PRESETS.telegram].sort());
+  flash(true, 'Сброшено (Instagram + Telegram). Нажми «Сохранить».', null, {noScroll: true});
+}
+async function saveForeignDomains() {
+  const domains = getForeignDomainsArray();
+  if (domains.length === 0) {
+    if (!confirm('Список пустой. После сохранения правило исчезнет, эти домены пойдут через PRIMARY. Продолжить?')) return;
+  } else {
+    const preview = domains.slice(0, 5).join('\n  • ');
+    const more = domains.length > 5 ? `\n  ... и ещё ${domains.length - 5}` : '';
+    if (!confirm(`Сохранить ${domains.length} доменов канала «Заблокированные в РФ»?\n\n  • ${preview}${more}\n\nЭти домены пойдут через выбранный выше outbound. Watchdog перегенерит routing на следующем тике.`)) return;
+  }
+  const fd = new FormData();
+  fd.append('domains', domains.join(' '));
+  flash(true, `Сохраняю ${domains.length} доменов...`);
+  const res = await apiCall('/api/xkeen/set-foreign-domains', fd);
+  if (res.ok) {
+    await saveDomainNotesSidecar();
+    flash(true, res.stdout || 'Сохранено. Watchdog подхватит при следующем тике (≤1 мин).');
+    setTimeout(() => location.reload(), 1800);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+async function toggleForeignFailBlock(enabled) {
+  const fd = new FormData();
+  fd.append('enabled', enabled ? '1' : '0');
+  flash(true, enabled ? '🛡️ Включаю kill-switch...' : '⚠️ Отключаю kill-switch...');
+  const res = await apiCall('/api/xkeen/set-foreign-fail-block', fd);
+  if (res.ok) {
+    flash(true, res.stdout || (enabled ? '🛡️ Kill-switch включён' : '⚠️ Kill-switch выключен'));
+    setTimeout(() => location.reload(), 1500);
+  } else {
+    flash(false, 'Ошибка', res.stderr);
+  }
+}
+function addForeignExtCat(name) { _extCatAdd('foreign-ext-categories', name); }
+function clearForeignExtCats() {
+  if (!confirm('Очистить все v2fly категории канала «Заблокированные в РФ»? Останутся только ручные домены.')) return;
+  document.getElementById('foreign-ext-categories').value = '';
+  flash(true, 'Категории очищены. Нажми «Сохранить».', null, {noScroll: true});
+}
+async function saveForeignExtCategories() { await _saveExtCategories('/api/xkeen/set-foreign-ext-categories', 'foreign-ext-categories', 'Заблок. в РФ'); }
+function addForeignGeoipCat(name) { _extCatAdd('foreign-geoip-categories', name); }
+function clearForeignGeoipCats() {
+  if (!confirm('Очистить все GeoIP-категории канала «Заблокированные в РФ»? IP-only приложения снова пойдут через PRIMARY.')) return;
+  document.getElementById('foreign-geoip-categories').value = '';
+  flash(true, 'GeoIP-категории очищены. Нажми «Сохранить».', null, {noScroll: true});
+}
+async function saveForeignGeoipCategories() { await _saveExtCategories('/api/xkeen/set-foreign-geoip-categories', 'foreign-geoip-categories', 'Заблок. GeoIP'); }
+
 // v1.6.4: переход в подсекцию ❓ Помощи из любого места страницы.
 // Открывает все родительские <details> над target-якорем (включая большую
 // секцию ❓ Помощь и саму подсекцию), потом скроллит к ней.
@@ -13214,7 +13501,7 @@ async function installExtendedGeoip() {
 async function setTarget(role) {
   const sel = document.getElementById('select-' + role);
   const tag = sel.value;
-  const labels = { primary: 'PRIMARY (основной)', failover: 'FAILOVER (резервный)', ai: 'AI-sticky', yt: 'YouTube-sticky' };
+  const labels = { primary: 'PRIMARY (основной)', failover: 'FAILOVER (резервный)', ai: 'AI-sticky', yt: 'YouTube-sticky', foreign: 'Заблокированные в РФ' };
   // Подробное описание что произойдёт
   let msg = 'Применить изменение?\n\n';
   msg += 'Новый ' + labels[role] + ' = ' + tag + '\n';
@@ -13234,7 +13521,10 @@ async function setTarget(role) {
     msg += '\nAI-домены (claude.ai, openai.com, etc) будут идти через ' + tag;
     msg += '\nWatchdog перегенерит routing на следующем тике.';
   } else if (role === 'yt') {
-    msg += '\nYouTube-домены (youtube.com, instagram.com, discord.com) будут идти через ' + tag;
+    msg += '\nYouTube-домены (youtube.com, googlevideo.com) будут идти через ' + tag;
+    msg += '\nWatchdog перегенерит routing на следующем тике.';
+  } else if (role === 'foreign') {
+    msg += '\nДомены «Заблокированные в РФ» (Meta/Telegram/Twitter/Discord) будут идти через ' + tag;
     msg += '\nWatchdog перегенерит routing на следующем тике.';
   }
   // Доп-предупреждение: anti-DPI / whitelist outbound в роли AI — почти наверняка RU exit-IP,
@@ -13247,6 +13537,16 @@ async function setTarget(role) {
       'получишь 403 / region-denied вместо ответов.\n\n' +
       'Для AI нужен EU-exit (например 🇳🇱_Netherlands, 🇩🇪_Germany, 🇫🇮_FInland).\n\n' +
       'Точно ставить «' + tag + '» как AI-канал?'
+    )) return;
+  }
+  // Канал «Заблокированные в РФ» через РОССИЙСКИЙ exit бессмысленен — RU-IP блок РКН не обходит.
+  if (role === 'foreign' && ANTI_DPI_TAGS.has(tag)) {
+    if (!confirm(
+      '🚨 ВНИМАНИЕ: «' + tag + '» помечен как anti-DPI / whitelist — обычно это РОССИЙСКИЙ exit-IP.\n\n' +
+      'Канал «Заблокированные в РФ» (Meta/Telegram/Twitter) через РОССИЙСКИЙ выход НЕ обойдёт блокировку РКН — ' +
+      'DPI режет TLS даже с RU-IP, сервисы не откроются.\n\n' +
+      'Нужен ЗАРУБЕЖНЫЙ выход (🇳🇱 Нидерланды, 🇩🇪 Германия, 🇫🇮 Финляндия).\n\n' +
+      'Точно ставить «' + tag + '» для этого канала?'
     )) return;
   }
   if (!confirm(msg)) return;
@@ -14203,9 +14503,38 @@ async function runSiteCompare() {
 
     const layout = document.createElement('div'); layout.className = 'xk-layout';
     const aside  = document.createElement('aside'); aside.className = 'xk-sidebar';
+    const resizer = document.createElement('div'); resizer.className = 'xk-resizer'; resizer.title = 'Потяни, чтобы изменить ширину панели · двойной клик — сброс';
     const main   = document.createElement('main');  main.className = 'xk-content';
-    layout.appendChild(aside); layout.appendChild(main);
+    layout.appendChild(aside); layout.appendChild(resizer); layout.appendChild(main);
     groups[0].els[0].parentNode.insertBefore(layout, groups[0].els[0]);
+
+    // Ширина сайдбара перетаскивается мышкой за границу между панелями. Запоминается в localStorage.
+    try {
+      const savedW = parseInt(localStorage.getItem('xkSidebarWidth'));
+      if (!isNaN(savedW) && savedW >= 220 && savedW <= 720) aside.style.flex = '0 0 ' + savedW + 'px';
+    } catch(e){}
+    (function(){
+      let dragging = false;
+      const MIN = 220, MAX = 720;
+      const onMove = (e) => {
+        if (!dragging) return;
+        let w = e.clientX - layout.getBoundingClientRect().left;
+        if (w < MIN) w = MIN;
+        if (w > MAX) w = MAX;
+        aside.style.flex = '0 0 ' + w + 'px';
+      };
+      const stop = () => {
+        if (!dragging) return;
+        dragging = false;
+        document.body.style.userSelect = '';
+        document.body.style.cursor = '';
+        try { localStorage.setItem('xkSidebarWidth', Math.round(aside.getBoundingClientRect().width)); } catch(e){}
+      };
+      resizer.addEventListener('mousedown', (e) => { dragging = true; document.body.style.userSelect = 'none'; document.body.style.cursor = 'col-resize'; e.preventDefault(); });
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', stop);
+      resizer.addEventListener('dblclick', () => { aside.style.flex = '0 0 380px'; try { localStorage.setItem('xkSidebarWidth', 380); } catch(e){} });
+    })();
 
     const subSubTargets = [];  // {page, el} — вложенные шаги, которые showPage раскрывает на своей странице
     const cleanSum = (el) => ((el && el.textContent) || '').replace(/[▶▼❓]/g, '').replace(/\s+/g, ' ').trim();
@@ -14245,7 +14574,7 @@ async function runSiteCompare() {
         const sp = document.createElement('div'); sp.className = 'xk-page'; sp.dataset.page = pi;
         sp.appendChild(el);  // переносим блок в свою страницу
         main.appendChild(sp);
-        const sub = { title: label, full: full, idx: pi, subs: [] };
+        const sub = { title: label, full: full, idx: pi, subs: [], group: el.getAttribute('data-xk-group') || '' };
         // под-под-пункты: вложенные details ПЕРВОГО уровня (напр. Шаг 1/2/3) → навигация + авто-раскрытие
         const nested = [...el.querySelectorAll('details')].filter(d =>
           d.querySelector('summary') && d.parentElement && d.parentElement.closest('details') === el);
@@ -14273,19 +14602,52 @@ async function runSiteCompare() {
       b.addEventListener('click', () => showPage(idx));
       return b;
     };
+    // 🔍 Поиск по разделам/темам — фильтрует пункты сайдбара вживую (по тексту и полному тултипу).
+    const search = document.createElement('input');
+    search.type = 'search'; search.className = 'xk-search'; search.placeholder = '🔍 Поиск по разделам…';
+    aside.appendChild(search);
+    function filterNav(q){
+      q = (q || '').trim().toLowerCase();
+      const searching = q.length > 0;
+      aside.querySelectorAll('.xk-nav-item, .xk-sub-item, .xk-subsub-item').forEach(b => {
+        const hay = ((b.title || '') + ' ' + (b.textContent || '')).toLowerCase();
+        b.style.display = (!searching || hay.indexOf(q) >= 0) ? '' : 'none';
+      });
+      aside.querySelectorAll('.xk-cat, .xk-subgroup').forEach(l => { l.style.display = searching ? 'none' : ''; });
+      aside.querySelectorAll('.xk-subgroup-box, .xk-subwrap, .xk-subwrap2').forEach(c => {
+        const vis = [...c.querySelectorAll('.xk-nav-item, .xk-sub-item, .xk-subsub-item')].some(b => b.style.display !== 'none');
+        c.style.display = (!searching || vis) ? '' : 'none';
+      });
+    }
+    search.addEventListener('input', () => filterNav(search.value));
+
     const byCat = {};
     items.forEach(it => { (byCat[it.cat] = byCat[it.cat] || []).push(it); });
     catOrder.forEach(cat => {
       const its = byCat[cat]; if (!its || !its.length) return;
-      const hdr = document.createElement('div'); hdr.className = 'xk-cat';
-      hdr.textContent = (catIcon[cat] || '') + ' ' + cat;
-      aside.appendChild(hdr);
+      if (its.length > 1) {  // категория-плашка нужна только если в ней >1 раздела (иначе дублирует сам раздел, напр. «Помощь»)
+        const hdr = document.createElement('div'); hdr.className = 'xk-cat';
+        hdr.textContent = (catIcon[cat] || '') + ' ' + cat;
+        aside.appendChild(hdr);
+      }
       its.forEach(it => {
         aside.appendChild(mkBtn('xk-nav-item', it.idx, it.title, it.full));
         if (it.subs.length) {
           const wrap = document.createElement('div'); wrap.className = 'xk-subwrap';
+          let groupBox = null, curGroup = null;
           it.subs.forEach(s => {
-            wrap.appendChild(mkBtn('xk-sub-item', s.idx, s.title, s.full));
+            let container = wrap;
+            if (s.group) {
+              if (s.group !== curGroup) {
+                groupBox = document.createElement('div'); groupBox.className = 'xk-subgroup-box';
+                const gl = document.createElement('div'); gl.className = 'xk-subgroup'; gl.textContent = s.group;
+                groupBox.appendChild(gl);
+                wrap.appendChild(groupBox);
+                curGroup = s.group;
+              }
+              container = groupBox;
+            } else { curGroup = null; groupBox = null; }
+            container.appendChild(mkBtn('xk-sub-item', s.idx, s.title, s.full));
             if (s.subs && s.subs.length) {
               const w2 = document.createElement('div'); w2.className = 'xk-subwrap2';
               s.subs.forEach(ss => {
@@ -14298,7 +14660,7 @@ async function runSiteCompare() {
                 });
                 w2.appendChild(b);
               });
-              wrap.appendChild(w2);
+              container.appendChild(w2);
             }
           });
           aside.appendChild(wrap);
@@ -14309,8 +14671,13 @@ async function runSiteCompare() {
     const css = document.createElement('style');
     css.textContent =
       'body{max-width:none !important;}' +
-      '.xk-layout{display:flex;gap:18px;align-items:flex-start;margin-top:18px;}' +
+      '.xk-layout{display:flex;gap:0;align-items:flex-start;margin-top:18px;}' +
+      '.xk-resizer{flex:0 0 16px;position:sticky;top:14px;height:calc(100vh - 28px);cursor:col-resize;}' +
+      '.xk-resizer::before{content:"";position:absolute;left:6px;top:0;bottom:0;width:4px;background:#dde3ea;border-radius:3px;transition:background .12s;}' +
+      '.xk-resizer:hover::before{background:#5cb87f;}' +
       '.xk-sidebar{flex:0 0 380px;position:sticky;top:14px;max-height:calc(100vh - 28px);overflow-y:auto;background:#fff;border:1px solid #ddd;border-radius:8px;padding:8px;}' +
+      '.xk-search{position:sticky;top:0;z-index:3;width:100%;box-sizing:border-box;padding:7px 10px;margin:0 0 8px;border:1px solid #d3d9e0;border-radius:6px;font-size:0.85em;background:#fff;}' +
+      '.xk-search:focus{outline:none;border-color:#5cb87f;box-shadow:0 0 0 2px rgba(92,184,127,0.25);}' +
       '.xk-content{flex:1 1 auto;min-width:0;}' +
       '.xk-cat{font-size:0.7em;font-weight:800;text-transform:uppercase;letter-spacing:0.06em;color:#3a6ea5;background:#eef3f9;padding:7px 12px;margin:12px 0 4px;border-radius:5px;}' +
       '.xk-cat:first-child{margin-top:2px;}' +
@@ -14321,6 +14688,8 @@ async function runSiteCompare() {
       '.xk-sub-item{display:block;width:100%;text-align:left;border:none;background:none;padding:5px 8px 5px 14px;margin:1px 0;border-radius:0 6px 6px 0;cursor:pointer;font-size:0.82em;color:#5a6470;line-height:1.25;}' +
       '.xk-sub-item:hover{background:#f0f3f7;color:#333;}' +
       '.xk-sub-item.active{background:#dde9f5;color:#1f3d6b;font-weight:600;}' +
+      '.xk-subgroup-box{border-left:3px solid #5cb87f;background:#f4faf6;border-radius:0 6px 6px 0;margin:4px 0 6px;padding:1px 0 3px;}' +
+      '.xk-subgroup{font-size:0.62em;font-weight:800;text-transform:uppercase;letter-spacing:0.06em;color:#2a7;padding:5px 8px 2px 12px;}' +
       '.xk-subwrap2{margin:1px 0 4px 12px;border-left:2px solid #e6eaef;}' +
       '.xk-subsub-item{display:block;width:100%;text-align:left;border:none;background:none;padding:3px 6px 3px 12px;margin:1px 0;border-radius:0 5px 5px 0;cursor:pointer;font-size:0.76em;color:#7a838d;line-height:1.2;}' +
       '.xk-subsub-item:hover{background:#f3f5f8;color:#3a4046;}' +
