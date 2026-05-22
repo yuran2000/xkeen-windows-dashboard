@@ -176,7 +176,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.20"
+_VERSION_FALLBACK = "1.0.21"
 
 
 def get_dashboard_version():
@@ -9136,6 +9136,53 @@ Use this token to access the HTTP API:
       </details>
 
       <p style="margin-top: 12px;" class="muted">Хочешь больше сценариев — например «полный VPN для всего» или «AI + банки направления» — напиши, добавим.</p>
+    </div>
+  </details>
+
+  <details class="help-section" id="help-dns-block">
+    <summary>🌐 Сайт не открывается через роутер, но работает через Happ? — это DNS</summary>
+    <div class="help-body">
+      <p><strong>Симптом</strong>: какой-то сайт (Instagram, заблокированный сервис) <strong>не открывается</strong> когда устройство подключено через роутер с XKeen, но <strong>работает</strong> если на том же устройстве включить Happ/v2ray к тому же VPS.</p>
+
+      <p><strong>Причина — отравленный DNS провайдера</strong>: провайдер (особенно офисный/корпоративный) блокирует сайт на уровне DNS — на запрос <code>instagram.com</code> отдаёт <code>127.0.0.1</code> (localhost) или «не найдено» вместо реального IP. Роутер форвардит DNS-запросы на провайдерский DNS → получает отравленный ответ → раздаёт устройствам → браузер идёт в никуда.</p>
+
+      <p><strong>Почему через Happ работает</strong>: Happ резолвит домены <strong>remote — на стороне VPS</strong> (туннелирует и DNS), минуя локальный отравленный DNS → получает реальный IP. Роутер XKeen же по умолчанию использует системный DNS Keenetic, который спрашивает провайдера.</p>
+
+      <h4 style="margin: 12px 0 6px;">Как проверить (по SSH на роутере)</h4>
+      <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">nslookup instagram.com 127.0.0.1   # локальный DNS роутера — если отдаёт 127.0.0.1, DNS отравлен
+nslookup instagram.com 8.8.8.8     # напрямую через Google — если реальный IP, провайдер не перехватывает :53</pre>
+      <p>Если локальный (<code>127.0.0.1</code>) даёт localhost, а через 8.8.8.8 — реальный IP → DNS провайдера отравлен, нужно сменить на чистый.</p>
+
+      <h4 style="margin: 12px 0 6px;">Решение — 2 настройки в Web UI Keenetic</h4>
+
+      <p><strong>① Игнорировать DNS провайдера</strong> (на WAN-интерфейсе):<br>
+      <strong>«Проводное подключение»</strong> (или твой WAN) → раздел <strong>«Параметры IPv4»</strong> → поставь галочку <strong>«Игнорировать DNSv4 интернет-провайдера»</strong>.<br>
+      Без неё Keenetic автоматически добавляет DNS провайдера (по DHCP) в список и использует их.</p>
+
+      <p><strong>② Добавить чистые DoH/DoT серверы</strong>:<br>
+      <strong>«Интернет-фильтры» → «Настройка DNS» → «Профили DNS»</strong> → профиль «Системный» → <strong>«+ Добавить сервер»</strong>:</p>
+      <ul>
+        <li>DoT: <code>9.9.9.9</code>, <code>9.9.9.10</code> (Quad9), <code>8.8.8.8</code>, <code>8.8.4.4</code> (Google)</li>
+        <li>DoH: <code>https://9.9.9.9/dns-query</code>, <code>https://dns.google/dns-query</code></li>
+      </ul>
+      <p>Затем карандашик ✏️ у профиля → сними <strong>«Разрешить транзит запросов»</strong> (станет «Транзитные запросы блокируются») — чтобы роутер не форвардил на провайдерские DNS.</p>
+
+      <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #1a5276;">
+        💡 <strong>Почему DoH/DoT, а не обычный 8.8.8.8</strong>: обычный DNS (порт 53) провайдер может перехватывать и подменять ответы даже когда ты указал Google. <strong>DoH (через 443) и DoT (через 853) — зашифрованы</strong>, провайдер не может вскрыть и подменить. В списке у зашифрованных <strong>зелёный замок</strong> 🔒, у обычных — открытый 🔓. Используй именно зашифрованные.
+      </div>
+
+      <div style="background: #fff3cd; border-left: 3px solid #f0c200; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #6a4900;">
+        ⚠ <strong>Провайдерские DNS не удаляются вручную?</strong> Keenetic не даёт убрать авто-добавленные DNS пока активен DHCP-lease. Поставь галочку «Игнорировать DNSv4 провайдера» (①) и <strong>перезагрузи роутер</strong> — при новом DHCP провайдерские DNS будут проигнорированы и в список не попадут. Но если уже добавил DoH/DoT (②) — сайт заработает и без перезагрузки (зашифрованные приоритетнее).
+      </div>
+
+      <h4 style="margin: 12px 0 6px;">После фикса — на клиенте</h4>
+      <p>Сбрось DNS-кеш и перезапусти браузер (он кеширует отравленный ответ):</p>
+      <pre style="background:#1e1e1e; color:#ddd; padding:8px 12px; border-radius:4px; font-size:0.85em;">ipconfig /flushdns</pre>
+      <p>Открой сайт в новом окне (лучше инкогнито).</p>
+
+      <div style="background: #f0fff0; border-left: 3px solid #2e7d32; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #1b5e20;">
+        ✅ <strong>Как это связано с VPN</strong>: после фикса DNS домен резолвится в реальный IP → браузер шлёт пакет наружу → xray TPROXY его перехватывает → sniffing видит домен (например instagram.com) → роутит через нужный VPN-канал. Без правильного DNS пакет уходил на localhost и до xray вообще не доходил — поэтому VPN-канал был «ни при чём», проблема была до туннеля.
+      </div>
     </div>
   </details>
 
