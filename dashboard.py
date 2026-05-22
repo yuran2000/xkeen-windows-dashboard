@@ -25,6 +25,19 @@ import sys
 import time as _time_mod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ── Вендоренный rkn_checker (папка rkn_checker/, см. rkn_checker/VENDOR.md) ──
+# Послойная диагностика блокировок (DNS/TCP/TLS/HTTP) для секции «Почему не
+# работает сайт». Импорт защищён: если пакета или зависимости requests нет — секция
+# покажет «недоступно», а сама панель продолжит работать без падения.
+try:
+    from rkn_checker.core import check_urls_parallel as _rkn_check_urls
+    _RKN_OK = True
+    _RKN_ERR = ""
+except Exception as _rkn_exc:  # noqa: BLE001
+    _rkn_check_urls = None
+    _RKN_OK = False
+    _RKN_ERR = repr(_rkn_exc)
+
 # ============== БАЗОВЫЕ ПАПКИ ПРИЛОЖЕНИЯ (portable-aware) ==============
 # _app_base_dir() — папка для EXTERNAL данных (config_local.py / config.ini, runtime_settings.json,
 #                   backups/, .ssh/). В dev-режиме = папка с dashboard.py. В portable-режиме
@@ -5568,7 +5581,7 @@ def api_xkeen_diagnose():
     )
 
     # ---- 3. xray config validity (test mode) ----
-    r = keenetic_ssh("/opt/sbin/xray test -confdir /opt/etc/xray/configs 2>&1 | tail -15", timeout=20)
+    r = keenetic_ssh("/opt/sbin/xray run -test -confdir /opt/etc/xray/configs 2>&1 | tail -15", timeout=20)
     test_out = ansi_re.sub('', r.get("stdout") or "")
     is_config_valid = "Configuration OK" in test_out or ("Failed to start" not in test_out and "infra/conf" not in test_out)
     _add(
@@ -5679,7 +5692,7 @@ def api_xkeen_diagnose():
         )
     else:
         # Проверяем xray test на ошибку "code not found in geoip.dat"
-        r = keenetic_ssh("/opt/sbin/xray test -confdir /opt/etc/xray/configs 2>&1 | grep -iE 'code not found in geoip|failed to load GeoIP' | head -3", timeout=20)
+        r = keenetic_ssh("/opt/sbin/xray run -test -confdir /opt/etc/xray/configs 2>&1 | grep -iE 'code not found in geoip|failed to load GeoIP' | head -3", timeout=20)
         missing_out = ansi_re.sub('', r.get("stdout") or "")
         has_missing = bool(missing_out.strip())
         _add(
@@ -5770,6 +5783,158 @@ def api_xkeen_diagnose():
     })
 
 
+_TEST_SOCKS_FILE = "06_socks_test.json"
+_TEST_SOCKS_PORT = 10809
+_TEST_SOCKS_USER = "diag"
+
+
+def _test_socks_path():
+    return f"{cfg.KEENETIC_XRAY_CONFIGS}/{_TEST_SOCKS_FILE}"
+
+
+def _test_socks_read():
+    """(user, pass, outbound_tag) из 06_socks_test.json на роутере, или (None, None, None)."""
+    try:
+        data = keenetic_load_json(_test_socks_path())
+    except Exception:
+        data = None
+    if not data:
+        return None, None, None
+    try:
+        inb = next(i for i in data.get("inbounds", []) if i.get("tag") == "socks-test")
+        acct = ((inb.get("settings") or {}).get("accounts") or [{}])[0]
+        rule = next(r for r in (data.get("routing", {}) or {}).get("rules", [])
+                    if "socks-test" in (r.get("inboundTag") or []))
+        return acct.get("user"), acct.get("pass"), rule.get("outboundTag")
+    except Exception:
+        return None, None, None
+
+
+def _test_socks_proxy_url():
+    """socks5h://user:pass@<router>:<port> для прогона проверки через тест-узел; иначе (None, None)."""
+    user, pw, tag = _test_socks_read()
+    if not user or not tag:
+        return None, None
+    from urllib.parse import quote
+    auth = f"{quote(user, safe='')}:{quote(pw or '', safe='')}@" if pw else ""
+    return f"socks5h://{auth}{cfg.KEENETIC_HOST}:{_TEST_SOCKS_PORT}", tag
+
+
+@app.route("/api/diagnose/site", methods=["GET"])
+@requires_auth
+def api_diagnose_site():
+    """Послойная диагностика доступности сайта (DNS/TCP/TLS/HTTP) с точки зрения хоста
+    панели — вендоренный rkn_checker. В отличие от /api/xkeen/diagnose (здоровье XKeen
+    на роутере) проверяет ИМЕННО доступность доменов и тип блокировки.
+
+    Query:
+      domains=instagram.com, x.com   (запятая/пробел/перевод строки, до 12 шт)
+      via=1                          дополнительно прогнать через тест-SOCKS
+                                     (см. /api/xkeen/test-socks) — сравнение
+                                     «текущий роутинг» vs «через выбранный outbound».
+    Ответ: { ok, available, results:[...], results_via?:[...], via_outbound?, via_error? }
+    """
+    if not _RKN_OK:
+        return jsonify({"ok": False, "available": False,
+                        "error": "rkn_checker недоступен: " + _RKN_ERR}), 200
+    raw = request.args.get("domains", "") or ""
+    items = [x.strip() for x in re.split(r"[\s,]+", raw) if x.strip()]
+    if not items:
+        return jsonify({"ok": False, "available": True, "error": "Не задан домен"}), 400
+    urls = {}
+    for it in items[:12]:
+        host = re.sub(r"^https?://", "", it, flags=re.IGNORECASE).split("/")[0]
+        if not host:
+            continue
+        urls[host] = it if re.match(r"^https?://", it, re.IGNORECASE) else "https://" + it
+    if not urls:
+        return jsonify({"ok": False, "available": True, "error": "Не распознан домен"}), 400
+
+    def _run(proxy_url=None):
+        return [r.to_dict() for r in _rkn_check_urls(urls, timeout=6.0, proxy_url=proxy_url)]
+
+    out = {"ok": True, "available": True}
+    try:
+        out["results"] = _run()
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "available": True, "error": repr(exc)}), 200
+
+    if request.args.get("via"):
+        proxy_url, via_tag = _test_socks_proxy_url()
+        if not proxy_url:
+            out["via_error"] = "Тест-узел не настроен — нажми «⚙ Подготовить узел»."
+        else:
+            out["via_outbound"] = via_tag
+            try:
+                out["results_via"] = _run(proxy_url)
+            except Exception as exc:  # noqa: BLE001
+                out["via_error"] = "Проверка через узел не удалась: " + repr(exc)
+    return jsonify(out)
+
+
+@app.route("/api/xkeen/test-socks", methods=["GET", "POST"])
+@requires_auth
+def api_xkeen_test_socks():
+    """Тест-SOCKS для сравнения «через outbound» (фича 🔎 Почему не работает сайт).
+
+    GET  → { provisioned, outbound, host, port }
+    POST outbound=<tag> → (пере)настроить изолированный 06_socks_test.json на роутере:
+          socks-инбаунд с auth на LAN-IP роутера + правило inboundTag→outbound.
+          Файл отдельный (xray confdir merge); watchdog регенерит только 05_routing.json
+          и этот файл не трогает. Реверт = удалить файл. Конфиг идёт через дашборд
+          (а не ручной правкой) — source of truth сохраняется.
+    """
+    if request.method == "GET":
+        user, _pw, tag = _test_socks_read()
+        return jsonify({"provisioned": bool(tag), "outbound": tag,
+                        "host": cfg.KEENETIC_HOST, "port": _TEST_SOCKS_PORT})
+
+    target = (request.form.get("outbound") or "").strip()
+    if not target:
+        return jsonify({"ok": False, "error": "Не задан outbound"}), 400
+    obs = keenetic_get_outbounds()
+    if obs is None:
+        return jsonify({"ok": False, "error": "Не смог прочитать outbounds с роутера"}), 200
+    if target not in [o.get("tag") for o in obs]:
+        return jsonify({"ok": False, "error": f"Outbound '{target}' не найден"}), 400
+
+    _, old_pw, _ = _test_socks_read()
+    import secrets as _secrets
+    pw = old_pw or _secrets.token_urlsafe(18)
+    socks_cfg = {
+        "inbounds": [{
+            "tag": "socks-test",
+            "listen": cfg.KEENETIC_HOST,
+            "port": _TEST_SOCKS_PORT,
+            "protocol": "socks",
+            "settings": {"auth": "password",
+                         "accounts": [{"user": _TEST_SOCKS_USER, "pass": pw}],
+                         "udp": False},
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
+        }],
+        "routing": {"rules": [{"type": "field",
+                               "inboundTag": ["socks-test"],
+                               "outboundTag": target}]},
+    }
+    content = json.dumps(socks_cfg, ensure_ascii=False, indent=2)
+    path = _test_socks_path()
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    keenetic_ssh(f"[ -f {path} ] && cp {path} {path}.bak-{ts}", timeout=10)
+    w = keenetic_ssh(f"cat > {path}", stdin_data=content, timeout=15)
+    if not w["ok"]:
+        return jsonify({"ok": False, "error": "Запись не удалась: " + (w.get("stderr") or "")}), 200
+    test = keenetic_ssh(f'/opt/sbin/xray run -test -confdir {cfg.KEENETIC_XRAY_CONFIGS} 2>&1; echo "XRAYRC=$?"', timeout=30)
+    test_out = test.get("stdout") or ""
+    valid = "XRAYRC=0" in test_out  # точная проверка по коду выхода xray (не по тексту)
+    if not valid:
+        keenetic_ssh(f"rm -f {path}", timeout=10)
+        return jsonify({"ok": False, "error": "xray run -test не прошёл — откат конфига.\n" + test_out[-600:]}), 200
+    r = keenetic_ssh("xkeen -restart 2>&1 | tail -3", timeout=70)
+    return jsonify({"ok": True, "outbound": target,
+                    "host": cfg.KEENETIC_HOST, "port": _TEST_SOCKS_PORT,
+                    "restart": (r.get("stdout") or "").strip()[-300:]})
+
+
 # Whitelist auto-fix-операций. Каждая — это безопасная операция с явным confirm в UI.
 XKEEN_AUTO_FIXES = {
     "restart_xkeen": {
@@ -5856,7 +6021,7 @@ def api_xkeen_auto_fix():
         r = keenetic_ssh("/opt/etc/xray/watchdog.sh 2>&1 | tail -10", timeout=30)
         log_lines.append((r.get("stdout") or "") or "(watchdog отработал тихо)")
         # Тест конфига после
-        r2 = keenetic_ssh("/opt/sbin/xray test -confdir /opt/etc/xray/configs 2>&1 | tail -5", timeout=15)
+        r2 = keenetic_ssh("/opt/sbin/xray run -test -confdir /opt/etc/xray/configs 2>&1 | tail -5", timeout=15)
         log_lines.append("---")
         log_lines.append(r2.get("stdout") or "")
         ok = "Configuration OK" in (r2.get("stdout") or "") or "Failed" not in (r2.get("stdout") or "")
@@ -7178,7 +7343,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   </div>
 
   <div class="row" style="margin-top: 16px;">
-    <div class="col">
+    <div class="col" data-xk-sub="🤖 AI">
       <div class="channel-card cc-ai">
         <label class="col-header col-ai">🤖 AI-sticky outbound <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — рекомендации по AI-каналу (Claude/ChatGPT не работают с RU-IP, нужен EU/US с kill-switch)">❓ помощь</a></label>
         <div class="channel-card-body">
@@ -7295,7 +7460,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         </div>
       </div>
     </div>
-    <div class="col">
+    <div class="col" data-xk-sub="📺 YouTube">
       <div class="channel-card cc-yt">
         <label class="col-header col-yt">📺 YouTube-sticky outbound <a href="#help-yt-recaptcha" onclick="openHelpAnchor('help-yt-recaptcha'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Если YouTube показывает reCAPTCHA «подозрительный трафик» — открой Сценарий 2 в Помощи. Там полный комплекс настроек: 🇷🇺 Рецепт A для RU-канала + 🇳🇱 Рецепт B для EU/US-канала.">❓ помощь</a></label>
         <div class="channel-card-body">
@@ -7459,7 +7624,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <div class="row" style="gap: 16px; margin-top: 16px;">
   <div class="col" style="flex: 1 1 460px; min-width: 0;">
   <!-- DIRECT домены — сайты идут напрямую без VPN -->
-  <div class="domain-section ds-direct">
+  <div class="domain-section ds-direct" data-xk-sub="🚫 Напрямую">
     <h3 class="domain-section-header">🚫 Сайты НАПРЯМУЮ без VPN <span class="subsec-hint">(DIRECT — пойдут через провайдера, без VPN)</span> <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.7em; color: #468; text-decoration: none; margin-left: 8px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — там объяснение когда нужны DIRECT-домены (банки, Госуслуги, российские сервисы которые блокируют не-RU IP)">❓ помощь</a></h3>
     <div class="domain-section-body">
       <p class="subtitle">
@@ -7498,7 +7663,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 
   <div class="col" style="flex: 1 1 460px; min-width: 0;">
   <!-- BLOCK домены — полностью заблокировать (outbound `block` / blackhole) -->
-  <div class="domain-section ds-block">
+  <div class="domain-section ds-block" data-xk-sub="⛔ Блокировать">
     <h3 class="domain-section-header">⛔ Заблокированные сайты <span class="subsec-hint">(BLOCK — outbound `block`/blackhole, пакеты дропаются)</span> <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.7em; color: #468; text-decoration: none; margin-left: 8px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — там пресеты BLOCK для Windows Update / Telemetry / Adobe Genuine / Office Telemetry">❓ помощь</a></h3>
     <div class="domain-section-body">
       <p class="subtitle">
@@ -7546,7 +7711,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   </details>
 
   <!-- v1.7.6 — Клиенты в политике XKeen (read-only) -->
-  <div class="domain-section ds-clients">
+  <div class="domain-section ds-clients" data-xk-sub="👥 Клиенты">
     <h3 class="domain-section-header">👥 Клиенты в политике XKeen <span class="subsec-hint">(меняй политику прямо в таблице через dropdown)</span></h3>
     <div class="domain-section-body">
       <p class="subtitle">
@@ -8501,6 +8666,28 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
   </div>
 
   <div id="diagnose-output" style="margin-top: 12px;"></div>
+
+  <!-- ===== 🔎 Проверка конкретного сайта (rkn_checker, послойно) ===== -->
+  <div data-xk-sub="🔎 Проверка сайта" style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 16px;">
+    <h3 style="margin: 0 0 6px; font-size: 1.05em; color: #6a1a1a;">🔎 Почему не работает сайт?</h3>
+    <p class="subtitle" style="margin: 0 0 10px;">
+      Послойная проверка <strong>с этого ПК</strong>: DNS → TCP → TLS → HTTP. Показывает <em>на каком уровне</em> рвётся соединение (DNS-подмена, TLS-DPI по SNI, TCP-reset, заглушка провайдера) — это полезнее, чем просто «не открывается».
+    </p>
+    <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+      <input id="site-check-input" type="text" placeholder="instagram.com, x.com, rutracker.org" style="flex: 1; min-width: 260px; padding: 7px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 0.95em;">
+      <button id="btn-site-check" type="button" class="btn-primary">🔎 Проверить</button>
+    </div>
+    <p style="margin: 6px 0 0; font-size: 0.82em; color: #888;">Несколько доменов — через запятую (до 12). Проверка идёт с хоста панели, а не с роутера — чужого провайдера она не видит.</p>
+    <div style="margin: 10px 0 0; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 0.9em;">
+      <span>🔬 Сравнить через узел:</span>
+      <select id="site-check-outbound" style="padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; max-width: 340px;">
+        {% for o in (outbounds or []) %}<option value="{{ o.tag }}">{{ o.tag }}</option>{% endfor %}
+      </select>
+      <button id="btn-site-compare" type="button" class="btn btn-sm" style="background:#468; color:#fff;">🔬 Сравнить (direct vs узел)</button>
+      <span id="site-check-node-status" style="font-size: 0.82em; color: #888;"></span>
+    </div>
+    <div id="site-check-output" style="margin-top: 12px;"></div>
+  </div>
 
   <details style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 14px;">
     <summary style="cursor: pointer; font-weight: 600; color: #6a1a1a; font-size: 0.95em;">📚 Что проверяет «Диагностика» и какие auto-fix доступны</summary>
@@ -13792,6 +13979,359 @@ async function applyFix(fixId, label, explain) {
 (function attachRescueHandlers(){
   const btn = document.getElementById('btn-diagnose');
   if (btn) btn.addEventListener('click', runDiagnose);
+})();
+
+// ============== 🔎 SITE BLOCK-CHECK (vendored rkn_checker) ==============
+// Послойная диагностика конкретного сайта с хоста панели: DNS / TCP / TLS / HTTP.
+// Дополняет «Диагностику XKeen» (та про роутер) — эта про доступность доменов.
+const RKN_VERDICTS = {
+  OK:        { icon: '✅', text: 'Открывается',          bg: '#f0f8f0', fg: '#1a5a1a' },
+  DNS_BLOCK: { icon: '🚫', text: 'DNS-блокировка',       bg: '#fde8e8', fg: '#6a1a1a' },
+  TCP_RESET: { icon: '✂️', text: 'TCP reset',            bg: '#fde8e8', fg: '#6a1a1a' },
+  TLS_BLOCK: { icon: '🛡️', text: 'TLS-DPI (по SNI)',     bg: '#fde8e8', fg: '#6a1a1a' },
+  HTTP_STUB: { icon: '📄', text: 'Заглушка провайдера',  bg: '#fde8e8', fg: '#6a1a1a' },
+  TIMEOUT:   { icon: '⏱️', text: 'Таймаут',              bg: '#fff8e1', fg: '#5a3a1c' },
+  DOWN:      { icon: '🔌', text: 'Недоступен / лежит',   bg: '#fff8e1', fg: '#5a3a1c' },
+  UNKNOWN:   { icon: '❔', text: 'Неясно',               bg: '#f5f5f5', fg: '#555'    },
+};
+const RKN_CONF = { HIGH: 'высокая', MEDIUM: 'средняя', LOW: 'низкая' };
+
+async function runSiteCheck() {
+  const btn = document.getElementById('btn-site-check');
+  const inp = document.getElementById('site-check-input');
+  const out = document.getElementById('site-check-output');
+  const domains = (inp.value || '').trim();
+  if (!domains) { inp.focus(); return; }
+  btn.disabled = true;
+  const oldLabel = btn.textContent;
+  btn.textContent = '⏳ Проверяю...';
+  out.innerHTML = '<p style="color:#888; font-style:italic;">Проверяю слои DNS / TCP / TLS / HTTP...</p>';
+  try {
+    const res = await fetch('/api/diagnose/site?domains=' + encodeURIComponent(domains));
+    const j = await res.json();
+    renderSiteCheck(j);
+  } catch (e) {
+    out.innerHTML = `<div style="padding: 10px; background: #fbd7d7; border-radius: 4px; color: #6a1a1a;">❌ Ошибка проверки: ${escapeHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldLabel;
+  }
+}
+
+function rknVerdictCell(r) {
+  const v = RKN_VERDICTS[r.verdict] || RKN_VERDICTS.UNKNOWN;
+  const conf = RKN_CONF[r.confidence] || (r.confidence || '').toLowerCase();
+  const tcp = r.tcp_ok ? (r.tcp_time_ms != null ? Math.round(r.tcp_time_ms) + 'ms' : '✓') : '—';
+  const tls = r.tls_ok ? (r.tls_time_ms != null ? Math.round(r.tls_time_ms) + 'ms' : '✓') : '—';
+  const http = (r.status_code != null) ? r.status_code : '—';
+  let cell = `<strong style="color:${v.fg};">${v.icon} ${escapeHtml(v.text)}</strong> <span style="font-size:0.8em; color:#888;">(${escapeHtml(conf)})</span>`;
+  cell += `<div style="font-size:0.8em; color:#777; margin-top:2px;">TCP ${escapeHtml(String(tcp))} · TLS ${escapeHtml(String(tls))} · HTTP ${escapeHtml(String(http))}</div>`;
+  const notes = (r.notes || []).filter(Boolean);
+  if (notes.length) {
+    cell += `<details style="margin-top:3px;"><summary style="cursor:pointer; font-size:0.82em; color:#555;">подробнее</summary><div style="font-size:0.82em; color:#444; margin-top:3px; line-height:1.5;">`;
+    for (const n of notes) cell += `• ${escapeHtml(n)}<br>`;
+    cell += `</div></details>`;
+  }
+  return { cell, bg: v.bg };
+}
+
+function renderSiteCheck(j) {
+  const out = document.getElementById('site-check-output');
+  if (!j.available) {
+    out.innerHTML = `<div style="padding: 10px 14px; background: #fff8e1; border-left: 4px solid #f0c200; border-radius: 4px; font-size: 0.9em;">⚠ Модуль диагностики недоступен.<br><span style="color:#888;">${escapeHtml(j.error || '')}</span><br>Проверь, что папка <code>rkn_checker/</code> лежит рядом с dashboard.py и установлен <code>requests</code> (<code>pip install -r requirements.txt</code>).</div>`;
+    return;
+  }
+  if (!j.ok || !j.results) {
+    out.innerHTML = `<div style="padding: 10px; background: #fde8e8; border-radius: 4px; color: #6a1a1a;">❌ ${escapeHtml(j.error || 'Нет данных')}</div>`;
+    return;
+  }
+  if (!j.results.length) { out.innerHTML = '<p style="color:#888;">Нечего проверять.</p>'; return; }
+
+  // Режим сравнения: текущий роутинг vs через выбранный outbound
+  if (j.results_via) {
+    const viaMap = {};
+    for (const r of j.results_via) viaMap[r.name] = r;
+    let html = '<table style="border-collapse: collapse; font-size: 0.9em; width: 100%; max-width: 940px;">';
+    html += `<thead><tr style="background:#f5f5f5;">`
+          + `<th style="padding:6px 10px; text-align:left; border-bottom:2px solid #ccc;">Сайт</th>`
+          + `<th style="padding:6px 10px; text-align:left; border-bottom:2px solid #ccc;">Текущий роутинг</th>`
+          + `<th style="padding:6px 10px; text-align:left; border-bottom:2px solid #ccc;">Через «${escapeHtml(j.via_outbound || 'узел')}»</th>`
+          + `</tr></thead><tbody>`;
+    for (const r of j.results) {
+      const d = rknVerdictCell(r);
+      const vr = viaMap[r.name];
+      const vc = vr ? rknVerdictCell(vr) : { cell: '<span style="color:#888;">—</span>', bg: '#fff' };
+      html += `<tr style="border-bottom:1px solid #eee;">`
+            + `<td style="padding:6px 10px; vertical-align:top;"><strong>${escapeHtml(r.name)}</strong></td>`
+            + `<td style="padding:6px 10px; vertical-align:top; background:${d.bg};">${d.cell}</td>`
+            + `<td style="padding:6px 10px; vertical-align:top; background:${vc.bg};">${vc.cell}</td>`
+            + `</tr>`;
+    }
+    html += '</tbody></table>';
+    if (j.via_error) html += `<p style="color:#c33; font-size:0.85em; margin-top:8px;">⚠ ${escapeHtml(j.via_error)}</p>`;
+    html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">Слева — как идёт сейчас (твой роутинг). Справа — через выбранный outbound. Если справа ✅, а слева блок — лечится переносом домена в этот канал.</p>`;
+    out.innerHTML = html;
+    return;
+  }
+
+  // Обычный режим: одна колонка
+  let html = '<table style="border-collapse: collapse; font-size: 0.9em; width: 100%; max-width: 900px;">';
+  html += '<thead><tr style="background:#f5f5f5;">'
+        + '<th style="padding:6px 10px; text-align:left; border-bottom:2px solid #ccc;">Сайт</th>'
+        + '<th style="padding:6px 10px; text-align:left; border-bottom:2px solid #ccc;">Вердикт</th>'
+        + '<th style="padding:6px 10px; text-align:center; border-bottom:2px solid #ccc;">TCP</th>'
+        + '<th style="padding:6px 10px; text-align:center; border-bottom:2px solid #ccc;">TLS</th>'
+        + '<th style="padding:6px 10px; text-align:center; border-bottom:2px solid #ccc;">HTTP</th>'
+        + '</tr></thead><tbody>';
+  for (const r of j.results) {
+    const v = RKN_VERDICTS[r.verdict] || RKN_VERDICTS.UNKNOWN;
+    const conf = RKN_CONF[r.confidence] || (r.confidence || '').toLowerCase();
+    const tcp = r.tcp_ok ? (r.tcp_time_ms != null ? Math.round(r.tcp_time_ms) + 'ms' : '✓') : '—';
+    const tls = r.tls_ok ? (r.tls_time_ms != null ? Math.round(r.tls_time_ms) + 'ms' : '✓') : '—';
+    const http = (r.status_code != null) ? r.status_code : '—';
+    html += `<tr style="background:${v.bg}; border-bottom:1px solid #eee;">`;
+    html += `<td style="padding:6px 10px;"><strong>${escapeHtml(r.name)}</strong></td>`;
+    html += `<td style="padding:6px 10px; color:${v.fg};"><strong>${v.icon} ${escapeHtml(v.text)}</strong> <span style="font-size:0.82em; color:#888;">(уверенность: ${escapeHtml(conf)})</span>`;
+    const notes = (r.notes || []).filter(Boolean);
+    if (notes.length) {
+      html += `<details style="margin-top:4px;"><summary style="cursor:pointer; font-size:0.85em; color:#555;">подробнее</summary><div style="font-size:0.84em; color:#444; margin-top:4px; line-height:1.5;">`;
+      for (const n of notes) html += `• ${escapeHtml(n)}<br>`;
+      html += `</div></details>`;
+    }
+    html += `</td>`;
+    html += `<td style="padding:6px 10px; text-align:center; font-size:0.86em;">${escapeHtml(String(tcp))}</td>`;
+    html += `<td style="padding:6px 10px; text-align:center; font-size:0.86em;">${escapeHtml(String(tls))}</td>`;
+    html += `<td style="padding:6px 10px; text-align:center; font-size:0.86em;">${escapeHtml(String(http))}</td>`;
+    html += `</tr>`;
+  }
+  html += '</tbody></table>';
+  if (j.via_error) html += `<p style="color:#c33; font-size:0.85em; margin-top:8px;">⚠ ${escapeHtml(j.via_error)}</p>`;
+  html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">«Вердикт» — на каком уровне рвётся соединение. TLS-DPI / DNS-блок лечатся включением нужного канала; «лежит / таймаут» может быть проблемой самого сайта.</p>`;
+  out.innerHTML = html;
+}
+
+async function siteCheckNodeStatus() {
+  const st = document.getElementById('site-check-node-status');
+  if (!st) return;
+  try {
+    const j = await (await fetch('/api/xkeen/test-socks')).json();
+    const sel = document.getElementById('site-check-outbound');
+    if (j.provisioned && j.outbound) {
+      if (sel && [...sel.options].some(o => o.value === j.outbound)) sel.value = j.outbound;
+      st.textContent = '✓ узел готов: ' + j.outbound;
+    } else {
+      st.textContent = 'узел не подготовлен — настроится при первом сравнении';
+    }
+  } catch (e) { /* ignore */ }
+}
+
+async function runSiteCompare() {
+  const inp = document.getElementById('site-check-input');
+  const sel = document.getElementById('site-check-outbound');
+  const btn = document.getElementById('btn-site-compare');
+  const out = document.getElementById('site-check-output');
+  const st  = document.getElementById('site-check-node-status');
+  const domains = (inp.value || '').trim();
+  if (!domains) { inp.focus(); return; }
+  const target = sel ? sel.value : '';
+  if (!target) { out.innerHTML = '<p style="color:#c33;">Не выбран outbound для сравнения.</p>'; return; }
+  btn.disabled = true;
+  const oldLabel = btn.textContent;
+  try {
+    const cur = await (await fetch('/api/xkeen/test-socks')).json();
+    if (!cur.provisioned || cur.outbound !== target) {
+      if (!confirm(`Подготовить тест-узел через «${target}»?\n\nДашборд запишет изолированный конфиг на роутер и перезапустит xkeen (≈10–20 сек, VPN кратко моргнёт). Это нужно один раз для выбранного узла.`)) {
+        btn.disabled = false; btn.textContent = oldLabel; return;
+      }
+      btn.textContent = '⚙ Готовлю узел...';
+      out.innerHTML = '<p style="color:#888; font-style:italic;">Настраиваю тест-узел на роутере и перезапускаю xkeen (≈10–20 сек)...</p>';
+      const fd = new FormData(); fd.append('outbound', target);
+      const pr = await (await fetch('/api/xkeen/test-socks', { method: 'POST', body: fd })).json();
+      if (!pr.ok) {
+        out.innerHTML = `<div style="padding:10px; background:#fde8e8; color:#6a1a1a; border-radius:4px;">❌ Не удалось подготовить узел: ${escapeHtml(pr.error || '')}</div>`;
+        btn.disabled = false; btn.textContent = oldLabel; return;
+      }
+      if (st) st.textContent = '✓ узел готов: ' + target;
+    }
+    btn.textContent = '⏳ Сравниваю...';
+    out.innerHTML = '<p style="color:#888; font-style:italic;">Проверяю напрямую и через узел (DNS / TCP / TLS / HTTP)...</p>';
+    const res = await fetch('/api/diagnose/site?via=1&domains=' + encodeURIComponent(domains));
+    renderSiteCheck(await res.json());
+  } catch (e) {
+    out.innerHTML = `<div style="padding:10px; background:#fbd7d7; color:#6a1a1a; border-radius:4px;">❌ Ошибка: ${escapeHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = oldLabel;
+  }
+}
+
+(function attachSiteCheckHandlers(){
+  const btn = document.getElementById('btn-site-check');
+  const inp = document.getElementById('site-check-input');
+  const cmp = document.getElementById('btn-site-compare');
+  if (btn) btn.addEventListener('click', runSiteCheck);
+  if (inp) inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSiteCheck(); } });
+  if (cmp) cmp.addEventListener('click', runSiteCompare);
+  siteCheckNodeStatus();
+})();
+
+// ============== 🧭 KEENETIC-STYLE SIDEBAR (Phase 1) ==============
+// Превращает длинную «колбасу» секций в навигацию: слева меню, справа одна секция.
+// Группировка делается в рантайме (секция = <details.section-collapsible> ИЛИ <h2.sec-*>
+// + следующие за ней элементы до следующего заголовка). Чисто аддитивно: если структура
+// не та — try/catch оставляет страницу как есть (обычный скролл). Реверт = удалить этот блок.
+(function buildKeeneticSidebar(){
+  try {
+    const body = document.body;
+    const isStart = (el) =>
+      (el.tagName === 'DETAILS' && el.classList.contains('section-collapsible')) ||
+      (el.tagName === 'H2' && [...el.classList].some(c => c.indexOf('sec-') === 0));
+    const groups = [];
+    let cur = null;
+    for (const el of [...body.children]) {
+      if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.tagName === 'H1') continue;
+      if (isStart(el)) {
+        const h2 = el.tagName === 'H2' ? el : el.querySelector('h2');
+        let full = h2 ? (h2.textContent || '').split('\n')[0].replace(/[▶▼]/g, '').trim() : 'Раздел';
+        let title = (full.replace(/\s+—\s.*$/, '').trim()) || full;  // отрезать «— подпись»/счётчик
+        cur = { title, full, els: [el] };
+        groups.push(cur);
+      } else if (cur) {
+        cur.els.push(el);
+      }
+    }
+    if (groups.length < 4) return;  // структура не та — не трогаем
+
+    const layout = document.createElement('div'); layout.className = 'xk-layout';
+    const aside  = document.createElement('aside'); aside.className = 'xk-sidebar';
+    const main   = document.createElement('main');  main.className = 'xk-content';
+    layout.appendChild(aside); layout.appendChild(main);
+    groups[0].els[0].parentNode.insertBefore(layout, groups[0].els[0]);
+
+    const subSubTargets = [];  // {page, el} — вложенные шаги, которые showPage раскрывает на своей странице
+    const cleanSum = (el) => ((el && el.textContent) || '').replace(/[▶▼❓]/g, '').replace(/\s+/g, ' ').trim();
+
+    function showPage(i){
+      main.querySelectorAll('.xk-page').forEach(p => { p.style.display = (p.dataset.page == i) ? '' : 'none'; });
+      aside.querySelectorAll('.xk-nav-item, .xk-sub-item').forEach(n => n.classList.toggle('active', n.dataset.page == i));
+      const pg = main.querySelector('.xk-page[data-page="' + i + '"]');
+      if (pg) pg.querySelectorAll('details.section-collapsible, details.help-section, :scope > details').forEach(d => { d.open = true; });
+      subSubTargets.forEach(s => { if (s.page == i) { try { s.el.open = true; } catch(e){} } });
+      try { localStorage.setItem('xkActivePage', i); } catch(e){}
+    }
+
+    // Категория РАЗДЕЛА (4 группы). Подпункты AI/YouTube/… вложены в свой раздел, не в категорию.
+    const catFor = (title) => {
+      const t = title.toLowerCase();
+      if (/основн|резерв|цепочк|failover|outbound|подписк|добав/.test(t)) return 'Каналы / VPN';
+      if (/бэкап|роутер|управление xkeen/.test(t)) return 'Обслуживание';
+      if (/алерт|восстановлен|диагност|telegram/.test(t)) return 'Диагностика';
+      if (/помощь/.test(t)) return 'Помощь';
+      return 'Прочее';
+    };
+
+    // Страницы: раздел → базовая страница; каждый data-xk-sub блок ВЫРЕЗАЕТСЯ в свою страницу-подпункт.
+    const items = [];  // верхнеуровневые разделы: {title, cat, idx, subs:[{title, idx}]}
+    let pi = 0;
+    groups.forEach(sec => {
+      const base = document.createElement('div'); base.className = 'xk-page'; base.dataset.page = pi;
+      sec.els.forEach(e => base.appendChild(e));
+      main.appendChild(base);
+      const entry = { title: sec.title, full: sec.full, cat: catFor(sec.title), idx: pi, subs: [] };
+      pi++;
+      [...base.querySelectorAll('[data-xk-sub], details.help-section, .card > details')].forEach(el => {
+        let full = el.getAttribute('data-xk-sub');
+        if (!full) { full = cleanSum(el.querySelector('summary')) || 'Тема'; }
+        const label = full.length > 38 ? full.slice(0, 36).trim() + '…' : full;  // короткий ярлык для сайдбара
+        const sp = document.createElement('div'); sp.className = 'xk-page'; sp.dataset.page = pi;
+        sp.appendChild(el);  // переносим блок в свою страницу
+        main.appendChild(sp);
+        const sub = { title: label, full: full, idx: pi, subs: [] };
+        // под-под-пункты: вложенные details ПЕРВОГО уровня (напр. Шаг 1/2/3) → навигация + авто-раскрытие
+        const nested = [...el.querySelectorAll('details')].filter(d =>
+          d.querySelector('summary') && d.parentElement && d.parentElement.closest('details') === el);
+        if (nested.length >= 2 && nested.length <= 8) {
+          nested.forEach(d => {
+            const nf = cleanSum(d.querySelector('summary')) || 'Шаг';
+            sub.subs.push({ title: nf.length > 34 ? nf.slice(0, 32).trim() + '…' : nf, full: nf, page: pi, el: d });
+            subSubTargets.push({ page: pi, el: d });
+          });
+        }
+        entry.subs.push(sub);
+        pi++;
+      });
+      base.querySelectorAll('.row').forEach(r => { if (r.childElementCount === 0) r.remove(); });  // убрать опустевшие ряды
+      items.push(entry);
+    });
+
+    // Навигация: КАТЕГОРИЯ → разделы → (всегда видимые) подпункты. Клик по любому = своя страница.
+    const catOrder = ['Каналы / VPN', 'Обслуживание', 'Диагностика', 'Помощь', 'Прочее'];
+    const catIcon = { 'Каналы / VPN':'📡', 'Обслуживание':'🛠', 'Диагностика':'🚑', 'Помощь':'❓', 'Прочее':'📋' };
+    const mkBtn = (cls, idx, text, full) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = cls; b.dataset.page = idx; b.textContent = text;
+      if (full && full !== text) b.title = full;  // полное имя в нативном тултипе при наведении
+      b.addEventListener('click', () => showPage(idx));
+      return b;
+    };
+    const byCat = {};
+    items.forEach(it => { (byCat[it.cat] = byCat[it.cat] || []).push(it); });
+    catOrder.forEach(cat => {
+      const its = byCat[cat]; if (!its || !its.length) return;
+      const hdr = document.createElement('div'); hdr.className = 'xk-cat';
+      hdr.textContent = (catIcon[cat] || '') + ' ' + cat;
+      aside.appendChild(hdr);
+      its.forEach(it => {
+        aside.appendChild(mkBtn('xk-nav-item', it.idx, it.title, it.full));
+        if (it.subs.length) {
+          const wrap = document.createElement('div'); wrap.className = 'xk-subwrap';
+          it.subs.forEach(s => {
+            wrap.appendChild(mkBtn('xk-sub-item', s.idx, s.title, s.full));
+            if (s.subs && s.subs.length) {
+              const w2 = document.createElement('div'); w2.className = 'xk-subwrap2';
+              s.subs.forEach(ss => {
+                const b = document.createElement('button');
+                b.type = 'button'; b.className = 'xk-subsub-item'; b.textContent = ss.title;
+                if (ss.full && ss.full !== ss.title) b.title = ss.full;
+                b.addEventListener('click', () => {
+                  showPage(ss.page);
+                  try { ss.el.open = true; ss.el.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch(e){}
+                });
+                w2.appendChild(b);
+              });
+              wrap.appendChild(w2);
+            }
+          });
+          aside.appendChild(wrap);
+        }
+      });
+    });
+
+    const css = document.createElement('style');
+    css.textContent =
+      'body{max-width:none !important;}' +
+      '.xk-layout{display:flex;gap:18px;align-items:flex-start;margin-top:18px;}' +
+      '.xk-sidebar{flex:0 0 380px;position:sticky;top:14px;max-height:calc(100vh - 28px);overflow-y:auto;background:#fff;border:1px solid #ddd;border-radius:8px;padding:8px;}' +
+      '.xk-content{flex:1 1 auto;min-width:0;}' +
+      '.xk-cat{font-size:0.7em;font-weight:800;text-transform:uppercase;letter-spacing:0.06em;color:#3a6ea5;background:#eef3f9;padding:7px 12px;margin:12px 0 4px;border-radius:5px;}' +
+      '.xk-cat:first-child{margin-top:2px;}' +
+      '.xk-nav-item{display:block;width:100%;text-align:left;border:none;background:none;padding:8px 10px 8px 16px;margin:1px 0;border-radius:6px;cursor:pointer;font-size:0.92em;color:#1a1a1a;font-weight:500;line-height:1.3;}' +
+      '.xk-nav-item:hover{background:#eef2f7;}' +
+      '.xk-nav-item.active{background:#e6eff8;color:#1f3d6b;font-weight:700;}' +
+      '.xk-subwrap{margin:0 0 4px 20px;border-left:2px solid #dde3ea;}' +
+      '.xk-sub-item{display:block;width:100%;text-align:left;border:none;background:none;padding:5px 8px 5px 14px;margin:1px 0;border-radius:0 6px 6px 0;cursor:pointer;font-size:0.82em;color:#5a6470;line-height:1.25;}' +
+      '.xk-sub-item:hover{background:#f0f3f7;color:#333;}' +
+      '.xk-sub-item.active{background:#dde9f5;color:#1f3d6b;font-weight:600;}' +
+      '.xk-subwrap2{margin:1px 0 4px 12px;border-left:2px solid #e6eaef;}' +
+      '.xk-subsub-item{display:block;width:100%;text-align:left;border:none;background:none;padding:3px 6px 3px 12px;margin:1px 0;border-radius:0 5px 5px 0;cursor:pointer;font-size:0.76em;color:#7a838d;line-height:1.2;}' +
+      '.xk-subsub-item:hover{background:#f3f5f8;color:#3a4046;}' +
+      '.xk-page>[data-xk-sub]{width:100%;max-width:100%;flex:none;}' +
+      '.xk-page>details.section-collapsible:first-of-type>summary>h2,.xk-page>h2{margin-top:0 !important;}';
+    document.head.appendChild(css);
+
+    let start = 0;
+    try { const s = parseInt(localStorage.getItem('xkActivePage')); if (!isNaN(s) && s >= 0 && s < pi) start = s; } catch(e){}
+    showPage(start);
+  } catch(e) { console.error('sidebar build failed', e); }
 })();
 
 // ============== UNSAVED DROPDOWN INDICATOR (v1.5.2 #8) ==============
