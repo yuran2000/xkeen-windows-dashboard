@@ -3,8 +3,8 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white)](#-quick-start-5-минут)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![GitHub Release](https://img.shields.io/github/v/release/yuran2000/xray-dashboard?include_prereleases&label=Latest&color=success)](https://github.com/yuran2000/xray-dashboard/releases/latest)
-[![GitHub last commit](https://img.shields.io/github/last-commit/yuran2000/xray-dashboard?color=brightgreen)](https://github.com/yuran2000/xray-dashboard/commits/main)
+[![GitHub Release](https://img.shields.io/github/v/release/yuran2000/xkeen-windows-dashboard?include_prereleases&label=Latest&color=success)](https://github.com/yuran2000/xkeen-windows-dashboard/releases/latest)
+[![GitHub last commit](https://img.shields.io/github/last-commit/yuran2000/xkeen-windows-dashboard?color=brightgreen)](https://github.com/yuran2000/xkeen-windows-dashboard/commits/main)
 [![For XKeen](https://img.shields.io/badge/For-XKeen%20on%20Keenetic-orange?logo=router)](https://github.com/Corvus-Malus/XKeen)
 
 > **xray-dashboard / xkeen-dashboard** — веб-панель для **Windows** для **XKeen** на роутере **Keenetic**. Поможет **установить** XKeen с нуля **И** управлять работающим setup'ом.
@@ -200,7 +200,7 @@ config_local.example.py (defaults, embedded в exe)
 
 ```powershell
 cd C:\
-git clone https://github.com/yuran2000/xray-dashboard.git
+git clone https://github.com/yuran2000/xkeen-windows-dashboard.git
 cd xray-dashboard
 ```
 
@@ -468,7 +468,7 @@ git clone https://github.com/<username>/<repo>.git xray-dashboard
 cd xray-dashboard
 .\install.bat
 # Notepad открывается → задаёшь PASSWORD → закрываешь.
-# В config_local.py пропиши KEENETIC_HOST = "192.168.15.1" (домашний роутер)
+# В config_local.py пропиши KEENETIC_HOST = "192.168.1.1" (домашний роутер)
 
 # Вторая установка — рабочий роутер через WG, порт 5001
 cd C:\

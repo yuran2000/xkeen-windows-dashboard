@@ -450,7 +450,7 @@ EFFECTIVE_AI_TAG="$AI_TAG"
 AI_PROBE_CODE=""
 if [ -n "$AI_DOMAINS" ] && [ -n "$AI_TAG" ] && [ "$AI_TAG" != "block" ]; then
   if [ "${AI_FAIL_BLOCK:-1}" = "1" ]; then
-    # Пингуем AI_TAG (TCP-probe, без HTTPS — у VETRYX нет HTTP endpoint)
+    # Пингуем AI_TAG (TCP-probe, без HTTPS — у некоторых провайдеров нет HTTP endpoint)
     if probe_tag "$AI_TAG" ""; then
       AI_PROBE_CODE="up"
     else

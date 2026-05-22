@@ -2,7 +2,7 @@
 
 Зачем: dashboard.py работает как SYSTEM-сервис, toast из SYSTEM-сессии
 пользователь НЕ видит (это особенность Windows session isolation).
-Этот скрипт бежит как interactive user (yuran) через Task Scheduler.
+Этот скрипт бежит как interactive user (текущий юзер Windows) через Task Scheduler.
 
 Что делает:
 1. Раз в 60 сек делает GET /api/xkeen/header-status на локальный dashboard.
@@ -19,7 +19,7 @@
 
 Архитектура — почему через HTTP к dashboard, а не сам SSH:
 - SSH-ключ имеет ACL только SYSTEM/Administrators (см. memory grабля 2026-05-16).
-- yuran не может прочитать ключ → SSH под yuran падает с «Permission denied».
+- юзер не может прочитать ключ → SSH под ним падает с «Permission denied».
 - Зато dashboard уже бежит как SYSTEM, имеет доступ к ключу, делает SSH,
   и отдаёт результат через HTTP. Daemon просто HTTP-клиент.
 - Дополнительный бонус — server-cache 30s в endpoint'е объединяет запросы

@@ -3932,7 +3932,7 @@ def _parse_ndmc_hosts(text):
 
 def _parse_ndmc_policies(text):
     """Распарсить 'show ip policy' в dict {description: internal_name}.
-    Например {'XKeen': 'Policy2', 'Amnezia': 'Policy0', 'hidemy': 'Policy1'}.
+    Например {'XKeen': 'Policy2', 'WG': 'Policy0', 'Proxy': 'Policy1'}.
     """
     if not text:
         return {}
@@ -4521,7 +4521,7 @@ def api_xkeen_set_client_policy():
       - валидация policy формата (Policy\\d+) или 'none'
       - проверка что policy реально существует в 'show ip policy'
         (исключает опечатки типа Policy99 → Keenetic мог бы создать новую)
-      - запрет на отвязку самого host'а с которого панель ходит (yuran-00):
+      - запрет на отвязку самого host'а с которого панель ходит (pc-01):
         панель ходит SSH'ом на роутер минуя политику, но в LAN сторона панели
         тоже работает — однако это не критично, поэтому ограничения нет (юзер
         сам себе режиссёр; локальный SSH к роутеру не зависит от политики).
@@ -4590,7 +4590,7 @@ def api_xkeen_flush_conntrack():
     Долгоживущие connection'ы (Telegram websocket, игры, ssh) могут «зависнуть»
     на старой политике до явного reconnect. Этот endpoint мгновенно их сбрасывает.
 
-    Body: ip=192.168.15.X (только IPv4; conntrack по MAC не фильтрует — он работает
+    Body: ip=192.168.1.X (только IPv4; conntrack по MAC не фильтрует — он работает
     на L3 по IP-адресам).
 
     Стратегии:
@@ -5151,7 +5151,7 @@ def _bootstrap_deploy_item(item, overwrite_existing):
     # outbound_meta.json и subscription_meta.json — sidecar файлы с маппингом «pbk → имя подписки».
     # При bootstrap «Перезаписать существующие» юзер ожидает что **конфиги** сбросятся, но
     # **метаданные подписок не пропадут**. Без этой защиты — после bootstrap dropdown'ы показывают
-    # «Reality h_z-q45m...» вместо «Юрков VPN» (см. сегодняшний баг).
+    # «Reality h_z-q45m...» вместо дружелюбного имени сервера (см. сегодняшний баг).
     elif key in ("outbound_meta", "subscription_meta") and overwrite_existing:
         existing = keenetic_load_json(remote, timeout=5)
         if isinstance(existing, dict):
@@ -7339,7 +7339,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     <span id="xray-status-badge" class="health-badge xs-pending" title="Состояние xray на роутере — обновляется каждые 60 сек. Клик → секция 📊 Статус XKeen.">⏳ xray ...</span>
     <span id="dashboard-health-badge" class="health-badge health-pending" title="Проверка процесса панели — каждые 15 сек">⏳ проверка...</span>
     {% if is_first_run %}<a href="#section-router-config" class="health-badge" style="background:#fde8c8; color:#7a5500; border:1px solid #e0c878; text-decoration:none; cursor:pointer; animation: blink 1.8s infinite;" title="Роутер не подключён — настрой SSH в разделе внизу страницы">⚠ роутер не подключён</a>{% endif %}
-    <a href="https://github.com/yuran2000/xray-dashboard/releases/latest" target="_blank" class="health-badge" style="background:#f0e6ff; color:#5a3a99; border:1px solid #c9b3e0; text-decoration:none;" title="Версия панели. Клик → последний релиз на GitHub. Сравни с тем что у тебя — если есть свежее, обнови через update.bat.">v{{ dashboard_version }}</a>
+    <a href="https://github.com/yuran2000/xkeen-windows-dashboard/releases/latest" target="_blank" class="health-badge" style="background:#f0e6ff; color:#5a3a99; border:1px solid #c9b3e0; text-decoration:none;" title="Версия панели. Клик → последний релиз на GitHub. Сравни с тем что у тебя — если есть свежее, обнови через update.bat.">v{{ dashboard_version }}</a>
     <a href="/logout" class="tb-link" title="Выход из аккаунта {{ username }}">⎋ выход</a>
   </span>
 </div>
@@ -9170,7 +9170,7 @@ Use this token to access the HTTP API:
         <tbody>
           <tr>
             <td style="border:1px solid #ccc; padding: 6px 10px;"><code>install_toast_alerts.bat</code></td>
-            <td style="border:1px solid #ccc; padding: 6px 10px;">Регистрирует <code>xkeen_toast_daemon.py</code> как Task Scheduler task <code>XrayToastAlerts</code> под <strong>текущим юзером</strong> (<code>/RU yuran /IT</code> = interactive — toast виден только в interactive-сессии). Auto-elevate через UAC.</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Регистрирует <code>xkeen_toast_daemon.py</code> как Task Scheduler task <code>XrayToastAlerts</code> под <strong>текущим юзером</strong> (<code>/RU %USERNAME% /IT</code> = interactive — toast виден только в interactive-сессии). Auto-elevate через UAC.</td>
             <td style="border:1px solid #ccc; padding: 6px 10px;">Один раз — чтобы получать Windows toast «🔴 Xray упал!» в правом нижнем углу когда панель закрыта в браузере. Подробности — в разделе «🚨 Алерты при падении xray».</td>
           </tr>
           <tr>
@@ -9949,7 +9949,7 @@ schtasks /Delete /TN XrayDashboard /F</pre>
       <ol>
         <li>Установи <strong>Git for Windows</strong>: <a href="https://git-scm.com/download/win" target="_blank">git-scm.com</a> (~50MB, 1 минута)</li>
         <li>Открой PowerShell в любой папке → выполни:
-          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">git clone https://github.com/yuran2000/xray-dashboard.git C:\xray-dashboard
+          <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">git clone https://github.com/yuran2000/xkeen-windows-dashboard.git C:\xray-dashboard
 cd C:\xray-dashboard
 .\install.bat</pre>
         </li>
@@ -9964,8 +9964,8 @@ cd C:\xray-dashboard
       <h4>🥈 Путь 2 (для разовой установки): ZIP-архив</h4>
       <p>Если Git ставить не хочется (например на чужой PC, или гость в чужой Windows), можно скачать ZIP:</p>
       <ul>
-        <li><strong>Последняя версия</strong>: <a href="https://github.com/yuran2000/xray-dashboard/archive/refs/heads/main.zip" target="_blank">main.zip</a> (всегда свежайший с main)</li>
-        <li><strong>Конкретная версия</strong>: на странице <a href="https://github.com/yuran2000/xray-dashboard/releases" target="_blank">Releases</a> у каждого тега есть «Source code (zip)» и «Source code (tar.gz)»</li>
+        <li><strong>Последняя версия</strong>: <a href="https://github.com/yuran2000/xkeen-windows-dashboard/archive/refs/heads/main.zip" target="_blank">main.zip</a> (всегда свежайший с main)</li>
+        <li><strong>Конкретная версия</strong>: на странице <a href="https://github.com/yuran2000/xkeen-windows-dashboard/releases" target="_blank">Releases</a> у каждого тега есть «Source code (zip)» и «Source code (tar.gz)»</li>
       </ul>
       <p>Распакуй в <code>C:\xray-dashboard\</code> (содержимое одной папки внутри ZIP — переименуй так чтобы было правильно). Дальше как в Путь 1 с шага 3 (<code>install.bat</code>).</p>
 
@@ -10002,7 +10002,7 @@ git reset --hard origin/main      # config_local.py не тронется (он 
       <p>Если ставил из ZIP, а потом передумал и хочешь иметь возможность обновляться через <code>update.bat</code>:</p>
       <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">cd C:\xray-dashboard
 git init
-git remote add origin https://github.com/yuran2000/xray-dashboard.git
+git remote add origin https://github.com/yuran2000/xkeen-windows-dashboard.git
 git fetch origin
 git reset --hard origin/main
 git branch -M main</pre>
@@ -12901,7 +12901,7 @@ async function flushConntrack(btn) {
           '<em>пакет conntrack не установлен на роутере</em>. ' +
           'Без него Keenetic не умеет точечно сбрасывать сессии. ' +
           '<button class="btn btn-sm" style="background:#3498db; color:#fff; margin-left:8px;" onclick="installConntrackTools(this)">📦 Установить через дашборд</button> ' +
-          '<span style="color:#666; font-size:0.9em;">или вручную: <code>ssh root@192.168.15.1 -p 222 "opkg update &amp;&amp; opkg install conntrack"</code></span>';
+          '<span style="color:#666; font-size:0.9em;">или вручную: <code>ssh root@192.168.1.1 -p 222 "opkg update &amp;&amp; opkg install conntrack"</code></span>';
         flash(false, msgHtml);
       } else {
         const details = (j.error || '') + (j.hint ? '\n\n💡 ' + j.hint : '') + (j.stdout ? '\n\nstdout:\n' + j.stdout : '') + (j.stderr ? '\n\nstderr:\n' + j.stderr : '');
@@ -13011,7 +13011,7 @@ function renderPolicyClients(j) {
   html += '<div class="pc-legend">';
   html += '<strong>📖 Легенда:</strong> ';
   html += '<span class="pc-leg-item">🔒 <strong>XKeen</strong> — через xray (фон строки светло-синий)</span>';
-  html += '<span class="pc-leg-item">🔵 <strong>другая политика</strong> (Amnezia/hidemy/…) — через свой WG/Proxy, не xray (фон серый)</span>';
+  html += '<span class="pc-leg-item">🔵 <strong>другая политика</strong> — через свой WG/Proxy, не xray (фон серый)</span>';
   html += '<span class="pc-leg-item">🌐 <strong>напрямую</strong> — через провайдера, минуя xray</span>';
   html += '<span class="pc-leg-item">📶 WiFi <small>(SSID)</small></span>';
   html += '<span class="pc-leg-item">🔌 Ethernet</span>';
@@ -14704,7 +14704,7 @@ async function runSiteCompare() {
 })();
 
 // ============== UNSAVED DROPDOWN INDICATOR (v1.5.2 #8) ==============
-// Юзер сегодня словил баг: выбрал в YT-dropdown «BravaVLESS», но не нажал
+// Юзер сегодня словил баг: выбрал в YT-dropdown другой канал, но не нажал
 // «Сохранить YouTube outbound» → в watchdog.config остался прежний канал →
 // 30 мин путаницы. Теперь dropdown подсвечивается оранжевой рамкой если
 // значение НЕ равно текущему сохранённому. После Save indicator снимается.
