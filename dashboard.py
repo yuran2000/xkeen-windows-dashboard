@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.37"
+_VERSION_FALLBACK = "1.0.38"
 
 
 def get_dashboard_version():
@@ -8273,7 +8273,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 
 <!-- ===== ЦЕПОЧКА FAILOVER (отдельный раздел, важная штука, сворачиваемая) ===== -->
 <details class="section-collapsible">
-<summary><h2 class="sec-chain">⛓️ Цепочка FAILOVER <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— порядок перебора резервных каналов watchdog'ом</span></h2></summary>
+<summary><h2 class="sec-chain">⛓️ Цепочка резерва (FAILOVER) <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— порядок перебора резервных каналов watchdog'ом</span></h2></summary>
 <div class="card">
   <p class="subtitle" style="margin-top: 0;">
     Watchdog при падении PRIMARY пробует резервные каналы <strong>сверху вниз по этой таблице</strong>
@@ -8484,7 +8484,11 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             {% if o.is_default %}<span class="badge badge-active">⚡ default сейчас</span>{% endif %}
             {% if o.is_primary %}<span class="badge badge-ok">🟢 primary</span>{% endif %}
             {% if o.is_failover %}<span class="badge badge-active">🟡 failover</span>{% endif %}
-            {% if o.in_failover_chain and not o.is_failover %}<span class="badge badge-dim">↩️ в цепочке резерва</span>{% endif %}
+            {% if o.in_failover_chain and not o.is_failover %}
+              {% set fpos = (targets.failover_tags or []).index(o.tag) + 1 if o.tag in (targets.failover_tags or []) else 0 %}
+              <span class="badge" style="background:#ffd27f; color:#6b3d00; border:1px solid #e0a23a; font-weight:700;" title="Резерв в цепочке FAILOVER (позиция {{ fpos }}). Watchdog переключится сюда, если каналы выше по списку мертвы.">↩️ в цепочке резерва{% if fpos %} №{{ fpos }}{% endif %}</span>
+              <button class="btn btn-sm" style="background:#fff1df; color:#a55a18; border:1px solid #e0b370; padding:1px 7px; font-size:0.72em; margin-left:3px;" onclick="removeFromFailoverChain('{{ o.tag }}')" title="Убрать этот канал из цепочки резерва — watchdog перестанет на него переключаться (удобно для мёртвых серверов из подписки)">✖ убрать из цепочки</button>
+            {% endif %}
             {% if o.is_ai %}<span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}
             {% if o.is_yt %}<span class="badge" style="background:#fbdada; color:#c33">📺 YT</span>{% endif %}
             {% if o.is_foreign %}<span class="badge" style="background:#efe2f7; color:#8e44ad">📱 РФ-блок</span>{% endif %}
@@ -8535,7 +8539,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   </details>
   {% endfor %}
   <p class="subtitle" style="margin-top: 10px;">
-    <strong>⚪ Статус</strong> — нажми кнопку <strong>«🔄 Проверить статус»</strong> в шапке таблицы → дашборд через SSH запустит на роутере параллельный HTTPS-`curl` к host:port каждого outbound'а и покажет **TCP+TLS handshake** (как в Happ "via Proxy"): 🟢 быстро (&lt;300ms) · 🟡 норм (300-500) · 🟠 медленно (500-800) · 🔴 очень медленно (&gt;800) · <span style="background:#dfe8ff; color:#1a55cc; padding:1px 4px;">🔌 TCP</span> порт открыт (Reality без фолбэка — TLS не прошёл, но VPN работает) · ⛔ <strong style="background:#333; color:#fff; padding:1px 4px;">не отвечает</strong> (порт закрыт — сервер мёртв). Числа будут меньше чем в Happ примерно в 1.5-2 раза (Happ делает 3-5 RTT через VLESS-туннель + запрос на gstatic.com; мы 2 RTT до Reality-fallback'а), но порядки сходятся. Результат кэшируется 60 сек. Probe идёт **с роутера**, потому что XKeen перехватывает TCP-трафик с PC через redirect+tproxy и handshake завершается локально за ~1ms.
+    <strong>⚪ Статус</strong> — нажми <strong>«🏓 Пинг»</strong> в нужной группе → дашборд через SSH запустит на роутере параллельный HTTPS-`curl` к host:port каждого outbound'а и покажет **TCP+TLS handshake** (как в Happ "via Proxy"): 🟢 быстро (&lt;300ms) · 🟡 норм (300-500) · 🟠 медленно (500-800) · 🔴 очень медленно (&gt;800) · <span style="background:#dfe8ff; color:#1a55cc; padding:1px 4px;">🔌 TCP</span> порт открыт (Reality без фолбэка — TLS не прошёл, но VPN работает) · ⛔ <strong style="background:#333; color:#fff; padding:1px 4px;">не отвечает</strong> (порт закрыт — сервер мёртв). Числа будут меньше чем в Happ примерно в 1.5-2 раза (Happ делает 3-5 RTT через VLESS-туннель + запрос на gstatic.com; мы 2 RTT до Reality-fallback'а), но порядки сходятся. Результат кэшируется 60 сек. Probe идёт **с роутера**, потому что XKeen перехватывает TCP-трафик с PC через redirect+tproxy и handshake завершается локально за ~1ms.
     <strong>⚡ default</strong> — через какой outbound идёт основной трафик прямо сейчас (читается из watchdog.state).
     <strong>🟢 primary</strong> — основной канал watchdog.
     <strong>🟡 failover</strong> — первый резервный (watchdog переключится сюда при падении PRIMARY).
@@ -9525,7 +9529,7 @@ Use this token to access the HTTP API:
       Если 2 пинга подряд провалились → переключается на FAILOVER. Если потом 3 пинга подряд успешны → возвращается обратно.</p>
 
       <h4>🟡 FAILOVER — резервный канал</h4>
-      <p>Это <strong>цепочка</strong> резервных каналов (см. подраздел ⛓️ «Цепочка FAILOVER» внизу страницы) — watchdog при падении PRIMARY перебирает их сверху вниз и переключается на <strong>первый живой</strong>. В dropdown'е показан только <strong>головной</strong> канал цепочки (он первый в списке).</p>
+      <p>Это <strong>цепочка</strong> резервных каналов (см. подраздел ⛓️ «Цепочка резерва (FAILOVER)» внизу страницы) — watchdog при падении PRIMARY перебирает их сверху вниз и переключается на <strong>первый живой</strong>. В dropdown'е показан только <strong>головной</strong> канал цепочки (он первый в списке).</p>
 
       <h4>🤖 AI-sticky outbound</h4>
       <p>Sticky-канал именно для AI-сайтов из списка <code>📦 Список AI-доменов</code>. <strong>Независим</strong> от PRIMARY/FAILOVER — даже если default переключился, AI всё равно идёт через выбранный канал.</p>
@@ -11860,7 +11864,7 @@ function _xkShowReminderOnLoad() {
     who + ' добавлено, но пока <b>НЕ задействовано</b> — трафик через него НЕ идёт.<br>' +
     'Чтобы включить: в разделе <b>«📋 Все outbounds»</b> найди его и нажми роль ' +
     '(🟢 PRIMARY · 🟡 FAILOVER · 🤖 AI · 📺 YouTube · 📱 Заблокированные в РФ), ' +
-    'либо добавь в <b>«🎯 Цепочка FAILOVER»</b>.');
+    'либо добавь в <b>«🎯 Цепочка резерва (FAILOVER)»</b>.');
 }
 try { setTimeout(_xkShowReminderOnLoad, 500); } catch (e) {}
 
@@ -12680,6 +12684,38 @@ async function saveFailoverChain() {
   const res = await apiCall('/api/xkeen/set-failover-chain', fd);
   if (res.ok) {
     flash(true, res.stdout || 'Цепочка обновлена');
+    setTimeout(() => location.reload(), 1500);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+
+// Убрать один канал из цепочки резерва (FAILOVER) прямо из строки таблицы outbound'ов.
+// Берём текущую цепочку (отмеченные строки таблицы цепочки, в порядке) МИНУС этот tag и
+// сохраняем через тот же set-failover-chain. Удобно для мёртвых серверов из подписки.
+async function removeFromFailoverChain(tag) {
+  const rows = document.querySelectorAll('#failover-chain tr');
+  const items = [];
+  rows.forEach(tr => {
+    const chk = tr.querySelector('.fc-check');
+    const ord = tr.querySelector('.fc-order');
+    if (chk && ord && chk.checked) {
+      const order = parseInt(ord.value) || 0;
+      if (order > 0 && chk.dataset.tag !== tag) items.push({ tag: chk.dataset.tag, order: order });
+    }
+  });
+  if (items.length === 0) {
+    flash(false, '«' + tag + '» — последний в цепочке резерва; убрать нельзя (цепочка не может быть пустой). Сначала добавь другой резерв или смени роль PRIMARY.');
+    return;
+  }
+  if (!confirm('Убрать «' + tag + '» из цепочки резерва (FAILOVER)?\n\nОстанется ' + items.length + ' канал(ов). Watchdog перестанет переключаться на него при падении PRIMARY.')) return;
+  items.sort((a, b) => a.order - b.order);
+  const fd = new FormData();
+  fd.append('tags', items.map(i => i.tag).join(','));
+  flash(true, 'Убираю из цепочки резерва...');
+  const res = await apiCall('/api/xkeen/set-failover-chain', fd);
+  if (res.ok) {
+    flash(true, '✅ «' + tag + '» убран из цепочки резерва.');
     setTimeout(() => location.reload(), 1500);
   } else {
     flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
