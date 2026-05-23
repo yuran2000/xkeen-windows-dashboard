@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.34"
+_VERSION_FALLBACK = "1.0.35"
 
 
 def get_dashboard_version():
@@ -1667,11 +1667,22 @@ def keenetic_add_outbound(payload, tag_override=None, overwrite=False):
     if not w["ok"]:
         keenetic_ssh(f"cp {ob_path}.bak-{ts} {ob_path}")
         return {"ok": False, "stderr": f"write failed: {w['stderr']}"}
-    restart = keenetic_ssh("xkeen -restart 2>&1 | tail -20", timeout=90)
-    if not restart["ok"]:
-        keenetic_ssh(f"cp {ob_path}.bak-{ts} {ob_path} && xkeen -restart")
-        _ansi = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
-        return {"ok": False, "stderr": f"xkeen -restart упал — откатил 04_outbounds.json к бэкапу (xray восстановлен). {_ansi.sub('', restart.get('stdout') or '')[:300]}"}
+    keenetic_ssh("xkeen -restart 2>&1 | tail -20", timeout=120)
+    # xkeen -restart при 50+ outbound'ах бывает дольше SSH-timeout И/ИЛИ SSH-канал не закрывается
+    # сразу — код возврата restart НЕ показателен (грабля: «restart мог реально выполниться, просто
+    # SSH не успел закрыться»). Поэтому НЕ доверяем результату, а проверяем РЕАЛЬНО ли xray поднялся
+    # (несколько попыток — у рестарта есть короткое окно простоя). Откат — только если xray реально лёг.
+    import time as _t
+    xray_up = False
+    for _ in range(4):
+        _t.sleep(3)
+        chk = keenetic_ssh("ps w 2>/dev/null | grep -q '[x]ray run' && echo XRAY_UP || echo XRAY_DOWN", timeout=15)
+        if "XRAY_UP" in (chk.get("stdout") or ""):
+            xray_up = True
+            break
+    if not xray_up:
+        keenetic_ssh(f"cp {ob_path}.bak-{ts} {ob_path} && /opt/sbin/xkeen -restart", timeout=120)
+        return {"ok": False, "stderr": "xray не поднялся после добавления — откатил 04_outbounds.json к бэкапу. Открой «🚑 Восстановление и диагностика» (частая причина — сломан curl/libnghttp2)."}
     host = (new_ob.get("settings", {}).get("vnext") or [{}])[0].get("address", "?")
     return {"ok": True, "tag": tag, "stdout": f"✅ Добавлен outbound '{tag}' ({host}). Бэкап: 04_outbounds.json.bak-{ts}. Чтобы пустить через него трафик — назначь роль (PRIMARY/FAILOVER/AI/…) в разделе каналов."}
 
