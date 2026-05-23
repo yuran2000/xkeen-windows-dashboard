@@ -550,4 +550,6 @@ Telegram-токен бота хранится **на роутере** (`/opt/etc
 
 MIT — см. [LICENSE](LICENSE). Используй свободно, модифицируй, форкай.
 
+Проект включает vendored-компонент `rkn_checker/` (rkn-block-checker, MIT, © Dmitry Vinogradov) — см. [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
 Используй на свой страх и риск — это инструмент для управления роутером, бывают непредвиденные взаимодействия. Перед массовыми изменениями делай snapshot через кнопку «💾 Сохранить snapshot на диск» (или setup автоматический ежедневный snapshot через `xkeen_snapshot_daily.py`).

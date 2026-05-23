@@ -19,19 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
--------------------------------------------------------------------------------
-THIRD-PARTY SOFTWARE
-
-This project vendors (bundles a copy of) the following third-party component.
-It retains its original copyright and is used under its own license; the full
-license text is kept next to its source.
-
-* rkn-block-checker  —  vendored under rkn_checker/
-  Copyright (c) 2026 Dmitry Vinogradov
-  Licensed under the MIT License.
-  Source:       https://github.com/MayersScott/rkn-block-checker
-  Full license: rkn_checker/LICENSE
-
-When redistributing this project (including the rkn_checker/ folder), the
-above copyright notice and the rkn_checker/LICENSE file must be retained.
