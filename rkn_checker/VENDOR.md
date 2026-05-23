@@ -33,13 +33,13 @@ license.
 ## How to update later
 
 Pick the new tag from the upstream releases page, then re-download the package
-files + LICENSE over this folder (PowerShell, run from anywhere):
+files + LICENSE over this folder (PowerShell, run from the repo root):
 
 ```powershell
 $gh = (Get-Command gh.exe).Source
 $repo = 'MayersScott/rkn-block-checker'
 $ref  = 'v0.6.0'   # <-- set to the new tag
-$dst  = 'D:\Claude\xray-dashboard-github\rkn_checker'
+$dst  = '.\rkn_checker'   # эта папка в репозитории
 $files = & $gh api "repos/$repo/contents/rkn_checker?ref=$ref" --jq '.[].name'
 foreach ($f in $files) {
   $b64 = (& $gh api "repos/$repo/contents/rkn_checker/$f`?ref=$ref" --jq '.content') -join ''

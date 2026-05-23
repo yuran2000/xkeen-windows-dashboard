@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.33"
+_VERSION_FALLBACK = "1.0.34"
 
 
 def get_dashboard_version():
@@ -1587,7 +1587,7 @@ def keenetic_add_outbound(payload, tag_override=None, overwrite=False):
 
     Раньше шелл-аут в Add-XKeenOutbound.ps1 (PowerShell 5.1). Он манглил UTF-8 при чтении
     конфига с эмодзи/кириллицей в тегах (cp1251-захват ssh-вывода → ConvertFrom-Json падал)
-    и был привязан к локальной машине (`D:\\Claude\\...ps1`) — у других этого файла нет,
+    и был привязан к локальной машине (внешний .ps1 по абсолютному пути) — у других его нет,
     добавление не работало. Теперь — нативный путь дашборда: keenetic_ssh корректно читает
     UTF-8, _strip_json_comments снимает //-комменты XKeen, откат как у keenetic_remove_outbound.
 
@@ -5202,7 +5202,7 @@ def _bootstrap_collect_state():
         "/opt/etc/xray/watchdog.sh",
         sh_local,
         "binary",
-        "D:\\Claude\\TelegramAssistent\\watchdog.sh.cur",
+        "bootstrap/watchdog.sh.cur",
         always_overwrite=True)
 
     tmpl_local = _bootstrap_find("05_routing.template.json.cur")
@@ -5211,7 +5211,7 @@ def _bootstrap_collect_state():
         "/opt/etc/xray/configs.bak/05_routing.template.json",
         tmpl_local,
         "text",
-        "D:\\Claude\\TelegramAssistent\\05_routing.template.json.cur",
+        "bootstrap/05_routing.template.json.cur",
         always_overwrite=True)
 
     add("watchdog_config",
