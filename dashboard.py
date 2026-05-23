@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.30"
+_VERSION_FALLBACK = "1.0.31"
 
 
 def get_dashboard_version():
@@ -1892,6 +1892,7 @@ def xkeen_page():
     # ПРИОРИТЕТ 3: orphan-<tag> если ни sub_url ни pbk нет.
     groups_dict = {}
     SERVICE_GROUP = "__service__"
+    ORPHAN_GROUP = "__orphan__"   # все vless без подписки и без pbk — в ОДНУ группу «Без подписки»
     for o in outbounds:
         if o["protocol"] != "vless":
             key = SERVICE_GROUP
@@ -1904,7 +1905,7 @@ def xkeen_page():
             elif pbk:
                 key = ("pbk_sni", pbk, sni)
             else:
-                key = ("orphan", o["tag"])
+                key = ORPHAN_GROUP
         groups_dict.setdefault(key, []).append(o)
 
     def _group_name(items, key):
@@ -1966,6 +1967,31 @@ def xkeen_page():
                 "sub_expires_at": "",
                 "sub_days_left": None,
                 "sub_url": "",
+            })
+        elif key == ORPHAN_GROUP:
+            # Одиночные outbound'ы без подписки и без Reality-pbk — в общей группе «Без подписки».
+            # Не служебная (key != 'service') → рендерится ряд действий + кнопка «🏓 Пинг» (измеряется).
+            # pbk="" → строка «✏️ Подписка» не показывается (это не подписка).
+            any_active = any(it.get("is_primary") or it.get("is_failover") or it.get("is_ai")
+                             or it.get("is_yt") or it.get("is_foreign") or it.get("in_failover_chain")
+                             for it in items)
+            inactive_tags = [it["tag"] for it in items if it.get("is_inactive")]
+            outbound_groups.append({
+                "name": "Без подписки",
+                "custom_name": "",
+                "key": "orphan",
+                "pbk": "",
+                "pbk_short": "",
+                "sni": "",
+                "count": len(items),
+                "outbounds": items,
+                "any_active": any_active,
+                "sub_note": "",
+                "sub_expires_at": "",
+                "sub_days_left": None,
+                "sub_url": "",
+                "inactive_tags": inactive_tags,
+                "inactive_count": len(inactive_tags),
             })
         else:
             # Определяем "canonical key" группы — используется как ключ в subscription_meta
@@ -8265,12 +8291,11 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 
 <!-- ===== ALL OUTBOUNDS ===== -->
 <h2 class="sec-list">📋 Все outbounds <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— {{ outbounds|length }} шт., сгруппированы по провайдерам</span>
-  <button class="btn btn-sm" onclick="refreshStatuses()" id="status-refresh-btn" style="margin-left: auto; font-size: 0.7em;" title="Заново TCP-probe всех outbound'ов (игнорирует 60s кэш)">🔄 Проверить статус</button>
-  <span id="status-refresh-info" class="subtitle" style="font-size: 0.7em;"></span>
 </h2>
 <div class="card">
   <p class="subtitle" style="margin-top: 0; margin-bottom: 12px;">
-    Outbound'ы сгруппированы по <strong>publicKey + SNI</strong> (Reality identity) — это значит «одна подписка от одного провайдера». Имя группы берётся из meta-поля «Провайдер» (если задано) или из общего префикса tag (например, provider-a-de1, provider-a-nl → группа «Provider A»). Сворачивай неинтересные группы ▶ чтобы не загромождать.
+    Outbound'ы сгруппированы по <strong>publicKey + SNI</strong> (Reality identity) — это значит «одна подписка от одного провайдера». Имя группы берётся из meta-поля «Провайдер» (если задано) или из общего префикса tag (например, provider-a-de1, provider-a-nl → группа «Provider A»). Сворачивай неинтересные группы ▶ чтобы не загромождать.<br>
+    <strong>Проверить связь</strong> — кнопка «🏓 Пинг» внутри каждой группы: TCP+TLS-probe до каждого сервера группы с дашборда, бейджи появляются в колонке «статус». Один probe покрывает все группы (кэш 60&nbsp;сек).
   </p>
   {% for group in outbound_groups %}
   <details data-group-key="{{ group.key }}" data-group-name="{{ group.name }}" style="margin-bottom: 14px; border: 1px solid #e0e0e0; border-radius: 6px; padding: 8px 12px; {% if group.any_active %}background: #f7fbf3;{% endif %}">
@@ -8330,7 +8355,10 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     {% endif %}
     {% if group.key != 'service' %}
     <div style="margin: 4px 0 8px; padding: 5px 10px; background:#fafafa; border-left: 3px solid #d0d0d0; border-radius: 3px; font-size: 0.83em; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-      <span style="color:#666;">Массовые действия:</span>
+      <button class="btn btn-sm" style="padding:2px 10px; font-size:0.85em; background:#eef7ee; color:#2a7; border:1px solid #b8d5b8;"
+              onclick="pingGroup(this)" title="TCP+TLS probe всех серверов этой группы с дашборда (один SSH-probe, кэш 60с). Бейджи появятся в колонке «статус» строк ниже.">🏓 Пинг</button>
+      <span class="group-ping-info subtitle" style="font-size:0.82em;"></span>
+      <span style="color:#666; margin-left:6px;">Массовые действия:</span>
       <button class="btn btn-sm" style="padding:2px 8px; font-size:0.85em; background:#eef3f9; color:#36a; border:1px solid #b8c5d8;"
               onclick="bulkSelectInactive(this)" title="Отметить все «не задействован» в этой группе">☑️ Все неактивные ({{ group.inactive_count }})</button>
       <button class="btn btn-sm" style="padding:2px 8px; font-size:0.85em; background:#f5f5f5; color:#666; border:1px solid #ccc;"
@@ -8393,7 +8421,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             <span class="badge" style="background:#ffe0e0; color:#a33;" title="TCP+TLS handshake — очень медленно"><strong>🔴 {{ o.status_ms }} ms</strong></span>
           {% endif %}
         {% elif o.status_ok is none %}
-          <span class="badge badge-dim" title="статус не проверялся — нажми «🔄 Проверить статус» в шапке таблицы">⚪ —</span>
+          <span class="badge badge-dim" title="статус не проверялся — нажми «🏓 Пинг» в шапке этой группы">⚪ —</span>
         {% else %}
           <span class="badge" style="background:#333; color:#fff;" title="TCP+TLS handshake не прошёл — {% if o.status_kind == 'noaddr' %}нет адреса{% else %}порт закрыт / таймаут / сервер мёртв{% endif %}"><strong>⛔ не отвечает</strong></span>
         {% endif %}
@@ -13927,6 +13955,62 @@ async function refreshStatuses() {
   } finally {
     btn.disabled = false;
     btn.textContent = orig;
+  }
+}
+
+// Пинг одной группы провайдера: один probe всех outbound'ов (force=0 → кэш 60с покрывает
+// все группы), но бейджи рисуем только для строк ЭТОЙ группы + счётчик рядом с кнопкой.
+// Рендер 1:1 как в refreshStatuses (проверенный путь).
+async function pingGroup(btn) {
+  const det = btn.closest('details[data-group-key]');
+  if (!det) return;
+  const info = det.querySelector('.group-ping-info');
+  const rows = det.querySelectorAll('tr[data-tag]');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳ probe...';
+  if (info) info.textContent = '';
+  try {
+    const res = await fetch('/api/xkeen/probe-status?force=0', { method: 'POST' });
+    const j = await res.json();
+    if (!j.ok) { if (info) info.textContent = '❌ ошибка probe'; return; }
+    const statuses = j.statuses || {};
+    let on = 0, off = 0;
+    for (const row of rows) {
+      const tag = row.getAttribute('data-tag');
+      const st = statuses[tag];
+      const cell = row.querySelector('.status-cell');
+      if (!cell || !st) continue;
+      if (st.kind === 'local') {
+        cell.innerHTML = '<span class="badge badge-dim" title="служебный outbound">—</span>';
+      } else if (st.kind === 'tcp_nc') {
+        cell.innerHTML = '<span class="badge" style="background:#dfe8ff; color:#1a55cc;" title="TCP-порт открыт · TLS не отвечает (Reality без фолбэка — норма, VPN работает)">🔌 TCP</span>';
+        on++;
+      } else if (st.ok) {
+        const ms = st.ms;
+        if (ms == null) {
+          cell.innerHTML = '<span class="badge badge-ok" title="handshake успешен">🟢</span>';
+        } else {
+          let bg = '', fg = '', dot = '🟢';
+          if (ms >= 800)      { bg='#ffe0e0'; fg='#a33';    dot='🔴'; }
+          else if (ms >= 500) { bg='#fff0d0'; fg='#a55a18'; dot='🟠'; }
+          else if (ms >= 300) { bg='#e9f5d8'; fg='#5a7c2c'; dot='🟡'; }
+          if (bg) cell.innerHTML = `<span class="badge" style="background:${bg}; color:${fg};" title="TCP+TLS handshake"><strong>${dot} ${ms} ms</strong></span>`;
+          else    cell.innerHTML = `<span class="badge badge-ok" title="TCP+TLS handshake"><strong>${dot} ${ms} ms</strong></span>`;
+        }
+        on++;
+      } else {
+        const why = st.kind === 'noaddr' ? 'нет адреса' : 'TCP fail';
+        cell.innerHTML = `<span class="badge" style="background:#333; color:#fff;" title="TCP+TLS handshake не прошёл — ${why}"><strong>⛔ не отвечает</strong></span>`;
+        off++;
+      }
+    }
+    const now = new Date().toLocaleTimeString('ru-RU');
+    if (info) info.textContent = `${now}: 🟢 ${on} / 🔴 ${off}`;
+    if (typeof applyStatusesToMeta === 'function') applyStatusesToMeta(statuses);
+  } catch (e) {
+    if (info) info.textContent = '❌ ' + e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
   }
 }
 
