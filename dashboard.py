@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.35"
+_VERSION_FALLBACK = "1.0.36"
 
 
 def get_dashboard_version():
@@ -14996,7 +14996,7 @@ function renderSiteCheck(j) {
       [...base.querySelectorAll('[data-xk-sub], details.help-section, .card > details:not([data-xk-keep-inline])')].forEach(el => {
         let full = el.getAttribute('data-xk-sub');
         if (!full) { full = cleanSum(el.querySelector('summary')) || 'Тема'; }
-        const label = full.length > 38 ? full.slice(0, 36).trim() + '…' : full;  // короткий ярлык для сайдбара
+        const label = full;  // CSS обрежет по ширине (ellipsis); шире панель → видно больше; полное — в title
         const sp = document.createElement('div'); sp.className = 'xk-page'; sp.dataset.page = pi;
         sp.appendChild(el);  // переносим блок в свою страницу
         main.appendChild(sp);
@@ -15007,7 +15007,7 @@ function renderSiteCheck(j) {
         if (nested.length >= 2 && nested.length <= 8) {
           nested.forEach(d => {
             const nf = cleanSum(d.querySelector('summary')) || 'Шаг';
-            sub.subs.push({ title: nf.length > 34 ? nf.slice(0, 32).trim() + '…' : nf, full: nf, page: pi, el: d });
+            sub.subs.push({ title: nf, full: nf, page: pi, el: d });
             subSubTargets.push({ page: pi, el: d });
           });
         }
@@ -15024,7 +15024,7 @@ function renderSiteCheck(j) {
     const mkBtn = (cls, idx, text, full) => {
       const b = document.createElement('button');
       b.type = 'button'; b.className = cls; b.dataset.page = idx; b.textContent = text;
-      if (full && full !== text) b.title = full;  // полное имя в нативном тултипе при наведении
+      if (full) b.title = full;  // полное имя в тултипе (видно при наведении, когда ярлык обрезан по ширине)
       b.addEventListener('click', () => showPage(idx));
       return b;
     };
@@ -15107,17 +15107,17 @@ function renderSiteCheck(j) {
       '.xk-content{flex:1 1 auto;min-width:0;}' +
       '.xk-cat{font-size:0.7em;font-weight:800;text-transform:uppercase;letter-spacing:0.06em;color:#3a6ea5;background:#eef3f9;padding:7px 12px;margin:12px 0 4px;border-radius:5px;}' +
       '.xk-cat:first-child{margin-top:2px;}' +
-      '.xk-nav-item{display:block;width:100%;text-align:left;border:none;background:none;padding:8px 10px 8px 16px;margin:1px 0;border-radius:6px;cursor:pointer;font-size:0.92em;color:#1a1a1a;font-weight:500;line-height:1.3;}' +
+      '.xk-nav-item{display:block;width:100%;text-align:left;border:none;background:none;padding:8px 10px 8px 16px;margin:1px 0;border-radius:6px;cursor:pointer;font-size:0.92em;color:#1a1a1a;font-weight:500;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
       '.xk-nav-item:hover{background:#eef2f7;}' +
       '.xk-nav-item.active{background:#e6eff8;color:#1f3d6b;font-weight:700;}' +
       '.xk-subwrap{margin:0 0 4px 20px;border-left:2px solid #dde3ea;}' +
-      '.xk-sub-item{display:block;width:100%;text-align:left;border:none;background:none;padding:5px 8px 5px 14px;margin:1px 0;border-radius:0 6px 6px 0;cursor:pointer;font-size:0.82em;color:#5a6470;line-height:1.25;}' +
+      '.xk-sub-item{display:block;width:100%;text-align:left;border:none;background:none;padding:5px 8px 5px 14px;margin:1px 0;border-radius:0 6px 6px 0;cursor:pointer;font-size:0.82em;color:#5a6470;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
       '.xk-sub-item:hover{background:#f0f3f7;color:#333;}' +
       '.xk-sub-item.active{background:#dde9f5;color:#1f3d6b;font-weight:600;}' +
       '.xk-subgroup-box{border-left:3px solid #5cb87f;background:#f4faf6;border-radius:0 6px 6px 0;margin:4px 0 6px;padding:1px 0 3px;}' +
       '.xk-subgroup{font-size:0.62em;font-weight:800;text-transform:uppercase;letter-spacing:0.06em;color:#2a7;padding:5px 8px 2px 12px;}' +
       '.xk-subwrap2{margin:1px 0 4px 12px;border-left:2px solid #e6eaef;}' +
-      '.xk-subsub-item{display:block;width:100%;text-align:left;border:none;background:none;padding:3px 6px 3px 12px;margin:1px 0;border-radius:0 5px 5px 0;cursor:pointer;font-size:0.76em;color:#7a838d;line-height:1.2;}' +
+      '.xk-subsub-item{display:block;width:100%;text-align:left;border:none;background:none;padding:3px 6px 3px 12px;margin:1px 0;border-radius:0 5px 5px 0;cursor:pointer;font-size:0.76em;color:#7a838d;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
       '.xk-subsub-item:hover{background:#f3f5f8;color:#3a4046;}' +
       '.xk-page>[data-xk-sub]{width:100%;max-width:100%;flex:none;}' +
       '.xk-page>details.section-collapsible:first-of-type>summary>h2,.xk-page>h2{margin-top:0 !important;}';
