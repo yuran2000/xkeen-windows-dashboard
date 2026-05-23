@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.26"
+_VERSION_FALLBACK = "1.0.27"
 
 
 def get_dashboard_version():
@@ -11540,9 +11540,13 @@ async function refreshXrayHeaderStatus() {
     badge.title = (j.tooltip || '') + '\n\nКлик → перейти к секции 📊 Статус XKeen.';
     badge.style.cursor = 'pointer';
     badge.onclick = () => {
-      // Скролл к секции «🛠 Управление XKeen» где есть кнопка status/restart
+      // Скролл к секции «🛠 Управление XKeen» где есть кнопка status/restart.
+      // В сайдбар-режиме секция — отдельная скрытая под-страница: сперва переключаемся на неё.
       const target = document.querySelector('.sec-xkmgmt');
-      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      if (target) {
+        if (window.__xkActivatePageForEl) window.__xkActivatePageForEl(target);
+        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
     };
 
     // Алерты при ПЕРЕХОДЕ в плохое состояние + повтор beep каждые 3 мин пока bad.
@@ -13600,6 +13604,10 @@ function openHelpAnchor(anchorId) {
     console.warn('openHelpAnchor: anchor not found:', anchorId);
     return;
   }
+  // Если включён Keenetic-сайдбар — Help-тема лежит в отдельной СКРЫТОЙ под-странице.
+  // Сначала переключаемся на неё (иначе scrollIntoView/подсветка ниже не видны — был баг
+  // «нажимаю помощь и ничего»). В обычном режиме (сайдбар не построен) хелпера нет — просто скроллим.
+  if (window.__xkActivatePageForEl) window.__xkActivatePageForEl(target);
   // Раскрыть все родительские <details>
   let el = target;
   while (el && el !== document.body) {
@@ -14648,6 +14656,16 @@ function renderSiteCheck(j) {
       subSubTargets.forEach(s => { if (s.page == i) { try { s.el.open = true; } catch(e){} } });
       try { localStorage.setItem('xkActivePage', i); } catch(e){}
     }
+
+    // Мост для внешних ссылок («❓ помощь» / openHelpAnchor): Help-темы и каналы — отдельные
+    // под-страницы сайдбара, по умолчанию СКРЫТЫЕ (display:none). Чтобы ссылка реально открыла
+    // тему, надо сперва переключиться на страницу с целевым элементом, иначе scroll/подсветка
+    // не видны (раньше клик по «помощь» = «ничего»). Возвращает true если страница найдена.
+    window.__xkActivatePageForEl = function(el){
+      const pg = (el && el.closest) ? el.closest('.xk-page') : null;
+      if (pg && pg.dataset && pg.dataset.page != null) { showPage(pg.dataset.page); return true; }
+      return false;
+    };
 
     // Категория РАЗДЕЛА (4 группы). Подпункты AI/YouTube/… вложены в свой раздел, не в категорию.
     const catFor = (title) => {
