@@ -132,8 +132,8 @@ config_local.example.py (defaults, embedded в exe)
 - xray-конфиги на роутере (`/opt/etc/xray/configs/01..07*.json`) — outbounds / routing / inbounds
 - **VLESS-подписки**: добавление через subscription URL (любой VLESS-совместимый провайдер), автоматическая выгрузка серверов с провайдера, обновление, группировка по подпискам, отображение даты истечения
 - Watchdog для автоматического failover между PRIMARY и резервными каналами (раз в минуту)
-- Sticky-каналы для AI и YouTube/Instagram
-- Списки доменов: DIRECT (мимо VPN) / BLOCK (полная блокировка) / AI / YT
+- Sticky-каналы для AI, YouTube и «Заблокированные в РФ» (Meta/Instagram, Telegram, Twitter/X, Discord)
+- Списки доменов: DIRECT (мимо VPN) / BLOCK (полная блокировка) / AI / YouTube / «Заблокированные в РФ»
 - **Клиенты в политике XKeen** — кто из устройств LAN идёт через xray (по fwmark Keenetic-политики). **Смена политики прямо из таблицы** через dropdown (через ndmc `ip hotspot host MAC policy NAME` + автосохранение)
 - Snapshot/restore всех настроек одним JSON-файлом
 - Telegram-алерты при падениях каналов
@@ -144,7 +144,7 @@ config_local.example.py (defaults, embedded в exe)
 - Видеть, добавлять, удалять, переименовывать outbounds в `/opt/etc/xray/configs/04_outbounds.json`
 - Bulk-удаление outbound'ов через чекбоксы (с защитой от удаления активных в watchdog)
 - Переключать PRIMARY/FAILOVER каналы вручную и через watchdog (каждую минуту автоматически)
-- Sticky-каналы для AI-сервисов и YouTube/Instagram/Discord
+- Sticky-каналы: AI-сервисы · YouTube · «Заблокированные в РФ» (Meta/Instagram, Telegram, Twitter/X, Discord)
 - DIRECT-список доменов (идут мимо VPN)
 - BLOCK-список доменов (заблокированы — Windows Update / Adobe Genuine / телеметрия и т.п.)
 - Виртуальный канал **🌐 Напрямую без VPN** — для сценария «всё мимо VPN, через VPN только YT/AI»
@@ -342,7 +342,7 @@ http://localhost:5000
 - Добавления VPN-подписок (раздел «📡 Обновить из подписки»)
 - Переключения каналов (раздел «🎯 Основное и резервное подключение»)
 - Управления клиентами политики (раздел «👥 Клиенты в политике XKeen»)
-- Списков доменов AI/YT/DIRECT/BLOCK
+- Списков доменов AI / YouTube / «Заблокированные в РФ» / DIRECT / BLOCK
 - Бэкапа настроек («💾 Бэкап и восстановление»)
 
 В самой панели есть свёрнутый раздел **«❓ Помощь»** в конце страницы — там детальные подразделы по каждой фиче.
