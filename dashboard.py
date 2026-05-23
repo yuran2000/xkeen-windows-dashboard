@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.39"
+_VERSION_FALLBACK = "1.0.40"
 
 
 def get_dashboard_version():
@@ -1963,6 +1963,13 @@ def xkeen_page():
                 key = ORPHAN_GROUP
         groups_dict.setdefault(key, []).append(o)
 
+    # Все ОДИНОЧНЫЕ pbk_sni-группы (1 сервер) → в общую «Без подписки» (туда же orphan'ы без pbk).
+    # Безусловно: реальные подписки — это ≥2 серверов (или sub_url-группа), они остаются своими.
+    # Как назван конкретный сервер — отдельная история (видно строкой в таблице по его tag).
+    for _k in list(groups_dict.keys()):
+        if isinstance(_k, tuple) and _k[0] == "pbk_sni" and len(groups_dict.get(_k) or []) == 1:
+            groups_dict.setdefault(ORPHAN_GROUP, []).extend(groups_dict.pop(_k))
+
     def _group_name(items, key):
         """Подобрать имя группы по приоритету:
         provider из meta (legacy) → host из sub_url (если группа sub_url-based)
@@ -1997,17 +2004,6 @@ def xkeen_page():
         return "Без имени"
 
     sub_meta_all = keenetic_read_sub_meta()
-    # Одиночные подключения (pbk_sni-группа из 1 сервера) БЕЗ своего имени — сливаем в общую
-    # «Без подписки», чтобы не плодить группы из одного сервера в сайдбаре. Реальные подписки
-    # (≥2 серверов ИЛИ с заданным именем custom_name/provider) остаются отдельными группами.
-    for _k in list(groups_dict.keys()):
-        if isinstance(_k, tuple) and _k[0] == "pbk_sni" and len(groups_dict.get(_k) or []) == 1:
-            _it = groups_dict[_k][0]
-            _named = bool(((sub_meta_all.get(_k[1], {}) or {}).get("name") or "").strip()) \
-                or bool((_it.get("provider") or "").strip())
-            if not _named:
-                groups_dict.setdefault(ORPHAN_GROUP, []).append(_it)
-                del groups_dict[_k]
     today_iso = datetime.now().strftime("%Y-%m-%d")
     def _days_until(date_str):
         try:
