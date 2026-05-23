@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.31"
+_VERSION_FALLBACK = "1.0.32"
 
 
 def get_dashboard_version():
@@ -8158,11 +8158,10 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         Это правила которые применяются <strong>ко всем клиентам в политике XKeen</strong> — независимо от того, что ты добавляешь в DIRECT/BLOCK секции. Например, <code>regexp:^*.ru$</code> отправляет ВСЕ .ru домены через провайдера (мимо VPN), даже если тебя нет в DIRECT-списке. Эти правила <strong>невозможно поменять через дашборд</strong> — они в template на роутере (<code>/opt/etc/xray/configs.bak/05_routing.template.json</code>), редактировать нужно через SSH.
       </p>
       <button class="btn btn-sm" style="background:#6c757d; color:#fff;" onclick="loadRoutingTemplateRules()">🔄 Загрузить правила</button>
-      <button class="btn btn-sm" style="background:#17a2b8; color:#fff; margin-left: 6px;" onclick="syncTemplateIps()" title="Синхронизирует IP-список в direct-правиле template с реальными IPv4 из outbounds. Защита от петель когда подписка обновилась.">🔁 Синхронизировать IP с подпиской</button>
       <div id="routing-template-rules-output" style="margin-top: 12px;">
         <p class="subtitle" style="color:#888;">Нажми «Загрузить правила» чтобы прочитать актуальный template с роутера.</p>
       </div>
-      <div id="sync-template-ips-output" style="margin-top: 12px;"></div>
+      <p class="subtitle" style="margin: 10px 0 0; color:#888;">🔁 Синхронизация IP-списка с подпиской переехала в <strong>«🚑 Восстановление и диагностика» → подменю «🔁 Синхронизация IP»</strong> (она для починки и активна только при расхождении).</p>
     </div>
   </details>
 
@@ -9140,6 +9139,21 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
     </div>
     <p style="margin: 6px 0 0; font-size: 0.82em; color: #888;">Несколько доменов — через запятую (до 12). Проверка идёт с хоста панели, а не с роутера — чужого провайдера она не видит.</p>
     <div id="site-check-output" style="margin-top: 12px;"></div>
+  </div>
+
+  <!-- ===== 🔁 Синхронизация IP template с подпиской (ремонт; кнопка активна только при расхождении) ===== -->
+  <div data-xk-sub="🔁 Синхронизация IP" style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 16px;">
+    <h3 style="margin: 0 0 6px; font-size: 1.05em; color: #6a1a1a;">🔁 Синхронизация IP template с подпиской</h3>
+    <p class="subtitle" style="margin: 0 0 10px;">
+      В базовом template есть жёсткий список IP <strong>твоих VPN-серверов</strong> — трафик роутера к ним должен идти <strong>напрямую</strong> (мимо xray), иначе петля и канал не работает. Когда подписка обновляется и IP серверов меняются, список может разойтись: новый сервер «не оживает», старые IP — мусор.<br>
+      <strong>Обычно это происходит автоматически</strong> — после «🔄 Обновить из подписки» и добавления/удаления outbound. Кнопка ниже — ручная починка, она <strong>активна только когда есть расхождение</strong>.
+    </p>
+    <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+      <button id="tpl-ip-sync-btn" type="button" class="btn-primary" style="background:#17a2b8; color:#fff;" disabled onclick="applyTemplateIpSync()">🔁 Синхронизировать IP с подпиской</button>
+      <button type="button" class="btn btn-sm" style="background:#6c757d; color:#fff;" onclick="checkTemplateIpSync()" title="Перепроверить расхождение прямо сейчас">↻ Проверить</button>
+      <span id="tpl-ip-sync-status" class="subtitle" style="font-size:0.9em;">⏳ проверяю…</span>
+    </div>
+    <p style="margin: 8px 0 0; font-size: 0.82em; color: #888;">Перед записью делается бэкап template; применяется без рестарта — watchdog подхватит за ≤1 мин.</p>
   </div>
 
   <details data-xk-keep-inline style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 14px;">
@@ -14013,6 +14027,51 @@ async function pingGroup(btn) {
     btn.disabled = false; btn.textContent = orig;
   }
 }
+
+// 🔁 Синхронизация IP template ↔ подписка. Проверка (apply=0) включает кнопку только при
+// расхождении; применение (apply=1) пишет template + бэкап (watchdog подхватит ≤1 мин).
+async function checkTemplateIpSync() {
+  const btn = document.getElementById('tpl-ip-sync-btn');
+  const st = document.getElementById('tpl-ip-sync-status');
+  if (!btn || !st) return;
+  st.textContent = '⏳ проверяю расхождение…';
+  btn.disabled = true;
+  try {
+    const fd = new FormData(); fd.append('apply', '0');
+    const r = await fetch('/api/xkeen/sync-template-ips', { method: 'POST', body: fd, credentials: 'same-origin' });
+    const j = await r.json();
+    if (!j.ok) { st.innerHTML = '<span style="color:#a33;">❌ не удалось проверить (роутер недоступен?)</span>'; btn.disabled = true; return; }
+    if (j.no_changes) {
+      st.innerHTML = '<span style="color:#3a7;">✅ IP в синхроне с подпиской — делать ничего не нужно.</span>';
+      btn.disabled = true;
+    } else {
+      const add = (j.to_add || []).length, rem = (j.to_remove || []).length;
+      st.innerHTML = '<span style="color:#a55a18; font-weight:600;">⚠ Расхождение: +' + add + ' новых / −' + rem + ' лишних IP — нажми «Синхронизировать».</span>';
+      btn.disabled = false;
+    }
+  } catch (e) { st.innerHTML = '<span style="color:#a33;">❌ ' + e.message + '</span>'; btn.disabled = true; }
+}
+async function applyTemplateIpSync() {
+  const btn = document.getElementById('tpl-ip-sync-btn');
+  const st = document.getElementById('tpl-ip-sync-status');
+  if (!btn || btn.disabled) return;
+  if (!confirm('Синхронизировать IP-список template с текущей подпиской?\n\nБудет сделан бэкап template, watchdog применит изменения за ≤1 мин.')) return;
+  btn.disabled = true; st.textContent = '⏳ синхронизирую…';
+  try {
+    const fd = new FormData(); fd.append('apply', '1');
+    const r = await fetch('/api/xkeen/sync-template-ips', { method: 'POST', body: fd, credentials: 'same-origin' });
+    const j = await r.json();
+    if (j.ok && j.applied) {
+      st.innerHTML = '<span style="color:#3a7;">✅ Синхронизировано (+' + (j.to_add || []).length + ' / −' + (j.to_remove || []).length + '). Бэкап: <code>' + (j.backup_path || '') + '</code>. Watchdog применит за ≤1 мин.</span>';
+    } else if (j.ok && j.no_changes) {
+      st.innerHTML = '<span style="color:#3a7;">✅ Уже в синхроне.</span>';
+    } else {
+      st.innerHTML = '<span style="color:#a33;">❌ ' + (j.error || 'не применилось') + '</span>'; btn.disabled = false;
+    }
+  } catch (e) { st.innerHTML = '<span style="color:#a33;">❌ ' + e.message + '</span>'; btn.disabled = false; }
+}
+// Авто-проверка фоном после загрузки — кнопка включится только при реальном расхождении.
+setTimeout(function(){ if (document.getElementById('tpl-ip-sync-btn')) checkTemplateIpSync(); }, 1500);
 
 function editMetaFromBtn(btn) {
   editMeta(btn.dataset.tag, btn.dataset.note);
