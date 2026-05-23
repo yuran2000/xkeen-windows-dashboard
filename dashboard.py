@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.36"
+_VERSION_FALLBACK = "1.0.37"
 
 
 def get_dashboard_version():
@@ -11844,6 +11844,26 @@ function flash(ok, message, details, options) {
   }
 }
 
+// После добавления outbound / синка подписки — напоминание (переживает reload), что новое
+// подключение надо ЗАДЕЙСТВОВАТЬ (назначить роль или добавить в цепочку), иначе трафик через
+// него не пойдёт. Кладём пометку в sessionStorage, показываем флэшем на следующей загрузке.
+function _xkRemindAssignRole(label) {
+  try { sessionStorage.setItem('xkAddReminder', label || '1'); } catch (e) {}
+}
+function _xkShowReminderOnLoad() {
+  let rem = null;
+  try { rem = sessionStorage.getItem('xkAddReminder'); } catch (e) {}
+  if (!rem) return;
+  try { sessionStorage.removeItem('xkAddReminder'); } catch (e) {}
+  const who = (rem && rem !== '1') ? ('«' + rem.replace(/</g, '&lt;') + '»') : 'Новое подключение';
+  flash(true,
+    who + ' добавлено, но пока <b>НЕ задействовано</b> — трафик через него НЕ идёт.<br>' +
+    'Чтобы включить: в разделе <b>«📋 Все outbounds»</b> найди его и нажми роль ' +
+    '(🟢 PRIMARY · 🟡 FAILOVER · 🤖 AI · 📺 YouTube · 📱 Заблокированные в РФ), ' +
+    'либо добавь в <b>«🎯 Цепочка FAILOVER»</b>.');
+}
+try { setTimeout(_xkShowReminderOnLoad, 500); } catch (e) {}
+
 async function apiCall(url, formData) {
   const res = await fetch(url, { method: 'POST', body: formData });
   return await res.json();
@@ -12069,6 +12089,7 @@ async function importSelectedOrphans() {
   fd.append('update_expires', '1');
   const res = await apiCall('/api/xkeen/subscription-sync', fd);
   if (res.ok) {
+    _xkRemindAssignRole((res.added_tags||[]).join(', '));
     flash(true, `✅ Добавлено ${(res.added_tags||[]).length} outbound: ${(res.added_tags||[]).join(', ')}`);
     setTimeout(() => location.reload(), 1500);
   } else {
@@ -12137,6 +12158,7 @@ async function syncSubscription() {
   if (overwriteExpires) fd.append('overwrite_expires', '1');
   const res = await apiCall('/api/xkeen/subscription-sync', fd);
   if (res.ok) {
+    if ((res.added_tags||[]).length) _xkRemindAssignRole((res.added_tags||[]).join(', '));
     flash(true, res.stdout || 'Обновлено');
     setTimeout(() => location.reload(), 3000);
   } else {
@@ -14266,6 +14288,7 @@ async function addOutbound() {
   flash(true, 'Добавляю и применяю...', null);
   const res = await apiCall('/api/xkeen/add', fd);
   if (res.ok) {
+    _xkRemindAssignRole(res.tag);
     flash(true, 'Готово! Outbound добавлен и xray перезапущен.', res.stdout);
     setTimeout(() => location.reload(), 2500);
   } else {
