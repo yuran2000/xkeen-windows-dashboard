@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.29"
+_VERSION_FALLBACK = "1.0.30"
 
 
 def get_dashboard_version():
@@ -3253,7 +3253,11 @@ def api_xkeen_subscription_sync():
                      stdin_data=new_json, timeout=15)
     if not r["ok"]:
         return jsonify({"ok": False, "stderr": f"write failed: {r['stderr']}"})
-    keenetic_ssh("xkeen -restart", timeout=20)
+    restart = keenetic_ssh("xkeen -restart", timeout=20)
+    if not restart["ok"]:
+        # xray не поднялся на новых outbounds (например битый vless из подписки) — откат к бэкапу
+        keenetic_ssh(f"cp {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.bak-pre-sync-{ts} {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json && xkeen -restart")
+        return jsonify({"ok": False, "stderr": f"xkeen -restart упал после синка — откатил 04_outbounds.json к бэкапу (xray восстановлен). Детали: {restart['stderr'][:200]}"})
 
     # Записываем sub_url в meta для всех обновлённых/добавленных
     affected = list(updated_tags) + list(added_tags)
@@ -3798,6 +3802,9 @@ def api_xkeen_set_ai_ext_categories():
         c = c.strip().lower()
         if c and re.match(r"^[a-z0-9_-]+$", c):
             categories.append(c)
+    ok, missing, _n = keenetic_validate_route_categories(categories, "geosite")
+    if not ok:
+        return jsonify({"ok": False, "stderr": _cat_missing_msg(missing, "geosite")})
     return jsonify(keenetic_write_watchdog_config({"AI_EXT_CATEGORIES": " ".join(categories)}))
 
 
@@ -3812,37 +3819,46 @@ def api_xkeen_set_yt_ext_categories():
         c = c.strip().lower()
         if c and re.match(r"^[a-z0-9_-]+$", c):
             categories.append(c)
+    ok, missing, _n = keenetic_validate_route_categories(categories, "geosite")
+    if not ok:
+        return jsonify({"ok": False, "stderr": _cat_missing_msg(missing, "geosite")})
     return jsonify(keenetic_write_watchdog_config({"YT_EXT_CATEGORIES": " ".join(categories)}))
 
 
-def keenetic_validate_geoip_categories(categories, timeout=30):
-    """Best-effort: какие geoip-категории ОТСУТСТВУЮТ в установленном geoip.dat.
+def keenetic_validate_route_categories(names, kind="geoip", timeout=30):
+    """Best-effort: какие категории ОТСУТСТВУЮТ в соответствующем .dat на роутере.
 
-    Зачем: сохранение категории, которой нет в geoip.dat (например `discord` в базовом
-    geoip.dat) генерит правило `ip: ["geoip:discord"]`, на котором xray НЕ стартует
-    («failed to check code DISCORD from geoip.dat») → весь VPN ложится (инцидент 2026-05-23).
-    Поэтому проверяем ДО записи в watchdog.config.
+    kind='geoip'   → правило ip:["geoip:NAME"] в geoip.dat;                 sentinel 'private'
+    kind='geosite' → правило domain:["ext:geosite_v2fly.dat:NAME"] в geosite_v2fly.dat; sentinel 'google'
 
-    Метод: на роутере для каждой категории гоняем минимальный `xray run -test` с правилом
-    ip:["geoip:CAT"] (тот же путь, что роняет xray). Sentinel 'private' (всегда есть в geoip.dat):
-    если даже он MISS — значит сломан сам тест → fail-open (не блокируем; подстрахует
-    watchdog-гейт). Перечислять коды внутри .dat напрямую нельзя (protobuf).
+    Зачем: сохранение категории, которой нет в .dat (например geoip:discord в базовом geoip.dat,
+    или опечатка в geosite-категории), генерит правило, на котором xray НЕ стартует → весь VPN
+    ложится (инцидент 2026-05-23). Проверяем ДО записи в watchdog.config.
+
+    Метод: на роутере для каждой категории гоняем минимальный `xray run -test` (тот же путь,
+    что роняет xray). Sentinel всегда есть в .dat: если даже он MISS — значит сломан сам тест →
+    fail-open (не блокируем; подстрахует watchdog-гейт v11). Перечислять коды внутри .dat нельзя.
 
     Возвращает (ok: bool, missing: list[str], note: str)."""
     cats = []
-    for c in (categories or []):
+    for c in (names or []):
         c = (c or "").strip().lower()
         if c and re.match(r"^[a-z0-9_-]+$", c) and c not in cats:
             cats.append(c)
     if not cats:
         return True, [], ""
-    cats_sh = " ".join(cats + ["private"])  # sentinel последним
+    if kind == "geosite":
+        sentinel = "google"
+        rule = '"domain":["ext:geosite_v2fly.dat:%s"]'
+    else:
+        sentinel = "private"
+        rule = '"ip":["geoip:%s"]'
+    fmt = ('{"outbounds":[{"protocol":"freedom","tag":"t"}],'
+           '"routing":{"rules":[{"type":"field",' + rule + ',"outboundTag":"t"}]}}')
     remote_cmd = (
-        "R=/tmp/wd_geoip_check.$$.json; "
-        "for c in " + cats_sh + "; do "
-        "printf '{\"outbounds\":[{\"protocol\":\"freedom\",\"tag\":\"t\"}],"
-        "\"routing\":{\"rules\":[{\"type\":\"field\",\"ip\":[\"geoip:%s\"],"
-        "\"outboundTag\":\"t\"}]}}' \"$c\" > \"$R\"; "
+        "R=/tmp/wd_cat_check.$$.json; "
+        "for c in " + " ".join(cats + [sentinel]) + "; do "
+        "printf '" + fmt + "' \"$c\" > \"$R\"; "
         "if XRAY_LOCATION_ASSET=/opt/etc/xray/dat /opt/sbin/xray run -test -config \"$R\" "
         ">/dev/null 2>&1; then echo \"OK $c\"; else echo \"MISS $c\"; fi; "
         "done; rm -f \"$R\""
@@ -3856,15 +3872,22 @@ def keenetic_validate_geoip_categories(categories, timeout=30):
         elif line.startswith("MISS "):
             results[line[5:].strip()] = False
     if not results:
-        return True, [], "geoip-проверка не выполнилась — пропускаю (подстрахует watchdog)"
-    if results.get("private") is False:
-        return True, [], "geoip-тест нестабилен (даже 'private' не найден) — проверка пропущена"
+        return True, [], "проверка категорий не выполнилась — пропускаю (подстрахует watchdog)"
+    if results.get(sentinel) is False:
+        return True, [], "тест нестабилен (даже sentinel не найден) — проверка пропущена"
     missing = [c for c in cats if results.get(c) is False]
     return (len(missing) == 0), missing, ""
 
 
-def _geoip_missing_msg(missing):
-    """Текст ошибки для UI когда geoip-категории отсутствуют в geoip.dat."""
+def _cat_missing_msg(missing, kind="geoip"):
+    """Текст ошибки для UI когда категории отсутствуют в .dat."""
+    if kind == "geosite":
+        return (
+            "❌ В geosite_v2fly.dat нет v2fly-категорий: " + ", ".join(missing) + ".\n"
+            "Скорее всего опечатка или это не v2fly-категория. Проверь имя на "
+            "github.com/v2fly/domain-list-community. Можно вместо категории задать домены вручную в поле выше.\n"
+            "Сохранение отменено — роутер не тронут, xray работает."
+        )
     return (
         "❌ В установленном geoip.dat нет geoip-категорий: " + ", ".join(missing) + ".\n"
         "Базовый XKeen geoip.dat содержит не все сервисы (например discord). Варианты:\n"
@@ -3889,9 +3912,9 @@ def api_xkeen_set_yt_geoip_categories():
         c = c.strip().lower()
         if c and re.match(r"^[a-z0-9_-]+$", c):
             categories.append(c)
-    ok, missing, _note = keenetic_validate_geoip_categories(categories)
+    ok, missing, _note = keenetic_validate_route_categories(categories, "geoip")
     if not ok:
-        return jsonify({"ok": False, "stderr": _geoip_missing_msg(missing)})
+        return jsonify({"ok": False, "stderr": _cat_missing_msg(missing, "geoip")})
     return jsonify(keenetic_write_watchdog_config({"YT_GEOIP_CATEGORIES": " ".join(categories)}))
 
 
@@ -3926,6 +3949,9 @@ def api_xkeen_set_foreign_ext_categories():
         c = c.strip().lower()
         if c and re.match(r"^[a-z0-9_-]+$", c):
             categories.append(c)
+    ok, missing, _n = keenetic_validate_route_categories(categories, "geosite")
+    if not ok:
+        return jsonify({"ok": False, "stderr": _cat_missing_msg(missing, "geosite")})
     return jsonify(keenetic_write_watchdog_config({"FOREIGN_EXT_CATEGORIES": " ".join(categories)}))
 
 
@@ -3942,9 +3968,9 @@ def api_xkeen_set_foreign_geoip_categories():
         c = c.strip().lower()
         if c and re.match(r"^[a-z0-9_-]+$", c):
             categories.append(c)
-    ok, missing, _note = keenetic_validate_geoip_categories(categories)
+    ok, missing, _note = keenetic_validate_route_categories(categories, "geoip")
     if not ok:
-        return jsonify({"ok": False, "stderr": _geoip_missing_msg(missing)})
+        return jsonify({"ok": False, "stderr": _cat_missing_msg(missing, "geoip")})
     return jsonify(keenetic_write_watchdog_config({"FOREIGN_GEOIP_CATEGORIES": " ".join(categories)}))
 
 
