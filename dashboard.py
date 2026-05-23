@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.28"
+_VERSION_FALLBACK = "1.0.29"
 
 
 def get_dashboard_version():
@@ -3815,6 +3815,66 @@ def api_xkeen_set_yt_ext_categories():
     return jsonify(keenetic_write_watchdog_config({"YT_EXT_CATEGORIES": " ".join(categories)}))
 
 
+def keenetic_validate_geoip_categories(categories, timeout=30):
+    """Best-effort: какие geoip-категории ОТСУТСТВУЮТ в установленном geoip.dat.
+
+    Зачем: сохранение категории, которой нет в geoip.dat (например `discord` в базовом
+    geoip.dat) генерит правило `ip: ["geoip:discord"]`, на котором xray НЕ стартует
+    («failed to check code DISCORD from geoip.dat») → весь VPN ложится (инцидент 2026-05-23).
+    Поэтому проверяем ДО записи в watchdog.config.
+
+    Метод: на роутере для каждой категории гоняем минимальный `xray run -test` с правилом
+    ip:["geoip:CAT"] (тот же путь, что роняет xray). Sentinel 'private' (всегда есть в geoip.dat):
+    если даже он MISS — значит сломан сам тест → fail-open (не блокируем; подстрахует
+    watchdog-гейт). Перечислять коды внутри .dat напрямую нельзя (protobuf).
+
+    Возвращает (ok: bool, missing: list[str], note: str)."""
+    cats = []
+    for c in (categories or []):
+        c = (c or "").strip().lower()
+        if c and re.match(r"^[a-z0-9_-]+$", c) and c not in cats:
+            cats.append(c)
+    if not cats:
+        return True, [], ""
+    cats_sh = " ".join(cats + ["private"])  # sentinel последним
+    remote_cmd = (
+        "R=/tmp/wd_geoip_check.$$.json; "
+        "for c in " + cats_sh + "; do "
+        "printf '{\"outbounds\":[{\"protocol\":\"freedom\",\"tag\":\"t\"}],"
+        "\"routing\":{\"rules\":[{\"type\":\"field\",\"ip\":[\"geoip:%s\"],"
+        "\"outboundTag\":\"t\"}]}}' \"$c\" > \"$R\"; "
+        "if XRAY_LOCATION_ASSET=/opt/etc/xray/dat /opt/sbin/xray run -test -config \"$R\" "
+        ">/dev/null 2>&1; then echo \"OK $c\"; else echo \"MISS $c\"; fi; "
+        "done; rm -f \"$R\""
+    )
+    r = keenetic_ssh(remote_cmd, timeout=timeout)
+    results = {}
+    for line in (r.get("stdout") or "").splitlines():
+        line = line.strip()
+        if line.startswith("OK "):
+            results[line[3:].strip()] = True
+        elif line.startswith("MISS "):
+            results[line[5:].strip()] = False
+    if not results:
+        return True, [], "geoip-проверка не выполнилась — пропускаю (подстрахует watchdog)"
+    if results.get("private") is False:
+        return True, [], "geoip-тест нестабилен (даже 'private' не найден) — проверка пропущена"
+    missing = [c for c in cats if results.get(c) is False]
+    return (len(missing) == 0), missing, ""
+
+
+def _geoip_missing_msg(missing):
+    """Текст ошибки для UI когда geoip-категории отсутствуют в geoip.dat."""
+    return (
+        "❌ В установленном geoip.dat нет geoip-категорий: " + ", ".join(missing) + ".\n"
+        "Базовый XKeen geoip.dat содержит не все сервисы (например discord). Варианты:\n"
+        "  • нажми «📥 Установить расширенный geoip.dat (Loyalsoldier)» — там эти категории есть, потом сохрани снова;\n"
+        "  • либо убери эти категории. Instagram/FB/Telegram уже идут в загран-выход по доменам и v2fly-категориям; "
+        "geoip нужен только для IP-only клиентов (Telegram Desktop, Discord).\n"
+        "Сохранение отменено — роутер не тронут, xray работает."
+    )
+
+
 @app.route("/api/xkeen/set-yt-geoip-categories", methods=["POST"])
 @requires_auth
 def api_xkeen_set_yt_geoip_categories():
@@ -3829,6 +3889,9 @@ def api_xkeen_set_yt_geoip_categories():
         c = c.strip().lower()
         if c and re.match(r"^[a-z0-9_-]+$", c):
             categories.append(c)
+    ok, missing, _note = keenetic_validate_geoip_categories(categories)
+    if not ok:
+        return jsonify({"ok": False, "stderr": _geoip_missing_msg(missing)})
     return jsonify(keenetic_write_watchdog_config({"YT_GEOIP_CATEGORIES": " ".join(categories)}))
 
 
@@ -3879,6 +3942,9 @@ def api_xkeen_set_foreign_geoip_categories():
         c = c.strip().lower()
         if c and re.match(r"^[a-z0-9_-]+$", c):
             categories.append(c)
+    ok, missing, _note = keenetic_validate_geoip_categories(categories)
+    if not ok:
+        return jsonify({"ok": False, "stderr": _geoip_missing_msg(missing)})
     return jsonify(keenetic_write_watchdog_config({"FOREIGN_GEOIP_CATEGORIES": " ".join(categories)}))
 
 

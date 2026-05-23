@@ -1,4 +1,9 @@
 #!/bin/sh
+# XKeen failover watchdog v11 (2026-05-23, xray-test gate перед apply):
+#   ПЕРЕД применением нового 05_routing.json гоняем `xray run -test` (с XRAY_LOCATION_ASSET).
+#   Если конфиг валиден как JSON, но xray на нём НЕ стартует (например ip:["geoip:discord"] —
+#   кода нет в geoip.dat) — НЕ применяем, оставляем текущий рабочий routing, xray не трогаем,
+#   шлём TG-алерт. Закрывает footgun «GeoIP-категории роняют весь VPN» (инцидент 2026-05-23).
 # XKeen failover watchdog v10 (2026-05-18, YT GeoIP-категории):
 #   YT_GEOIP_CATEGORIES — список geoip-категорий (telegram, discord, ...) для YT-канала.
 #   Зачем: IP-only приложения вроде Telegram Desktop коннектятся напрямую к датацентрам
@@ -318,6 +323,38 @@ routing_changed() {
   [ "$md5_old" != "$md5_new" ]
 }
 
+# Проверяет КАНДИДАТ-routing (05_routing.json.new) через `xray run -test` ПЕРЕД применением.
+# Зачем: jq-валидация ловит только синтаксис JSON, но НЕ отсутствие geoip/geosite-кода
+# (ip:["geoip:discord"] при базовом geoip.dat — валидный JSON, но xray НЕ стартует → весь
+# VPN ложится; инцидент 2026-05-23). Тестируем во временном confdir (все текущие конфиги +
+# кандидат-routing), боевые файлы не трогаем.
+# Возврат: 0 = рабочий (или тест выполнить не удалось — fail-open, чтобы не заморозить
+# легитимный failover); 1 = xray-test однозначно сказал что конфиг битый → НЕ применять.
+XRAY_BIN=/opt/sbin/xray
+XRAY_ASSET=/opt/etc/xray/dat
+validate_routing_xray() {
+  local cand="$CONFIG_DIR/05_routing.json.new"
+  [ -f "$cand" ] || return 0
+  [ -x "$XRAY_BIN" ] || { log "WARN: $XRAY_BIN не найден — пропускаю xray-test gate (fail-open)"; return 0; }
+  local td="/tmp/wd_xraytest.$$"
+  rm -rf "$td" 2>/dev/null
+  mkdir -p "$td" || { log "WARN: не создать $td — пропускаю xray-test gate (fail-open)"; return 0; }
+  cp "$CONFIG_DIR"/*.json "$td"/ 2>/dev/null
+  cp "$cand" "$td/05_routing.json" 2>/dev/null
+  local out rc
+  out=$(XRAY_LOCATION_ASSET="$XRAY_ASSET" "$XRAY_BIN" run -test -confdir "$td" 2>&1)
+  rc=$?
+  rm -rf "$td" 2>/dev/null
+  [ "$rc" -eq 0 ] && return 0
+  # Не-ноль: блокируем ТОЛЬКО при явной ошибке конфига (не при сбое запуска самого теста).
+  if echo "$out" | grep -qiE 'failed to (check code|load|build)|invalid|not found|neither outboundTag'; then
+    log "XRAY-TEST FAIL (routing НЕ применён): $(echo "$out" | grep -iE 'failed to|invalid|not found|neither' | head -2 | tr '\n' ' ')"
+    return 1
+  fi
+  log "WARN: xray-test rc=$rc без явной config-ошибки — применяю (fail-open). tail: $(echo "$out" | tail -1)"
+  return 0
+}
+
 # ---------- State ----------
 # Формат state: "<current_state> <counter> <current_default_tag>"
 # current_state: primary | failover
@@ -511,7 +548,12 @@ PREV_FOREIGN=$(grep -o 'EFFECTIVE_FOREIGN=\S*' "$STATE_FILE" 2>/dev/null | cut -
 # AI_DOMAINS / AI_TAG / YT_DOMAINS / YT_TAG / шаблона (юзер правит из дашборда).
 if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFFECTIVE_FOREIGN_TAG"; then
   if routing_changed; then
-    if mv "$CONFIG_DIR/05_routing.json.new" "$CONFIG_DIR/05_routing.json"; then
+    if ! validate_routing_xray; then
+      _ts="$(date +%Y%m%d-%H%M%S)"
+      mv "$CONFIG_DIR/05_routing.json.new" "$CONFIG_DIR/05_routing.json.new.bad-${_ts}" 2>/dev/null
+      log "BLOCKED: новый routing не прошёл xray -test — оставляю текущий (xray не трогаю). Битый → 05_routing.json.new.bad-${_ts}"
+      tg_alert "🛡️ <b>XKeen watchdog</b>: новый routing не прошёл проверку <code>xray -test</code> и НЕ применён — текущая конфигурация сохранена, VPN работает. Вероятно geoip/geosite-категория отсутствует в .dat. Проверь категории в панели."
+    elif mv "$CONFIG_DIR/05_routing.json.new" "$CONFIG_DIR/05_routing.json"; then
       /opt/sbin/xkeen -restart >/dev/null 2>&1
       if [ "$NEW_DEFAULT" != "$CUR_DEFAULT" ]; then
         log "SWITCH default $CUR_DEFAULT -> $NEW_DEFAULT (state=$CUR/$NEW_STATE probe=$PROBE_CODE)"
