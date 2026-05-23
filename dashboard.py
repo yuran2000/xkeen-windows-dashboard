@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.25"
+_VERSION_FALLBACK = "1.0.26"
 
 
 def get_dashboard_version():
@@ -2436,17 +2436,26 @@ def api_xkeen_header_status():
             "label": f"xray {mode} · ошибка",
             "tooltip": error_text[:400],
         }
-    elif mode == "TPROXY":
+    elif mode in ("TPROXY", "Mixed", "Redirect"):
+        # Все три — ВАЛИДНЫЕ рабочие режимы XKeen. Mixed = TCP через redirect + UDP через
+        # tproxy (штатный/частый дефолт на MT7621). Раньше Mixed/Redirect метились «warn»
+        # (жёлтый) и пугали зря — VPN полностью работает. Теперь любой рабочий режим = ok.
+        if mode == "TPROXY":
+            _modenote = "Режим TPROXY (TCP+UDP через tproxy) — оптимальный."
+        elif mode == "Mixed":
+            _modenote = "Режим Mixed (TCP через redirect + UDP через tproxy) — штатный режим XKeen, всё нормально."
+        else:
+            _modenote = "Режим Redirect (TCP через redirect) — рабочий режим."
         result = {
             "ok": True, "state": "ok",
-            "label": f"xray TPROXY · {active_tag}" if active_tag else "xray TPROXY",
-            "tooltip": f"PRIMARY: {active_tag or '(не определён)'}\nРежим TPROXY — оптимальный.",
+            "label": f"xray {mode} · {active_tag}" if active_tag else f"xray {mode}",
+            "tooltip": f"PRIMARY: {active_tag or '(не определён)'}\n{_modenote} VPN работает.",
         }
     else:
         result = {
             "ok": True, "state": "warn",
             "label": f"xray {mode} · {active_tag}" if active_tag else f"xray {mode}",
-            "tooltip": f"PRIMARY: {active_tag or '(не определён)'}\nРежим {mode} — валидный, но не оптимальный. VPN работает.",
+            "tooltip": f"PRIMARY: {active_tag or '(не определён)'}\nРежим не распознан ({mode}). xray запущен — глянь «📊 Статус».",
         }
 
     result.update({
@@ -5945,6 +5954,41 @@ def _test_socks_deprovision():
     return _test_socks_run_bg(script)
 
 
+_RU_TLD_RE = re.compile(r"\.(?:ru|su|xn--p1ai|рф)$", re.IGNORECASE)
+
+
+def _domain_in_list(host, domain_list):
+    """True (и какой именно домен совпал) если host == d ИЛИ host — поддомен d."""
+    h = (host or "").lower().strip(".")
+    for d in (domain_list or []):
+        d = (d or "").lower().strip(".")
+        if d and (h == d or h.endswith("." + d)):
+            return d
+    return None
+
+
+def _channel_for_domain(host, tg):
+    """В какой канал попадёт домен ПО ПРЕСЕТАМ (watchdog.config). Приоритет = как в watchdog:
+    BLOCK > DIRECT(список) > RU-домен(.ru/.su/.рф) > AI > YT > FOREIGN > PRIMARY (по умолчанию).
+    ⚠ Geo-категории (ext:geosite:...) НЕ учитываются (на хосте панели нет geo-БД) — домен,
+    попадающий в канал ТОЛЬКО через geo-категорию, тут покажется как PRIMARY (см. note во фронте).
+    tg = keenetic_get_watchdog_targets(). Возвращает {label, tag, kind, match}."""
+    h = (host or "").lower().strip(".")
+    m = _domain_in_list(h, tg.get("block_domains"))
+    if m: return {"label": "⛔ Блокировать", "tag": "block", "kind": "block", "match": m}
+    m = _domain_in_list(h, tg.get("direct_domains"))
+    if m: return {"label": "🚫 Напрямую", "tag": "direct", "kind": "direct", "match": m}
+    if _RU_TLD_RE.search(h):
+        return {"label": "🚫 Напрямую", "tag": "direct", "kind": "direct", "match": "RU-домен (.ru/.su/.рф)"}
+    m = _domain_in_list(h, tg.get("ai_domains"))
+    if m: return {"label": "🤖 AI", "tag": tg.get("ai_tag"), "kind": "ai", "match": m}
+    m = _domain_in_list(h, tg.get("yt_domains"))
+    if m: return {"label": "📺 YouTube", "tag": tg.get("yt_tag"), "kind": "yt", "match": m}
+    m = _domain_in_list(h, tg.get("foreign_domains"))
+    if m: return {"label": "📱 Заблокированные в РФ", "tag": tg.get("foreign_tag"), "kind": "foreign", "match": m}
+    return {"label": "🌍 Основной (PRIMARY)", "tag": tg.get("primary_tag"), "kind": "primary", "match": None}
+
+
 @app.route("/api/diagnose/site", methods=["GET"])
 @requires_auth
 def api_diagnose_site():
@@ -5984,6 +6028,15 @@ def api_diagnose_site():
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "available": True, "error": repr(exc)}), 200
 
+    # 🧭 Для каждого домена — в какой канал он попадёт ПО ПРЕСЕТАМ роутера (read-only).
+    # Это «проверка настроек»: видно сразу, что напр. instagram реально в канале FOREIGN.
+    # Если роутер недоступен — не критично, послойная проверка всё равно показана.
+    try:
+        _tg = keenetic_get_watchdog_targets()
+        out["channels"] = {h: _channel_for_domain(h, _tg) for h in urls}
+    except Exception:  # noqa: BLE001
+        out["channels"] = None
+
     if request.args.get("via"):
         proxy_url, via_tag = _test_socks_proxy_url()
         if not proxy_url:
@@ -6021,6 +6074,11 @@ def api_xkeen_test_socks():
     if (request.form.get("action") or "").strip() == "remove":
         _test_socks_deprovision()
         return jsonify({"ok": True, "removed": True})
+
+    # 🚫 Фича «Сравнить через outbound» УДАЛЕНА 2026-05-23: провижининг socks-test ронял
+    # household-VPN (рвал tproxy при xkeen -restart — 3 инцидента 22-23 мая). Провижининг
+    # отключён наглухо. action=remove (выше) оставлен как safety-очистка забытого узла.
+    return jsonify({"ok": False, "error": "Фича «Сравнить через outbound» отключена — она роняла роутерный VPN. Используй «🔎 Проверить» (диагностика с ПК)."}), 410
 
     target = (request.form.get("outbound") or "").strip()
     if not target:
@@ -7769,7 +7827,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <div class="row" style="margin-top: 16px;">
     <div class="col" data-xk-sub="📱 Заблокированные в РФ" data-xk-group="🧭 Куда идёт трафик">
       <div class="channel-card">
-        <label class="col-header" style="color:#8e44ad;">📱 «Заблокированные в РФ» — sticky outbound</label>
+        <label class="col-header" style="color:#8e44ad;">📱 «Заблокированные в РФ» — sticky outbound <a href="#help-foreign" onclick="openHelpAnchor('help-foreign'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Открыть «📱 Заблокированные в РФ» в Помощи — зачем канал и какой выход выбирать">❓ помощь</a></label>
         <div class="channel-card-body">
           <select id="select-foreign" style="width: 100%; padding: 7px; font-size: 0.95em; border: 1px solid #ccc; border-radius: 4px;">
             {% for grp in vless_option_groups %}
@@ -8023,7 +8081,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     </div>
   </div>
 
-  <details class="subsec subsec-log">
+  <details class="subsec subsec-log" data-xk-keep-inline>
     <summary>📋 Лог watchdog <span class="subsec-hint">(последние 30 строк — события переключений)</span></summary>
     <div class="subsec-body">
     <pre class="log" style="margin: 0;">{% for line in watchdog.log %}{{ line }}
@@ -8409,7 +8467,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 <div class="card">
   <p class="subtitle" style="margin-top: 0;">
     Сохраняет/восстанавливает <strong>ВСЕ настройки XKeen</strong> одним файлом — 16 конфигов:
-    <details style="display: inline; margin-left: 4px;">
+    <details style="display: inline; margin-left: 4px;" data-xk-keep-inline>
       <summary style="cursor: pointer; display: inline; color: #2a7;">список файлов</summary>
       <div style="margin-top: 6px; padding: 8px; background: #f9f9f4; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.85em;">
         Активные xray (01-06): <code>01_log.json</code> · <code>02_dns.json</code> · <code>03_inbounds.json</code> · <code>04_outbounds.json</code> · <code>05_routing.json</code> · <code>06_policy.json</code><br>
@@ -8770,7 +8828,7 @@ echo OK</pre>
     Для Xray это может быть pre-release (бета) — если хочешь именно stable, используй TTY-SSH с ручным выбором номера (см. пояснение ниже).
   </p>
 
-  <details style="margin-top: 8px;">
+  <details style="margin-top: 8px;" data-xk-keep-inline>
     <summary style="cursor: pointer; font-weight: 600; color: #555;">❓ Что делают эти команды и в чём разница между Xray и XKeen</summary>
     <div style="margin: 10px 0 6px; font-size: 0.92em; line-height: 1.55;">
 
@@ -8861,8 +8919,8 @@ echo OK</pre>
       <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left;">Значение</th>
     </tr></thead>
     <tbody>
-      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟢 зелёный</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>ok</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray в TPROXY-режиме, error.log чистый — оптимально</td></tr>
-      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟡 жёлтый</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>warn</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray в Mixed/Redirect режиме — рабочий, но не оптимальный. VPN работает.</td></tr>
+      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟢 зелёный</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>ok</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray запущен в рабочем режиме (<strong>TPROXY / Mixed / Redirect</strong> — все три валидны), error.log чистый. <em>Mixed</em> = TCP через redirect + UDP через tproxy — штатный режим XKeen, не хуже остальных.</td></tr>
+      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟡 жёлтый</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>warn</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray запущен, но режим не распознан / статус прочитать не удалось. VPN скорее всего работает — глянь «📊 Статус».</td></tr>
       <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟠 оранжевый (мигает)</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>error</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray запущен, но в error.log есть <code>failed to load</code> / <code>cannot find</code> / <code>panic</code> / <code>fatal</code> — что-то поломалось в конфиге.</td></tr>
       <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🔴 красный (мигает)</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>stopped</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray НЕ запущен — VPN не работает совсем.</td></tr>
       <tr><td style="border:1px solid #ccc; padding: 6px 10px;">⚪ серый</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>unreachable</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">SSH-таймаут к роутеру — сам роутер недоступен (нет связи).</td></tr>
@@ -8937,30 +8995,21 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
   <div id="diagnose-output" style="margin-top: 12px;"></div>
 
   <!-- ===== 🔎 Проверка конкретного сайта (rkn_checker, послойно) ===== -->
-  <div data-xk-sub="🔎 Проверка сайта" style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 16px;">
+  <div data-xk-sub="🔎 Почему не работает сайт" style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 16px;">
     <h3 style="margin: 0 0 6px; font-size: 1.05em; color: #6a1a1a;">🔎 Почему не работает сайт?</h3>
     <p class="subtitle" style="margin: 0 0 10px;">
-      Послойная проверка <strong>с этого ПК</strong>: DNS → TCP → TLS → HTTP. Показывает <em>на каком уровне</em> рвётся соединение (DNS-подмена, TLS-DPI по SNI, TCP-reset, заглушка провайдера) — это полезнее, чем просто «не открывается».
+      Послойная проверка (DNS → TCP → TLS → HTTP) — показывает <em>на каком уровне</em> рвётся соединение (DNS-подмена, TLS-DPI по SNI, TCP-reset, заглушка провайдера).<br>
+      <strong>🔌 Идёт через интернет ИМЕННО ЭТОГО компьютера</strong> — так, как он сейчас выходит в сеть: через роутер с VPN, либо через Happ (если включён), либо напрямую. Это <u>не</u> с роутера и <u>не</u> через выбранный VPN-канал — поэтому вердикт может отличаться от того, что видит телефон или другое устройство. <em>(Если на ПК активен Happ — проверка покажет картину через Happ, а не через домашний роутер.)</em>
     </p>
     <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
       <input id="site-check-input" type="text" placeholder="instagram.com, x.com, rutracker.org" style="flex: 1; min-width: 260px; padding: 7px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 0.95em;">
       <button id="btn-site-check" type="button" class="btn-primary">🔎 Проверить</button>
     </div>
     <p style="margin: 6px 0 0; font-size: 0.82em; color: #888;">Несколько доменов — через запятую (до 12). Проверка идёт с хоста панели, а не с роутера — чужого провайдера она не видит.</p>
-    <div style="margin: 10px 0 0; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 0.9em;">
-      <span>🔬 Сравнить через узел:</span>
-      <select id="site-check-outbound" style="padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; max-width: 340px;">
-        {% for o in (outbounds or []) %}<option value="{{ o.tag }}">{{ o.tag }}</option>{% endfor %}
-      </select>
-      <button id="btn-site-compare" type="button" class="btn btn-sm" style="background:#468; color:#fff;">🔬 Сравнить (direct vs узел)</button>
-      <button id="btn-site-node-remove" type="button" class="btn btn-sm" style="background:#777; color:#fff; display:none;" title="Удалить тест-узел с роутера прямо сейчас">✖ убрать узел</button>
-      <span id="site-check-node-status" style="font-size: 0.82em; color: #888;"></span>
-    </div>
-    <p style="margin: 6px 0 0; font-size: 0.8em; color: #999;">🛡 Тест-узел — временный: роутер сам удалит его через ~10 мин и перезапустится. Можно убрать сразу кнопкой «✖ убрать узел». Это диагностический узел, держать его постоянно не нужно.</p>
     <div id="site-check-output" style="margin-top: 12px;"></div>
   </div>
 
-  <details style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 14px;">
+  <details data-xk-keep-inline style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 14px;">
     <summary style="cursor: pointer; font-weight: 600; color: #6a1a1a; font-size: 0.95em;">📚 Что проверяет «Диагностика» и какие auto-fix доступны</summary>
     <div style="margin-top: 10px; font-size: 0.9em; line-height: 1.55;">
       <table style="width: 100%; border-collapse: collapse; font-size: 0.92em;">
@@ -8982,7 +9031,7 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
     </div>
   </details>
 
-  <details style="margin-top: 14px;">
+  <details data-xk-keep-inline style="margin-top: 14px;">
     <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.92em;">🆘 Если auto-fix не помог</summary>
     <div style="margin-top: 8px; font-size: 0.9em; line-height: 1.55;">
       <ol style="margin: 0 0 0 22px; padding: 0;">
@@ -9670,6 +9719,36 @@ nslookup instagram.com 8.8.8.8     # напрямую через Google — ес
       <div style="background: #f0fff0; border-left: 3px solid #2e7d32; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #1b5e20;">
         ✅ <strong>Как это связано с VPN</strong>: после фикса DNS домен резолвится в реальный IP → браузер шлёт пакет наружу → xray TPROXY его перехватывает → sniffing видит домен (например instagram.com) → роутит через нужный VPN-канал. Без правильного DNS пакет уходил на localhost и до xray вообще не доходил — поэтому VPN-канал был «ни при чём», проблема была до туннеля.
       </div>
+    </div>
+  </details>
+
+  <details class="help-section" id="help-foreign">
+    <summary>📱 Канал «Заблокированные в РФ» — Meta / Telegram / Twitter / Discord</summary>
+    <div class="help-body">
+      <p><strong>Что это</strong>: отдельный sticky-канал для сервисов, которые <strong>заблокированы РКН</strong> (Instagram/Meta, WhatsApp, Telegram, Twitter/X, Discord). Их домены принудительно идут через выбранный <strong>заграничный</strong> выход, отдельно от остального трафика.</p>
+
+      <h4>Зачем отдельный канал (а не через YouTube)</h4>
+      <p>У YouTube и у заблокированных сервисов <strong>противоположные</strong> требования к выходу:</p>
+      <ul>
+        <li><strong>YouTube</strong> в РФ только <em>тормозят</em> (не блокируют) → ему хорош <strong>российский</strong> выход с де-троттлингом (быстрее + меньше рекламы).</li>
+        <li><strong>Meta/Telegram/Twitter</strong> <em>заблокированы</em> → российский выход блокировку <strong>НЕ обходит</strong> (DPI режет TLS даже через RU-IP). Нужен <strong>заграничный</strong> выход.</li>
+      </ul>
+      <p>Поэтому Instagram и т.п. вынесены из YouTube-канала в этот отдельный — каждому свой тип выхода. <em>(Раньше Meta сидела в YouTube-канале с RU-выходом и не открывалась — «вместо сайта скачивался файл»: это огрызок TLS, который порезал DPI.)</em></p>
+
+      <h4>Как настроить</h4>
+      <ol>
+        <li>В разделе <strong>«🎯 Основное и резервное подключение» → «📱 Заблокированные в РФ»</strong> выбери <strong>заграничный</strong> outbound (🇳🇱 Нидерланды, 🇩🇪 Германия, 🇪🇪 Эстония и т.п.). <strong>НЕ</strong> российский (🇷🇺 — пометка «НЕ годится») и <strong>НЕ</strong> «Напрямую».</li>
+        <li>Список доменов задаётся там же — есть пресеты (Meta, Telegram, Twitter/X, Discord). Можно добавлять свои.</li>
+        <li><strong>GeoIP-категории</strong> — для приложений, которые ходят на IP <em>мимо DNS</em> (Telegram Desktop коннектится прямо к датацентрам). Доменные правила их не ловят — добавь <code>telegram</code> в GeoIP, чтобы и они шли через загран-выход.</li>
+      </ol>
+
+      <h4>🛡️ Kill-switch (защита от утечки)</h4>
+      <p>Если включён (<code>FOREIGN_FAIL_BLOCK=1</code>) и заграничный выход <strong>упадёт</strong> — трафик Meta/Telegram <strong>блокируется</strong>, а не уходит через провайдера напрямую. Зачем: иначе при падении канала сервисы всё равно не откроются (РКН-блок), а твой <strong>реальный IP засветится</strong>. Лучше временно заблокировать до восстановления канала. Восстанавливается автоматически, как только выход оживёт.</p>
+
+      <div style="background: #f6f0fb; border-left: 3px solid #8e44ad; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #5b2c6f;">
+        💡 <strong>Совет по надёжности</strong>: если выбрать для этого канала <strong>тот же сервер</strong>, что и основной (PRIMARY), то при его падении ляжет и инстаграм. Для независимого резерва выбери <strong>другой</strong> заграничный узел.
+      </div>
+      <p class="muted">Связанные темы: <a href="#help-dns-block" onclick="openHelpAnchor('help-dns-block'); return false;">DNS-блокировка провайдера</a>, <a href="#help-ipv6-leak" onclick="openHelpAnchor('help-ipv6-leak'); return false;">Утечка IPv6</a> — обе тоже могут мешать заблокированным сервисам.</p>
     </div>
   </details>
 
@@ -14401,6 +14480,17 @@ function rknVerdictCell(r) {
   return { cell, bg: v.bg };
 }
 
+function chCell(channels, name) {
+  if (channels === null || channels === undefined) return '<span style="color:#aaa;">— (роутер недоступен)</span>';
+  const c = channels[name];
+  if (!c) return '<span style="color:#aaa;">—</span>';
+  const tag = c.tag ? ` <span style="font-size:0.8em; color:#888;">→ ${escapeHtml(c.tag)}</span>` : '';
+  let note = '';
+  if (c.kind === 'primary') note = '<div style="font-size:0.76em; color:#999;">не в явных списках каналов</div>';
+  else if (c.match) note = `<div style="font-size:0.76em; color:#999;">совпал по «${escapeHtml(c.match)}»</div>`;
+  return `<strong>${escapeHtml(c.label)}</strong>${tag}${note}`;
+}
+
 function renderSiteCheck(j) {
   const out = document.getElementById('site-check-output');
   if (!j.available) {
@@ -14444,6 +14534,7 @@ function renderSiteCheck(j) {
   let html = '<table style="border-collapse: collapse; font-size: 0.9em; width: 100%; max-width: 900px;">';
   html += '<thead><tr style="background:#f5f5f5;">'
         + '<th style="padding:6px 10px; text-align:left; border-bottom:2px solid #ccc;">Сайт</th>'
+        + '<th style="padding:6px 10px; text-align:left; border-bottom:2px solid #ccc;">🧭 Идёт через <span style="font-weight:400; color:#888; font-size:0.85em;">(по пресетам)</span></th>'
         + '<th style="padding:6px 10px; text-align:left; border-bottom:2px solid #ccc;">Вердикт</th>'
         + '<th style="padding:6px 10px; text-align:center; border-bottom:2px solid #ccc;">TCP</th>'
         + '<th style="padding:6px 10px; text-align:center; border-bottom:2px solid #ccc;">TLS</th>'
@@ -14457,6 +14548,7 @@ function renderSiteCheck(j) {
     const http = (r.status_code != null) ? r.status_code : '—';
     html += `<tr style="background:${v.bg}; border-bottom:1px solid #eee;">`;
     html += `<td style="padding:6px 10px;"><strong>${escapeHtml(r.name)}</strong></td>`;
+    html += `<td style="padding:6px 10px; vertical-align:top;">${chCell(j.channels, r.name)}</td>`;
     html += `<td style="padding:6px 10px; color:${v.fg};"><strong>${v.icon} ${escapeHtml(v.text)}</strong> <span style="font-size:0.82em; color:#888;">(уверенность: ${escapeHtml(conf)})</span>`;
     const notes = (r.notes || []).filter(Boolean);
     if (notes.length) {
@@ -14472,95 +14564,15 @@ function renderSiteCheck(j) {
   }
   html += '</tbody></table>';
   if (j.via_error) html += `<p style="color:#c33; font-size:0.85em; margin-top:8px;">⚠ ${escapeHtml(j.via_error)}</p>`;
-  html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">«Вердикт» — на каком уровне рвётся соединение. TLS-DPI / DNS-блок лечатся включением нужного канала; «лежит / таймаут» может быть проблемой самого сайта.</p>`;
+  html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">«Вердикт» — на каком уровне рвётся соединение (с этого ПК). TLS-DPI / DNS-блок лечатся включением нужного канала; «лежит / таймаут» может быть проблемой самого сайта.<br>🧭 <strong>«Идёт через»</strong> — в какой канал роутер направит домен <em>по твоим пресетам</em> (списки доменов в каналах). Удобно проверять настройки: например instagram должен идти через «📱 Заблокированные в РФ» на загран-выход. <em>Совпадения через geo-категории (geosite:) тут не отражаются — такой домен покажется как «Основной (PRIMARY)».</em></p>`;
   out.innerHTML = html;
-}
-
-function setSiteCheckNodeUI(provisioned, outbound) {
-  const st  = document.getElementById('site-check-node-status');
-  const rm  = document.getElementById('btn-site-node-remove');
-  if (provisioned && outbound) {
-    if (st) st.textContent = '✓ узел готов: ' + outbound + ' · сам уберётся через ~10 мин';
-    if (rm) rm.style.display = '';
-  } else {
-    if (st) st.textContent = 'узел не подготовлен — настроится при первом сравнении';
-    if (rm) rm.style.display = 'none';
-  }
-}
-
-async function siteCheckNodeStatus() {
-  const st = document.getElementById('site-check-node-status');
-  if (!st) return;
-  try {
-    const j = await (await fetch('/api/xkeen/test-socks')).json();
-    const sel = document.getElementById('site-check-outbound');
-    if (j.provisioned && j.outbound && sel && [...sel.options].some(o => o.value === j.outbound)) sel.value = j.outbound;
-    setSiteCheckNodeUI(j.provisioned && j.outbound, j.outbound);
-  } catch (e) { /* ignore */ }
-}
-
-async function removeSiteCheckNode() {
-  const rm = document.getElementById('btn-site-node-remove');
-  const st = document.getElementById('site-check-node-status');
-  if (rm) { rm.disabled = true; }
-  if (st) st.textContent = '⏳ убираю узел и перезапускаю xkeen...';
-  try {
-    const fd = new FormData(); fd.append('action', 'remove');
-    await fetch('/api/xkeen/test-socks', { method: 'POST', body: fd });
-  } catch (e) { /* ignore */ }
-  if (rm) rm.disabled = false;
-  setSiteCheckNodeUI(false, null);
-}
-
-async function runSiteCompare() {
-  const inp = document.getElementById('site-check-input');
-  const sel = document.getElementById('site-check-outbound');
-  const btn = document.getElementById('btn-site-compare');
-  const out = document.getElementById('site-check-output');
-  const st  = document.getElementById('site-check-node-status');
-  const domains = (inp.value || '').trim();
-  if (!domains) { inp.focus(); return; }
-  const target = sel ? sel.value : '';
-  if (!target) { out.innerHTML = '<p style="color:#c33;">Не выбран outbound для сравнения.</p>'; return; }
-  btn.disabled = true;
-  const oldLabel = btn.textContent;
-  try {
-    const cur = await (await fetch('/api/xkeen/test-socks')).json();
-    if (!cur.provisioned || cur.outbound !== target) {
-      if (!confirm(`Подготовить тест-узел через «${target}»?\n\nДашборд запишет изолированный конфиг на роутер и перезапустит xkeen (≈10–20 сек, VPN кратко моргнёт). Это нужно один раз для выбранного узла.\n\n🛡 Узел временный: роутер сам удалит его через ~10 мин (или убери сразу кнопкой «✖ убрать узел»).`)) {
-        btn.disabled = false; btn.textContent = oldLabel; return;
-      }
-      btn.textContent = '⚙ Готовлю узел...';
-      out.innerHTML = '<p style="color:#888; font-style:italic;">Настраиваю тест-узел на роутере и перезапускаю xkeen (≈10–20 сек)...</p>';
-      const fd = new FormData(); fd.append('outbound', target);
-      const pr = await (await fetch('/api/xkeen/test-socks', { method: 'POST', body: fd })).json();
-      if (!pr.ok) {
-        out.innerHTML = `<div style="padding:10px; background:#fde8e8; color:#6a1a1a; border-radius:4px;">❌ Не удалось подготовить узел: ${escapeHtml(pr.error || '')}</div>`;
-        btn.disabled = false; btn.textContent = oldLabel; return;
-      }
-      setSiteCheckNodeUI(true, target);
-    }
-    btn.textContent = '⏳ Сравниваю...';
-    out.innerHTML = '<p style="color:#888; font-style:italic;">Проверяю напрямую и через узел (DNS / TCP / TLS / HTTP)...</p>';
-    const res = await fetch('/api/diagnose/site?via=1&domains=' + encodeURIComponent(domains));
-    renderSiteCheck(await res.json());
-  } catch (e) {
-    out.innerHTML = `<div style="padding:10px; background:#fbd7d7; color:#6a1a1a; border-radius:4px;">❌ Ошибка: ${escapeHtml(e.message)}</div>`;
-  } finally {
-    btn.disabled = false; btn.textContent = oldLabel;
-  }
 }
 
 (function attachSiteCheckHandlers(){
   const btn = document.getElementById('btn-site-check');
   const inp = document.getElementById('site-check-input');
-  const cmp = document.getElementById('btn-site-compare');
-  const rm  = document.getElementById('btn-site-node-remove');
   if (btn) btn.addEventListener('click', runSiteCheck);
   if (inp) inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSiteCheck(); } });
-  if (cmp) cmp.addEventListener('click', runSiteCompare);
-  if (rm) rm.addEventListener('click', removeSiteCheckNode);
-  siteCheckNodeStatus();
 })();
 
 // ============== 🧭 KEENETIC-STYLE SIDEBAR (Phase 1) ==============
@@ -14656,7 +14668,7 @@ async function runSiteCompare() {
       main.appendChild(base);
       const entry = { title: sec.title, full: sec.full, cat: catFor(sec.title), idx: pi, subs: [] };
       pi++;
-      [...base.querySelectorAll('[data-xk-sub], details.help-section, .card > details')].forEach(el => {
+      [...base.querySelectorAll('[data-xk-sub], details.help-section, .card > details:not([data-xk-keep-inline])')].forEach(el => {
         let full = el.getAttribute('data-xk-sub');
         if (!full) { full = cleanSum(el.querySelector('summary')) || 'Тема'; }
         const label = full.length > 38 ? full.slice(0, 36).trim() + '…' : full;  // короткий ярлык для сайдбара
