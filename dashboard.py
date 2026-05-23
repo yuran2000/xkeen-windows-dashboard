@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.27"
+_VERSION_FALLBACK = "1.0.28"
 
 
 def get_dashboard_version():
@@ -1475,6 +1475,8 @@ def keenetic_remove_outbound(tag):
         return {"ok": False, "stderr": f"tag '{tag}' сейчас AI-sticky. Сначала смени AI на другой outbound."}
     if tag == targets.get("yt_tag"):
         return {"ok": False, "stderr": f"tag '{tag}' сейчас YouTube-sticky. Сначала смени YouTube на другой outbound."}
+    if tag == targets.get("foreign_tag"):
+        return {"ok": False, "stderr": f"tag '{tag}' сейчас канал «Заблокированные в РФ». Сначала смени его на другой outbound."}
     if tag in (targets.get("failover_tags") or []):
         return {"ok": False, "stderr": f"tag '{tag}' в списке FAILOVER. Сначала убери его оттуда (смени FAILOVER на другой)."}
     raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
@@ -1520,6 +1522,7 @@ def keenetic_remove_outbounds_bulk(tags):
     primary = targets.get("primary_tag")
     ai = targets.get("ai_tag")
     yt = targets.get("yt_tag")
+    foreign = targets.get("foreign_tag")
     failover_set = set(targets.get("failover_tags") or [])
     skipped = {}
     to_remove = []
@@ -1532,6 +1535,8 @@ def keenetic_remove_outbounds_bulk(tags):
             skipped[t] = "сейчас AI-sticky"
         elif t == yt:
             skipped[t] = "сейчас YouTube-sticky"
+        elif t == foreign:
+            skipped[t] = "сейчас «Заблокированные в РФ»"
         elif t in failover_set:
             skipped[t] = "в списке FAILOVER"
         else:
@@ -1746,6 +1751,7 @@ def xkeen_page():
     failover_tag = targets.get("failover_tag")
     ai_tag = targets.get("ai_tag")
     yt_tag = targets.get("yt_tag")
+    foreign_tag = targets.get("foreign_tag")
     failover_tags = targets.get("failover_tags") or []
     # Статусы outbound'ов — НЕ probим автоматически (это шум на серверах
     # провайдеров + лаг рендера ~3 сек). Берём только из кэша. Если кэш пуст
@@ -1778,6 +1784,7 @@ def xkeen_page():
         o["is_failover"] = (o["tag"] == failover_tag)
         o["is_ai"]       = (o["tag"] == ai_tag)
         o["is_yt"]       = (o["tag"] == yt_tag)
+        o["is_foreign"]  = (o["tag"] == foreign_tag)
         o["in_failover_chain"] = (o["tag"] in failover_tags)
         st = statuses.get(o["tag"], {})
         o["status_ok"]   = st.get("ok")
@@ -3149,6 +3156,8 @@ def api_xkeen_subscription_sync():
     active_tags = set()
     if targets.get("primary_tag"): active_tags.add(targets["primary_tag"])
     if targets.get("ai_tag"): active_tags.add(targets["ai_tag"])
+    if targets.get("yt_tag"): active_tags.add(targets["yt_tag"])
+    if targets.get("foreign_tag"): active_tags.add(targets["foreign_tag"])
     active_tags.update(targets.get("failover_tags") or [])
 
     updated_tags = []
@@ -3167,6 +3176,8 @@ def api_xkeen_subscription_sync():
                 roles = []
                 if t == targets.get("primary_tag"):  roles.append("PRIMARY")
                 if t == targets.get("ai_tag"):       roles.append("AI-sticky")
+                if t == targets.get("yt_tag"):       roles.append("YouTube-sticky")
+                if t == targets.get("foreign_tag"):  roles.append("«Заблокированные в РФ»")
                 if t in (targets.get("failover_tags") or []):
                     pos = (targets.get("failover_tags") or []).index(t) + 1
                     roles.append(f"FAILOVER цепочка #{pos}")
@@ -8060,7 +8071,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     <div class="domain-section-body">
       <div style="background: #eefbe5; border-left: 4px solid #2a7; padding: 8px 12px; margin: 0 0 12px; border-radius: 3px; font-size: 0.88em;">
         <strong style="color: #2a7;">🛡️ Безопасно для AI:</strong> кнопки ниже меняют <strong>только default-канал</strong> (общий трафик).
-        🤖 <strong>AI-sticky</strong> (<code>{{ targets.ai_tag }}</code>) и 📺 <strong>YouTube-sticky</strong> (<code>{{ targets.yt_tag }}</code>) <strong>не затрагиваются</strong> — продолжают идти через свои выбранные каналы.
+        🤖 <strong>AI-sticky</strong> (<code>{{ targets.ai_tag }}</code>), 📺 <strong>YouTube-sticky</strong> (<code>{{ targets.yt_tag }}</code>) и 📱 <strong>«Заблокированные в РФ»</strong> (<code>{{ targets.foreign_tag }}</code>) <strong>не затрагиваются</strong> — продолжают идти через свои выбранные каналы.
         Anthropic <strong>не увидит твой IP</strong> при нажатии FAILOVER — AI-трафик как шёл через <code>{{ targets.ai_tag }}</code>, так и идёт.
         Поменять AI/YT канал можно только через их собственные dropdown'ы выше в этом же разделе.
       </div>
@@ -8144,7 +8155,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         <td class="mono"><strong>{{ o.tag }}</strong>{% if o.note %}<br><span style="font-style:italic; font-size:0.8em; color:#3a6;">📝 {{ o.note }}</span>{% endif %}</td>
         <td class="group-cell"><span class="group-name-badge" title="pbk={{ o.group_pbk_short }}">{{ o.group_name or '?' }}</span></td>
         <td class="mono">{{ o.host }}:{{ o.port }}</td>
-        <td>{% if o.tag == watchdog.current_default %}<span class="badge badge-active">⚡ активен</span>{% endif %}{% if o.is_ai %} <span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}</td>
+        <td>{% if o.tag == watchdog.current_default %}<span class="badge badge-active">⚡ активен</span>{% endif %}{% if o.is_ai %} <span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}{% if o.is_yt %} <span class="badge" style="background:#fbdada; color:#c33">📺 YT</span>{% endif %}{% if o.is_foreign %} <span class="badge" style="background:#efe2f7; color:#8e44ad">📱 РФ-блок</span>{% endif %}</td>
       </tr>
     {% endif %}
     {% endfor %}
@@ -8296,7 +8307,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         {% endif %}
       </td>
       <td style="vertical-align: top;">
-        {% set has_current = o.is_default or o.is_primary or o.is_failover or o.in_failover_chain or o.is_ai or o.tag in ('direct','block') %}
+        {% set has_current = o.is_default or o.is_primary or o.is_failover or o.in_failover_chain or o.is_ai or o.is_yt or o.is_foreign or o.tag in ('direct','block') %}
         <div style="background: #f0f5f0; border-left: 3px solid #6a9; padding: 2px 8px; border-radius: 3px; margin-bottom: 4px;">
           <span style="color:#3a6; font-size:0.72em; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px; margin-right:5px;">▼ сейчас:</span>
           {% if has_current %}
@@ -8305,6 +8316,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             {% if o.is_failover %}<span class="badge badge-active">🟡 failover</span>{% endif %}
             {% if o.in_failover_chain and not o.is_failover %}<span class="badge badge-dim">↩️ в цепочке резерва</span>{% endif %}
             {% if o.is_ai %}<span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}
+            {% if o.is_yt %}<span class="badge" style="background:#fbdada; color:#c33">📺 YT</span>{% endif %}
+            {% if o.is_foreign %}<span class="badge" style="background:#efe2f7; color:#8e44ad">📱 РФ-блок</span>{% endif %}
             {% if o.tag in ('direct','block') %}<span class="badge badge-dim">служ.</span>{% endif %}
           {% else %}
             <span class="badge badge-dim" style="opacity:0.7;">не задействован</span>
@@ -9182,7 +9195,7 @@ Use this token to access the HTTP API:
       <ul>
         <li><strong>Подписки VPN</strong>: добавить subscription URL (любой VLESS-совместимый провайдер) — панель скачивает список серверов с провайдера, выкладывает их как outbounds на роутер. Группировка по подписке, дата истечения с цветной шкалой, ручное обновление кнопкой.</li>
         <li><strong>Outbounds</strong>: видеть, добавлять, удалять, переименовывать VPN-каналы (читает/пишет <code>04_outbounds.json</code> на роутере). Bulk-удаление через чекбоксы.</li>
-        <li><strong>Routing</strong>: куда какой трафик идёт — PRIMARY / FAILOVER / AI-sticky / YouTube-sticky / DIRECT / BLOCK</li>
+        <li><strong>Routing</strong>: куда какой трафик идёт — PRIMARY / FAILOVER / AI-sticky / YouTube-sticky / «Заблокированные в РФ» / DIRECT / BLOCK</li>
         <li><strong>Watchdog</strong>: автоматический failover между каналами каждую минуту</li>
         <li><strong>Списки доменов</strong>: VK / Mail.ru / Yandex / банки (DIRECT), Windows Update / Adobe / телеметрия (BLOCK)</li>
         <li><strong>Бэкап</strong>: snapshot всех XKeen-настроек одним JSON, восстановление на новый роутер за один клик</li>
@@ -9319,10 +9332,10 @@ Use this token to access the HTTP API:
   </details>
 
   <details class="help-section">
-    <summary>📡 4 канала: PRIMARY · FAILOVER · AI-sticky · YouTube-sticky</summary>
+    <summary>📡 Каналы: PRIMARY · FAILOVER · AI · YouTube · «Заблокированные в РФ»</summary>
     <div class="help-body">
       <h4>🟢 PRIMARY — основной канал</h4>
-      <p>Через него идёт <strong>весь трафик</strong> (кроме того что попадает под специальные правила: AI / YouTube / DIRECT).
+      <p>Через него идёт <strong>весь трафик</strong> (кроме того что попадает под специальные правила: AI / YouTube / «Заблокированные в РФ» / DIRECT).
       Дефолт — <code>vless-reality</code> (твой собственный VPN-сервер). Watchdog раз в минуту пингует его через <code>https://&lt;your-vpn-domain&gt;:8444/</code>.
       Если 2 пинга подряд провалились → переключается на FAILOVER. Если потом 3 пинга подряд успешны → возвращается обратно.</p>
 
@@ -9335,14 +9348,19 @@ Use this token to access the HTTP API:
       <p><strong>Kill-switch (рекомендую включён)</strong>: если AI-канал упал — AI-домены идут в <code>block</code> (drop), а не через PRIMARY. Защита от засветки твоего RU-IP в Anthropic/OpenAI (после такого аккаунт могут заблокировать).</p>
 
       <h4>📺 YouTube-sticky outbound</h4>
-      <p>Sticky-канал для YouTube/Instagram/Discord/TikTok из списка <code>📺 Список YouTube-доменов</code>. Аналог AI-sticky.</p>
-      <p>Зачем: при просмотре YouTube через EU/US-VPN — <strong>лезет реклама</strong> (Google показывает по geo-IP). Если же канал — <strong>RU-exit</strong> (через российский IP), реклама в YouTube не показывается (РКН-Google решение). Поэтому выбирай канал с бейджем <strong>📺 Ютуб</strong> в dropdown'е (это RU-exit без anti-DPI маскировки) — например <code>🇷🇺_Россия_YouTube</code> от Provider C или <code>🇷🇺_Санкт-Петербург_⚡️_YouTube_Instagram_Discord</code> от Provider B.</p>
-      <p><strong>Kill-switch выключен по умолчанию</strong> — если YT-канал упал, YouTube идёт через PRIMARY (с рекламой, но работает). Включи галочку «Блокировать трафик если канал упал» если хочешь чтобы YT вообще не работал без RU-канала.</p>
+      <p>Sticky-канал для YouTube/Google-видео из списка <code>📺 Список YouTube-доменов</code>. Аналог AI-sticky. <em>(Instagram/Telegram/Twitter/Discord сюда НЕ кладём — они в отдельном канале «Заблокированные в РФ» ниже.)</em></p>
+      <p>Зачем: при просмотре YouTube через EU/US-VPN — <strong>лезет реклама</strong> (Google показывает по geo-IP) и видео могут тротлить. Если же канал — <strong>RU-exit</strong> (через российский IP), рекламы меньше и троттлинга нет (РКН-Google решение). Поэтому выбирай канал с бейджем <strong>📺 Ютуб</strong> в dropdown'е (это RU-exit без anti-DPI маскировки).</p>
+      <p><strong>Kill-switch выключен по умолчанию</strong> — если YT-канал упал, YouTube идёт через PRIMARY (с рекламой, но работает).</p>
+
+      <h4>📱 «Заблокированные в РФ»-sticky outbound</h4>
+      <p>Sticky-канал для сервисов, <strong>заблокированных РКН</strong>: Meta/Instagram, WhatsApp, Telegram, Twitter/X, Discord (список <code>📱 Список доменов</code> в этом канале).</p>
+      <p>Зачем отдельно от YouTube: у них <strong>противоположные</strong> требования к выходу. YouTube хочет <strong>российский</strong> выход (де-троттл + меньше рекламы), а Meta/Telegram <strong>заблокированы</strong> — российский выход блокировку НЕ обходит (DPI режет TLS даже через RU-IP). Поэтому здесь выбирай <strong>заграничный</strong> выход (🇳🇱/🇩🇪/🇪🇪). <em>(Раньше Instagram сидел в YouTube-канале с RU-выходом и не открывался — «вместо сайта скачивался файл».)</em></p>
+      <p><strong>Kill-switch (рекомендую включён)</strong>: если загран-канал упал — эти сервисы идут в <code>block</code>, а не через PRIMARY. Иначе при RU-default они всё равно не откроются (РКН-блок), а реальный IP засветится. Подробнее — отдельная тема <a href="#help-foreign" onclick="openHelpAnchor('help-foreign'); return false;">«📱 Канал Заблокированные в РФ»</a>.</p>
     </div>
   </details>
 
   <details class="help-section">
-    <summary>🌐 Маршрутизация по доменам — AI / YT / DIRECT списки</summary>
+    <summary>🌐 Маршрутизация по доменам — AI / YouTube / «Заблокированные в РФ» / DIRECT списки</summary>
     <div class="help-body">
       <h4>Что такое «список доменов»</h4>
       <p>Это <strong>текстовое поле</strong> со списком доменов (через пробел или с новой строки). Watchdog генерирует правило xray: «<code>трафик к этим доменам → через выбранный outbound</code>».</p>
@@ -9352,8 +9370,11 @@ Use this token to access the HTTP API:
       <p>Домены AI-сервисов которые должны идти через AI-sticky outbound. Готовые пресеты-кнопки (🟣 Claude, 🟢 ChatGPT, 🔵 Gemini, …) добавляют известные домены сразу.</p>
 
       <h4>📺 Список YouTube-доменов (красная карточка)</h4>
-      <p>Домены YouTube/IG/Discord/Twitch/Twitter/Reddit/Telegram/Spotify которые идут через YT-sticky.</p>
-      <p><strong>Пустой список = правило выключено</strong>, YT идёт через PRIMARY.</p>
+      <p>Домены YouTube/Google-видео (и подобных, которым хорош RU-выход) — идут через YouTube-sticky. <em>(Instagram/Telegram/Twitter/Discord теперь в отдельном канале «Заблокированные в РФ» — см. ниже.)</em></p>
+      <p><strong>Пустой список = правило выключено</strong>, YouTube идёт через PRIMARY.</p>
+
+      <h4>📱 Список доменов «Заблокированные в РФ» (фиолетовая карточка)</h4>
+      <p>Домены сервисов, заблокированных РКН (Meta/Instagram, WhatsApp, Telegram, Twitter/X, Discord) — идут через заграничный канал «Заблокированные в РФ». Пресеты-кнопки добавляют известные домены сразу. <strong>Пустой список = правило выключено.</strong></p>
 
       <h4>🚫 Сайты НАПРЯМУЮ без VPN — DIRECT (оранжевая карточка)</h4>
       <p>Домены которые идут <strong>через твоего обычного провайдера</strong> минуя VPN. Полезно для:</p>
@@ -9832,7 +9853,7 @@ another-server.io   # ✏️</pre>
       </ul>
 
       <h4>Группировка в dropdown'ах</h4>
-      <p>Все 4 dropdown'а каналов (PRIMARY/FAILOVER/AI/YT) группируют опции по подпискам через <code>&lt;optgroup&gt;</code>. Внутри каждой группы опции имеют пастельный фон цвета подписки (зелёный/синий/бежевый/фиолетовый — ротация 6 цветов).</p>
+      <p>Все 5 dropdown'ов каналов (PRIMARY/FAILOVER/AI/YT/«Заблокированные в РФ») группируют опции по подпискам через <code>&lt;optgroup&gt;</code>. Внутри каждой группы опции имеют пастельный фон цвета подписки (зелёный/синий/бежевый/фиолетовый — ротация 6 цветов).</p>
 
       <h4>Бейджи в опциях</h4>
       <ul>
