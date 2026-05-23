@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.32"
+_VERSION_FALLBACK = "1.0.33"
 
 
 def get_dashboard_version():
@@ -1583,53 +1583,97 @@ def keenetic_remove_outbounds_bulk(tags):
 
 
 def keenetic_add_outbound(payload, tag_override=None, overwrite=False):
-    """Добавить outbound через PowerShell-скрипт Add-XKeenOutbound.ps1.
-    payload — string: vless:// URL или JSON-text.
-    Возвращает {ok, stdout, stderr}."""
-    if not payload or not payload.strip():
+    """Добавить outbound в 04_outbounds.json на роутере — НАТИВНО (через keenetic_ssh).
+
+    Раньше шелл-аут в Add-XKeenOutbound.ps1 (PowerShell 5.1). Он манглил UTF-8 при чтении
+    конфига с эмодзи/кириллицей в тегах (cp1251-захват ssh-вывода → ConvertFrom-Json падал)
+    и был привязан к локальной машине (`D:\\Claude\\...ps1`) — у других этого файла нет,
+    добавление не работало. Теперь — нативный путь дашборда: keenetic_ssh корректно читает
+    UTF-8, _strip_json_comments снимает //-комменты XKeen, откат как у keenetic_remove_outbound.
+
+    payload — vless:// URL или JSON (одиночный outbound либо xray-config с .outbounds).
+    Возвращает {ok, stdout|stderr, tag}."""
+    payload = (payload or "").strip()
+    if not payload:
         return {"ok": False, "stderr": "пустой payload"}
-    # Если JSON — сохраняем в temp-файл и передаём через -JsonPath (URL может быть длиннее cmdline лимита)
-    payload = payload.strip()
-    tmp_path = None
-    args = [
-        "powershell.exe",
-        "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-File", cfg.ADD_XKEEN_PS1,
-    ]
+
+    # 1. payload → outbound dict + сырой tag
     if payload.startswith("{"):
-        # JSON — через файл
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="xkeen-add-")
         try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-            args += ["-JsonPath", tmp_path]
+            j = json.loads(_strip_json_comments(payload))
         except Exception as ex:
-            return {"ok": False, "stderr": f"temp file: {ex}"}
+            return {"ok": False, "stderr": f"JSON не парсится: {ex}"}
+        if isinstance(j, dict) and j.get("outbounds"):
+            cand = [o for o in j["outbounds"] if isinstance(o, dict) and o.get("protocol") == "vless"]
+            new_ob = cand[0] if cand else None
+        elif isinstance(j, dict) and j.get("protocol") == "vless":
+            new_ob = j
+        else:
+            new_ob = None
+        if not new_ob:
+            return {"ok": False, "stderr": "в JSON нет outbound с protocol=vless"}
+        raw_tag = tag_override or new_ob.get("tag") or ""
     elif payload.lower().startswith("vless://"):
-        args += ["-Url", payload]
+        parsed = _parse_vless_url_dict(payload)
+        if not parsed:
+            return {"ok": False, "stderr": "vless:// URL не парсится"}
+        raw_tag = tag_override or parsed.get("tag") or ""
+        new_ob = _build_vless_outbound_dict(parsed, raw_tag or "tmp")
     else:
         return {"ok": False, "stderr": "Не похоже ни на vless://, ни на JSON"}
-    if tag_override:
-        args += ["-Tag", tag_override]
-    if overwrite:
-        args += ["-OverwriteExisting"]
+
+    # 2. Нормализуем tag (без shell-метасимволов, без ведущих/хвостовых -_); fallback по хосту
+    tag = _normalize_outbound_tag((raw_tag or "").strip())
+    if not tag:
+        host = (new_ob.get("settings", {}).get("vnext") or [{}])[0].get("address", "vpn")
+        tag = _normalize_outbound_tag(f"imported-{host}") or "imported"
+    new_ob["tag"] = tag
+
+    # 3. Текущий 04_outbounds.json (UTF-8 + strip //-комменты)
+    ob_path = f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json"
+    raw = keenetic_read_file(ob_path)
+    if not raw:
+        return {"ok": False, "stderr": f"не смог прочитать {ob_path} с роутера"}
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=60)
-        return {
-            "ok": result.returncode == 0,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "code": result.returncode,
-        }
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "stdout": "", "stderr": "PowerShell timeout (60s)", "code": -1}
+        cfg_json = json.loads(_strip_json_comments(raw))
     except Exception as ex:
-        return {"ok": False, "stdout": "", "stderr": str(ex), "code": -2}
-    finally:
-        if tmp_path:
-            try: os.unlink(tmp_path)
-            except OSError: pass
+        return {"ok": False, "stderr": f"текущий 04_outbounds.json не парсится: {ex}"}
+    obs = cfg_json.get("outbounds", []) or []
+
+    # 4. Дедуп по tag
+    has_dup = any(o.get("tag") == tag for o in obs)
+    if has_dup and not overwrite:
+        return {"ok": False, "stderr": f"outbound с tag '{tag}' уже есть. Поставь «Перезаписать если такой tag уже есть» или задай другой Tag."}
+    if has_dup:
+        obs = [o for o in obs if o.get("tag") != tag]
+
+    # 5. Вставляем перед 'direct'
+    merged, inserted = [], False
+    for o in obs:
+        if not inserted and o.get("tag") == "direct":
+            merged.append(new_ob); inserted = True
+        merged.append(o)
+    if not inserted:
+        merged.append(new_ob)
+    cfg_json["outbounds"] = merged
+    new_json = json.dumps(cfg_json, indent=4, ensure_ascii=False)
+
+    # 6. Бэкап + запись + xkeen -restart с откатом (как keenetic_remove_outbound)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    bak = keenetic_ssh(f"cp {ob_path} {ob_path}.bak-{ts}")
+    if not bak["ok"]:
+        return {"ok": False, "stderr": f"backup failed: {bak['stderr']}"}
+    w = keenetic_ssh(f"cat > {ob_path}", stdin_data=new_json, timeout=15)
+    if not w["ok"]:
+        keenetic_ssh(f"cp {ob_path}.bak-{ts} {ob_path}")
+        return {"ok": False, "stderr": f"write failed: {w['stderr']}"}
+    restart = keenetic_ssh("xkeen -restart 2>&1 | tail -20", timeout=90)
+    if not restart["ok"]:
+        keenetic_ssh(f"cp {ob_path}.bak-{ts} {ob_path} && xkeen -restart")
+        _ansi = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+        return {"ok": False, "stderr": f"xkeen -restart упал — откатил 04_outbounds.json к бэкапу (xray восстановлен). {_ansi.sub('', restart.get('stdout') or '')[:300]}"}
+    host = (new_ob.get("settings", {}).get("vnext") or [{}])[0].get("address", "?")
+    return {"ok": True, "tag": tag, "stdout": f"✅ Добавлен outbound '{tag}' ({host}). Бэкап: 04_outbounds.json.bak-{ts}. Чтобы пустить через него трафик — назначь роль (PRIMARY/FAILOVER/AI/…) в разделе каналов."}
 
 
 # ============== ROUTES ==============
@@ -2246,11 +2290,7 @@ def api_xkeen_add():
     note     = request.form.get("note", "").strip()
     result = keenetic_add_outbound(payload, tag_override=tag, overwrite=overwrite)
     if result.get("ok") and (sub_url or note):
-        effective_tag = tag
-        if not effective_tag:
-            mm = re.search(r"tag[:\s=]+([A-Za-z0-9_\-]+)", result.get("stdout", "") or "")
-            if mm:
-                effective_tag = mm.group(1)
+        effective_tag = tag or result.get("tag")
         if effective_tag:
             keenetic_set_meta(effective_tag, sub_url=sub_url, note=note)
     if result.get("ok"):
@@ -2867,7 +2907,7 @@ def _normalize_outbound_tag(t):
     if not t:
         return t
     n = _SHELL_UNSAFE_RE.sub("_", t.strip())
-    return n.strip("_")
+    return n.strip("_-")
 
 
 def _parse_vless_url_dict(url):
