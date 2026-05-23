@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.21"
+_VERSION_FALLBACK = "1.0.25"
 
 
 def get_dashboard_version():
@@ -5861,6 +5861,13 @@ def api_xkeen_diagnose():
 _TEST_SOCKS_FILE = "06_socks_test.json"
 _TEST_SOCKS_PORT = 10809
 _TEST_SOCKS_USER = "diag"
+# Тест-узел (socks-инбаунд для сравнения «через outbound») — ДИАГНОСТИЧЕСКИЙ и НЕ должен
+# жить вечно: если 06_socks_test.json забыть на роутере, он способен поломать нормальный
+# роутинг (был инцидент 2026-05-23 — instagram и «почти любой сайт» отдавали мусор). Поэтому
+# узел самоуничтожается НА РОУТЕРЕ через _TEST_SOCKS_TTL сек (не зависит от дашборда/браузера).
+_TEST_SOCKS_TTL = 600  # 10 минут — хватает посравнивать, но роутер чинит себя сам
+_TEST_SOCKS_SD_DEADLINE = "/tmp/socks_test_sd.deadline"
+_TEST_SOCKS_SD_LOG = "/tmp/socks_test_sd.log"
 
 
 def _test_socks_path():
@@ -5893,6 +5900,49 @@ def _test_socks_proxy_url():
     from urllib.parse import quote
     auth = f"{quote(user, safe='')}:{quote(pw or '', safe='')}@" if pw else ""
     return f"socks5h://{auth}{cfg.KEENETIC_HOST}:{_TEST_SOCKS_PORT}", tag
+
+
+def _test_socks_run_bg(script):
+    """Прогнать многострочный sh-скрипт на роутере через base64-обёртку (без головной боли
+    с экранированием вложенных кавычек/переносов — проверенный паттерн)."""
+    import base64 as _b64
+    b64 = _b64.b64encode(script.encode("utf-8")).decode("ascii")
+    return keenetic_ssh(f"echo {b64} | base64 -d | sh", timeout=15)
+
+
+def _test_socks_arm_selfdestruct(ttl=_TEST_SOCKS_TTL):
+    """🛡 КЛЮЧЕВАЯ защита от footgun'а. Вооружить на РОУТЕРЕ авто-удаление 06_socks_test.json
+    через ttl секунд. Самоуничтожение идёт НА РОУТЕРЕ (nohup + sleep), поэтому НЕ зависит ни
+    от дашборда, ни от браузера, ни от чего-либо внешнего — роутер чинит себя сам, даже если
+    юзер забыл нажать «убрать» / закрыл вкладку / дашборд упал.
+
+    Координация через файл-дедлайн: каждый provision вооружает свой таймер и пишет новый
+    дедлайн; сработавший таймер сверяет now>=deadline И что дедлайн ещё существует — поэтому
+    при нескольких provision'ах реально срабатывает только ПОСЛЕДНИЙ (без лишних рестартов),
+    а после явного «убрать» (дедлайн удалён) pending-таймеры ничего не трогают."""
+    path = _test_socks_path()
+    script = (
+        f'DL=$(($(date +%s)+{ttl}))\n'
+        f'echo "$DL" > {_TEST_SOCKS_SD_DEADLINE}\n'
+        f"nohup sh -c 'sleep {ttl}; "
+        f'now=$(date +%s); dl=$(cat {_TEST_SOCKS_SD_DEADLINE} 2>/dev/null) || dl=; '
+        f'if [ -n "$dl" ] && [ "$now" -ge "$dl" ]; then '
+        f'rm -f {path} {path}.bak-* {_TEST_SOCKS_SD_DEADLINE}; /opt/sbin/xkeen -restart; '
+        f"fi' >{_TEST_SOCKS_SD_LOG} 2>&1 &\n"
+    )
+    return _test_socks_run_bg(script)
+
+
+def _test_socks_deprovision():
+    """Немедленно убрать тест-узел: снять дедлайн (чтобы pending-таймеры самоуничтожения
+    ничего не трогали), удалить 06_socks_test.json и перезапустить xkeen в фоне (nohup —
+    HTTP-запрос не висит). Идемпотентно (rm -f безопасен когда файла уже нет)."""
+    path = _test_socks_path()
+    script = (
+        f'rm -f {_TEST_SOCKS_SD_DEADLINE} {path} {path}.bak-*\n'
+        f'nohup /opt/sbin/xkeen -restart >{_TEST_SOCKS_SD_LOG} 2>&1 &\n'
+    )
+    return _test_socks_run_bg(script)
 
 
 @app.route("/api/diagnose/site", methods=["GET"])
@@ -5952,17 +6002,25 @@ def api_diagnose_site():
 def api_xkeen_test_socks():
     """Тест-SOCKS для сравнения «через outbound» (фича 🔎 Почему не работает сайт).
 
-    GET  → { provisioned, outbound, host, port }
+    GET  → { provisioned, outbound, host, port, ttl }
+    POST action=remove → немедленно убрать тест-узел (rm файла + рестарт xkeen в фоне).
     POST outbound=<tag> → (пере)настроить изолированный 06_socks_test.json на роутере:
           socks-инбаунд с auth на LAN-IP роутера + правило inboundTag→outbound.
           Файл отдельный (xray confdir merge); watchdog регенерит только 05_routing.json
-          и этот файл не трогает. Реверт = удалить файл. Конфиг идёт через дашборд
-          (а не ручной правкой) — source of truth сохраняется.
+          и этот файл не трогает. Конфиг идёт через дашборд (а не ручной правкой).
+          🛡 Узел САМОУНИЧТОЖАЕТСЯ на роутере через _TEST_SOCKS_TTL сек — диагностический
+          файл не должен жить вечно (был инцидент: забытый файл ломал роутинг). См.
+          _test_socks_arm_selfdestruct().
     """
     if request.method == "GET":
         user, _pw, tag = _test_socks_read()
         return jsonify({"provisioned": bool(tag), "outbound": tag,
-                        "host": cfg.KEENETIC_HOST, "port": _TEST_SOCKS_PORT})
+                        "host": cfg.KEENETIC_HOST, "port": _TEST_SOCKS_PORT,
+                        "ttl": _TEST_SOCKS_TTL})
+
+    if (request.form.get("action") or "").strip() == "remove":
+        _test_socks_deprovision()
+        return jsonify({"ok": True, "removed": True})
 
     target = (request.form.get("outbound") or "").strip()
     if not target:
@@ -5993,8 +6051,8 @@ def api_xkeen_test_socks():
     }
     content = json.dumps(socks_cfg, ensure_ascii=False, indent=2)
     path = _test_socks_path()
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    keenetic_ssh(f"[ -f {path} ] && cp {path} {path}.bak-{ts}", timeout=10)
+    # Бэкап эфемерного диагностического файла не нужен (он каждый раз генерится дашбордом),
+    # а старые .bak-* только копятся как мусор → пишем напрямую, без cp.
     w = keenetic_ssh(f"cat > {path}", stdin_data=content, timeout=15)
     if not w["ok"]:
         return jsonify({"ok": False, "error": "Запись не удалась: " + (w.get("stderr") or "")}), 200
@@ -6005,8 +6063,14 @@ def api_xkeen_test_socks():
         keenetic_ssh(f"rm -f {path}", timeout=10)
         return jsonify({"ok": False, "error": "xray run -test не прошёл — откат конфига.\n" + test_out[-600:]}), 200
     r = keenetic_ssh("xkeen -restart 2>&1 | tail -3", timeout=70)
+    # 🛡 Защита от footgun'а: вооружаем самоуничтожение тест-узла на РОУТЕРЕ. Даже если юзер
+    # забудет нажать «убрать», закроет вкладку или дашборд упадёт — роутер сам удалит
+    # 06_socks_test.json и перезапустится через _TEST_SOCKS_TTL сек. Узел больше не способен
+    # «застрять» и поломать роутинг.
+    _test_socks_arm_selfdestruct()
     return jsonify({"ok": True, "outbound": target,
                     "host": cfg.KEENETIC_HOST, "port": _TEST_SOCKS_PORT,
+                    "ttl": _TEST_SOCKS_TTL,
                     "restart": (r.get("stdout") or "").strip()[-300:]})
 
 
@@ -8889,8 +8953,10 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
         {% for o in (outbounds or []) %}<option value="{{ o.tag }}">{{ o.tag }}</option>{% endfor %}
       </select>
       <button id="btn-site-compare" type="button" class="btn btn-sm" style="background:#468; color:#fff;">🔬 Сравнить (direct vs узел)</button>
+      <button id="btn-site-node-remove" type="button" class="btn btn-sm" style="background:#777; color:#fff; display:none;" title="Удалить тест-узел с роутера прямо сейчас">✖ убрать узел</button>
       <span id="site-check-node-status" style="font-size: 0.82em; color: #888;"></span>
     </div>
+    <p style="margin: 6px 0 0; font-size: 0.8em; color: #999;">🛡 Тест-узел — временный: роутер сам удалит его через ~10 мин и перезапустится. Можно убрать сразу кнопкой «✖ убрать узел». Это диагностический узел, держать его постоянно не нужно.</p>
     <div id="site-check-output" style="margin-top: 12px;"></div>
   </div>
 
@@ -14410,19 +14476,40 @@ function renderSiteCheck(j) {
   out.innerHTML = html;
 }
 
+function setSiteCheckNodeUI(provisioned, outbound) {
+  const st  = document.getElementById('site-check-node-status');
+  const rm  = document.getElementById('btn-site-node-remove');
+  if (provisioned && outbound) {
+    if (st) st.textContent = '✓ узел готов: ' + outbound + ' · сам уберётся через ~10 мин';
+    if (rm) rm.style.display = '';
+  } else {
+    if (st) st.textContent = 'узел не подготовлен — настроится при первом сравнении';
+    if (rm) rm.style.display = 'none';
+  }
+}
+
 async function siteCheckNodeStatus() {
   const st = document.getElementById('site-check-node-status');
   if (!st) return;
   try {
     const j = await (await fetch('/api/xkeen/test-socks')).json();
     const sel = document.getElementById('site-check-outbound');
-    if (j.provisioned && j.outbound) {
-      if (sel && [...sel.options].some(o => o.value === j.outbound)) sel.value = j.outbound;
-      st.textContent = '✓ узел готов: ' + j.outbound;
-    } else {
-      st.textContent = 'узел не подготовлен — настроится при первом сравнении';
-    }
+    if (j.provisioned && j.outbound && sel && [...sel.options].some(o => o.value === j.outbound)) sel.value = j.outbound;
+    setSiteCheckNodeUI(j.provisioned && j.outbound, j.outbound);
   } catch (e) { /* ignore */ }
+}
+
+async function removeSiteCheckNode() {
+  const rm = document.getElementById('btn-site-node-remove');
+  const st = document.getElementById('site-check-node-status');
+  if (rm) { rm.disabled = true; }
+  if (st) st.textContent = '⏳ убираю узел и перезапускаю xkeen...';
+  try {
+    const fd = new FormData(); fd.append('action', 'remove');
+    await fetch('/api/xkeen/test-socks', { method: 'POST', body: fd });
+  } catch (e) { /* ignore */ }
+  if (rm) rm.disabled = false;
+  setSiteCheckNodeUI(false, null);
 }
 
 async function runSiteCompare() {
@@ -14440,7 +14527,7 @@ async function runSiteCompare() {
   try {
     const cur = await (await fetch('/api/xkeen/test-socks')).json();
     if (!cur.provisioned || cur.outbound !== target) {
-      if (!confirm(`Подготовить тест-узел через «${target}»?\n\nДашборд запишет изолированный конфиг на роутер и перезапустит xkeen (≈10–20 сек, VPN кратко моргнёт). Это нужно один раз для выбранного узла.`)) {
+      if (!confirm(`Подготовить тест-узел через «${target}»?\n\nДашборд запишет изолированный конфиг на роутер и перезапустит xkeen (≈10–20 сек, VPN кратко моргнёт). Это нужно один раз для выбранного узла.\n\n🛡 Узел временный: роутер сам удалит его через ~10 мин (или убери сразу кнопкой «✖ убрать узел»).`)) {
         btn.disabled = false; btn.textContent = oldLabel; return;
       }
       btn.textContent = '⚙ Готовлю узел...';
@@ -14451,7 +14538,7 @@ async function runSiteCompare() {
         out.innerHTML = `<div style="padding:10px; background:#fde8e8; color:#6a1a1a; border-radius:4px;">❌ Не удалось подготовить узел: ${escapeHtml(pr.error || '')}</div>`;
         btn.disabled = false; btn.textContent = oldLabel; return;
       }
-      if (st) st.textContent = '✓ узел готов: ' + target;
+      setSiteCheckNodeUI(true, target);
     }
     btn.textContent = '⏳ Сравниваю...';
     out.innerHTML = '<p style="color:#888; font-style:italic;">Проверяю напрямую и через узел (DNS / TCP / TLS / HTTP)...</p>';
@@ -14468,9 +14555,11 @@ async function runSiteCompare() {
   const btn = document.getElementById('btn-site-check');
   const inp = document.getElementById('site-check-input');
   const cmp = document.getElementById('btn-site-compare');
+  const rm  = document.getElementById('btn-site-node-remove');
   if (btn) btn.addEventListener('click', runSiteCheck);
   if (inp) inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSiteCheck(); } });
   if (cmp) cmp.addEventListener('click', runSiteCompare);
+  if (rm) rm.addEventListener('click', removeSiteCheckNode);
   siteCheckNodeStatus();
 })();
 
