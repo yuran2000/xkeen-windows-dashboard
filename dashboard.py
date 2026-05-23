@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.40"
+_VERSION_FALLBACK = "1.0.41"
 
 
 def get_dashboard_version():
@@ -8422,7 +8422,10 @@ XKEEN_TEMPLATE = r"""<!doctype html>
               onclick="bulkSelectAll(this)" title="Отметить вообще все outbound'ы в группе">☑️ Все</button>
       <button class="btn btn-sm" style="padding:2px 8px; font-size:0.85em; background:#f5f5f5; color:#666; border:1px solid #ccc;"
               onclick="bulkClearSelection(this)">⬜ Снять</button>
-      <button class="btn btn-sm bulk-remove-btn" style="margin-left:auto; padding:2px 10px; font-size:0.85em; background:#c33; color:#fff; opacity:0.5; cursor:not-allowed;"
+      <button class="btn btn-sm bulk-addchain-btn" style="margin-left:auto; padding:2px 10px; font-size:0.85em; background:#fff3e0; color:#a55a18; border:1px solid #e0b370; opacity:0.5; cursor:not-allowed;"
+              onclick="bulkAddToChain(this)" disabled
+              title="Добавить отмеченные outbound'ы в цепочку резерва (FAILOVER) — watchdog будет переключаться на них при падении PRIMARY. Уже состоящие в цепочке пропускаются. Порядок потом можно изменить в «⛓️ Цепочка резерва».">➕ В цепочку резерва (<span class="bulk-addchain-count">0</span>)</button>
+      <button class="btn btn-sm bulk-remove-btn" style="padding:2px 10px; font-size:0.85em; background:#c33; color:#fff; opacity:0.5; cursor:not-allowed;"
               data-group-name="{{ group.name }}"
               onclick="bulkRemoveSelected(this)" disabled
               title="Удалить отмеченные outbound'ы одной транзакцией. Активные в watchdog (PRIMARY/FAILOVER/AI/в цепочке) — будут пропущены автоматически.">🗑 Удалить выделенные (<span class="bulk-count">0</span>)</button>
@@ -12267,21 +12270,18 @@ function _groupRoot(btn) {
 }
 
 function _updateBulkCounter(groupRoot) {
-  const cbs = groupRoot.querySelectorAll('.bulk-cb:checked');
-  const count = cbs.length;
-  const btn = groupRoot.querySelector('.bulk-remove-btn');
-  if (!btn) return;
-  const counterSpan = btn.querySelector('.bulk-count');
-  if (counterSpan) counterSpan.textContent = count;
-  if (count > 0) {
-    btn.disabled = false;
-    btn.style.opacity = '1';
-    btn.style.cursor = 'pointer';
-  } else {
-    btn.disabled = true;
-    btn.style.opacity = '0.5';
-    btn.style.cursor = 'not-allowed';
-  }
+  const count = groupRoot.querySelectorAll('.bulk-cb:checked').length;
+  const _set = (btnSel, countSel) => {
+    const b = groupRoot.querySelector(btnSel);
+    if (!b) return;
+    const cs = b.querySelector(countSel);
+    if (cs) cs.textContent = count;
+    b.disabled = count === 0;
+    b.style.opacity = count > 0 ? '1' : '0.5';
+    b.style.cursor = count > 0 ? 'pointer' : 'not-allowed';
+  };
+  _set('.bulk-remove-btn', '.bulk-count');
+  _set('.bulk-addchain-btn', '.bulk-addchain-count');
 }
 
 function bulkOnChange(cb) {
@@ -12335,6 +12335,38 @@ async function bulkRemoveSelected(btn) {
     setTimeout(() => location.reload(), 1800);
   } else {
     flash(false, 'Ошибка bulk-удаления', res.stderr || JSON.stringify(res));
+  }
+}
+
+// Массово добавить выделенные outbound'ы в цепочку резерва (FAILOVER).
+// Берём текущую цепочку (отмеченные строки таблицы цепочки, в порядке) + выделенные (дедуп) → set-failover-chain.
+async function bulkAddToChain(btn) {
+  const root = _groupRoot(btn);
+  const tags = Array.from(root.querySelectorAll('.bulk-cb:checked')).map(cb => cb.dataset.tag);
+  if (!tags.length) return;
+  const cur = [];
+  document.querySelectorAll('#failover-chain tr').forEach(tr => {
+    const chk = tr.querySelector('.fc-check');
+    const ord = tr.querySelector('.fc-order');
+    if (chk && ord && chk.checked && (parseInt(ord.value) || 0) > 0) {
+      cur.push({ tag: chk.dataset.tag, order: parseInt(ord.value) });
+    }
+  });
+  cur.sort((a, b) => a.order - b.order);
+  let chain = cur.map(i => i.tag);
+  const toAdd = tags.filter(t => !chain.includes(t));
+  if (!toAdd.length) { flash(false, 'Все выбранные уже в цепочке резерва.'); return; }
+  if (!confirm('Добавить в цепочку резерва (FAILOVER) ' + toAdd.length + ' канал(ов)?\n\n  • ' + toAdd.join('\n  • ') + '\n\nДобавятся в КОНЕЦ цепочки (порядок потом можно изменить в «⛓️ Цепочка резерва»).')) return;
+  chain = chain.concat(toAdd);
+  flash(true, '➕ Добавляю в цепочку резерва...');
+  const fd = new FormData();
+  fd.append('tags', chain.join(','));
+  const res = await apiCall('/api/xkeen/set-failover-chain', fd);
+  if (res.ok) {
+    flash(true, '✅ В цепочку резерва добавлено: ' + toAdd.join(', '));
+    setTimeout(() => location.reload(), 1500);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
   }
 }
 
