@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.41"
+_VERSION_FALLBACK = "1.0.42"
 
 
 def get_dashboard_version():
@@ -15002,7 +15002,7 @@ function renderSiteCheck(j) {
     const groups = [];
     let cur = null;
     for (const el of [...body.children]) {
-      if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.tagName === 'H1') continue;
+      if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.tagName === 'H1' || el.tagName === 'FOOTER') continue;
       if (isStart(el)) {
         const h2 = el.tagName === 'H2' ? el : el.querySelector('h2');
         let full = h2 ? (h2.textContent || '').split('\n')[0].replace(/[▶▼]/g, '').trim() : 'Раздел';
@@ -15411,6 +15411,29 @@ async function scanDatCategories() {
     out.innerHTML = '<p style="color:#c33;">❌ ' + escapeHtml(e.message) + '</p>';
   }
 }
+</script>
+
+<footer class="xk-footer" style="margin:30px 0 12px;padding:16px;border-top:1px solid #e2e2e2;text-align:center;color:#777;font-size:0.9em;">
+  <span style="font-weight:600;color:#555;">📬 Контакты:</span>
+  <a href="https://github.com/yuran2000/xkeen-windows-dashboard" target="_blank" rel="noopener" style="color:#5a3a99;text-decoration:none;">проект на GitHub</a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/yuran2000/xkeen-windows-dashboard/issues" target="_blank" rel="noopener" style="color:#5a3a99;text-decoration:none;">задать вопрос / сообщить о баге (Issues)</a>
+  &nbsp;·&nbsp;
+  <a href="#" id="xk-contact-mail" rel="nofollow" style="color:#5a3a99;text-decoration:none;" title="Откроется почтовый клиент">✉ написать автору на почту</a>
+  <div style="margin-top:7px;font-size:0.86em;color:#999;">Не разобрался или что-то не работает — напиши, помогу.</div>
+</footer>
+<script>
+(function(){
+  // E-mail автора собирается из частей в момент клика — открытого адреса в HTML НЕТ (анти-спам:
+  // массовые скрейперы ищут mailto: / шаблон x@y и тут их не находят).
+  var a = document.getElementById('xk-contact-mail');
+  if (!a) return;
+  var addr = ['yu','yuriy'].join('.') + String.fromCharCode(64) + ['gmail','com'].join('.');
+  a.addEventListener('click', function(e){
+    e.preventDefault();
+    window.location.href = 'mailto:' + addr + '?subject=' + encodeURIComponent('xray-dashboard — вопрос');
+  });
+})();
 </script>
 
 </body>
