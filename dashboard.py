@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.43"
+_VERSION_FALLBACK = "1.0.44"
 
 
 def get_dashboard_version():
@@ -6176,6 +6176,33 @@ def _channel_for_domain(host, tg):
     return {"label": "🌍 Основной (PRIMARY)", "tag": tg.get("primary_tag"), "kind": "primary", "match": None}
 
 
+# Фейковый IPv4 для IPv6-only / заблокированных-по-IP доменов (RFC 2544 — зарезервирован,
+# в реальной маршрутизации не встречается). Клиент коннектится на него → TPROXY ловит →
+# xray по SNI понимает домен → шлёт на VPN-сервер, который сам резолвит реальный (IPv6) адрес.
+_FAKE_IP_FOR_V6ONLY = "198.18.0.1"
+# Строгая валидация домена перед подстановкой в ndmc-команду (защита от инъекции).
+_IPHOST_DOMAIN_RE = re.compile(r'^(?=.{1,253}$)([a-z0-9](-?[a-z0-9]){0,62}\.)+[a-z]{2,}$', re.IGNORECASE)
+
+
+def _doh_has_records(host, rrtype, timeout=4.0):
+    """DoH-запрос к Cloudflare за конкретным типом записи (A или AAAA).
+    Возвращает True/False (есть ли записи) или None если запрос не удался.
+    Идёт НАПРЯМУЮ к публичному DoH → обходит локальный резолвер и наш `ip host`
+    (важно: после fake-IP локальный getaddrinfo вернул бы фейк-A и скрыл IPv6-only)."""
+    try:
+        import requests as _rq
+        r = _rq.get("https://cloudflare-dns.com/dns-query",
+                    params={"name": host, "type": rrtype},
+                    headers={"accept": "application/dns-json"}, timeout=timeout)
+        if not r.ok:
+            return None
+        want = {"A": 1, "AAAA": 28}.get(rrtype)
+        return any(a.get("type") == want and a.get("data")
+                   for a in (r.json().get("Answer") or []))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 @app.route("/api/diagnose/site", methods=["GET"])
 @requires_auth
 def api_diagnose_site():
@@ -6224,6 +6251,21 @@ def api_diagnose_site():
     except Exception:  # noqa: BLE001
         out["channels"] = None
 
+    # 🔵 IPv6-only детект. rkn_checker сам IPv4-only (resolve_system_all=AF_INET, DoH type=A)
+    # → для IPv6-only домена (есть только AAAA) выдаёт невнятное «DOWN / низкая уверенность».
+    # Спрашиваем A и AAAA напрямую через DoH: если A нет, а AAAA есть = IPv6-only.
+    # Такой домен с роутера (где IPv6 выключен) не открыть → предложим fake-IP (кнопка в UI).
+    v6only = {}
+    for h in urls:
+        has_aaaa = _doh_has_records(h, "AAAA")
+        if has_aaaa:
+            has_a = _doh_has_records(h, "A")
+            v6only[h] = (has_a is False)   # есть AAAA, A точно нет
+        else:
+            v6only[h] = False
+    out["ipv6_only"] = v6only
+    out["fake_ip"] = _FAKE_IP_FOR_V6ONLY
+
     if request.args.get("via"):
         proxy_url, via_tag = _test_socks_proxy_url()
         if not proxy_url:
@@ -6235,6 +6277,50 @@ def api_diagnose_site():
             except Exception as exc:  # noqa: BLE001
                 out["via_error"] = "Проверка через узел не удалась: " + repr(exc)
     return jsonify(out)
+
+
+@app.route("/api/xkeen/iphost", methods=["GET", "POST"])
+@requires_auth
+def api_xkeen_iphost():
+    """Статический DNS-хост на Keenetic (ndm `ip host <домен> <fake-IPv4>`).
+
+    Зачем: IPv6-only сайты (или заблокированные по IP) не открываются с роутера, где
+    IPv6 выключен — клиент не получает рабочего IPv4 и соединение не доходит до xray.
+    Фейковый IPv4 чинит это: клиент коннектится на него → TPROXY ловит → xray по SNI
+    (sniffing http,tls) понимает домен → VPN-сервер сам резолвит реальный (IPv6) адрес.
+
+    🛡 БЕЗОПАСНО: трогает ТОЛЬКО ndm-DNS (как `set-client-policy`), НИКОГДА не xray /
+    tproxy / `xkeen -restart` → физически не может повторить инцидент Phase-2-socks.
+
+    GET  → { ok, entries:[{host,ip}], fake_ip }
+    POST → domain=<host>  action=add|remove   → ndmc `ip host` / `no ip host` + save
+    """
+    ansi_re = re.compile(r'\x1b?\[[0-9;?]*[a-zA-Z]')
+    if request.method == "GET":
+        r = keenetic_ssh('ndmc -c "show running-config" 2>&1 | grep -iE "^[[:space:]]*ip host "', timeout=25)
+        entries = []
+        for line in ansi_re.sub('', r.get("stdout", "") or "").splitlines():
+            m = re.search(r'ip host\s+(\S+)\s+(\S+)', line)
+            if m:
+                entries.append({"host": m.group(1), "ip": m.group(2)})
+        return jsonify({"ok": r["ok"], "entries": entries, "fake_ip": _FAKE_IP_FOR_V6ONLY})
+
+    domain = (request.form.get("domain", "") or "").strip().lower().rstrip(".")
+    action = (request.form.get("action", "add") or "add").strip()
+    if not _IPHOST_DOMAIN_RE.match(domain):
+        return jsonify({"ok": False, "error": f"Невалидный домен: {domain!r}"}), 400
+    ip = _FAKE_IP_FOR_V6ONLY
+    verb = "no ip host" if action == "remove" else "ip host"
+    cmd = (f'ndmc -c "{verb} {domain} {ip}" 2>&1; echo "---SAVE---"; '
+           f'ndmc -c "system configuration save" 2>&1')
+    r = keenetic_ssh(cmd, timeout=25)
+    stdout_clean = ansi_re.sub('', r.get("stdout", "") or "").strip()
+    has_error = bool(re.search(r'\berror\[?\d', stdout_clean, re.IGNORECASE)) or not r["ok"]
+    return jsonify({
+        "ok": r["ok"] and not has_error,
+        "domain": domain, "ip": ip, "action": action,
+        "stdout": stdout_clean[:1500],
+    })
 
 
 @app.route("/api/xkeen/test-socks", methods=["GET", "POST"])
@@ -14954,7 +15040,9 @@ function renderSiteCheck(j) {
         + '<th style="padding:6px 10px; text-align:center; border-bottom:2px solid #ccc;">HTTP</th>'
         + '</tr></thead><tbody>';
   for (const r of j.results) {
-    const v = RKN_VERDICTS[r.verdict] || RKN_VERDICTS.UNKNOWN;
+    const isV6 = !!(j.ipv6_only && j.ipv6_only[r.name]);
+    const v = isV6 ? { icon: '🔵', text: 'IPv6-only сайт', bg: '#e8f0fe', fg: '#1a3a6a' }
+                   : (RKN_VERDICTS[r.verdict] || RKN_VERDICTS.UNKNOWN);
     const conf = RKN_CONF[r.confidence] || (r.confidence || '').toLowerCase();
     const tcp = r.tcp_ok ? (r.tcp_time_ms != null ? Math.round(r.tcp_time_ms) + 'ms' : '✓') : '—';
     const tls = r.tls_ok ? (r.tls_time_ms != null ? Math.round(r.tls_time_ms) + 'ms' : '✓') : '—';
@@ -14962,14 +15050,25 @@ function renderSiteCheck(j) {
     html += `<tr style="background:${v.bg}; border-bottom:1px solid #eee;">`;
     html += `<td style="padding:6px 10px;"><strong>${escapeHtml(r.name)}</strong></td>`;
     html += `<td style="padding:6px 10px; vertical-align:top;">${chCell(j.channels, r.name)}</td>`;
-    html += `<td style="padding:6px 10px; color:${v.fg};"><strong>${v.icon} ${escapeHtml(v.text)}</strong> <span style="font-size:0.82em; color:#888;">(уверенность: ${escapeHtml(conf)})</span>`;
-    const notes = (r.notes || []).filter(Boolean);
-    if (notes.length) {
-      html += `<details style="margin-top:4px;"><summary style="cursor:pointer; font-size:0.85em; color:#555;">подробнее</summary><div style="font-size:0.84em; color:#444; margin-top:4px; line-height:1.5;">`;
-      for (const n of notes) html += `• ${escapeHtml(n)}<br>`;
-      html += `</div></details>`;
+    if (isV6) {
+      const fip = escapeHtml(j.fake_ip || '198.18.0.1');
+      const okNow = (r.verdict === 'OK');
+      html += `<td style="padding:6px 10px; color:${v.fg};"><strong>🔵 IPv6-only сайт</strong>`
+            + (okNow ? ` <span style="font-size:0.8em; color:#1a5a1a;">✅ сейчас открывается с этого ПК</span>` : '')
+            + `<div style="font-size:0.82em; color:#555; margin-top:3px; line-height:1.5;">У сайта только IPv6-адрес, а на роутере IPv6 выключен. Чтобы открывался у <strong>всех устройств дома</strong> — задай ему рабочий IPv4 (<code>${fip}</code>) на роутере: клиент пойдёт через VPN-сервер, а тот откроет IPv6 сам. <strong>Только DNS, без перезапуска VPN.</strong></div>`
+            + `<button data-domain="${escapeHtml(r.name)}" onclick="makeSiteReachable(this)" style="margin-top:6px; padding:5px 12px; background:#1a73e8; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:0.86em;">✅ Сделать доступным (на весь дом)</button>`
+            + `<span class="mk-reachable-msg" style="font-size:0.83em;"></span>`
+            + `</td>`;
+    } else {
+      html += `<td style="padding:6px 10px; color:${v.fg};"><strong>${v.icon} ${escapeHtml(v.text)}</strong> <span style="font-size:0.82em; color:#888;">(уверенность: ${escapeHtml(conf)})</span>`;
+      const notes = (r.notes || []).filter(Boolean);
+      if (notes.length) {
+        html += `<details style="margin-top:4px;"><summary style="cursor:pointer; font-size:0.85em; color:#555;">подробнее</summary><div style="font-size:0.84em; color:#444; margin-top:4px; line-height:1.5;">`;
+        for (const n of notes) html += `• ${escapeHtml(n)}<br>`;
+        html += `</div></details>`;
+      }
+      html += `</td>`;
     }
-    html += `</td>`;
     html += `<td style="padding:6px 10px; text-align:center; font-size:0.86em;">${escapeHtml(String(tcp))}</td>`;
     html += `<td style="padding:6px 10px; text-align:center; font-size:0.86em;">${escapeHtml(String(tls))}</td>`;
     html += `<td style="padding:6px 10px; text-align:center; font-size:0.86em;">${escapeHtml(String(http))}</td>`;
@@ -14979,6 +15078,35 @@ function renderSiteCheck(j) {
   if (j.via_error) html += `<p style="color:#c33; font-size:0.85em; margin-top:8px;">⚠ ${escapeHtml(j.via_error)}</p>`;
   html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">«Вердикт» — на каком уровне рвётся соединение (с этого ПК). TLS-DPI / DNS-блок лечатся включением нужного канала; «лежит / таймаут» может быть проблемой самого сайта.<br>🧭 <strong>«Идёт через»</strong> — в какой канал роутер направит домен <em>по твоим пресетам</em> (списки доменов в каналах). Удобно проверять настройки: например instagram должен идти через «📱 Заблокированные в РФ» на загран-выход. <em>Совпадения через geo-категории (geosite:) тут не отражаются — такой домен покажется как «Основной (PRIMARY)».</em></p>`;
   out.innerHTML = html;
+}
+
+// «✅ Сделать доступным» для IPv6-only сайта: ставит на роутере fake-IPv4 (ndm `ip host`)
+// через /api/xkeen/iphost. Только DNS — xray/tproxy не трогает, перезапуска VPN нет.
+async function makeSiteReachable(btn) {
+  const domain = (btn && btn.dataset) ? btn.dataset.domain : '';
+  if (!domain) return;
+  const msg = btn.parentElement ? btn.parentElement.querySelector('.mk-reachable-msg') : null;
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳ Делаю...';
+  if (msg) msg.innerHTML = '';
+  try {
+    const res = await fetch('/api/xkeen/iphost', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ domain: domain, action: 'add' }).toString(),
+    });
+    const j = await res.json();
+    if (j.ok) {
+      btn.textContent = '✅ Сделано';
+      if (msg) msg.innerHTML = ` <span style="color:#1a5a1a;">Готово (${escapeHtml(domain)} → ${escapeHtml(j.ip || '')}). Обнови страницу сайта (Ctrl+F5); если была открыта — закрой вкладку и зайди заново.</span>`;
+    } else {
+      btn.disabled = false; btn.textContent = old;
+      if (msg) msg.innerHTML = ` <span style="color:#c33;">Не удалось: ${escapeHtml(j.error || j.stdout || 'ошибка ndmc')}</span>`;
+    }
+  } catch (e) {
+    btn.disabled = false; btn.textContent = old;
+    if (msg) msg.innerHTML = ` <span style="color:#c33;">Ошибка сети: ${escapeHtml(e.message)}</span>`;
+  }
 }
 
 (function attachSiteCheckHandlers(){
