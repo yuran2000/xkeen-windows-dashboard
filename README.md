@@ -513,6 +513,31 @@ cd xray-dashboard-work
 8. 🔧 Подключение к роутеру       ← конфигурация (свёрнуто, редко трогаем)
 9. 🤖 Telegram-бот для алертов    ← конфигурация (свёрнуто, редко трогаем)
 
+## 🐧 Linux (экспериментально, без гарантий)
+
+Панель не тестировалась на Linux, но ядро — обычный Python/Flask, управление роутером идёт по SSH (на Linux нативный), жёстких Windows-импортов в коде нет. Базово запустить можно вручную:
+
+```bash
+git clone https://github.com/yuran2000/xkeen-windows-dashboard.git
+cd xkeen-windows-dashboard
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp config_local.example.py config_local.py
+# отредактировать config_local.py:
+#   SECRET_KEY       — python3 -c "import secrets; print(secrets.token_hex(32))"
+#   PASSWORD         — задать свой
+#   KEENETIC_HOST    — IP роутера; KEENETIC_PORT (222); KEENETIC_USER (root)
+#   KEENETIC_SSH_KEY — путь к SSH-ключу, авторизованному на роутере (chmod 600)
+python3 dashboard.py
+# открыть http://localhost:5000/xkeen
+```
+
+**Работает** (ядро): управление XKeen по SSH — каналы (PRIMARY / FAILOVER / AI / YouTube / «Заблокированные в РФ»), подписки и outbounds, диагностика «почему не работает сайт», бэкапы конфигов.
+
+**Не работает** на Linux (Windows-специфика): установщики `.bat`, режим сервиса/автозапуск, Windows-уведомления (toast), кнопка «рестарт панели» (через Task Scheduler), `update.bat` / portable-EXE. Мелочь: ssh может создать пустой файл `NUL` в рабочей папке (опция `UserKnownHostsFile`) — безвреден, в `_ssh_args` его можно заменить на `/dev/null`.
+
+Полноценная поддержка Linux приветствуется через **Pull Request** (платформенный слой для установщиков / сервиса / уведомлений).
+
 ## Структура
 
 - `dashboard.py` — основной Flask-код (в одном файле)
