@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.45"
+_VERSION_FALLBACK = "1.0.46"
 
 
 def get_dashboard_version():
@@ -15061,8 +15061,10 @@ function renderSiteCheck(j) {
         + '</tr></thead><tbody>';
   for (const r of j.results) {
     const isV6 = !!(j.ipv6_only && j.ipv6_only[r.name]);
+    const rejected = !isV6 && (r.status_code === 403 || r.status_code === 401);
     const v = isV6 ? { icon: '🔵', text: 'IPv6-only сайт', bg: '#e8f0fe', fg: '#1a3a6a' }
-                   : (RKN_VERDICTS[r.verdict] || RKN_VERDICTS.UNKNOWN);
+            : rejected ? { icon: '⚠️', text: 'IP отклонён (HTTP ' + r.status_code + ')', bg: '#fff4e0', fg: '#8a5a00' }
+            : (RKN_VERDICTS[r.verdict] || RKN_VERDICTS.UNKNOWN);
     const conf = RKN_CONF[r.confidence] || (r.confidence || '').toLowerCase();
     const tcp = r.tcp_ok ? (r.tcp_time_ms != null ? Math.round(r.tcp_time_ms) + 'ms' : '✓') : '—';
     const tls = r.tls_ok ? (r.tls_time_ms != null ? Math.round(r.tls_time_ms) + 'ms' : '✓') : '—';
@@ -15085,6 +15087,14 @@ function renderSiteCheck(j) {
               + `<button data-domain="${escapeHtml(r.name)}" data-action="add" onclick="makeSiteReachable(this)" style="margin-top:6px; padding:5px 12px; background:#1a73e8; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:0.86em;">✅ Сделать доступным (на весь дом)</button>`;
       }
       html += `<span class="mk-reachable-msg" style="font-size:0.83em;"></span></td>`;
+    } else if (rejected) {
+      const ch = (j.channels && j.channels[r.name]) ? j.channels[r.name] : null;
+      const isAI = (ch && ch.kind === 'ai') || /claude|anthropic|openai|chatgpt/i.test(r.name);
+      html += `<td style="padding:6px 10px; color:${v.fg};"><strong>⚠️ HTTP ${r.status_code} — сайт отклонил запрос</strong>`
+            + `<div style="font-size:0.82em; color:#6a4a00; margin-top:3px; line-height:1.5;">Сеть дошла (TLS ок) — это <strong>не</strong> DPI/блокировка сети, запрос отклонил сам сервис.`
+            + (isAI ? ` У AI-сервисов (Anthropic/OpenAI) это обычно <strong>VPN/датацентр-IP в бане</strong> → смени AI-выход на другой/менее общий узел (в идеале <strong>резидентный</strong>); иногда помогает рестарт xray.` : ` Часто = IP в чёрном списке сервиса, попробуй другой выход.`)
+            + ` <span style="color:#999;">NB: 403 бывает и обычной анти-бот-защитой на не-браузерную проверку — тогда это не про твой IP.</span>`
+            + `</div></td>`;
     } else {
       html += `<td style="padding:6px 10px; color:${v.fg};"><strong>${v.icon} ${escapeHtml(v.text)}</strong> <span style="font-size:0.82em; color:#888;">(уверенность: ${escapeHtml(conf)})</span>`;
       const notes = (r.notes || []).filter(Boolean);
