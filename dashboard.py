@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.44"
+_VERSION_FALLBACK = "1.0.45"
 
 
 def get_dashboard_version():
@@ -6203,6 +6203,18 @@ def _doh_has_records(host, rrtype, timeout=4.0):
         return None
 
 
+def _iphost_entries(timeout=20):
+    """Список статических DNS-хостов (ndm `ip host`) на роутере → ([{host, ip}], ok)."""
+    r = keenetic_ssh('ndmc -c "show running-config" 2>&1 | grep -iE "^[[:space:]]*ip host "', timeout=timeout)
+    ansi_re = re.compile(r'\x1b?\[[0-9;?]*[a-zA-Z]')
+    entries = []
+    for line in ansi_re.sub('', r.get("stdout", "") or "").splitlines():
+        m = re.search(r'ip host\s+(\S+)\s+(\S+)', line)
+        if m:
+            entries.append({"host": m.group(1), "ip": m.group(2)})
+    return entries, r.get("ok", False)
+
+
 @app.route("/api/diagnose/site", methods=["GET"])
 @requires_auth
 def api_diagnose_site():
@@ -6266,6 +6278,19 @@ def api_diagnose_site():
     out["ipv6_only"] = v6only
     out["fake_ip"] = _FAKE_IP_FOR_V6ONLY
 
+    # Уже стоит ли `ip host` для IPv6-only доменов — чтобы не предлагать «Сделать доступным»
+    # повторно (показать «уже доступен» + кнопку «убрать»). Роутер дёргаем ТОЛЬКО если есть
+    # хоть один IPv6-only домен (иначе лишний ndmc-вызов на каждую проверку).
+    iphost_set = {}
+    if any(v6only.values()):
+        try:
+            _entries, _ = _iphost_entries(timeout=15)
+            _hosts = {e["host"].lower().rstrip(".") for e in _entries}
+            iphost_set = {h: (h.lower().rstrip(".") in _hosts) for h in urls}
+        except Exception:  # noqa: BLE001
+            iphost_set = {}
+    out["iphost"] = iphost_set
+
     if request.args.get("via"):
         proxy_url, via_tag = _test_socks_proxy_url()
         if not proxy_url:
@@ -6297,13 +6322,8 @@ def api_xkeen_iphost():
     """
     ansi_re = re.compile(r'\x1b?\[[0-9;?]*[a-zA-Z]')
     if request.method == "GET":
-        r = keenetic_ssh('ndmc -c "show running-config" 2>&1 | grep -iE "^[[:space:]]*ip host "', timeout=25)
-        entries = []
-        for line in ansi_re.sub('', r.get("stdout", "") or "").splitlines():
-            m = re.search(r'ip host\s+(\S+)\s+(\S+)', line)
-            if m:
-                entries.append({"host": m.group(1), "ip": m.group(2)})
-        return jsonify({"ok": r["ok"], "entries": entries, "fake_ip": _FAKE_IP_FOR_V6ONLY})
+        entries, ok = _iphost_entries(timeout=25)
+        return jsonify({"ok": ok, "entries": entries, "fake_ip": _FAKE_IP_FOR_V6ONLY})
 
     domain = (request.form.get("domain", "") or "").strip().lower().rstrip(".")
     action = (request.form.get("action", "add") or "add").strip()
@@ -15052,13 +15072,19 @@ function renderSiteCheck(j) {
     html += `<td style="padding:6px 10px; vertical-align:top;">${chCell(j.channels, r.name)}</td>`;
     if (isV6) {
       const fip = escapeHtml(j.fake_ip || '198.18.0.1');
-      const okNow = (r.verdict === 'OK');
-      html += `<td style="padding:6px 10px; color:${v.fg};"><strong>🔵 IPv6-only сайт</strong>`
-            + (okNow ? ` <span style="font-size:0.8em; color:#1a5a1a;">✅ сейчас открывается с этого ПК</span>` : '')
-            + `<div style="font-size:0.82em; color:#555; margin-top:3px; line-height:1.5;">У сайта только IPv6-адрес, а на роутере IPv6 выключен. Чтобы открывался у <strong>всех устройств дома</strong> — задай ему рабочий IPv4 (<code>${fip}</code>) на роутере: клиент пойдёт через VPN-сервер, а тот откроет IPv6 сам. <strong>Только DNS, без перезапуска VPN.</strong></div>`
-            + `<button data-domain="${escapeHtml(r.name)}" onclick="makeSiteReachable(this)" style="margin-top:6px; padding:5px 12px; background:#1a73e8; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:0.86em;">✅ Сделать доступным (на весь дом)</button>`
-            + `<span class="mk-reachable-msg" style="font-size:0.83em;"></span>`
-            + `</td>`;
+      const alreadySet = !!(j.iphost && j.iphost[r.name]);
+      html += `<td style="padding:6px 10px; color:${v.fg};"><strong>🔵 IPv6-only сайт</strong>`;
+      if (alreadySet) {
+        html += ` <span style="font-size:0.8em; color:#1a5a1a;">✅ уже доступен на всех устройствах</span>`
+              + `<div style="font-size:0.82em; color:#555; margin-top:3px; line-height:1.5;">Роутер уже выдаёт <code>${escapeHtml(r.name)}</code> → <code>${fip}</code> и пускает через VPN-сервер. Менять ничего не нужно.</div>`
+              + `<button data-domain="${escapeHtml(r.name)}" data-action="remove" onclick="makeSiteReachable(this)" style="margin-top:6px; padding:4px 10px; background:#eee; color:#666; border:1px solid #ccc; border-radius:4px; cursor:pointer; font-size:0.82em;">✖ убрать fake-IP</button>`;
+      } else {
+        const okNow = (r.verdict === 'OK');
+        html += (okNow ? ` <span style="font-size:0.8em; color:#1a5a1a;">✅ сейчас открывается с этого ПК</span>` : '')
+              + `<div style="font-size:0.82em; color:#555; margin-top:3px; line-height:1.5;">У сайта только IPv6-адрес, а на роутере IPv6 выключен. Чтобы открывался у <strong>всех устройств дома</strong> — задай ему рабочий IPv4 (<code>${fip}</code>) на роутере: клиент пойдёт через VPN-сервер, а тот откроет IPv6 сам. <strong>Только DNS, без перезапуска VPN.</strong></div>`
+              + `<button data-domain="${escapeHtml(r.name)}" data-action="add" onclick="makeSiteReachable(this)" style="margin-top:6px; padding:5px 12px; background:#1a73e8; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:0.86em;">✅ Сделать доступным (на весь дом)</button>`;
+      }
+      html += `<span class="mk-reachable-msg" style="font-size:0.83em;"></span></td>`;
     } else {
       html += `<td style="padding:6px 10px; color:${v.fg};"><strong>${v.icon} ${escapeHtml(v.text)}</strong> <span style="font-size:0.82em; color:#888;">(уверенность: ${escapeHtml(conf)})</span>`;
       const notes = (r.notes || []).filter(Boolean);
@@ -15085,20 +15111,26 @@ function renderSiteCheck(j) {
 async function makeSiteReachable(btn) {
   const domain = (btn && btn.dataset) ? btn.dataset.domain : '';
   if (!domain) return;
+  const action = (btn.dataset.action === 'remove') ? 'remove' : 'add';
   const msg = btn.parentElement ? btn.parentElement.querySelector('.mk-reachable-msg') : null;
   const old = btn.textContent;
-  btn.disabled = true; btn.textContent = '⏳ Делаю...';
+  btn.disabled = true; btn.textContent = (action === 'remove') ? '⏳ Убираю...' : '⏳ Делаю...';
   if (msg) msg.innerHTML = '';
   try {
     const res = await fetch('/api/xkeen/iphost', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ domain: domain, action: 'add' }).toString(),
+      body: new URLSearchParams({ domain: domain, action: action }).toString(),
     });
     const j = await res.json();
     if (j.ok) {
-      btn.textContent = '✅ Сделано';
-      if (msg) msg.innerHTML = ` <span style="color:#1a5a1a;">Готово (${escapeHtml(domain)} → ${escapeHtml(j.ip || '')}). Обнови страницу сайта (Ctrl+F5); если была открыта — закрой вкладку и зайди заново.</span>`;
+      if (action === 'remove') {
+        btn.textContent = '✖ Убрано';
+        if (msg) msg.innerHTML = ` <span style="color:#777;">fake-IP снят (${escapeHtml(domain)}). Сайт снова станет недоступен напрямую.</span>`;
+      } else {
+        btn.textContent = '✅ Сделано';
+        if (msg) msg.innerHTML = ` <span style="color:#1a5a1a;">Готово (${escapeHtml(domain)} → ${escapeHtml(j.ip || '')}). Обнови страницу сайта (Ctrl+F5); если была открыта — закрой вкладку и зайди заново.</span>`;
+      }
     } else {
       btn.disabled = false; btn.textContent = old;
       if (msg) msg.innerHTML = ` <span style="color:#c33;">Не удалось: ${escapeHtml(j.error || j.stdout || 'ошибка ndmc')}</span>`;
