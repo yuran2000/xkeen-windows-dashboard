@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.42"
+_VERSION_FALLBACK = "1.0.43"
 
 
 def get_dashboard_version():
@@ -15419,19 +15419,40 @@ async function scanDatCategories() {
   &nbsp;·&nbsp;
   <a href="https://github.com/yuran2000/xkeen-windows-dashboard/issues" target="_blank" rel="noopener" style="color:#5a3a99;text-decoration:none;">задать вопрос / сообщить о баге (Issues)</a>
   &nbsp;·&nbsp;
-  <a href="#" id="xk-contact-mail" rel="nofollow" style="color:#5a3a99;text-decoration:none;" title="Откроется почтовый клиент">✉ написать автору на почту</a>
+  <a href="#" id="xk-contact-mail" rel="nofollow" style="color:#5a3a99;text-decoration:none;" title="Показать адрес и скопировать в буфер">✉ написать автору на почту</a>
+  <span id="xk-mail-reveal" style="display:none;"></span>
   <div style="margin-top:7px;font-size:0.86em;color:#999;">Не разобрался или что-то не работает — напиши, помогу.</div>
 </footer>
 <script>
 (function(){
   // E-mail автора собирается из частей в момент клика — открытого адреса в HTML НЕТ (анти-спам:
-  // массовые скрейперы ищут mailto: / шаблон x@y и тут их не находят).
+  // скрейперы ищут mailto:/шаблон x@y и не находят; адрес попадает в DOM только после клика человека).
   var a = document.getElementById('xk-contact-mail');
-  if (!a) return;
+  var box = document.getElementById('xk-mail-reveal');
+  if (!a || !box) return;
   var addr = ['yu','yuriy'].join('.') + String.fromCharCode(64) + ['gmail','com'].join('.');
+  var subj = encodeURIComponent('xray-dashboard — вопрос');
   a.addEventListener('click', function(e){
     e.preventDefault();
-    window.location.href = 'mailto:' + addr + '?subject=' + encodeURIComponent('xray-dashboard — вопрос');
+    // Показываем адрес ТЕКСТОМ (работает даже без почтового клиента) + кладём в буфер обмена.
+    // Ссылка mailto рядом — для тех, у кого клиент настроен (нажимать необязательно).
+    a.style.display = 'none';
+    box.style.display = 'inline';
+    box.innerHTML = '✉ <a href="mailto:' + addr + '?subject=' + subj + '" style="color:#5a3a99;">' + addr + '</a> <span id="xk-mail-note" style="color:#2e7d32;font-size:0.85em;"></span>';
+    var note = document.getElementById('xk-mail-note');
+    var ok = function(){ if (note) note.textContent = ' — скопировано, можно вставить в письмо'; };
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(addr).then(ok, function(){});
+      } else {
+        // fallback для http-LAN (clipboard API доступен только в https/localhost)
+        var t = document.createElement('textarea');
+        t.value = addr; t.style.position = 'fixed'; t.style.opacity = '0';
+        document.body.appendChild(t); t.focus(); t.select();
+        try { document.execCommand('copy'); ok(); } catch (_e) {}
+        document.body.removeChild(t);
+      }
+    } catch (err) {}
   });
 })();
 </script>
