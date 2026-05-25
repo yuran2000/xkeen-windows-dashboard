@@ -1,7 +1,7 @@
 @echo off
 :: Clean restart of xray-dashboard.
-:: Читает DASHBOARD_PORT из config_local.py — поддерживает несколько инстансов с разными портами.
-:: Имя task'а: XrayDashboard (порт 5000) или XrayDashboard-<port> (другие порты).
+:: Reads DASHBOARD_PORT from config_local.py - supports multiple instances on different ports.
+:: Task name: XrayDashboard (port 5000) or XrayDashboard-<port> (other ports).
 :: Self-elevates via UAC if not admin. Double-click from Explorer.
 
 cd /d "%~dp0"
@@ -12,7 +12,7 @@ if not '%errorlevel%' == '0' (
     exit /b
 )
 
-REM Читаем DASHBOARD_PORT из config_local.py (default 5000)
+REM Read DASHBOARD_PORT from config_local.py (default 5000)
 set DPORT=5000
 if exist "config_local.py" (
     if exist ".venv\Scripts\python.exe" (
@@ -21,7 +21,7 @@ if exist "config_local.py" (
 )
 if "%DPORT%"=="" set DPORT=5000
 
-REM Имя task'а: XrayDashboard на 5000, XrayDashboard-<port> на других
+REM Task name: XrayDashboard on 5000, XrayDashboard-<port> otherwise
 set TASKNAME=XrayDashboard
 if not "%DPORT%"=="5000" set TASKNAME=XrayDashboard-%DPORT%
 
