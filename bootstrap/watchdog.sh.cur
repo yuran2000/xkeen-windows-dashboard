@@ -1,4 +1,11 @@
 #!/bin/sh
+# XKeen failover watchdog v16 (2026-05-25, гистерезис kill-switch'ей AI/YT/FOREIGN):
+#   Раньше kill-switch блокировал канал по ОДНОЙ неудачной пробе и снимал блок по одной удачной.
+#   Транзиентный false-down пробы (Reality-ноды периодически не пробиваются curl'ом, хотя живы)
+#   вызывал «дребезг»: block↔unblock каждую минуту → спам TG-алертов + лишние пары xkeen -restart
+#   (каждая = микро-обрыв интернета). Теперь блок включается только после KILL_FAIL_THRESHOLD
+#   подряд неудачных проб и снимается после KILL_PASS_THRESHOLD подряд успешных (по умолчанию 2/2),
+#   как у PRIMARY-failover. Latch (0/1) + счётчик хранятся в watchdog.state между тиками.
 # XKeen failover watchdog v15 (2026-05-25, идентификация роутера + гарантированная доставка TG):
 #   (1) Каждое TG-сообщение начинается с префикса «🛰 <hostname> (<LAN-IP>) / 🕒 <время> МСК» —
 #       чтобы различать роутеры (дом/работа) и видеть время СОБЫТИЯ.
@@ -129,6 +136,35 @@ probe_tag() {
     7|28) return 1 ;;  # 7=couldn't connect, 28=timeout
     *)    return 0 ;;  # любой другой — TCP-connect был успешен
   esac
+}
+
+# ---------- Kill-switch гистерезис (v16) ----------
+# Сглаживает «дребезг» AI/YT/FOREIGN kill-switch'ей: одиночная неудачная проба больше НЕ роняет
+# канал в block (а одиночная удачная — не снимает блок). Нужно KILL_FAIL_THRESHOLD подряд неудач,
+# чтобы включить блок, и KILL_PASS_THRESHOLD подряд успехов, чтобы снять. Симметрично PRIMARY.
+# Состояние (latch 0/1 + счётчик подряд-противоположных проб) живёт в watchdog.state между тиками.
+# Вызов: killswitch_decide <up|down> <prev_latch 0/1> <prev_ctr>; результат в KS_BLOCKED / KS_CTR.
+KILL_FAIL_THRESHOLD=${KILL_FAIL_THRESHOLD:-2}
+KILL_PASS_THRESHOLD=${KILL_PASS_THRESHOLD:-2}
+killswitch_decide() {
+  local probe="$1" blocked="${2:-0}" ctr="${3:-0}"
+  if [ "$probe" = "down" ]; then
+    if [ "$blocked" = "0" ]; then
+      ctr=$((ctr+1))
+      [ "$ctr" -ge "$KILL_FAIL_THRESHOLD" ] && { blocked=1; ctr=0; }
+    else
+      ctr=0
+    fi
+  else
+    if [ "$blocked" = "1" ]; then
+      ctr=$((ctr+1))
+      [ "$ctr" -ge "$KILL_PASS_THRESHOLD" ] && { blocked=0; ctr=0; }
+    else
+      ctr=0
+    fi
+  fi
+  KS_BLOCKED="$blocked"
+  KS_CTR="$ctr"
 }
 
 # Telegram-алерт через локальный SOCKS5-прокси xray (127.0.0.1:10808 → выбранный VPN-outbound),
@@ -661,18 +697,20 @@ esac
 # (например, российский для Anthropic/OpenAI), сервис может заблокировать аккаунт по geo.
 # Лучше вообще не ходить туда до восстановления AI-канала, чем рискнуть.
 # Логируем переключение чтобы юзер знал.
+# v16: latch + счётчик гистерезиса из state (предыдущий тик).
+AI_BLOCKED=$(grep -o 'AI_BLOCKED=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$AI_BLOCKED" ] && AI_BLOCKED=0
+AI_KCTR=$(grep -o 'AI_KCTR=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$AI_KCTR" ] && AI_KCTR=0
 EFFECTIVE_AI_TAG="$AI_TAG"
 AI_PROBE_CODE=""
-if [ -n "$AI_DOMAINS" ] && [ -n "$AI_TAG" ] && [ "$AI_TAG" != "block" ]; then
-  if [ "${AI_FAIL_BLOCK:-1}" = "1" ]; then
-    # Пингуем AI_TAG (TCP-probe, без HTTPS — у некоторых провайдеров нет HTTP endpoint)
-    if probe_tag "$AI_TAG" ""; then
-      AI_PROBE_CODE="up"
-    else
-      AI_PROBE_CODE="down"
-      EFFECTIVE_AI_TAG="block"
-    fi
-  fi
+if [ -n "$AI_DOMAINS" ] && [ -n "$AI_TAG" ] && [ "$AI_TAG" != "block" ] && [ "${AI_FAIL_BLOCK:-1}" = "1" ]; then
+  # Пингуем AI_TAG (TCP-probe, без HTTPS — у некоторых провайдеров нет HTTP endpoint)
+  if probe_tag "$AI_TAG" ""; then AI_PROBE_CODE="up"; else AI_PROBE_CODE="down"; fi
+  # v16: блок/снятие — только после порога подряд (не по одной пробе) → нет «дребезга».
+  killswitch_decide "$AI_PROBE_CODE" "$AI_BLOCKED" "$AI_KCTR"
+  AI_BLOCKED="$KS_BLOCKED"; AI_KCTR="$KS_CTR"
+  [ "$AI_BLOCKED" = "1" ] && EFFECTIVE_AI_TAG="block"
+else
+  AI_BLOCKED=0; AI_KCTR=0   # kill-switch неактивен — сбрасываем latch
 fi
 
 # ---------- YT kill-switch (по умолчанию ВЫКЛЮЧЕН — YT_FAIL_BLOCK=0) ----------
@@ -681,17 +719,17 @@ fi
 # чем «засветка» страны. Поэтому дефолт = 0 (kill-switch выключен): при падении
 # YT_TAG → YouTube идёт через PRIMARY (с рекламой, но работает).
 # Включи YT_FAIL_BLOCK=1 если хочешь вообще не пускать YT в обход выбранного канала.
+YT_BLOCKED=$(grep -o 'YT_BLOCKED=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$YT_BLOCKED" ] && YT_BLOCKED=0
+YT_KCTR=$(grep -o 'YT_KCTR=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$YT_KCTR" ] && YT_KCTR=0
 EFFECTIVE_YT_TAG="$YT_TAG"
 YT_PROBE_CODE=""
-if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ]; then
-  if [ "${YT_FAIL_BLOCK:-0}" = "1" ]; then
-    if probe_tag "$YT_TAG" ""; then
-      YT_PROBE_CODE="up"
-    else
-      YT_PROBE_CODE="down"
-      EFFECTIVE_YT_TAG="block"
-    fi
-  fi
+if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "${YT_FAIL_BLOCK:-0}" = "1" ]; then
+  if probe_tag "$YT_TAG" ""; then YT_PROBE_CODE="up"; else YT_PROBE_CODE="down"; fi
+  killswitch_decide "$YT_PROBE_CODE" "$YT_BLOCKED" "$YT_KCTR"
+  YT_BLOCKED="$KS_BLOCKED"; YT_KCTR="$KS_CTR"
+  [ "$YT_BLOCKED" = "1" ] && EFFECTIVE_YT_TAG="block"
+else
+  YT_BLOCKED=0; YT_KCTR=0
 fi
 
 # ---------- FOREIGN kill-switch (канал «Заблокированные в РФ», default ВЫКЛ) ----------
@@ -699,17 +737,17 @@ fi
 # Зачем: сервисы заблокированы в РФ. Если загран-канал упал и трафик пойдёт через PRIMARY
 # (RU-выход) — сервисы всё равно не откроются (блок РКН), а реальный IP засветится.
 # Лучше заблокировать до восстановления канала.
+FOREIGN_BLOCKED=$(grep -o 'FOREIGN_BLOCKED=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$FOREIGN_BLOCKED" ] && FOREIGN_BLOCKED=0
+FOREIGN_KCTR=$(grep -o 'FOREIGN_KCTR=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$FOREIGN_KCTR" ] && FOREIGN_KCTR=0
 EFFECTIVE_FOREIGN_TAG="$FOREIGN_TAG"
 FOREIGN_PROBE_CODE=""
-if [ -n "$FOREIGN_DOMAINS$FOREIGN_EXT_CATEGORIES$FOREIGN_GEOIP_CATEGORIES" ] && [ -n "$FOREIGN_TAG" ] && [ "$FOREIGN_TAG" != "block" ]; then
-  if [ "${FOREIGN_FAIL_BLOCK:-0}" = "1" ]; then
-    if probe_tag "$FOREIGN_TAG" ""; then
-      FOREIGN_PROBE_CODE="up"
-    else
-      FOREIGN_PROBE_CODE="down"
-      EFFECTIVE_FOREIGN_TAG="block"
-    fi
-  fi
+if [ -n "$FOREIGN_DOMAINS$FOREIGN_EXT_CATEGORIES$FOREIGN_GEOIP_CATEGORIES" ] && [ -n "$FOREIGN_TAG" ] && [ "$FOREIGN_TAG" != "block" ] && [ "${FOREIGN_FAIL_BLOCK:-0}" = "1" ]; then
+  if probe_tag "$FOREIGN_TAG" ""; then FOREIGN_PROBE_CODE="up"; else FOREIGN_PROBE_CODE="down"; fi
+  killswitch_decide "$FOREIGN_PROBE_CODE" "$FOREIGN_BLOCKED" "$FOREIGN_KCTR"
+  FOREIGN_BLOCKED="$KS_BLOCKED"; FOREIGN_KCTR="$KS_CTR"
+  [ "$FOREIGN_BLOCKED" = "1" ] && EFFECTIVE_FOREIGN_TAG="block"
+else
+  FOREIGN_BLOCKED=0; FOREIGN_KCTR=0
 fi
 
 # Запомнить предыдущий effective_ai/effective_yt/effective_foreign чтобы логировать смену
@@ -847,4 +885,4 @@ fi
 
 # ---------- Save state ----------
 # Формат: "<state> <counter> <default_tag> EFFECTIVE_AI=<tag> EFFECTIVE_YT=<tag> LAST_FULL_PROBE=<epoch> PREV_ALIVE=<n>"
-echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5" > "$STATE_FILE"
+echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR" > "$STATE_FILE"
