@@ -49,8 +49,68 @@ if (Test-Path $ConfigFile) {
 $TaskName = if ($Port -eq 5000) { "XrayDashboard" } else { "XrayDashboard-$Port" }
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
-# ---- Step 1: stop current instance ----
-Write-Host "[1/5] Stopping current instance ..." -ForegroundColor Yellow
+# ---- Step 1: git pull FIRST (with auto-stash if local changes block it) ----
+# v2 (2026-05-25): pull BEFORE stopping the instance. If pull fails (no internet /
+# GitHub unreachable - the common case), the running dashboard is left UNTOUCHED, so a
+# failed update never takes the panel down. We stop+restart only AFTER pull succeeds.
+$OldReqHash = ""
+if (Test-Path "requirements.txt") {
+    $OldReqHash = (Get-FileHash "requirements.txt" -Algorithm MD5).Hash
+}
+
+Write-Host "[1/5] git pull ..." -ForegroundColor Yellow
+
+# Try git pull, capture stdout+stderr together so we can detect known errors
+$pullOutput = git pull 2>&1 | Out-String
+Write-Host $pullOutput
+
+# If git pull failed because of local changes - auto-stash and retry.
+$needStash = ($LASTEXITCODE -ne 0) -and ($pullOutput -match 'local changes' -or
+                                          $pullOutput -match 'would be overwritten' -or
+                                          $pullOutput -match 'Please commit your changes' -or
+                                          $pullOutput -match 'commit your changes or stash')
+
+if ($needStash) {
+    Write-Host ""
+    Write-Host "[INFO] git pull blocked by local changes - auto-stashing them." -ForegroundColor Yellow
+    Write-Host "       (You can see them later with: git stash list / git stash show -p)" -ForegroundColor Gray
+    $stashMsg = "auto-stash-by-update-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    git stash push -u -m $stashMsg 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[ERROR] git stash also failed - update aborted. Dashboard left RUNNING (not touched)." -ForegroundColor Red
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
+    Write-Host "       Stashed as: $stashMsg" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "       Retrying git pull ..." -ForegroundColor Yellow
+    git pull
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host "[ERROR] git pull still failed after stash - update aborted. Dashboard left RUNNING. Check 'git status' manually." -ForegroundColor Red
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
+}
+elseif ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "[ERROR] git pull failed - update aborted, dashboard left RUNNING (not touched)." -ForegroundColor Red
+    Write-Host "  Common causes:" -ForegroundColor Red
+    Write-Host "  - No internet or GitHub unreachable" -ForegroundColor Red
+    Write-Host "  - Need to re-login: gh auth login" -ForegroundColor Red
+    Write-Host "  - Diverged branches / merge conflict (try: git status)" -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    exit 1
+}
+
+$NewReqHash = ""
+if (Test-Path "requirements.txt") {
+    $NewReqHash = (Get-FileHash "requirements.txt" -Algorithm MD5).Hash
+}
+
+# ---- Step 2: stop current instance (only AFTER a successful pull) ----
+Write-Host ""
+Write-Host "[2/5] Stopping current instance ..." -ForegroundColor Yellow
 
 # Remember the OLD pythonw PID so we can verify restart actually happened
 $oldPids = @()
@@ -85,76 +145,18 @@ if ($task) {
     }
 }
 
-# ---- Step 2: git pull (with auto-stash if local changes block it) ----
-$OldReqHash = ""
-if (Test-Path "requirements.txt") {
-    $OldReqHash = (Get-FileHash "requirements.txt" -Algorithm MD5).Hash
-}
-
-Write-Host ""
-Write-Host "[2/5] git pull ..." -ForegroundColor Yellow
-
-# Try git pull, capture stdout+stderr together so we can detect known errors
-$pullOutput = git pull 2>&1 | Out-String
-Write-Host $pullOutput
-
-# If git pull failed because of local changes - auto-stash and retry.
-# Git prints "Your local changes to the following files would be overwritten by merge"
-# (English) or the localized variant. Match the English error since git on Windows
-# typically respects LANG/LC_ALL=C in default config, but be tolerant.
-$needStash = ($LASTEXITCODE -ne 0) -and ($pullOutput -match 'local changes' -or
-                                          $pullOutput -match 'would be overwritten' -or
-                                          $pullOutput -match 'Please commit your changes' -or
-                                          $pullOutput -match 'commit your changes or stash')
-
-if ($needStash) {
-    Write-Host ""
-    Write-Host "[INFO] git pull blocked by local changes - auto-stashing them." -ForegroundColor Yellow
-    Write-Host "       (You can see them later with: git stash list / git stash show -p)" -ForegroundColor Gray
-    $stashMsg = "auto-stash-by-update-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-    git stash push -u -m $stashMsg 2>&1 | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[ERROR] git stash also failed - cannot continue safely." -ForegroundColor Red
-        Read-Host "Press Enter to exit"
-        exit 1
-    }
-    Write-Host "       Stashed as: $stashMsg" -ForegroundColor Gray
-    Write-Host ""
-    Write-Host "       Retrying git pull ..." -ForegroundColor Yellow
-    git pull
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host ""
-        Write-Host "[ERROR] git pull still failed after stash. Check 'git status' manually." -ForegroundColor Red
-        Read-Host "Press Enter to exit"
-        exit 1
-    }
-}
-elseif ($LASTEXITCODE -ne 0) {
-    Write-Host ""
-    Write-Host "[ERROR] git pull failed. Common causes:" -ForegroundColor Red
-    Write-Host "  - No internet or GitHub unreachable" -ForegroundColor Red
-    Write-Host "  - Need to re-login: gh auth login" -ForegroundColor Red
-    Write-Host "  - Diverged branches / merge conflict (try: git status)" -ForegroundColor Red
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-
-$NewReqHash = ""
-if (Test-Path "requirements.txt") {
-    $NewReqHash = (Get-FileHash "requirements.txt" -Algorithm MD5).Hash
-}
-
 # ---- Step 3: pip install if requirements.txt changed ----
 Write-Host ""
 if ($OldReqHash -ne $NewReqHash) {
     Write-Host "[3/5] requirements.txt changed - reinstalling dependencies ..." -ForegroundColor Yellow
     & ".\.venv\Scripts\python.exe" -m pip install -r requirements.txt --quiet
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "[ERROR] Failed to update dependencies" -ForegroundColor Red
-        Read-Host "Press Enter to exit"
-        exit 1
+        # Do NOT exit here - a pip failure must not leave the panel stopped.
+        # Warn and continue to the start step (panel runs with previous deps - far better than down).
+        Write-Host "[WARN] Failed to update dependencies - will start with existing deps anyway." -ForegroundColor Yellow
+    } else {
+        Write-Host "  OK"
     }
-    Write-Host "  OK"
 } else {
     Write-Host "[3/5] requirements.txt unchanged - skipping pip install" -ForegroundColor Gray
 }
