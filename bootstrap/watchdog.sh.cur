@@ -1,4 +1,9 @@
 #!/bin/sh
+# XKeen failover watchdog v17 (2026-05-25, kill-switch FAIL-порог 2→3 — анти-дребезг при потерях пути):
+#   Путь до удалённого узла может давать короткие потери пакетов (таймауты connect) — это НЕ
+#   порт-специфичный DPI. При пороге 2 редкие 2-подряд false-down всё ещё роняли kill-switch
+#   (FOREIGN/AI/YT) → пары xkeen -restart. KILL_FAIL_THRESHOLD по умолчанию = 3 (блок только при
+#   ≈3 мин реального падения), PASS = 2.
 # XKeen failover watchdog v16 (2026-05-25, гистерезис kill-switch'ей AI/YT/FOREIGN):
 #   Раньше kill-switch блокировал канал по ОДНОЙ неудачной пробе и снимал блок по одной удачной.
 #   Транзиентный false-down пробы (Reality-ноды периодически не пробиваются curl'ом, хотя живы)
@@ -144,7 +149,7 @@ probe_tag() {
 # чтобы включить блок, и KILL_PASS_THRESHOLD подряд успехов, чтобы снять. Симметрично PRIMARY.
 # Состояние (latch 0/1 + счётчик подряд-противоположных проб) живёт в watchdog.state между тиками.
 # Вызов: killswitch_decide <up|down> <prev_latch 0/1> <prev_ctr>; результат в KS_BLOCKED / KS_CTR.
-KILL_FAIL_THRESHOLD=${KILL_FAIL_THRESHOLD:-2}
+KILL_FAIL_THRESHOLD=${KILL_FAIL_THRESHOLD:-3}
 KILL_PASS_THRESHOLD=${KILL_PASS_THRESHOLD:-2}
 killswitch_decide() {
   local probe="$1" blocked="${2:-0}" ctr="${3:-0}"
