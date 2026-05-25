@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.46"
+_VERSION_FALLBACK = "1.0.47"
 
 
 def get_dashboard_version():
@@ -7944,7 +7944,6 @@ XKEEN_TEMPLATE = r"""<!doctype html>
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIExtCat('openai')" title="Добавить категорию openai (все домены ChatGPT/OpenAI из geosite_v2fly.dat). Автоподхват новых поддоменов после xkeen -ug.">🟢 openai</button>
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIExtCat('anthropic')" title="Добавить категорию anthropic (все домены Claude/Anthropic).">🟣 anthropic</button>
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIExtCat('deepseek')" title="Добавить категорию deepseek (домены DeepSeek AI).">🔷 deepseek</button>
-                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIExtCat('mistral')" title="Добавить категорию mistral (домены Mistral AI).">⚫ mistral</button>
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIExtCat('huggingface')" title="Добавить категорию huggingface (Hugging Face — модели + Spaces).">🤗 huggingface</button>
                 <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearAIExtCats()" title="Очистить все v2fly-категории AI. Ручные домены в textarea выше не трогаются.">🗑 Очистить</button>
               </div>
