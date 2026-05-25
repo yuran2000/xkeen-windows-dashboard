@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.52"
+_VERSION_FALLBACK = "1.0.53"
 
 
 def get_dashboard_version():
@@ -15472,7 +15472,7 @@ async function makeSiteReachable(btn) {
       '.xk-search{position:sticky;top:0;z-index:3;width:100%;box-sizing:border-box;padding:7px 10px;margin:0 0 8px;border:1px solid #d3d9e0;border-radius:6px;font-size:0.85em;background:#fff;}' +
       '.xk-search:focus{outline:none;border-color:#5cb87f;box-shadow:0 0 0 2px rgba(92,184,127,0.25);}' +
       '.xk-content{flex:1 1 auto;min-width:0;}' +
-      '.xk-cat{font-size:0.7em;font-weight:800;text-transform:uppercase;letter-spacing:0.06em;color:#3a6ea5;background:#eef3f9;padding:7px 12px;margin:12px 0 4px;border-radius:5px;}' +
+      '.xk-cat{font-size:0.78em;font-weight:800;text-transform:uppercase;letter-spacing:0.07em;color:#fff;background:linear-gradient(90deg,#3f6fa3,#5689bd);padding:9px 12px;margin:18px 0 6px;border-radius:6px;box-shadow:0 1px 2px rgba(40,70,110,0.22);}' +
       '.xk-cat:first-child{margin-top:2px;}' +
       '.xk-nav-item{display:block;width:100%;text-align:left;border:none;background:none;padding:8px 10px 8px 16px;margin:1px 0;border-radius:6px;cursor:pointer;font-size:0.92em;color:#1a1a1a;font-weight:500;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
       '.xk-nav-item:hover{background:#eef2f7;}' +
