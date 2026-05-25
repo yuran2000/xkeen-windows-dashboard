@@ -5672,9 +5672,11 @@ def api_keenetic_tg_test():
     if not token or not chat_id:
         return jsonify({"ok": False, "error": "Не задан token или chat_id (ни в форме, ни в watchdog.config)."}), 400
 
+    _router = getattr(cfg, "KEENETIC_HOST", "") or "роутер"
     msg = (
+        f"🛰 роутер {_router}\n"
+        f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} МСК\n\n"
         "🧪 Тестовое сообщение от xray-dashboard\n"
-        f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} МСК\n"
         "Если ты это видишь — TG-алерты watchdog'а будут работать."
     )
     # Запрос через роутер + ОБЯЗАТЕЛЬНО через SOCKS5-inbound xray (127.0.0.1:10808) — так же как
@@ -5769,7 +5771,10 @@ def api_keenetic_repair_tg_channel():
     test_sent = None
     if token and chat_id:
         import shlex
-        msg = "🔧 Канал TG-алертов починен из панели — проверка связи."
+        _router = getattr(cfg, "KEENETIC_HOST", "") or "роутер"
+        msg = (f"🛰 роутер {_router}\n"
+               f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} МСК\n\n"
+               "🔧 Канал TG-алертов починен из панели — проверка связи.")
         cmd = (f"curl -sS --max-time 10 --socks5-hostname 127.0.0.1:{SOCKS_LOCAL_PORT} "
                f"-d chat_id={shlex.quote(chat_id)} --data-urlencode text={shlex.quote(msg)} "
                f"https://api.telegram.org/bot{shlex.quote(token)}/sendMessage")
@@ -9861,6 +9866,39 @@ Use this token to access the HTTP API:
           </tr>
         </tbody>
       </table>
+
+      <div style="background:#eef4fb; border:2px solid #4a7bbf; border-radius:6px; padding:14px 16px; margin: 18px 0;">
+        <div style="font-weight:700; font-size:1.05em; color:#2a5a8f; margin-bottom:8px;">🔄 Как обновлять (панель + роутер) — пошагово</div>
+        <p style="margin:4px 0 10px; font-size:0.9em; color:#555;">Обновление состоит из <strong>двух слоёв</strong>, они обновляются по-разному: код самой панели и «структура» на роутере (watchdog + правила routing + socks-local).</p>
+
+        <div style="margin:10px 0;">
+          <strong>1️⃣ Панель (код)</strong>
+          <ul style="margin:4px 0 0 18px; font-size:0.9em; line-height:1.5;">
+            <li><strong>Из GitHub:</strong> двойной клик <code>update.bat</code> → сам делает <code>git pull</code> + рестарт. Когда вышел новый релиз.</li>
+            <li><strong>Локальные правки</strong> (правил <code>dashboard.py</code> руками, без GitHub): <code>Restart-Clean.bat</code> — рестарт без <code>git pull</code>.</li>
+          </ul>
+        </div>
+
+        <div style="margin:10px 0;">
+          <strong>2️⃣ Структура на роутере (watchdog / routing / socks-local)</strong>
+          <ul style="margin:4px 0 0 18px; font-size:0.9em; line-height:1.5;">
+            <li>Заливается <strong>автоматически</strong>: открой панель → нажми <strong>«💾 Сохранить»</strong> на любой настройке каналов <em>или</em> <strong>«🔧 Починить»</strong>. Панель сверит версию watchdog на роутере со встроенной и, если на роутере старее, зальёт свежую <em>перед</em> применением (с бэкапом и проверкой <code>xray -test</code>) + перегенерит routing.</li>
+            <li>Роутер <strong>с нуля</strong>: <strong>«🚀 Развернуть на чистом XKeen»</strong> — ставит всё разом, включая socks-local для TG-алертов.</li>
+          </ul>
+        </div>
+
+        <div style="margin:10px 0;">
+          <strong>3️⃣ Проверить, что применилось</strong>
+          <ul style="margin:4px 0 0 18px; font-size:0.9em; line-height:1.5;">
+            <li><strong>«🔬 Диагностика XKeen»</strong> → строка <strong>«Версия watchdog на роутере»</strong> должна совпасть со встроенной в панель (✅).</li>
+            <li>Версия панели — бейдж <code>vX.Y.Z</code> в шапке (клик → последний релиз на GitHub).</li>
+          </ul>
+        </div>
+
+        <div style="background:#fff8e6; border-left:3px solid #e6a817; padding:8px 12px; margin-top:10px; font-size:0.88em;">
+          ⚠️ <strong>Порядок при нескольких роутерах</strong> (например дом и работа): чтобы обновить роутер на другой машине, код панели туда сначала приходит с GitHub (<code>update.bat</code> = <code>git pull</code>). То есть свежий код сперва <strong>публикуется</strong>, потом подтягивается на каждой машине. Сначала обнови и проверь на одной, затем — на остальных.
+        </div>
+      </div>
 
       <h4 style="margin-top: 16px;">🔧 Обновление и обслуживание</h4>
       <table style="border-collapse: collapse; width: 100%; font-size: 0.9em;">

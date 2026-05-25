@@ -1,4 +1,10 @@
 #!/bin/sh
+# XKeen failover watchdog v15 (2026-05-25, идентификация роутера + гарантированная доставка TG):
+#   (1) Каждое TG-сообщение начинается с префикса «🛰 <hostname> (<LAN-IP>) / 🕒 <время> МСК» —
+#       чтобы различать роутеры (дом/работа) и видеть время СОБЫТИЯ.
+#   (2) Гарантированная доставка: если канал упал в момент события — сообщение НЕ теряется, а
+#       кладётся в очередь /opt/etc/xray/tg_outbox (base64) и дослыается на следующих тиках
+#       (flush_outbox в начале тика), когда канал поднимется. TTL 24ч, лимит 50 сообщений.
 # XKeen failover watchdog v14 (2026-05-25, socks-local TG-канал авто-следует за конфигом):
 #   Правило socks-local (через него watchdog/панель шлют TG-алерты к api.telegram.org) больше НЕ
 #   хардкодит outbound — watchdog переписывает его outboundTag на АКТУАЛЬНЫЙ канал, через который
@@ -60,6 +66,12 @@ TEMPL=/opt/etc/xray/configs.bak/05_routing.template.json
 OUTBOUNDS_JSON=/opt/etc/xray/configs/04_outbounds.json
 STATE_FILE=/opt/etc/xray/watchdog.state
 LOG=/opt/var/log/xray/watchdog.log
+# v15: очередь гарантированной доставки TG-алертов. Если канал упал в момент события — сообщение
+# не теряется, а кладётся сюда (по строке: "<epoch> <base64(html)>") и дослыается на следующих
+# тиках, когда канал поднимется. TTL отбрасывает совсем старое (чтобы не спамить стариной).
+TG_OUTBOX=/opt/etc/xray/tg_outbox
+TG_OUTBOX_MAX=50
+TG_OUTBOX_TTL=86400
 
 mkdir -p "$(dirname "$LOG")"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
@@ -119,21 +131,72 @@ probe_tag() {
   esac
 }
 
-# Telegram-алерт. Молча если TG_BOT_TOKEN или TG_CHAT_ID пусты.
-# Идёт через локальный SOCKS5-прокси xray (127.0.0.1:10808 → выбранный VPN-outbound),
-# чтобы обойти возможную блокировку api.telegram.org в стране роутера.
-# Прямой curl с роутера может не работать там где api.telegram.org заблокирован,
-# а исходящий трафик с самого роутера НЕ перехватывается XKeen redirect/tproxy (только LAN).
+# Telegram-алерт через локальный SOCKS5-прокси xray (127.0.0.1:10808 → выбранный VPN-outbound),
+# чтобы обойти блокировку api.telegram.org в стране роутера (прямой curl с роутера может не
+# работать, а исходящий трафик роутера XKeen-перехватом НЕ ловится — только LAN).
+
+# Префикс сообщения: какой это роутер (hostname + LAN-IP — чтобы различать дом/работу) + когда (МСК).
+_tg_prefix() {
+  local ip hn now
+  ip=$(get_lan_ip); [ -z "$ip" ] && ip="?"
+  hn=$(hostname 2>/dev/null); [ -z "$hn" ] && hn=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+  [ -z "$hn" ] && hn="роутер"
+  now=$(TZ='Europe/Moscow' date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+  [ -z "$now" ] && now=$(date '+%Y-%m-%d %H:%M:%S')
+  printf '\360\237\233\260 <b>%s</b> (%s)\n\360\237\225\222 %s \320\234\320\241\320\232\n\n' "$hn" "$ip" "$now"
+}
+
+# Низкоуровневая отправка готового HTML-текста. Возврат: 0 = Telegram принял (ok:true).
+_tg_send_raw() {
+  local resp
+  resp=$(curl -s --connect-timeout 5 --max-time 10 \
+    --socks5-hostname 127.0.0.1:10808 \
+    -d "chat_id=$TG_CHAT_ID" \
+    --data-urlencode "text=$1" \
+    -d "parse_mode=HTML" \
+    "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" 2>/dev/null)
+  echo "$resp" | grep -q '"ok":true'
+}
+
+# Публичный алерт: добавляет префикс (роутер+время) и шлёт. При неудаче (канал упал) сообщение
+# НЕ теряется — кладётся в очередь tg_outbox и дослыается на следующих тиках через flush_outbox.
 tg_alert() {
   [ -z "$TG_BOT_TOKEN" ] && return 0
   [ -z "$TG_CHAT_ID" ] && return 0
-  local text="$1"
-  curl -s --connect-timeout 5 --max-time 10 \
-    --socks5-hostname 127.0.0.1:10808 \
-    -d "chat_id=$TG_CHAT_ID" \
-    --data-urlencode "text=$text" \
-    -d "parse_mode=HTML" \
-    "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1
+  local text b64
+  text="$(_tg_prefix)$1"
+  if _tg_send_raw "$text"; then
+    return 0
+  fi
+  b64=$(printf '%s' "$text" | base64 2>/dev/null | tr -d '\n')
+  [ -n "$b64" ] && echo "$(date +%s) $b64" >> "$TG_OUTBOX"
+  if [ -f "$TG_OUTBOX" ]; then
+    tail -n "$TG_OUTBOX_MAX" "$TG_OUTBOX" > "$TG_OUTBOX.tmp" 2>/dev/null && mv "$TG_OUTBOX.tmp" "$TG_OUTBOX"
+  fi
+  return 1
+}
+
+# Досыл очереди недоставленных (вызывается в начале каждого тика). Время СОБЫТИЯ в префиксе
+# сохраняется (формировалось в момент tg_alert) — видно, когда реально произошло, не когда дошло.
+flush_outbox() {
+  [ -z "$TG_BOT_TOKEN" ] && return 0
+  [ -z "$TG_CHAT_ID" ] && return 0
+  [ -s "$TG_OUTBOX" ] || return 0
+  local now ts b64 age text keep
+  now=$(date +%s)
+  keep="$TG_OUTBOX.keep"; : > "$keep"
+  while read -r ts b64; do
+    [ -z "$b64" ] && continue
+    age=$((now - ts))
+    [ "$age" -gt "$TG_OUTBOX_TTL" ] && continue   # слишком старое — выбрасываем (не спамим стариной)
+    text=$(printf '%s' "$b64" | base64 -d 2>/dev/null)
+    if [ -n "$text" ] && _tg_send_raw "$text"; then
+      :                                            # доставлено — не переносим
+    else
+      echo "$ts $b64" >> "$keep"                   # ещё не ушло — оставляем на следующий тик
+    fi
+  done < "$TG_OUTBOX"
+  if [ -s "$keep" ]; then mv "$keep" "$TG_OUTBOX"; else rm -f "$keep" "$TG_OUTBOX"; fi
 }
 
 # Генерит финальный 05_routing.json из template через подмену 2 placeholder'ов:
@@ -454,6 +517,10 @@ health_check() {
   log "HEALTH FAIL: за $((tries*3))s xray не запущен ИЛИ DNS не резолвится через $lan (github/google/cloudflare)"
   return 1
 }
+
+# ---------- Досыл застрявших TG-алертов (v15) ----------
+# В начале каждого тика пробуем дослать всё, что не ушло из-за упавшего канала.
+flush_outbox
 
 # ---------- State ----------
 # Формат state: "<current_state> <counter> <current_default_tag>"
