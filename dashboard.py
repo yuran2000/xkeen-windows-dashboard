@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.50"
+_VERSION_FALLBACK = "1.0.51"
 
 
 def get_dashboard_version():
@@ -5924,6 +5924,37 @@ def api_xkeen_diagnose():
         fix_explain=("xray-конфиги невалидны. Самая частая причина — битый routing.json (пустой "
                      "outboundTag или ссылка на несуществующий outbound). Перегенерация через watchdog "
                      "обычно помогает." if not is_config_valid else None),
+    )
+
+    # ---- watchdog.sh: версия на роутере vs встроенная в панель ----
+    _wd_remote_ver = 0
+    r = keenetic_ssh("head -40 /opt/etc/xray/watchdog.sh 2>/dev/null", timeout=8)
+    if r["ok"]:
+        _wd_remote_ver = _parse_watchdog_version(r.get("stdout", ""))
+    _wd_local_ver = 0
+    _wd_local_path = _bootstrap_find("watchdog.sh.cur")
+    if _wd_local_path and os.path.exists(_wd_local_path):
+        try:
+            with open(_wd_local_path, "rb") as _f:
+                _wd_local_ver = _parse_watchdog_version(_f.read().decode("utf-8", "replace"))
+        except Exception:
+            pass
+    _wd_ok = (_wd_remote_ver > 0) and (_wd_remote_ver >= _wd_local_ver)
+    if _wd_remote_ver == 0:
+        _wd_detail = "Не удалось определить версию watchdog на роутере (роутер недоступен или /opt/etc/xray/watchdog.sh отсутствует)."
+    elif _wd_ok:
+        _wd_detail = f"На роутере: v{_wd_remote_ver}\nВстроенная в панель: v{_wd_local_ver}\n✅ Актуальна — на роутере новейший safety-watchdog (health-check + авто-откат)."
+    else:
+        _wd_detail = (f"На роутере: v{_wd_remote_ver}\nВстроенная в панель: v{_wd_local_ver}\n"
+                      f"⚠ Устарела. Обновится АВТОМАТИЧЕСКИ при следующем «Сохранить» в панели "
+                      f"(любая настройка → панель сама зальёт свежий watchdog перед применением).")
+    _add(
+        "watchdog_version", "Версия watchdog на роутере", _wd_ok,
+        "info" if _wd_ok else "warning",
+        _wd_detail,
+        fix_id=None, fix_label=None,
+        fix_explain=(None if _wd_ok else
+                     "Нажми любое «Сохранить» (например PRIMARY в «Основном») — авто-синк (v1.0.50+) сам поднимет watchdog до актуальной версии перед применением."),
     )
 
     # ---- 4. watchdog.config: PRIMARY_TAG не пустой ----
