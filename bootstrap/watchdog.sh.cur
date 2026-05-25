@@ -83,6 +83,13 @@ get_host_port() {
 #   0 / 35 / 51 / 52 / 56 / 60 / 77 (любые SSL/HTTP-ошибки ПОСЛЕ connect) → порт жив
 probe_tag() {
   local tag="$1" probe_url="$2"
+  # v12: direct/block — локальные outbound'ы без удалённого сервера, "пинговать" нечем.
+  # Для них "жив" = верно: если direct не работает — упал весь интернет, и failover на VPN
+  # это не починит. Без этого watchdog ложно считает primary=direct "упавшим" и шлёт ложные
+  # алерты «интернет down» + зря churn'ит state-машину (актуально для режима primary=direct).
+  case "$tag" in
+    direct|block|"") return 0 ;;
+  esac
   if [ -n "$probe_url" ]; then
     code=$(curl -sk --connect-timeout 5 --max-time 8 -o /dev/null -w '%{http_code}' "$probe_url" 2>/dev/null)
     [ -n "$code" ] && [ "$code" != "000" ] && return 0
