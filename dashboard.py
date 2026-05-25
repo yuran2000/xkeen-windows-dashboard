@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.61"
+_VERSION_FALLBACK = "1.0.62"
 
 
 def _find_git():
@@ -236,6 +236,10 @@ def get_dashboard_version():
 # Перезаписывают атрибуты cfg-модуля → существующий код cfg.KEENETIC_* работает без правок.
 RUNTIME_SETTINGS_FILE = os.path.join(_app_base_dir(), "runtime_settings.json")
 _RUNTIME_LOCK = _threading.Lock()
+# Сериализует read-modify-write watchdog.config: при двойном «Сохранить» (PRIMARY сразу за
+# FAILOVER) без него два запроса могут прочитать конфиг одновременно и один затереть правку
+# другого. Лок in-process (хватает для threaded-сервера; на один pythonw-процесс — то что нужно).
+_WATCHDOG_CFG_LOCK = _threading.Lock()
 
 # key в runtime.keenetic → attr в cfg-модуле. KEENETIC_PORT — int, остальные str.
 KEENETIC_RUNTIME_KEYS = [
@@ -1258,6 +1262,7 @@ def keenetic_get_watchdog():
     effective_ai = None
     effective_yt = None
     effective_foreign = None
+    last_bad_md5 = None
     if state_raw:
         parts = state_raw.strip().split()
         if len(parts) >= 1:
@@ -1276,6 +1281,8 @@ def keenetic_get_watchdog():
                     effective_yt = p.split("=", 1)[1]
                 elif p.startswith("EFFECTIVE_FOREIGN="):
                     effective_foreign = p.split("=", 1)[1]
+                elif p.startswith("LAST_BAD_MD5="):
+                    last_bad_md5 = p.split("=", 1)[1] or None
     log_lines = keenetic_tail_log(cfg.KEENETIC_WATCHDOG_LOG, n=30)
     return {
         "state": state, "counter": counter,
@@ -1283,6 +1290,7 @@ def keenetic_get_watchdog():
         "effective_ai": effective_ai,
         "effective_yt": effective_yt,
         "effective_foreign": effective_foreign,
+        "last_bad_md5": last_bad_md5,
         "log": log_lines,
     }
 
@@ -1476,44 +1484,49 @@ def keenetic_write_watchdog_config(updates):
     """Прочитать текущий watchdog.config, применить updates, залить обратно.
     После заливки запускаем watchdog.sh — он применит изменения."""
     # v1.0.50: сначала подтянуть свежий watchdog на роутер, если он старее встроенного в панель.
-    _wd_sync = keenetic_ensure_watchdog_current()
-    cur = keenetic_read_watchdog_config()
-    # Defaults если первый раз
-    if "PRIMARY_TAG" not in cur: cur["PRIMARY_TAG"] = "vless-reality"
-    if "FAILOVER_TAGS" not in cur: cur["FAILOVER_TAGS"] = "provider-a-nl"
-    if "AI_TAG" not in cur: cur["AI_TAG"] = "provider-a-nl"
-    if "YT_TAG" not in cur: cur["YT_TAG"] = ""
-    if "YT_DOMAINS" not in cur: cur["YT_DOMAINS"] = ""
-    if "YT_FAIL_BLOCK" not in cur: cur["YT_FAIL_BLOCK"] = "0"
-    # v8 (2026-05-17): ext-категории v2fly для AI/YT — необязательны, пустые по умолчанию.
-    # Когда юзер добавляет напр. "openai anthropic" — watchdog подставит ext:geosite_v2fly.dat:openai
-    # в AI-правило 05_routing.json (вместе с ручными доменами из AI_DOMAINS).
-    if "AI_EXT_CATEGORIES" not in cur: cur["AI_EXT_CATEGORIES"] = ""
-    if "YT_EXT_CATEGORIES" not in cur: cur["YT_EXT_CATEGORIES"] = ""
-    # v1.6.0 (2026-05-18): YT_GEOIP_CATEGORIES — для IP-only приложений (Telegram Desktop, Discord).
-    # Когда юзер добавляет "telegram" — watchdog v10 сгенерит отдельное правило
-    # {"ip": ["geoip:telegram"], "outboundTag": YT_TAG} в 05_routing.json.
-    if "YT_GEOIP_CATEGORIES" not in cur: cur["YT_GEOIP_CATEGORIES"] = ""
-    # «📱 Заблокированные в РФ» канал (FOREIGN_*): Meta/IG/Telegram/Twitter/Discord — сервисы,
-    # заблокированные в РФ, требуют ЗАРУБЕЖНОГО exit (RU-выход блок НЕ обходит). Вынесены из YT.
-    # Структура 1:1 как YT. Дефолты пустые — юзер выбирает домены/outbound в UI.
-    if "FOREIGN_TAG" not in cur: cur["FOREIGN_TAG"] = ""
-    if "FOREIGN_DOMAINS" not in cur: cur["FOREIGN_DOMAINS"] = ""
-    if "FOREIGN_EXT_CATEGORIES" not in cur: cur["FOREIGN_EXT_CATEGORIES"] = ""
-    if "FOREIGN_GEOIP_CATEGORIES" not in cur: cur["FOREIGN_GEOIP_CATEGORIES"] = ""
-    if "FOREIGN_FAIL_BLOCK" not in cur: cur["FOREIGN_FAIL_BLOCK"] = "0"
-    if "PRIMARY_PROBE_URL" not in cur: cur["PRIMARY_PROBE_URL"] = f"https://{getattr(cfg, 'EXTERNAL_DOMAIN', None) or 'your-vpn-domain.example'}:8444/"
-    if "FAIL_THRESHOLD" not in cur: cur["FAIL_THRESHOLD"] = "2"
-    if "PASS_THRESHOLD" not in cur: cur["PASS_THRESHOLD"] = "3"
-    if "FORCE_MODE" not in cur: cur["FORCE_MODE"] = "auto"
-    cur.update(updates)
-    new_text = _build_watchdog_config(cur)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    keenetic_ssh(f"cp /opt/etc/xray/watchdog.config /opt/etc/xray/watchdog.config.bak-{ts}")
-    r = keenetic_ssh("cat > /opt/etc/xray/watchdog.config", stdin_data=new_text, timeout=10)
-    if not r["ok"]:
-        return {"ok": False, "stderr": f"write config failed: {r['stderr']}"}
-    # Сразу применяем — запускаем watchdog.sh
+    # Лок вокруг read-modify-write: при двойном «Сохранить» (PRIMARY сразу за FAILOVER) одно
+    # сохранение не прочитает старый конфиг и не затрёт правку другого. Запуск watchdog.sh —
+    # СНАРУЖИ лока (он долгий, ~30с с health-check; второе сохранение не должно его ждать).
+    with _WATCHDOG_CFG_LOCK:
+        _wd_sync = keenetic_ensure_watchdog_current()
+        cur = keenetic_read_watchdog_config()
+        # Defaults если первый раз
+        if "PRIMARY_TAG" not in cur: cur["PRIMARY_TAG"] = "vless-reality"
+        if "FAILOVER_TAGS" not in cur: cur["FAILOVER_TAGS"] = "provider-a-nl"
+        if "AI_TAG" not in cur: cur["AI_TAG"] = "provider-a-nl"
+        if "YT_TAG" not in cur: cur["YT_TAG"] = ""
+        if "YT_DOMAINS" not in cur: cur["YT_DOMAINS"] = ""
+        if "YT_FAIL_BLOCK" not in cur: cur["YT_FAIL_BLOCK"] = "0"
+        # v8 (2026-05-17): ext-категории v2fly для AI/YT — необязательны, пустые по умолчанию.
+        # Когда юзер добавляет напр. "openai anthropic" — watchdog подставит ext:geosite_v2fly.dat:openai
+        # в AI-правило 05_routing.json (вместе с ручными доменами из AI_DOMAINS).
+        if "AI_EXT_CATEGORIES" not in cur: cur["AI_EXT_CATEGORIES"] = ""
+        if "YT_EXT_CATEGORIES" not in cur: cur["YT_EXT_CATEGORIES"] = ""
+        # v1.6.0 (2026-05-18): YT_GEOIP_CATEGORIES — для IP-only приложений (Telegram Desktop, Discord).
+        # Когда юзер добавляет "telegram" — watchdog v10 сгенерит отдельное правило
+        # {"ip": ["geoip:telegram"], "outboundTag": YT_TAG} в 05_routing.json.
+        if "YT_GEOIP_CATEGORIES" not in cur: cur["YT_GEOIP_CATEGORIES"] = ""
+        # «📱 Заблокированные в РФ» канал (FOREIGN_*): Meta/IG/Telegram/Twitter/Discord — сервисы,
+        # заблокированные в РФ, требуют ЗАРУБЕЖНОГО exit (RU-выход блок НЕ обходит). Вынесены из YT.
+        # Структура 1:1 как YT. Дефолты пустые — юзер выбирает домены/outbound в UI.
+        if "FOREIGN_TAG" not in cur: cur["FOREIGN_TAG"] = ""
+        if "FOREIGN_DOMAINS" not in cur: cur["FOREIGN_DOMAINS"] = ""
+        if "FOREIGN_EXT_CATEGORIES" not in cur: cur["FOREIGN_EXT_CATEGORIES"] = ""
+        if "FOREIGN_GEOIP_CATEGORIES" not in cur: cur["FOREIGN_GEOIP_CATEGORIES"] = ""
+        if "FOREIGN_FAIL_BLOCK" not in cur: cur["FOREIGN_FAIL_BLOCK"] = "0"
+        if "PRIMARY_PROBE_URL" not in cur: cur["PRIMARY_PROBE_URL"] = f"https://{getattr(cfg, 'EXTERNAL_DOMAIN', None) or 'your-vpn-domain.example'}:8444/"
+        if "FAIL_THRESHOLD" not in cur: cur["FAIL_THRESHOLD"] = "2"
+        if "PASS_THRESHOLD" not in cur: cur["PASS_THRESHOLD"] = "3"
+        if "FORCE_MODE" not in cur: cur["FORCE_MODE"] = "auto"
+        cur.update(updates)
+        new_text = _build_watchdog_config(cur)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        keenetic_ssh(f"cp /opt/etc/xray/watchdog.config /opt/etc/xray/watchdog.config.bak-{ts}")
+        r = keenetic_ssh("cat > /opt/etc/xray/watchdog.config", stdin_data=new_text, timeout=10)
+        if not r["ok"]:
+            return {"ok": False, "stderr": f"write config failed: {r['stderr']}"}
+    # Сразу применяем — запускаем watchdog.sh (ВНЕ лока: долгий, и параллельные тики
+    # сериализует сам watchdog через /tmp/xkeen_watchdog.lock на роутере).
     apply = keenetic_ssh("/opt/etc/xray/watchdog.sh", timeout=30)
     _msg = "watchdog.config обновлён, watchdog.sh запущен (см. /opt/var/log/xray/watchdog.log)."
     if _wd_sync.get("action") == "upgraded":
@@ -2120,6 +2133,7 @@ def xkeen_page():
             "current_default": None,
             "effective_ai": None,
             "effective_yt": None,
+            "last_bad_md5": None,
         }
         targets = {
             "primary_tag": None,
@@ -8318,7 +8332,13 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     <span class="mono" style="margin-left: 8px; color: #888;">counter={{ watchdog.counter }}</span>
     <span class="mono" style="margin-left: 8px;">default сейчас → <strong style="color: {% if watchdog.current_default == targets.primary_tag %}#2a7{% else %}#e80{% endif %};">{{ watchdog.current_default or routing.default_outbound or '?' }}</strong></span>
     {% if watchdog.current_default and watchdog.current_default != targets.primary_tag %}
+      {% if watchdog.state == 'failover' %}
       <span class="subtitle" style="margin-left: 8px; color: #e80;">⚠️ работаем через резерв, PRIMARY ({{ targets.primary_tag }}) недоступен</span>
+      {% elif watchdog.last_bad_md5 %}
+      <span class="subtitle" style="margin-left: 8px; color: #c33;">🛡 авто-откат: PRIMARY ({{ targets.primary_tag }}) не прошёл проверку связи — watchdog держит рабочий {{ watchdog.current_default }}. Смени настройки (или почини PRIMARY), чтобы применить заново.</span>
+      {% else %}
+      <span class="subtitle" style="margin-left: 8px; color: #888;">🔄 PRIMARY ({{ targets.primary_tag }}) только что изменён — watchdog ещё применяет переключение (сейчас активен {{ watchdog.current_default }}; обнови страницу через ~30 c)</span>
+      {% endif %}
     {% endif %}
   </div>
 
@@ -8687,6 +8707,9 @@ XKEEN_TEMPLATE = r"""<!doctype html>
                 ВЫКЛ: при падении <code>{{ targets.foreign_tag }}</code> трафик пойдёт через default (PRIMARY/FAILOVER) — если это RU-выход, Meta/Telegram всё равно не откроются.
               {% endif %}
             </p>
+            <p class="subtitle" style="margin: 6px 0 0; color:#777;">
+              🛡 <strong>Анти-дребезг (watchdog v17+):</strong> когда включено, блокировка срабатывает только после <strong>3 подряд</strong> неудачных проб (≈3 мин) и снимается после 2 удачных — короткие провалы связи (потеря пакетов на пути к каналу) его не роняют и не плодят лишних <code>xkeen -restart</code>. Порог общий с AI/YouTube.
+            </p>
           </div>
         </div>
       </div>
@@ -8898,7 +8921,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     </div>
   </div>
 
-  <details class="subsec subsec-log" data-xk-keep-inline>
+  <details class="subsec subsec-log">
     <summary>📋 Лог watchdog <span class="subsec-hint">(последние 30 строк — события переключений)</span></summary>
     <div class="subsec-body">
     <pre class="log" style="margin: 0;">{% for line in watchdog.log %}{{ line }}
@@ -15929,10 +15952,70 @@ async function makeSiteReachable(btn) {
       b.addEventListener('click', () => showPage(idx));
       return b;
     };
-    // 🔍 Поиск по разделам/темам — фильтрует пункты сайдбара вживую (по тексту и полному тултипу).
+    // 🔍 Поиск: фильтрует пункты сайдбара + ГЛУБОКИЙ поиск по заголовкам/инлайн-блокам ВСЕХ
+    // страниц (включая те, что не вынесены в сайдбар: «📋 Лог watchdog», подзаголовки
+    // «🎛 Каналы и текущее состояние…» и т.п.). Совпадения — списком под полем; клик открывает
+    // нужную страницу, разворачивает <details>, скроллит к цели и подсвечивает её.
     const search = document.createElement('input');
-    search.type = 'search'; search.className = 'xk-search'; search.placeholder = '🔍 Поиск по разделам…';
+    search.type = 'search'; search.className = 'xk-search'; search.placeholder = '🔍 Поиск (разделы, заголовки, лог…)';
     aside.appendChild(search);
+    const results = document.createElement('div'); results.className = 'xk-search-results'; results.style.display = 'none';
+    aside.appendChild(results);
+
+    // Индекс «якорей»: заголовки и сворачиваемые блоки внутри каждой страницы.
+    const deepIndex = [];
+    (function buildDeepIndex(){
+      const pageTitle = {};
+      items.forEach(it => {
+        pageTitle[it.idx] = it.title;
+        (it.subs || []).forEach(s => { pageTitle[s.idx] = it.title + ' › ' + s.title; });
+      });
+      const seen = new Set();
+      main.querySelectorAll('.xk-page').forEach(pg => {
+        const page = pg.dataset.page;
+        const sec = pageTitle[page] || '';
+        pg.querySelectorAll('h2, h3, h4, summary, [data-xk-sub]').forEach(el => {
+          let label = el.getAttribute('data-xk-sub') || cleanSum(el);
+          if (!label) return;
+          if (label.length > 90) label = label.slice(0, 90) + '…';
+          const key = page + '|' + label.toLowerCase();
+          if (seen.has(key)) return;
+          seen.add(key);
+          deepIndex.push({ label: label, low: label.toLowerCase(), page: page, el: el, sec: sec });
+        });
+      });
+    })();
+
+    function gotoAnchor(rec){
+      showPage(rec.page);
+      let p = rec.el;  // развернуть все родительские <details>, чтобы цель стала видимой
+      while (p && p !== main) { if (p.tagName === 'DETAILS') p.open = true; p = p.parentElement; }
+      if (rec.el.tagName === 'SUMMARY' && rec.el.parentElement) rec.el.parentElement.open = true;
+      try { rec.el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch(e){}
+      rec.el.classList.add('xk-hit'); setTimeout(() => { try { rec.el.classList.remove('xk-hit'); } catch(e){} }, 2000);
+    }
+
+    function renderDeepResults(q){
+      q = (q || '').trim().toLowerCase();
+      results.innerHTML = '';
+      if (q.length < 2) { results.style.display = 'none'; return; }
+      const hits = deepIndex.filter(r => r.low.indexOf(q) >= 0).slice(0, 18);
+      if (!hits.length) { results.style.display = 'none'; return; }
+      const hdr = document.createElement('div'); hdr.className = 'xk-sr-hdr'; hdr.textContent = '🎯 Найдено на страницах:';
+      results.appendChild(hdr);
+      hits.forEach(r => {
+        const b = document.createElement('button');
+        b.type = 'button'; b.className = 'xk-sr-item';
+        const l = document.createElement('span'); l.className = 'xk-sr-label'; l.textContent = r.label;
+        const s = document.createElement('span'); s.className = 'xk-sr-sec'; if (r.sec) s.textContent = r.sec;
+        b.appendChild(l); b.appendChild(s);
+        b.title = r.label + (r.sec ? ' — ' + r.sec : '');
+        b.addEventListener('click', () => gotoAnchor(r));
+        results.appendChild(b);
+      });
+      results.style.display = '';
+    }
+
     function filterNav(q){
       q = (q || '').trim().toLowerCase();
       const searching = q.length > 0;
@@ -15946,7 +16029,7 @@ async function makeSiteReachable(btn) {
         c.style.display = (!searching || vis) ? '' : 'none';
       });
     }
-    search.addEventListener('input', () => filterNav(search.value));
+    search.addEventListener('input', () => { filterNav(search.value); renderDeepResults(search.value); });
 
     const byCat = {};
     items.forEach(it => { (byCat[it.cat] = byCat[it.cat] || []).push(it); });
@@ -16021,7 +16104,15 @@ async function makeSiteReachable(btn) {
       '.xk-subsub-item{display:block;width:100%;text-align:left;border:none;background:none;padding:3px 6px 3px 12px;margin:1px 0;border-radius:0 5px 5px 0;cursor:pointer;font-size:0.76em;color:#7a838d;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
       '.xk-subsub-item:hover{background:#f3f5f8;color:#3a4046;}' +
       '.xk-page>[data-xk-sub]{width:100%;max-width:100%;flex:none;}' +
-      '.xk-page>details.section-collapsible:first-of-type>summary>h2,.xk-page>h2{margin-top:0 !important;}';
+      '.xk-page>details.section-collapsible:first-of-type>summary>h2,.xk-page>h2{margin-top:0 !important;}' +
+      '.xk-search-results{margin:-4px 0 8px;border:1px solid #d3d9e0;border-radius:6px;background:#fbfdff;max-height:46vh;overflow-y:auto;}' +
+      '.xk-sr-hdr{font-size:0.68em;font-weight:800;text-transform:uppercase;letter-spacing:0.05em;color:#5689bd;padding:6px 10px 3px;}' +
+      '.xk-sr-item{display:block;width:100%;text-align:left;border:none;background:none;border-top:1px solid #eef2f7;padding:6px 10px;cursor:pointer;}' +
+      '.xk-sr-item:hover{background:#eef5ff;}' +
+      '.xk-sr-label{display:block;font-size:0.84em;color:#1f3d6b;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
+      '.xk-sr-sec{display:block;font-size:0.7em;color:#8a93a0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
+      '.xk-hit{animation:xkHit 2s ease-out;border-radius:6px;}' +
+      '@keyframes xkHit{0%,40%{background:rgba(92,184,127,0.32);box-shadow:0 0 0 4px rgba(92,184,127,0.25);}100%{background:transparent;box-shadow:none;}}';
     document.head.appendChild(css);
 
     let start = 0;
