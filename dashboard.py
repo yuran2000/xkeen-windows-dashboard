@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.62"
+_VERSION_FALLBACK = "1.0.63"
 
 
 def _find_git():
@@ -8377,7 +8377,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           </select>
           <button class="btn btn-sm btn-warn" style="margin-top: 6px;" onclick="setTarget('failover')">Сохранить FAILOVER</button>
           <p class="subtitle">Первый в цепочке резерва. При падении watchdog каскадно перебирает остальные tag'и из цепочки ниже сверху вниз.</p>
-          <div class="failover-active-label">🎯 Сейчас в роутинге как default:</div>
+          <div class="failover-active-label" id="failover-active-label">🎯 Сейчас в роутинге как default:</div>
           <div id="info-failover" class="outbound-info"></div>
         </div>
       </div>
@@ -12118,20 +12118,26 @@ function refreshFailoverInfo() {
   const sel = document.getElementById('select-failover');
   if (!sel) return;
   const chainHead = sel.value;  // первый в FAILOVER_TAGS
-  let activeTag, note;
+  let activeTag, note, label;
   if (!WATCHDOG_CURRENT_DEFAULT) {
     activeTag = chainHead;
+    label = '🎯 Голова цепочки резерва:';
     note = '<span style="color:#a55;">⚠️ статус watchdog неизвестен — показан head цепочки</span>';
   } else if (WATCHDOG_CURRENT_DEFAULT === WATCHDOG_PRIMARY_TAG) {
     activeTag = chainHead;
+    label = '🛟 Голова цепочки резерва (в ожидании — сейчас default = PRIMARY):';
     note = '<span style="color:#2a7;">💤 цепочка спит — PRIMARY работает</span>';
   } else if (WATCHDOG_CURRENT_DEFAULT === 'block') {
     activeTag = chainHead;
+    label = '🛟 Голова цепочки резерва (сейчас default = block):';
     note = '<span style="color:#c33;">🚫 default=block — трафик дропается</span>';
   } else {
     activeTag = WATCHDOG_CURRENT_DEFAULT;
+    label = '🎯 Сейчас в роутинге как default:';
     note = '<span style="background:#ffe28a; color:#7a4d00; padding:1px 6px; border-radius:3px;">⚡ АКТИВЕН СЕЙЧАС (watchdog в failover)</span>';
   }
+  const labelEl = document.getElementById('failover-active-label');
+  if (labelEl) labelEl.textContent = label;
   renderOutboundInfo('info-failover', activeTag, { showTagInTitle: true, activeNote: note });
   syncSelectColor(sel);
 }
