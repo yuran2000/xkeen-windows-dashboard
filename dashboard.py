@@ -1747,6 +1747,114 @@ def keenetic_add_outbound(payload, tag_override=None, overwrite=False):
     return {"ok": True, "tag": tag, "stdout": f"✅ Добавлен outbound '{tag}' ({host}). Бэкап: 04_outbounds.json.bak-{ts}. Чтобы пустить через него трафик — назначь роль (PRIMARY/FAILOVER/AI/…) в разделе каналов."}
 
 
+SOCKS_LOCAL_TAG  = "socks-local"
+SOCKS_LOCAL_PORT = 10808
+
+
+def _socks_local_inbound():
+    """Эталонный socks-local inbound: локальный SOCKS5 на 127.0.0.1:10808.
+    Через него watchdog/панель шлют TG-алерты к api.telegram.org (РКН блокирует его для
+    RU-IP с самого роутера; socks-local идёт через VPN-выход → доходит). Слушает ТОЛЬКО
+    loopback — в LAN не виден, с tproxy-перехватом не конфликтует."""
+    return {
+        "tag": SOCKS_LOCAL_TAG,
+        "listen": "127.0.0.1",
+        "port": SOCKS_LOCAL_PORT,
+        "protocol": "socks",
+        "settings": {"auth": "noauth", "udp": False},
+    }
+
+
+def keenetic_ensure_socks_local():
+    """Idempotent: гарантировать socks-local inbound (127.0.0.1:10808) в 03_inbounds.json.
+    Уже есть (по tag или порту) → no-op. Иначе: добавить → бэкап → xray run -test ПЕРЕД
+    рестартом (с XRAY_LOCATION_ASSET — durable-урок v1.0.52, иначе ложный fail на .dat) →
+    xkeen -restart → проверить что xray реально поднялся (рестарт дольше SSH-таймаута, код
+    возврата не показателен) → откат при провале. Возврат: {ok, action: present|added|failed, detail}."""
+    path = f"{cfg.KEENETIC_XRAY_CONFIGS}/03_inbounds.json"
+    raw = keenetic_read_file(path)
+    if raw is None:
+        return {"ok": False, "action": "failed", "detail": f"не смог прочитать {path} с роутера"}
+    try:
+        conf = json.loads(_strip_json_comments(raw))
+    except Exception as ex:
+        return {"ok": False, "action": "failed", "detail": f"{path} не парсится: {ex}"}
+    inbounds = conf.get("inbounds", []) or []
+    for ib in inbounds:
+        if isinstance(ib, dict) and (ib.get("tag") == SOCKS_LOCAL_TAG or ib.get("port") == SOCKS_LOCAL_PORT):
+            return {"ok": True, "action": "present", "detail": f"socks-local уже поднят (порт {SOCKS_LOCAL_PORT})"}
+    inbounds.append(_socks_local_inbound())
+    conf["inbounds"] = inbounds
+    new_json = json.dumps(conf, indent=2, ensure_ascii=False)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if not keenetic_ssh(f"cp {path} {path}.bak-{ts}")["ok"]:
+        return {"ok": False, "action": "failed", "detail": "не смог сделать бэкап 03_inbounds.json"}
+    w = keenetic_ssh(f"cat > {path}", stdin_data=new_json, timeout=15)
+    if not w["ok"]:
+        keenetic_ssh(f"cp {path}.bak-{ts} {path}")
+        return {"ok": False, "action": "failed", "detail": f"запись 03_inbounds.json не удалась: {w['stderr']}"}
+    test = keenetic_ssh(
+        f'XRAY_LOCATION_ASSET=/opt/etc/xray/dat /opt/sbin/xray run -test '
+        f'-confdir {cfg.KEENETIC_XRAY_CONFIGS} 2>&1; echo "XRAYRC=$?"', timeout=30)
+    if "XRAYRC=0" not in (test.get("stdout") or ""):
+        keenetic_ssh(f"cp {path}.bak-{ts} {path}")
+        return {"ok": False, "action": "failed",
+                "detail": "xray run -test не прошёл с новым socks-local — откатил 03_inbounds.json.\n"
+                          + (test.get("stdout") or "")[-400:]}
+    keenetic_ssh("xkeen -restart 2>&1 | tail -20", timeout=120)
+    import time as _t
+    xray_up = False
+    for _ in range(4):
+        _t.sleep(3)
+        chk = keenetic_ssh("ps w 2>/dev/null | grep -q '[x]ray run' && echo XRAY_UP || echo XRAY_DOWN", timeout=15)
+        if "XRAY_UP" in (chk.get("stdout") or ""):
+            xray_up = True
+            break
+    if not xray_up:
+        keenetic_ssh(f"cp {path}.bak-{ts} {path} && /opt/sbin/xkeen -restart", timeout=120)
+        return {"ok": False, "action": "failed",
+                "detail": "xray не поднялся после добавления socks-local — откатил 03_inbounds.json к бэкапу. "
+                          "Открой «🚑 Восстановление и диагностика»."}
+    return {"ok": True, "action": "added",
+            "detail": f"socks-local inbound поднят на 127.0.0.1:{SOCKS_LOCAL_PORT}. Бэкап: 03_inbounds.json.bak-{ts}"}
+
+
+def keenetic_ensure_socks_route():
+    """Idempotent: гарантировать правило socks-local в 05_routing.template.json (из него
+    watchdog генерит активный 05_routing.json). Нет правила → вставить перед catch-all
+    (__DEFAULT_TAG__). outboundTag здесь = direct-плейсхолдер: watchdog v13 при генерации
+    перепишет его на актуальный зарубежный канал. Нужно, т.к. на роутере с устаревшим
+    template (авто-синк льёт watchdog, но НЕ template) правила может не быть → socks-инбаунд
+    поднят, а трафик к Telegram идёт через catch-all (мимо VPN). Возврат: {ok, action, detail}."""
+    tpath = "/opt/etc/xray/configs.bak/05_routing.template.json"
+    raw = keenetic_read_file(tpath)
+    if raw is None:
+        return {"ok": False, "action": "failed", "detail": f"не смог прочитать template {tpath}"}
+    if '"socks-local"' in raw:
+        return {"ok": True, "action": "present", "detail": "правило socks-local уже есть в template"}
+    rule = '{ "inboundTag": ["socks-local"], "outboundTag": "direct", "type": "field" },'
+    out, inserted = [], False
+    for ln in raw.splitlines():
+        if not inserted and "__DEFAULT_TAG__" in ln:
+            indent = ln[:len(ln) - len(ln.lstrip())]
+            out.append(indent + rule)
+            inserted = True
+        out.append(ln)
+    if not inserted:
+        return {"ok": False, "action": "failed",
+                "detail": "не нашёл catch-all (__DEFAULT_TAG__) в template — не вставляю правило вслепую"}
+    new_tpl = "\n".join(out) + ("\n" if raw.endswith("\n") else "")
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if not keenetic_ssh(f"cp {tpath} {tpath}.bak-{ts}")["ok"]:
+        return {"ok": False, "action": "failed", "detail": "не смог сделать бэкап template"}
+    w = keenetic_ssh(f"cat > {tpath}", stdin_data=new_tpl, timeout=15)
+    if not w["ok"]:
+        keenetic_ssh(f"cp {tpath}.bak-{ts} {tpath}")
+        return {"ok": False, "action": "failed", "detail": f"запись template не удалась: {w['stderr']}"}
+    return {"ok": True, "action": "added",
+            "detail": f"правило socks-local добавлено в template. Бэкап: 05_routing.template.json.bak-{ts}"}
+
+
 # ============== ROUTES ==============
 @app.route("/")
 @requires_auth
@@ -5584,9 +5692,11 @@ def api_keenetic_tg_test():
     if not r["ok"]:
         err = (r["stderr"] or r["stdout"] or "")[:300]
         if "10808" in err or "Failed to connect to 127.0.0.1" in err:
-            err += (" — 💡 SOCKS5-inbound xray (127.0.0.1:10808) НЕ поднят на этом роутере → канал для "
-                    "TG-алертов не настроен. Нужен socks-local inbound в xray + правило роутинга через "
-                    "ЗАРУБЕЖНЫЙ канал (как на домашнем роутере). Без него и watchdog не шлёт алерты с этого роутера.")
+            err += (" — 💡 SOCKS5-inbound xray (127.0.0.1:10808) на этом роутере не поднят → канал "
+                    "для TG-алертов ещё не настроен. Нажми «🔧 Починить канал TG-алертов» ниже — панель "
+                    "сама поднимет socks-local inbound и пропишет маршрут через зарубежный канал. Без "
+                    "этого канала watchdog тоже не сможет слать алерты с этого роутера.")
+            return jsonify({"ok": False, "error": "curl на роутере не сработал: " + err, "need_socks_repair": True})
         return jsonify({"ok": False, "error": "curl на роутере не сработал: " + err})
     # Telegram возвращает {"ok":true,...} либо {"ok":false,"error_code":...,"description":...}
     try:
@@ -5606,6 +5716,87 @@ def api_keenetic_tg_test():
     elif "bot was blocked" in err.lower():
         hint = "💡 Ты заблокировал бота — разблокируй и напиши ему /start."
     return jsonify({"ok": False, "error": f"Telegram API: {err} (code {code})", "hint": hint})
+
+
+@app.route("/api/keenetic/repair-tg-channel", methods=["POST"])
+@requires_auth
+def api_keenetic_repair_tg_channel():
+    """Self-healing канала TG-алертов на ЭТОМ роутере (issue #14 — ремонт без SSH-команд).
+    Поднимает socks-local inbound + гарантирует правило в template + актуальный watchdog
+    (v13 ведёт outboundTag socks-local за конфигом) + перегенерит routing (watchdog v12:
+    health-check + авто-откат) + тестовый curl. Каждый шаг — с бэкапом/откатом, xray-test
+    перед рестартом. Возврат: {ok, steps:[...], foreign_ok, test_sent, summary}."""
+    steps = []
+    def _rec(name, r, ok=None):
+        steps.append({"name": name,
+                      "ok": (r.get("ok") if ok is None else ok),
+                      "action": r.get("action", ""),
+                      "detail": r.get("detail") or r.get("note", "")})
+
+    # 1. socks-local inbound — обязательный шаг (без него весь канал бессмыслен)
+    r1 = keenetic_ensure_socks_local()
+    _rec("Поднять socks-local inbound", r1)
+    if not r1.get("ok"):
+        return jsonify({"ok": False, "steps": steps,
+                        "error": "Не удалось поднять socks-local inbound (см. шаги). Роутер откатан к бэкапу."})
+
+    # 2. правило socks-local в шаблоне routing (чтобы watchdog добавил его в активный 05_routing.json)
+    _rec("Маршрут socks-local в шаблоне routing", keenetic_ensure_socks_route())
+
+    # 3. актуальный watchdog (v13 переписывает outboundTag socks-local на зарубежный канал)
+    try:
+        wd = keenetic_ensure_watchdog_current()
+    except Exception as ex:
+        wd = {"action": "failed", "note": str(ex)}
+    _rec("Актуальный watchdog (v13+)", wd, ok=wd.get("action") in ("current", "upgraded"))
+
+    # 4. перегенерить routing: watchdog подставит socks-local правило + v13 outboundTag + v12 health-check
+    keenetic_ssh(f"sh {WATCHDOG_REMOTE_PATH} 2>&1 | tail -5", timeout=120)
+
+    # 5. есть ли зарубежный канал, через который socks реально дойдёт до Telegram?
+    #    (на роутере с PRIMARY=direct и пустыми FOREIGN/AI алерт уйдёт мимо VPN — честно предупреждаем)
+    wcfg = keenetic_read_watchdog_config() or {}
+    # Тот же приоритет, что watchdog v14 при выборе socks-local-канала:
+    # FOREIGN → YT (RU-каналы YT/IG/Telegram пропускают api.telegram.org) → PRIMARY → AI → failover.
+    cands = [wcfg.get("FOREIGN_TAG", ""), wcfg.get("YT_TAG", ""),
+             wcfg.get("PRIMARY_TAG", ""), wcfg.get("AI_TAG", "")]
+    cands += [t.strip() for t in re.split(r"[,\s]+", wcfg.get("FAILOVER_TAGS", "") or "") if t.strip()]
+    foreign_ok = any(c and c not in ("direct", "block") for c in cands)
+
+    # 6. тестовый curl через socks (если заданы токен/chat_id)
+    token   = (wcfg.get("TG_BOT_TOKEN") or "").strip()
+    chat_id = (wcfg.get("TG_CHAT_ID") or "").strip()
+    test_sent = None
+    if token and chat_id:
+        import shlex
+        msg = "🔧 Канал TG-алертов починен из панели — проверка связи."
+        cmd = (f"curl -sS --max-time 10 --socks5-hostname 127.0.0.1:{SOCKS_LOCAL_PORT} "
+               f"-d chat_id={shlex.quote(chat_id)} --data-urlencode text={shlex.quote(msg)} "
+               f"https://api.telegram.org/bot{shlex.quote(token)}/sendMessage")
+        rt = keenetic_ssh(cmd, timeout=15)
+        try:
+            test_sent = bool(json.loads(rt["stdout"]).get("ok")) if rt.get("ok") else False
+        except Exception:
+            test_sent = False
+        _rec("Тестовое сообщение в Telegram",
+             {"detail": "доставлено" if test_sent else "не ушло (проверь токен/Chat ID)"}, ok=test_sent)
+
+    if not foreign_ok:
+        summary = ("✅ socks-local поднят, НО на этом роутере нет ни одного канала для Telegram "
+                   "(FOREIGN/YT/PRIMARY/AI/резерв — все direct или пусто). Алерт пойдёт мимо VPN и не "
+                   "дойдёт. Добавь канал, через который у тебя ходит Telegram (RU-канал для YouTube/"
+                   "Instagram/Telegram годится так же, как загран FOREIGN/AI), назначь ему роль — и нажми "
+                   "«Починить» ещё раз.")
+    elif test_sent is True:
+        summary = "✅ Готово! socks-local поднят, тестовое сообщение доставлено в Telegram. Алерты watchdog заработают."
+    elif test_sent is False:
+        summary = ("✅ socks-local поднят и маршрут есть, но тест не ушёл — скорее всего токен/Chat ID. "
+                   "Проверь их и нажми «📨 Отправить тестовое сообщение».")
+    else:
+        summary = ("✅ socks-local поднят и маршрут готов. Заполни Bot Token и Chat ID выше, "
+                   "затем нажми «📨 Отправить тестовое сообщение».")
+
+    return jsonify({"ok": True, "steps": steps, "foreign_ok": foreign_ok, "test_sent": test_sent, "summary": summary})
 
 
 @app.route("/api/keenetic/bootstrap-preview", methods=["GET"])
@@ -5661,6 +5852,18 @@ def api_keenetic_bootstrap_apply():
     if overall_ok and "watchdog_sh" in selected_keys and "cron_entry" in selected_keys:
         r = keenetic_ssh("/opt/etc/xray/watchdog.sh 2>&1 | tail -10", timeout=90)
         log.append({"key": "first_run", "ok": r["ok"], "msg": "первый запуск watchdog: " + (r["stdout"] or r["stderr"])[:300]})
+
+    # socks-local inbound для TG-алертов watchdog. На чистом роутере его нет (XKeen-installer
+    # кладёт только redirect/tproxy) → watchdog/панель не достучатся до api.telegram.org (РКН
+    # блокирует для RU-IP, обход — локальный SOCKS5 через VPN-выход). Idempotent + бэкап +
+    # xray-test + откат; bootstrap не валим, если не получилось (алерты — не критичный компонент).
+    if overall_ok and "watchdog_sh" in selected_keys:
+        try:
+            sl = keenetic_ensure_socks_local()
+            log.append({"key": "socks_local", "ok": sl.get("ok", False),
+                        "msg": "socks-local (канал TG-алертов): " + (sl.get("detail") or "")})
+        except Exception as ex:
+            log.append({"key": "socks_local", "ok": False, "msg": "socks-local: " + str(ex)})
 
     return jsonify({"ok": overall_ok, "log": log})
 
@@ -9505,6 +9708,7 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
       <button type="button" id="btn-tg-save" class="btn-primary" style="background:#2a7; color:#fff;">💾 Сохранить</button>
       <button type="button" id="btn-tg-test" class="btn-primary" style="background:#29b; color:#fff;">📨 Отправить тестовое сообщение</button>
       <button type="button" id="btn-tg-clear" class="btn-primary" style="background:#999; color:#fff;" title="Очистить TG_BOT_TOKEN и TG_CHAT_ID — алерты перестанут отправляться">✖ Очистить (отключить)</button>
+      <button type="button" id="btn-tg-repair" class="btn-primary" style="background:#e67e22; color:#fff; display:none;" title="Поднять socks-local inbound и маршрут для TG-алертов на этом роутере (с бэкапом и откатом)">🔧 Починить канал TG-алертов</button>
       <span id="tg-settings-status" class="mono" style="margin-left: 10px; color: #666;"></span>
     </div>
 
@@ -9574,6 +9778,7 @@ Use this token to access the HTTP API:
             <li><strong>Unauthorized</strong> — токен неверный или бот удалён в BotFather.</li>
             <li><strong>bot was blocked</strong> — ты заблокировал бота в Telegram. Разблокируй и напиши /start.</li>
             <li><strong>Timeout / connection refused</strong> — роутер не может выйти на <code>api.telegram.org</code>. Проверь, что PRIMARY/FAILOVER канал работает (раздел ниже).</li>
+            <li><strong>curl: (7) Failed to connect to 127.0.0.1 port 10808</strong> — на этом роутере не поднят локальный SOCKS5-inbound (через него идут алерты в обход блокировки Telegram для RU-IP). Нажми появившуюся кнопку <strong>«🔧 Починить канал TG-алертов»</strong> — панель сама поднимет его и пропишет маршрут через зарубежный канал (с бэкапом и откатом). Если зарубежного канала на роутере нет — сначала добавь outbound и назначь ему роль «📱 Заблокированные в РФ» или AI.</li>
           </ul>
         </div>
       </details>
@@ -14910,9 +15115,11 @@ async function tgTest() {
   const status = document.getElementById('tg-settings-status');
   const result = document.getElementById('tg-test-result');
   const btn = document.getElementById('btn-tg-test');
+  const repairBtn = document.getElementById('btn-tg-repair');
   status.textContent = '📨 шлю...';
   btn.disabled = true;
   result.innerHTML = '';
+  if (repairBtn) repairBtn.style.display = 'none';
   try {
     const body = {
       token:   document.getElementById('tg-token').value.trim(),
@@ -14931,9 +15138,42 @@ async function tgTest() {
       status.textContent = '❌ не доставлено';
       const hint = j.hint ? `<span class="hint">${escapeHtml(j.hint)}</span>` : '';
       result.innerHTML = `<div class="test-result-box bad"><strong>❌ Не доставлено</strong>${hint}\n${escapeHtml(j.error || '')}</div>`;
+      // socks-local не поднят на этом роутере → предложить авто-ремонт без SSH
+      if (j.need_socks_repair && repairBtn) repairBtn.style.display = '';
     }
   } catch (e) {
     status.textContent = '❌ ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function repairTgChannel() {
+  const status = document.getElementById('tg-settings-status');
+  const result = document.getElementById('tg-test-result');
+  const btn = document.getElementById('btn-tg-repair');
+  if (!confirm('Починить канал TG-алертов на этом роутере?\n\nПанель поднимет socks-local inbound и пропишет маршрут, затем перезапустит xray (xkeen -restart — на несколько секунд связь моргнёт). Все изменения с бэкапом и авто-откатом, если xray не поднимется.')) return;
+  status.textContent = '🔧 чиню...';
+  btn.disabled = true;
+  result.innerHTML = '<div class="test-result-box" style="background:#fff6ec; border-color:#e67e22;">⏳ Поднимаю socks-local inbound, проверяю конфиг (xray -test), перезапускаю xray... это может занять до минуты.</div>';
+  try {
+    const res = await fetch('/api/keenetic/repair-tg-channel', { method: 'POST' });
+    const j = await res.json();
+    const steps = (j.steps || []).map(s =>
+      `${s.ok ? '✅' : '❌'} ${escapeHtml(s.name)}${s.detail ? ' — ' + escapeHtml(s.detail) : ''}`
+    ).join('\n');
+    if (j.ok) {
+      status.textContent = j.test_sent ? '✅ канал починен' : '✅ socks-local поднят';
+      const cls = j.foreign_ok ? 'ok' : 'bad';
+      result.innerHTML = `<div class="test-result-box ${cls}"><strong>${escapeHtml(j.summary || 'Готово')}</strong>\n\n${steps}</div>`;
+      if (j.test_sent) btn.style.display = 'none';
+    } else {
+      status.textContent = '❌ не починилось';
+      result.innerHTML = `<div class="test-result-box bad"><strong>❌ ${escapeHtml(j.error || 'Не удалось починить')}</strong>\n\n${steps}</div>`;
+    }
+  } catch (e) {
+    status.textContent = '❌ ' + e.message;
+    result.innerHTML = `<div class="test-result-box bad">❌ ${escapeHtml(e.message)}</div>`;
   } finally {
     btn.disabled = false;
   }
@@ -14951,9 +15191,11 @@ async function tgClear() {
   const t = document.getElementById('btn-tg-test');
   const c = document.getElementById('btn-tg-clear');
   const tg = document.getElementById('btn-tg-toggle');
+  const rp = document.getElementById('btn-tg-repair');
   if (s) s.addEventListener('click', tgSave);
   if (t) t.addEventListener('click', tgTest);
   if (c) c.addEventListener('click', tgClear);
+  if (rp) rp.addEventListener('click', repairTgChannel);
   if (tg) tg.addEventListener('click', () => {
     const f = document.getElementById('tg-token');
     f.type = f.type === 'password' ? 'text' : 'password';
