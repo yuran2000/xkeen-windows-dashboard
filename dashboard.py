@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.53"
+_VERSION_FALLBACK = "1.0.54"
 
 
 def get_dashboard_version():
@@ -5569,19 +5569,25 @@ def api_keenetic_tg_test():
         f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} МСК\n"
         "Если ты это видишь — TG-алерты watchdog'а будут работать."
     )
-    # Запрос через роутер чтобы обойти блокировку api.telegram.org для RU-IP.
-    # На роутере есть curl (Entware). Шлём через SOCKS5-inbound xray (127.0.0.1:1080) если поднят,
-    # иначе обычным curl (для роутера через XKeen маршрутизация уже работает).
+    # Запрос через роутер + ОБЯЗАТЕЛЬНО через SOCKS5-inbound xray (127.0.0.1:10808) — так же как
+    # watchdog'овский tg_alert. Прямой curl с роутера к api.telegram.org заблокирован РКН для RU-IP
+    # (timeout 28), а socks-local идёт через VPN-выход → доходит. Если socks-inbound не поднят
+    # (нет :10808, curl rc 7) — тест честно падает с подсказкой, что канал TG-алертов не настроен.
     import shlex
     cmd = (
-        f"curl -sS --max-time 10 "
+        f"curl -sS --max-time 10 --socks5-hostname 127.0.0.1:10808 "
         f"-d chat_id={shlex.quote(chat_id)} "
         f"--data-urlencode text={shlex.quote(msg)} "
         f"https://api.telegram.org/bot{shlex.quote(token)}/sendMessage"
     )
     r = keenetic_ssh(cmd, timeout=15)
     if not r["ok"]:
-        return jsonify({"ok": False, "error": "curl на роутере не сработал: " + (r["stderr"] or r["stdout"])[:300]})
+        err = (r["stderr"] or r["stdout"] or "")[:300]
+        if "10808" in err or "Failed to connect to 127.0.0.1" in err:
+            err += (" — 💡 SOCKS5-inbound xray (127.0.0.1:10808) НЕ поднят на этом роутере → канал для "
+                    "TG-алертов не настроен. Нужен socks-local inbound в xray + правило роутинга через "
+                    "ЗАРУБЕЖНЫЙ канал (как на домашнем роутере). Без него и watchdog не шлёт алерты с этого роутера.")
+        return jsonify({"ok": False, "error": "curl на роутере не сработал: " + err})
     # Telegram возвращает {"ok":true,...} либо {"ok":false,"error_code":...,"description":...}
     try:
         resp = json.loads(r["stdout"])
@@ -7654,10 +7660,12 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   .nav { float: right; }
   .nav a { color: #888; text-decoration: none; padding: 0 8px; font-size: 0.9em; }
   .nav a:hover { color: #2a7; }
-  .flash { padding: 10px 14px; border-radius: 4px; margin-bottom: 12px; font-size: 0.9em; display: none; }
+  .flash { position: relative; padding: 10px 38px 10px 14px; border-radius: 4px; margin-bottom: 12px; font-size: 0.9em; display: none; }
   .flash.ok { background: #d4eedd; color: #2a7; border: 1px solid #2a7; }
   .flash.bad { background: #fbd7d7; color: #c33; border: 1px solid #c33; }
   .flash pre { font-size: 0.8em; margin: 6px 0 0; max-height: 200px; overflow-y: auto; }
+  .flash-close { position: absolute; top: 4px; right: 6px; background: none; border: none; color: inherit; font-size: 1.2em; line-height: 1; cursor: pointer; opacity: 0.55; padding: 2px 7px; border-radius: 4px; font-weight: 700; }
+  .flash-close:hover { opacity: 1; background: rgba(0,0,0,0.10); }
   .wd-state { font-size: 1.4em; font-weight: 700; padding: 4px 14px; border-radius: 4px; }
   .wd-state.primary  { background: #d4eedd; color: #2a7; }
   .wd-state.failover { background: #fff4cc; color: #997300; }
@@ -9391,7 +9399,7 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
 
   <div style="margin: 12px 0;">
     <button id="btn-diagnose" type="button" class="btn-primary" style="background:#c33; color:#fff;">🔬 Диагностика XKeen</button>
-    <span style="margin-left: 8px; font-size: 0.85em; color: #888;">Запустит 8 проверок состояния (xray binary, configs, watchdog.config, cron, ...) и предложит auto-fix для каждой найденной проблемы.</span>
+    <span style="margin-left: 8px; font-size: 0.85em; color: #888;">Запустит 12 проверок состояния (xray binary, configs, версия watchdog, geoip.dat, cron, curl/RCI, ...) и предложит auto-fix для каждой найденной проблемы.</span>
   </div>
 
   <div id="diagnose-output" style="margin-top: 12px;"></div>
@@ -9438,11 +9446,15 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>xray binary</code></td><td style="padding: 5px 10px;">Бинарь /opt/sbin/xray даёт SIGSEGV (Go runtime crash) — обычно <strong>неправильная архитектура</strong> (mips32 BE вместо mips32le на MT7621). Auto-fix НЕТ — нужно вручную скачать <code>Xray-linux-mips32le.zip</code> с XTLS/Xray-core releases (см. Help-секция).</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>xkeen запущен</code></td><td style="padding: 5px 10px;">xray-процесс не запущен. Auto-fix: <strong>🔄 Запустить xkeen</strong> (xkeen -restart). Если после рестарта снова «не запущен» — проблема в конфигах, проверяй следующие пункты.</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>configs валидны</code></td><td style="padding: 5px 10px;"><code>xray test</code> показывает ошибки. Самая частая — <strong>пустой outboundTag</strong> в routing.json или ссылка на несуществующий outbound. Auto-fix: <strong>🔧 Перегенерить routing</strong> (через watchdog.sh из template).</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>Версия watchdog</code></td><td style="padding: 5px 10px;">Версия <code>watchdog.sh</code> на роутере СТАРЕЕ встроенной в панель. Auto-fix НЕТ — обновится <strong>автоматически при следующем «Сохранить»</strong> (авто-синк v1.0.50: панель сама заливает свежий watchdog перед применением любой настройки).</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>PRIMARY_TAG</code></td><td style="padding: 5px 10px;">В <code>watchdog.config</code> поле <code>PRIMARY_TAG=""</code> (пустое). Watchdog не может построить routing → xray валится. Auto-fix: <strong>🔧 PRIMARY = direct</strong> (трафик через провайдера, безопасный default).</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>direct + block</code></td><td style="padding: 5px 10px;">В <code>04_outbounds.json</code> отсутствуют outbound'ы с <code>tag=direct</code> или <code>tag=block</code>. Без них не работает «🌐 Напрямую» и BLOCK-список. Auto-fix: <strong>🔧 Добавить direct + block</strong> (existing outbound'ы из подписки сохраняются).</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>routing.json валиден</code></td><td style="padding: 5px 10px;"><code>05_routing.json</code> содержит синтаксическую ошибку JSON (trailing comma, битый escape, etc). Auto-fix: <strong>🔧 Перегенерить routing</strong>. После v9 watchdog сам не записывает битый JSON (см. v1.5.0 changelog), но если файл уже битый — нужна перегенерация.</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>cron watchdog</code></td><td style="padding: 5px 10px;">Cron-задача для watchdog отсутствует — failover при падении канала не сработает. Auto-fix: <strong>🔧 Добавить cron</strong> (запись <code>*/1 * * * * /opt/etc/xray/watchdog.sh</code>).</td></tr>
-          <tr><td style="padding: 5px 10px; vertical-align: top;"><code>watchdog log без ошибок</code></td><td style="padding: 5px 10px;">В <code>/opt/var/log/xray/watchdog.log</code> свежие WARN/ERROR. Auto-fix НЕТ — нужно посмотреть детали в раскрытой проверке. Может быть нормально (временная недоступность канала).</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>watchdog log без ошибок</code></td><td style="padding: 5px 10px;">В <code>/opt/var/log/xray/watchdog.log</code> свежие WARN/ERROR. Auto-fix НЕТ — нужно посмотреть детали в раскрытой проверке. Может быть нормально (временная недоступность канала).</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>geoip.dat категории</code></td><td style="padding: 5px 10px;">GeoIP-категории из routing (например <code>geoip:telegram</code>) отсутствуют в установленном <code>geoip.dat</code> → xray падает на старте. Auto-fix: <strong>📥 Установить расширенный geoip.dat</strong> (от Loyalsoldier — содержит сервисы telegram/discord, а не только страны cn/ru/us).</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>curl + RCI Keenetic</code></td><td style="padding: 5px 10px;">На роутере нет рабочего <code>curl</code> (watchdog пробит им каналы) или недоступен RCI Keenetic (<code>localhost:79</code> — DNS-профили/политики). Auto-fix НЕТ — проверь <code>opkg install curl</code> и доступность веб-интерфейса роутера.</td></tr>
+          <tr><td style="padding: 5px 10px; vertical-align: top;"><code>Entware GNU tar</code></td><td style="padding: 5px 10px;">Установлен BusyBox tar (не GNU) — миграция через <code>tar</code> может не работать (нет <code>--exclude</code> и пр.). Auto-fix НЕТ — <code>opkg install tar</code> ставит GNU tar.</td></tr>
         </tbody>
       </table>
     </div>
@@ -12041,11 +12053,17 @@ async function refreshDashboardHealth() {
   }
 }
 
+function closeFlash() {
+  const f = document.getElementById('flash');
+  if (f) f.style.display = 'none';
+  if (window._flashTimer) { clearTimeout(window._flashTimer); window._flashTimer = null; }
+}
 function flash(ok, message, details, options) {
   const f = document.getElementById('flash');
   f.className = 'flash ' + (ok ? 'ok' : 'bad');
   f.style.display = 'block';
-  let html = '<strong>' + (ok ? '✅' : '❌') + '</strong> ' + message;
+  let html = '<button type="button" class="flash-close" onclick="closeFlash()" title="Закрыть" aria-label="Закрыть">✕</button>';
+  html += '<strong>' + (ok ? '✅' : '❌') + '</strong> ' + message;
   if (details) html += '<pre>' + details.replace(/</g,'&lt;') + '</pre>';
   f.innerHTML = html;
   // Скроллим наверх по умолчанию (для важных save/restart-уведомлений), но при noScroll=true
