@@ -189,7 +189,24 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.54"
+_VERSION_FALLBACK = "1.0.57"
+
+
+def _find_git():
+    """Путь к git.exe: сначала PATH, иначе стандартные места установки. Важно для
+    SYSTEM-процесса (Task Scheduler): у него PATH часто БЕЗ git → git describe молча
+    падал и версия откатывалась на устаревший _VERSION_FALLBACK (симптом: дом-панель
+    от SYSTEM показывала старую версию, хотя репо обновлён)."""
+    import shutil
+    g = shutil.which("git")
+    if g:
+        return g
+    for p in (r"C:\Program Files\Git\cmd\git.exe",
+              r"C:\Program Files\Git\bin\git.exe",
+              r"C:\Program Files (x86)\Git\cmd\git.exe"):
+        if os.path.exists(p):
+            return p
+    return "git"
 
 
 def get_dashboard_version():
@@ -202,7 +219,7 @@ def get_dashboard_version():
     version = _VERSION_FALLBACK
     try:
         result = subprocess.run(
-            ["git", "describe", "--tags", "--abbrev=0"],
+            [_find_git(), "describe", "--tags", "--abbrev=0"],
             cwd=_resource_dir(),
             capture_output=True, text=True, timeout=2,
         )
@@ -15244,14 +15261,14 @@ async function tgClear() {
 
 // ============== 🚑 RECOVERY / DIAGNOSE / AUTO-REPAIR (v1.5.1) ==============
 // Self-healing fix через UI без SSH. Юзер жмёт «🔬 Диагностика» → видит
-// таблицу 8 проверок с ✅/❌ → для каждой failed предлагается «🔧 Применить fix».
+// таблицу 12 проверок с ✅/❌ → для каждой failed предлагается «🔧 Применить fix».
 
 async function runDiagnose() {
   const btn = document.getElementById('btn-diagnose');
   const out = document.getElementById('diagnose-output');
   btn.disabled = true;
   btn.textContent = '⏳ Проверяю...';
-  out.innerHTML = '<p style="color:#888; font-style:italic;">Запускаю 8 проверок через SSH (xray version, xkeen-status, config test, watchdog.config, JSON syntax, cron, errors)...</p>';
+  out.innerHTML = '<p style="color:#888; font-style:italic;">Запускаю 12 проверок через SSH (xray, xkeen-status, валидность конфигов, watchdog.config + версия, JSON-синтаксис, geoip.dat, cron, curl/RCI-политика, Entware tar, ошибки в логах)...</p>';
   try {
     const res = await fetch('/api/xkeen/diagnose');
     const j = await res.json();
