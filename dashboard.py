@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.64"
+_VERSION_FALLBACK = "1.0.65"
 
 
 def _find_git():
@@ -7854,7 +7854,6 @@ XKEEN_TEMPLATE = r"""<!doctype html>
      Визуально слиты с card снизу (нет нижней границы). Каждый раздел — свой цвет
      через .sec-1..sec-5, чтобы глаз сразу узнавал «где я». Цвет передаётся через
      CSS-переменные --sec-fg / --sec-bg / --sec-border. */
-  body { counter-reset: sec; }
   h2 {
     --sec-fg: #2a7; --sec-bg-1: #e8f3ea; --sec-bg-2: #f3f9f3; --sec-text: #1f4d2c; --sec-border: #c5dcc9;
     color: var(--sec-text);
@@ -7868,17 +7867,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     font-weight: 600;
     font-size: 1.4em;
     border-radius: 4px 4px 0 0;
-    counter-increment: sec;
     display: flex; align-items: center; gap: 12px;
-  }
-  h2::before {
-    content: counter(sec);
-    flex: 0 0 auto;
-    background: var(--sec-fg); color: #fff;
-    font-size: 0.75em; font-weight: 700;
-    width: 1.9em; height: 1.9em; line-height: 1.9em;
-    text-align: center; border-radius: 50%;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
   }
   /* Цветовые варианты h2 — по разделам */
   h2.sec-routing { --sec-fg: #2a7; --sec-bg-1: #e8f3ea; --sec-bg-2: #f3f9f3; --sec-text: #1f4d2c; --sec-border: #c5dcc9; }
@@ -8260,7 +8249,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 <body>
 
 <style>
-  .topbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px 14px;padding:4px 0 9px;border-bottom:1px solid #e8e8e8;margin-bottom:8px;}
+  .topbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px 14px;padding:6px 0 9px;border-bottom:1px solid #e8e8e8;margin-bottom:8px;position:sticky;top:0;z-index:50;background:#f5f5f0;box-shadow:0 3px 6px -3px rgba(0,0,0,0.10);}
   .topbar h1{font-size:1.3em;margin:0;font-weight:700;line-height:1.2;letter-spacing:-0.01em;}
   .topbar h1 .tb-host{font-size:0.6em;font-weight:500;color:#8a8f98;letter-spacing:0;cursor:help;}
   .topbar-actions{margin-left:auto;display:flex;align-items:center;flex-wrap:wrap;gap:6px 9px;font-size:0.9em;}
@@ -15825,6 +15814,19 @@ async function makeSiteReachable(btn) {
 // Группировка делается в рантайме (секция = <details.section-collapsible> ИЛИ <h2.sec-*>
 // + следующие за ней элементы до следующего заголовка). Чисто аддитивно: если структура
 // не та — try/catch оставляет страницу как есть (обычный скролл). Реверт = удалить этот блок.
+// Sticky-шапка: меряем высоту .topbar → CSS-переменная --xk-tb, чтобы липкий сайдбар встал ПОД
+// шапкой, а не под неё. Обновляется на resize и при переносе строк в шапке (ResizeObserver).
+(function stickyTopbarOffset(){
+  try {
+    const tb = document.querySelector('.topbar');
+    if (!tb) return;
+    const apply = () => document.documentElement.style.setProperty('--xk-tb', tb.offsetHeight + 'px');
+    apply();
+    window.addEventListener('resize', apply);
+    if (window.ResizeObserver) { new ResizeObserver(apply).observe(tb); }
+  } catch(e) {}
+})();
+
 (function buildKeeneticSidebar(){
   try {
     const body = document.body;
@@ -16041,13 +16043,19 @@ async function makeSiteReachable(btn) {
     items.forEach(it => { (byCat[it.cat] = byCat[it.cat] || []).push(it); });
     catOrder.forEach(cat => {
       const its = byCat[cat]; if (!its || !its.length) return;
-      if (its.length > 1) {  // категория-плашка нужна только если в ней >1 раздела (иначе дублирует сам раздел, напр. «Помощь»)
+      // Плашка категории — ВСЕГДА, однотипно для всех разделов (включая одиночную «❓ Помощь»,
+      // чтобы она не липла к «Диагностике»). «Прочее» пустое, лишних плашек не будет.
+      {
         const hdr = document.createElement('div'); hdr.className = 'xk-cat';
         hdr.textContent = (catIcon[cat] || '') + ' ' + cat;
         aside.appendChild(hdr);
       }
+      // «❓ Помощь»: один самоназванный раздел → его подтемы идут ПРЯМО под плашкой,
+      // без дубля-пункта «Помощь» (он вёл на почти пустую обзорную страницу; сама она
+      // остаётся доступной через поиск). Обзор раздела всё ещё в deep-index.
+      const helpMerge = (its.length === 1 && cat === 'Помощь');
       its.forEach(it => {
-        aside.appendChild(mkBtn('xk-nav-item', it.idx, it.title, it.full));
+        if (!helpMerge) aside.appendChild(mkBtn('xk-nav-item', it.idx, it.title, it.full));
         if (it.subs.length) {
           const wrap = document.createElement('div'); wrap.className = 'xk-subwrap';
           let groupBox = null, curGroup = null;
@@ -16088,10 +16096,10 @@ async function makeSiteReachable(btn) {
     css.textContent =
       'body{max-width:none !important;}' +
       '.xk-layout{display:flex;gap:0;align-items:flex-start;margin-top:18px;}' +
-      '.xk-resizer{flex:0 0 16px;position:sticky;top:14px;height:calc(100vh - 28px);cursor:col-resize;}' +
+      '.xk-resizer{flex:0 0 16px;position:sticky;top:calc(var(--xk-tb,52px) + 8px);height:calc(100vh - var(--xk-tb,52px) - 16px);cursor:col-resize;}' +
       '.xk-resizer::before{content:"";position:absolute;left:6px;top:0;bottom:0;width:4px;background:#dde3ea;border-radius:3px;transition:background .12s;}' +
       '.xk-resizer:hover::before{background:#5cb87f;}' +
-      '.xk-sidebar{flex:0 0 380px;position:sticky;top:14px;max-height:calc(100vh - 28px);overflow-y:auto;background:#fff;border:1px solid #ddd;border-radius:8px;padding:8px;}' +
+      '.xk-sidebar{flex:0 0 380px;position:sticky;top:calc(var(--xk-tb,52px) + 8px);max-height:calc(100vh - var(--xk-tb,52px) - 16px);overflow-y:auto;background:#fff;border:1px solid #ddd;border-radius:8px;padding:8px;}' +
       '.xk-search{position:sticky;top:0;z-index:3;width:100%;box-sizing:border-box;padding:7px 10px;margin:0 0 8px;border:1px solid #d3d9e0;border-radius:6px;font-size:0.85em;background:#fff;}' +
       '.xk-search:focus{outline:none;border-color:#5cb87f;box-shadow:0 0 0 2px rgba(92,184,127,0.25);}' +
       '.xk-content{flex:1 1 auto;min-width:0;}' +
