@@ -1,4 +1,13 @@
 #!/bin/sh
+# XKeen failover watchdog v12 (2026-05-25, health-check + АВТО-ОТКАТ после apply):
+#   ПОСЛЕ применения нового routing + xkeen -restart проверяем РЕАЛЬНОЕ здоровье сети:
+#   (1) xray запущен, (2) клиентский DNS резолвится через LAN-IP:53. Если нет — это рантайм-
+#   обвал, который xray -test НЕ ловит (напр. валидный primary=direct, но DNS подвис при
+#   грязном перезапуске — инцидент 2026-05-25, лёг DNS всего офиса). Тогда АВТО-ОТКАТ на
+#   последний здоровый routing (05_routing.json.lastgood) + рестарт + повторная проверка +
+#   TG-алерт. md5 битого кандидата запоминается (LAST_BAD_MD5) и НЕ переприменяется в цикле
+#   (анти-флап), пока пользователь не сменит настройки в панели. + lock против наложения тиков.
+#   Цель: ЛЮБЫЕ настройки панели физически не могут оставить сеть без DNS/интернета.
 # XKeen failover watchdog v11 (2026-05-23, xray-test gate перед apply):
 #   ПЕРЕД применением нового 05_routing.json гоняем `xray run -test` (с XRAY_LOCATION_ASSET).
 #   Если конфиг валиден как JSON, но xray на нём НЕ стартует (например ip:["geoip:discord"] —
@@ -44,6 +53,20 @@ LOG=/opt/var/log/xray/watchdog.log
 
 mkdir -p "$(dirname "$LOG")"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+# ---------- Anti-overlap lock (v12) ----------
+# Тик теперь может идти дольше (health-check + возможный откат + до 2 рестартов). cron каждую
+# минуту мог бы запустить второй экземпляр поверх — это опасно во время xkeen -restart.
+# Берём lock; если живой процесс уже держит его — тихо выходим. Stale-lock (мёртвый pid) снимаем.
+LOCK=/tmp/xkeen_watchdog.lock
+if [ -f "$LOCK" ]; then
+  _oldpid=$(cat "$LOCK" 2>/dev/null)
+  if [ -n "$_oldpid" ] && kill -0 "$_oldpid" 2>/dev/null; then
+    exit 0
+  fi
+fi
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
 
 # ---------- Helpers ----------
 
@@ -355,6 +378,40 @@ validate_routing_xray() {
   return 0
 }
 
+# ---------- Health-check (v12) ----------
+# LAN-IP роутера (br0). Кэшируем. Несколько способов на случай разных прошивок.
+LAN_IP_CACHE=""
+get_lan_ip() {
+  [ -n "$LAN_IP_CACHE" ] && { echo "$LAN_IP_CACHE"; return 0; }
+  local ip4=""
+  ip4=$(ip -4 -o addr show br0 2>/dev/null | grep -oE 'inet [0-9.]+' | awk '{print $2}' | head -1)
+  [ -z "$ip4" ] && ip4=$(ifconfig br0 2>/dev/null | grep -oE 'inet addr:[0-9.]+' | head -1 | cut -d: -f2)
+  [ -z "$ip4" ] && ip4=$(ifconfig br0 2>/dev/null | grep -oE 'inet [0-9.]+' | awk '{print $2}' | head -1)
+  LAN_IP_CACHE="$ip4"
+  echo "$ip4"
+}
+
+# Реальное здоровье сети ПОСЛЕ apply: (1) xray запущен, (2) клиентский DNS резолвится
+# через LAN-IP:53 (именно этот путь лёг 2026-05-25, тогда как 127.0.0.1 резолвил).
+# Поллим несколько раз — xray после рестарта поднимается не мгновенно.
+# Возврат: 0 = здорово, 1 = нет.
+health_check() {
+  local tries="${1:-6}" i=0 lan d
+  lan=$(get_lan_ip); [ -z "$lan" ] && lan=127.0.0.1
+  while [ "$i" -lt "$tries" ]; do
+    if ps w 2>/dev/null | grep -q '[x]ray run'; then
+      for d in dns.google cloudflare.com google.com; do
+        if nslookup "$d" "$lan" 2>/dev/null | grep -q '^Name:'; then
+          return 0
+        fi
+      done
+    fi
+    i=$((i+1)); sleep 3
+  done
+  log "HEALTH FAIL: за $((tries*3))s xray не запущен ИЛИ DNS не резолвится через $lan"
+  return 1
+}
+
 # ---------- State ----------
 # Формат state: "<current_state> <counter> <current_default_tag>"
 # current_state: primary | failover
@@ -369,6 +426,17 @@ fi
 [ -z "$CUR" ] && CUR=primary
 [ -z "$CTR" ] && CTR=0
 [ -z "$CUR_DEFAULT" ] && CUR_DEFAULT="$PRIMARY_TAG"
+
+# v12: md5 последнего кандидата, который УРОНИЛ health-check (анти-флап — не переприменяем его).
+LAST_BAD_MD5=$(grep -o 'LAST_BAD_MD5=[0-9a-f]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+
+# v12: seed «последнего рабочего» routing — если резервной копии ещё нет, а текущий здоров.
+if [ ! -f "$CONFIG_DIR/05_routing.json.lastgood" ] && [ -f "$CONFIG_DIR/05_routing.json" ]; then
+  if health_check 2; then
+    cp "$CONFIG_DIR/05_routing.json" "$CONFIG_DIR/05_routing.json.lastgood" 2>/dev/null
+    log "v12: seed 05_routing.json.lastgood (текущий routing здоров)"
+  fi
+fi
 
 # ---------- Force-mode override ----------
 case "$FORCE_MODE" in
@@ -548,48 +616,82 @@ PREV_FOREIGN=$(grep -o 'EFFECTIVE_FOREIGN=\S*' "$STATE_FILE" 2>/dev/null | cut -
 # AI_DOMAINS / AI_TAG / YT_DOMAINS / YT_TAG / шаблона (юзер правит из дашборда).
 if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFFECTIVE_FOREIGN_TAG"; then
   if routing_changed; then
-    if ! validate_routing_xray; then
+    NEW_MD5=$(md5sum < "$CONFIG_DIR/05_routing.json.new" 2>/dev/null | awk '{print $1}')
+    if [ -n "$LAST_BAD_MD5" ] && [ "$NEW_MD5" = "$LAST_BAD_MD5" ]; then
+      # v12 анти-флап: этот кандидат уже ронял health-check. НЕ переприменяем по кругу.
+      log "SKIP (анти-флап): кандидат routing уже ронял сеть (md5=$LAST_BAD_MD5) — НЕ применяю, текущий рабочий routing сохранён. Смени настройки в панели."
+      rm -f "$CONFIG_DIR/05_routing.json.new"
+    elif ! validate_routing_xray; then
       _ts="$(date +%Y%m%d-%H%M%S)"
       mv "$CONFIG_DIR/05_routing.json.new" "$CONFIG_DIR/05_routing.json.new.bad-${_ts}" 2>/dev/null
       log "BLOCKED: новый routing не прошёл xray -test — оставляю текущий (xray не трогаю). Битый → 05_routing.json.new.bad-${_ts}"
       tg_alert "🛡️ <b>XKeen watchdog</b>: новый routing не прошёл проверку <code>xray -test</code> и НЕ применён — текущая конфигурация сохранена, VPN работает. Вероятно geoip/geosite-категория отсутствует в .dat. Проверь категории в панели."
     elif mv "$CONFIG_DIR/05_routing.json.new" "$CONFIG_DIR/05_routing.json"; then
       /opt/sbin/xkeen -restart >/dev/null 2>&1
-      if [ "$NEW_DEFAULT" != "$CUR_DEFAULT" ]; then
-        log "SWITCH default $CUR_DEFAULT -> $NEW_DEFAULT (state=$CUR/$NEW_STATE probe=$PROBE_CODE)"
-        tg_alert "🚦 <b>XKeen watchdog</b>: default переключён <code>$CUR_DEFAULT</code> → <code>$NEW_DEFAULT</code>${PROBE_CODE:+ (probe=$PROBE_CODE)}"
+      # v12: health-check ПОСЛЕ применения — реально ли живы xray и клиентский DNS.
+      # Ловит рантайм-обвалы, которые xray -test пропускает (валидный конфиг, но DNS подвис).
+      if health_check 6; then
+        cp "$CONFIG_DIR/05_routing.json" "$CONFIG_DIR/05_routing.json.lastgood" 2>/dev/null
+        LAST_BAD_MD5=""   # успешное применение — снимаем «бракованную» метку
+        if [ "$NEW_DEFAULT" != "$CUR_DEFAULT" ]; then
+          log "SWITCH default $CUR_DEFAULT -> $NEW_DEFAULT (state=$CUR/$NEW_STATE probe=$PROBE_CODE)"
+          tg_alert "🚦 <b>XKeen watchdog</b>: default переключён <code>$CUR_DEFAULT</code> → <code>$NEW_DEFAULT</code>${PROBE_CODE:+ (probe=$PROBE_CODE)}"
+        else
+          log "UPDATE routing config changed (AI_DOMAINS / AI_TAG / kill-switch state) — default остаётся $NEW_DEFAULT"
+        fi
+        # AI kill-switch event log
+        if [ "$EFFECTIVE_AI_TAG" != "$PREV_AI" ]; then
+          if [ "$EFFECTIVE_AI_TAG" = "block" ]; then
+            log "AI-KILL-SWITCH: AI_TAG=$AI_TAG мёртв — AI-трафик заблокирован"
+            tg_alert "🛡️ <b>XKeen AI kill-switch</b>: канал <code>$AI_TAG</code> недоступен → AI-сайты ВРЕМЕННО заблокированы (чтобы не светить RU IP). Восстановится автоматически когда $AI_TAG оживёт."
+          else
+            log "AI-KILL-SWITCH-CLEAR: $AI_TAG восстановился — AI-трафик пошёл через него"
+            tg_alert "✅ <b>XKeen AI kill-switch</b>: канал <code>$AI_TAG</code> восстановился, AI-сайты снова работают через него."
+          fi
+        fi
+        # YT kill-switch event log + TG-уведомление (с 2026-05-15)
+        if [ "$EFFECTIVE_YT_TAG" != "$PREV_YT" ]; then
+          if [ "$EFFECTIVE_YT_TAG" = "block" ]; then
+            log "YT-KILL-SWITCH: YT_TAG=$YT_TAG мёртв — YouTube-трафик заблокирован (YT_FAIL_BLOCK=1)"
+            tg_alert "📺 <b>XKeen YT kill-switch</b>: канал <code>$YT_TAG</code> недоступен → YouTube/IG/Discord ВРЕМЕННО заблокированы. Восстановится автоматически когда $YT_TAG оживёт."
+          else
+            log "YT-KILL-SWITCH-CLEAR: $YT_TAG восстановился — YouTube-трафик пошёл через него"
+            tg_alert "✅ <b>XKeen YT kill-switch</b>: канал <code>$YT_TAG</code> восстановился, YouTube/IG/Discord снова работают через него."
+          fi
+        fi
+        # FOREIGN kill-switch event log + TG-уведомление
+        if [ "$EFFECTIVE_FOREIGN_TAG" != "$PREV_FOREIGN" ]; then
+          if [ "$EFFECTIVE_FOREIGN_TAG" = "block" ]; then
+            log "FOREIGN-KILL-SWITCH: FOREIGN_TAG=$FOREIGN_TAG мёртв — трафик «Заблокированные в РФ» заблокирован (FOREIGN_FAIL_BLOCK=1)"
+            tg_alert "🛡️ <b>XKeen FOREIGN kill-switch</b>: канал <code>$FOREIGN_TAG</code> недоступен → Meta/Telegram/Twitter ВРЕМЕННО заблокированы (чтобы не светить реальный IP). Восстановится когда $FOREIGN_TAG оживёт."
+          else
+            log "FOREIGN-KILL-SWITCH-CLEAR: $FOREIGN_TAG восстановился — трафик пошёл через него"
+            tg_alert "✅ <b>XKeen FOREIGN kill-switch</b>: канал <code>$FOREIGN_TAG</code> восстановился, Meta/Telegram/Twitter снова работают через него."
+          fi
+        fi
       else
-        log "UPDATE routing config changed (AI_DOMAINS / AI_TAG / kill-switch state) — default остаётся $NEW_DEFAULT"
-      fi
-      # AI kill-switch event log
-      if [ "$EFFECTIVE_AI_TAG" != "$PREV_AI" ]; then
-        if [ "$EFFECTIVE_AI_TAG" = "block" ]; then
-          log "AI-KILL-SWITCH: AI_TAG=$AI_TAG мёртв — AI-трафик заблокирован"
-          tg_alert "🛡️ <b>XKeen AI kill-switch</b>: канал <code>$AI_TAG</code> недоступен → AI-сайты ВРЕМЕННО заблокированы (чтобы не светить RU IP). Восстановится автоматически когда $AI_TAG оживёт."
+        # v12 РАНТАЙМ-ОБВАЛ: конфиг прошёл xray -test, но после рестарта DNS/инет легли.
+        # Авто-откат на последний здоровый routing + рестарт + повторная проверка.
+        _ts="$(date +%Y%m%d-%H%M%S)"
+        cp "$CONFIG_DIR/05_routing.json" "$CONFIG_DIR/05_routing.json.unhealthy-${_ts}" 2>/dev/null
+        LAST_BAD_MD5="$NEW_MD5"   # запомнить чтобы не переприменять (анти-флап)
+        if [ -f "$CONFIG_DIR/05_routing.json.lastgood" ]; then
+          cp "$CONFIG_DIR/05_routing.json.lastgood" "$CONFIG_DIR/05_routing.json"
+          /opt/sbin/xkeen -restart >/dev/null 2>&1
+          if health_check 6; then
+            log "AUTO-ROLLBACK OK: новый routing уронил DNS/инет → откат на lastgood, сеть восстановлена. Битый кандидат → 05_routing.json.unhealthy-${_ts}"
+            tg_alert "🛡️ <b>XKeen watchdog</b>: новая конфигурация уронила DNS/интернет — выполнен <b>авто-откат</b> на последнюю рабочую. Сеть восстановлена. Изменения НЕ применятся повторно, пока не сменишь настройки в панели."
+          else
+            log "AUTO-ROLLBACK: после отката health-check всё ещё FAIL — повторный рестарт xray"
+            /opt/sbin/xkeen -restart >/dev/null 2>&1
+            tg_alert "🚨 <b>XKeen watchdog</b>: конфигурация уронила сеть, откат выполнен, но DNS пока не отвечает. Нужна ручная проверка роутера."
+          fi
         else
-          log "AI-KILL-SWITCH-CLEAR: $AI_TAG восстановился — AI-трафик пошёл через него"
-          tg_alert "✅ <b>XKeen AI kill-switch</b>: канал <code>$AI_TAG</code> восстановился, AI-сайты снова работают через него."
+          log "AUTO-ROLLBACK: нет 05_routing.json.lastgood — откатывать не на что; повторный рестарт xray"
+          /opt/sbin/xkeen -restart >/dev/null 2>&1
+          tg_alert "🚨 <b>XKeen watchdog</b>: новая конфигурация уронила DNS, а рабочей резервной копии нет. Нужна ручная проверка роутера."
         fi
-      fi
-      # YT kill-switch event log + TG-уведомление (с 2026-05-15)
-      if [ "$EFFECTIVE_YT_TAG" != "$PREV_YT" ]; then
-        if [ "$EFFECTIVE_YT_TAG" = "block" ]; then
-          log "YT-KILL-SWITCH: YT_TAG=$YT_TAG мёртв — YouTube-трафик заблокирован (YT_FAIL_BLOCK=1)"
-          tg_alert "📺 <b>XKeen YT kill-switch</b>: канал <code>$YT_TAG</code> недоступен → YouTube/IG/Discord ВРЕМЕННО заблокированы. Восстановится автоматически когда $YT_TAG оживёт."
-        else
-          log "YT-KILL-SWITCH-CLEAR: $YT_TAG восстановился — YouTube-трафик пошёл через него"
-          tg_alert "✅ <b>XKeen YT kill-switch</b>: канал <code>$YT_TAG</code> восстановился, YouTube/IG/Discord снова работают через него."
-        fi
-      fi
-      # FOREIGN kill-switch event log + TG-уведомление
-      if [ "$EFFECTIVE_FOREIGN_TAG" != "$PREV_FOREIGN" ]; then
-        if [ "$EFFECTIVE_FOREIGN_TAG" = "block" ]; then
-          log "FOREIGN-KILL-SWITCH: FOREIGN_TAG=$FOREIGN_TAG мёртв — трафик «Заблокированные в РФ» заблокирован (FOREIGN_FAIL_BLOCK=1)"
-          tg_alert "🛡️ <b>XKeen FOREIGN kill-switch</b>: канал <code>$FOREIGN_TAG</code> недоступен → Meta/Telegram/Twitter ВРЕМЕННО заблокированы (чтобы не светить реальный IP). Восстановится когда $FOREIGN_TAG оживёт."
-        else
-          log "FOREIGN-KILL-SWITCH-CLEAR: $FOREIGN_TAG восстановился — трафик пошёл через него"
-          tg_alert "✅ <b>XKeen FOREIGN kill-switch</b>: канал <code>$FOREIGN_TAG</code> восстановился, Meta/Telegram/Twitter снова работают через него."
-        fi
+        NEW_DEFAULT="$CUR_DEFAULT"  # не фиксируем смену как успешную в state
       fi
     else
       log "ERROR: не удалось применить новый routing.json"
@@ -635,4 +737,4 @@ fi
 
 # ---------- Save state ----------
 # Формат: "<state> <counter> <default_tag> EFFECTIVE_AI=<tag> EFFECTIVE_YT=<tag> LAST_FULL_PROBE=<epoch> PREV_ALIVE=<n>"
-echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER" > "$STATE_FILE"
+echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5" > "$STATE_FILE"
