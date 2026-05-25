@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.63"
+_VERSION_FALLBACK = "1.0.64"
 
 
 def _find_git():
@@ -8385,7 +8385,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   </div>
 
   <div class="row" style="margin-top: 16px;">
-    <div class="col" data-xk-sub="🤖 AI" data-xk-group="🧭 Куда идёт трафик">
+    <div class="col" data-xk-sub="🤖 AI">
       <div class="channel-card cc-ai">
         <label class="col-header col-ai">🤖 AI-sticky outbound <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — рекомендации по AI-каналу (Claude/ChatGPT не работают с RU-IP, нужен EU/US с kill-switch)">❓ помощь</a></label>
         <div class="channel-card-body">
@@ -8501,7 +8501,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         </div>
       </div>
     </div>
-    <div class="col" data-xk-sub="📺 YouTube" data-xk-group="🧭 Куда идёт трафик">
+    <div class="col" data-xk-sub="📺 YouTube">
       <div class="channel-card cc-yt">
         <label class="col-header col-yt">📺 YouTube-sticky outbound <a href="#help-yt-recaptcha" onclick="openHelpAnchor('help-yt-recaptcha'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Если YouTube показывает reCAPTCHA «подозрительный трафик» — открой Сценарий 2 в Помощи. Там полный комплекс настроек: 🇷🇺 Рецепт A для RU-канала + 🇳🇱 Рецепт B для EU/US-канала.">❓ помощь</a></label>
         <div class="channel-card-body">
@@ -8663,7 +8663,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 
   <!-- ===== «📱 Заблокированные в РФ» канал (FOREIGN_*) — Meta/Telegram/Twitter/Discord через ЗАГРАН-exit ===== -->
   <div class="row" style="margin-top: 16px;">
-    <div class="col" data-xk-sub="📱 Заблокированные в РФ" data-xk-group="🧭 Куда идёт трафик">
+    <div class="col" data-xk-sub="📱 Заблокированные в РФ">
       <div class="channel-card">
         <label class="col-header" style="color:#8e44ad;">📱 «Заблокированные в РФ» — sticky outbound <a href="#help-foreign" onclick="openHelpAnchor('help-foreign'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Открыть «📱 Заблокированные в РФ» в Помощи — зачем канал и какой выход выбирать">❓ помощь</a></label>
         <div class="channel-card-body">
@@ -8792,7 +8792,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <div class="row" style="gap: 16px; margin-top: 16px;">
   <div class="col" style="flex: 1 1 460px; min-width: 0;">
   <!-- DIRECT домены — сайты идут напрямую без VPN -->
-  <div class="domain-section ds-direct" data-xk-sub="🚫 Напрямую" data-xk-group="🧭 Куда идёт трафик">
+  <div class="domain-section ds-direct" data-xk-sub="🚫 Напрямую">
     <h3 class="domain-section-header">🚫 Сайты НАПРЯМУЮ без VPN <span class="subsec-hint">(DIRECT — пойдут через провайдера, без VPN)</span> <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.7em; color: #468; text-decoration: none; margin-left: 8px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — там объяснение когда нужны DIRECT-домены (банки, Госуслуги, российские сервисы которые блокируют не-RU IP)">❓ помощь</a></h3>
     <div class="domain-section-body">
       <p class="subtitle">
@@ -8831,7 +8831,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 
   <div class="col" style="flex: 1 1 460px; min-width: 0;">
   <!-- BLOCK домены — полностью заблокировать (outbound `block` / blackhole) -->
-  <div class="domain-section ds-block" data-xk-sub="⛔ Блокировать" data-xk-group="🧭 Куда идёт трафик">
+  <div class="domain-section ds-block" data-xk-sub="⛔ Блокировать">
     <h3 class="domain-section-header">⛔ Заблокированные сайты <span class="subsec-hint">(BLOCK — outbound `block`/blackhole, пакеты дропаются)</span> <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.7em; color: #468; text-decoration: none; margin-left: 8px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — там пресеты BLOCK для Windows Update / Telemetry / Adobe Genuine / Office Telemetry">❓ помощь</a></h3>
     <div class="domain-section-body">
       <p class="subtitle">
@@ -16095,7 +16095,7 @@ async function makeSiteReachable(btn) {
       '.xk-search{position:sticky;top:0;z-index:3;width:100%;box-sizing:border-box;padding:7px 10px;margin:0 0 8px;border:1px solid #d3d9e0;border-radius:6px;font-size:0.85em;background:#fff;}' +
       '.xk-search:focus{outline:none;border-color:#5cb87f;box-shadow:0 0 0 2px rgba(92,184,127,0.25);}' +
       '.xk-content{flex:1 1 auto;min-width:0;}' +
-      '.xk-cat{font-size:0.78em;font-weight:800;text-transform:uppercase;letter-spacing:0.07em;color:#fff;background:linear-gradient(90deg,#3f6fa3,#5689bd);padding:9px 12px;margin:18px 0 6px;border-radius:6px;box-shadow:0 1px 2px rgba(40,70,110,0.22);}' +
+      '.xk-cat{font-size:0.78em;font-weight:800;text-transform:uppercase;letter-spacing:0.07em;color:#fff;background:linear-gradient(90deg,#3f6fa3,#5689bd);padding:9px 12px;margin:18px 0 6px;border-radius:6px;box-shadow:0 1px 2px rgba(40,70,110,0.22);cursor:default;}' +
       '.xk-cat:first-child{margin-top:2px;}' +
       '.xk-nav-item{display:block;width:100%;text-align:left;border:none;background:none;padding:8px 10px 8px 16px;margin:1px 0;border-radius:6px;cursor:pointer;font-size:0.92em;color:#1a1a1a;font-weight:500;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
       '.xk-nav-item:hover{background:#eef2f7;}' +
@@ -16105,7 +16105,7 @@ async function makeSiteReachable(btn) {
       '.xk-sub-item:hover{background:#f0f3f7;color:#333;}' +
       '.xk-sub-item.active{background:#dde9f5;color:#1f3d6b;font-weight:600;}' +
       '.xk-subgroup-box{border-left:3px solid #5cb87f;background:#f4faf6;border-radius:0 6px 6px 0;margin:4px 0 6px;padding:1px 0 3px;}' +
-      '.xk-subgroup{font-size:0.62em;font-weight:800;text-transform:uppercase;letter-spacing:0.06em;color:#2a7;padding:5px 8px 2px 12px;}' +
+      '.xk-subgroup{display:inline-block;font-size:0.63em;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:#2a7;background:#e3f3ea;border-radius:4px;padding:3px 9px;margin:4px 8px 3px 10px;cursor:default;}' +
       '.xk-subwrap2{margin:1px 0 4px 12px;border-left:2px solid #e6eaef;}' +
       '.xk-subsub-item{display:block;width:100%;text-align:left;border:none;background:none;padding:3px 6px 3px 12px;margin:1px 0;border-radius:0 5px 5px 0;cursor:pointer;font-size:0.76em;color:#7a838d;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
       '.xk-subsub-item:hover{background:#f3f5f8;color:#3a4046;}' +
