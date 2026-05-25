@@ -198,9 +198,13 @@ if ($task) {
     }
 }
 
-Write-Host "  Waiting 6 seconds to verify ..."
-Start-Sleep -Seconds 6
-$listen = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+Write-Host "  Waiting for dashboard to come up (up to ~30s) ..."
+$listen = $null
+for ($i = 0; $i -lt 15; $i++) {
+    $listen = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if ($listen) { break }
+    Start-Sleep -Seconds 2
+}
 if ($listen) {
     $newPids = $listen.OwningProcess | Sort-Object -Unique
     Write-Host "  Process on :$Port now -> PID(s): $($newPids -join ', ')"
