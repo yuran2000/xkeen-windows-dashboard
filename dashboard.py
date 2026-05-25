@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.59"
+_VERSION_FALLBACK = "1.0.60"
 
 
 def _find_git():
@@ -1386,6 +1386,51 @@ def _parse_watchdog_version(text):
     m = re.search(r"watchdog\s+v(\d+)", text or "")
     return int(m.group(1)) if m else 0
 
+
+TEMPLATE_REMOTE_PATH = "/opt/etc/xray/configs.bak/05_routing.template.json"
+
+
+def _parse_template_version(text):
+    """Целочисленная версия из заголовка '// Watchdog template vNN ...' (0 если не нашли)."""
+    m = re.search(r"template\s+v(\d+)", text or "")
+    return int(m.group(1)) if m else 0
+
+
+def _structure_drift_status():
+    """Версии watchdog.sh и routing-template на роутере vs встроенные в панель — для баннера
+    «структура отстала». Возврат: {"watchdog": {remote,local,outdated}, "template": {...},
+    "outdated": bool} или None если роутер недоступен (head не прочитался)."""
+    r = keenetic_ssh(f"head -40 {WATCHDOG_REMOTE_PATH} 2>/dev/null", timeout=8)
+    if not r["ok"]:
+        return None
+    wd_remote = _parse_watchdog_version(r.get("stdout", ""))
+    wd_local = 0
+    p = _bootstrap_find("watchdog.sh.cur")
+    if p and os.path.exists(p):
+        try:
+            with open(p, "rb") as f:
+                wd_local = _parse_watchdog_version(f.read().decode("utf-8", "replace"))
+        except Exception:
+            pass
+    r2 = keenetic_ssh(f"head -5 {TEMPLATE_REMOTE_PATH} 2>/dev/null", timeout=8)
+    tmpl_remote = _parse_template_version(r2.get("stdout", "")) if r2["ok"] else 0
+    tmpl_local = 0
+    p2 = _bootstrap_find("05_routing.template.json.cur")
+    if p2 and os.path.exists(p2):
+        try:
+            with open(p2, "rb") as f:
+                tmpl_local = _parse_template_version(f.read().decode("utf-8", "replace"))
+        except Exception:
+            pass
+    wd_out = wd_remote > 0 and wd_local > wd_remote
+    tmpl_out = tmpl_remote > 0 and tmpl_local > tmpl_remote
+    return {
+        "watchdog": {"remote": wd_remote, "local": wd_local, "outdated": wd_out},
+        "template": {"remote": tmpl_remote, "local": tmpl_local, "outdated": tmpl_out},
+        "outdated": bool(wd_out or tmpl_out),
+    }
+
+
 def keenetic_ensure_watchdog_current():
     """Подтянуть свежий watchdog.sh на роутер, если он старее встроенного в панель.
     Best-effort: при любой проблеме (роутер недоступен / нет шаблона / sh -n не прошёл) —
@@ -1870,6 +1915,118 @@ def keenetic_ensure_socks_route():
         return {"ok": False, "action": "failed", "detail": f"запись template не удалась: {w['stderr']}"}
     return {"ok": True, "action": "added",
             "detail": f"правило socks-local добавлено в template. Бэкап: 05_routing.template.json.bak-{ts}"}
+
+
+def keenetic_sync_structure():
+    """Применить актуальную СТРУКТУРУ на роутер (watchdog.sh + routing template), сохранив
+    кастомные IP, с ПОЛНЫМ авто-откатом если сеть после применения сломалась.
+    Переиспользует keenetic_ensure_watchdog_current (watchdog) и _auto_sync_template_ips_silent
+    (вернуть твои IP после overwrite свежей структурой template). Возврат:
+      {ok, steps:[...], rolled_back: bool, summary}."""
+    steps = []
+    def _rec(name, ok, detail=""):
+        steps.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    cfgdir = cfg.KEENETIC_XRAY_CONFIGS
+    tmpl    = f"{cfg.KEENETIC_XRAY_BAK_DIR}/05_routing.template.json"
+    routing = f"{cfgdir}/05_routing.json"
+    lan = getattr(cfg, "KEENETIC_HOST", "") or "127.0.0.1"
+    ts  = datetime.now().strftime("%Y%m%d-%H%M%S")
+    import time as _t
+
+    # 0. что отстало?
+    drift = _structure_drift_status()
+    if not drift:
+        return {"ok": False, "steps": steps, "rolled_back": False, "error": "Роутер недоступен."}
+    if not drift["outdated"]:
+        return {"ok": True, "steps": steps, "rolled_back": False,
+                "summary": "Структура уже актуальна — применять нечего."}
+
+    # 1. ПОЛНЫЙ бэкап того, что можем менять (для гарантированного отката)
+    keenetic_ssh(
+        f"cp {WATCHDOG_REMOTE_PATH} {WATCHDOG_REMOTE_PATH}.syncbak-{ts} 2>/dev/null; "
+        f"cp {tmpl} {tmpl}.syncbak-{ts} 2>/dev/null; "
+        f"cp {routing} {routing}.syncbak-{ts} 2>/dev/null; echo OK", timeout=10)
+    _rec("Бэкап watchdog.sh + template + routing", True, f"*.syncbak-{ts}")
+
+    # 2. watchdog → актуальный (overwrite свежим, у ensure свой sh -n + бэкап)
+    if drift["watchdog"]["outdated"]:
+        try:
+            wd = keenetic_ensure_watchdog_current()
+        except Exception as ex:
+            wd = {"action": "failed", "note": str(ex)}
+        _rec("watchdog → актуальный", wd.get("action") in ("current", "upgraded"),
+             f"{wd.get('action')} v{wd.get('from','')}→v{wd.get('to','')}".strip())
+
+    # 3. template → свежая СТРУКТУРА + пересинк твоих IP из outbounds
+    if drift["template"]["outdated"]:
+        local_tmpl = _bootstrap_find("05_routing.template.json.cur")
+        if not local_tmpl or not os.path.exists(local_tmpl):
+            _rec("template → свежая структура", False, "встроенный шаблон не найден — пропуск")
+        else:
+            with open(local_tmpl, "rb") as f:
+                tmpl_text = f.read().decode("utf-8", "replace")
+            w = keenetic_ssh(f"cat > {tmpl}", stdin_data=tmpl_text, timeout=15)
+            _rec("template → свежая структура", w.get("ok"), w.get("stderr", "")[:200])
+            try:
+                ip_sync = _auto_sync_template_ips_silent()
+                _rec("template → вернуть твои IP из outbounds", True,
+                     (str(ip_sync) if isinstance(ip_sync, str) else "ок"))
+            except Exception as ex:
+                _rec("template → вернуть твои IP из outbounds", False, str(ex))
+
+    # 4. прогон watchdog → перегенерить routing из новых watchdog/template
+    keenetic_ssh(f"sh {WATCHDOG_REMOTE_PATH} 2>&1 | tail -3", timeout=120)
+
+    # 5. xray -test (валидность конфига; ОБЯЗАТЕЛЬНО с XRAY_LOCATION_ASSET)
+    test = keenetic_ssh(
+        f'XRAY_LOCATION_ASSET=/opt/etc/xray/dat /opt/sbin/xray run -test -confdir {cfgdir} 2>&1; echo "RC=$?"',
+        timeout=30)
+    valid = "RC=0" in (test.get("stdout") or "")
+    _rec("xray -test", valid, "" if valid else (test.get("stdout") or "")[-300:])
+
+    # 6. применить + health-check: xray запущен И DNS резолвится через LAN-IP
+    healthy = False
+    if valid:
+        keenetic_ssh("xkeen -restart 2>&1 | tail -5", timeout=120)
+        for _ in range(6):
+            _t.sleep(3)
+            chk = keenetic_ssh(
+                f"ps w 2>/dev/null | grep -q '[x]ray run' && nslookup github.com {lan} 2>/dev/null "
+                f"| grep -q '^Name' && echo HEALTHY || echo NO", timeout=15)
+            if "HEALTHY" in (chk.get("stdout") or ""):
+                healthy = True
+                break
+    _rec("health-check (xray + DNS)", healthy, "" if healthy else "сеть не отвечает после применения")
+
+    # 7. АВТО-ОТКАТ если сеть сломалась
+    if not healthy:
+        keenetic_ssh(
+            f"[ -f {WATCHDOG_REMOTE_PATH}.syncbak-{ts} ] && cp {WATCHDOG_REMOTE_PATH}.syncbak-{ts} {WATCHDOG_REMOTE_PATH}; "
+            f"[ -f {tmpl}.syncbak-{ts} ] && cp {tmpl}.syncbak-{ts} {tmpl}; "
+            f"[ -f {routing}.syncbak-{ts} ] && cp {routing}.syncbak-{ts} {routing}; "
+            f"xkeen -restart >/dev/null 2>&1; echo ROLLED", timeout=120)
+        ok2 = False
+        for _ in range(4):
+            _t.sleep(3)
+            chk = keenetic_ssh("ps w 2>/dev/null | grep -q '[x]ray run' && echo UP || echo DOWN", timeout=15)
+            if "UP" in (chk.get("stdout") or ""):
+                ok2 = True
+                break
+        _rec("⏮ авто-откат структуры", True,
+             "восстановлены watchdog.sh + template + routing из бэкапа" + ("; сеть поднялась" if ok2 else "; ⚠ xray не поднялся"))
+        try:
+            wcfg = keenetic_read_watchdog_config() or {}
+            if wcfg.get("TG_BOT_TOKEN") and wcfg.get("TG_CHAT_ID"):
+                keenetic_ssh("sh " + WATCHDOG_REMOTE_PATH + " >/dev/null 2>&1", timeout=60)
+        except Exception:
+            pass
+        return {"ok": False, "steps": steps, "rolled_back": True,
+                "summary": ("⏮ Применение структуры сломало сеть — выполнен АВТО-ОТКАТ к рабочей версии. "
+                            + ("Сеть восстановлена." if ok2 else "⚠ xray не поднялся — проверь роутер вручную."))}
+
+    return {"ok": True, "steps": steps, "rolled_back": False,
+            "summary": "✅ Структура применена, сеть здорова (xray работает, DNS резолвится). Твои IP сохранены."}
 
 
 # ============== ROUTES ==============
@@ -2442,6 +2599,11 @@ def xkeen_page():
         domain_notes = keenetic_read_domain_notes()
     except Exception:
         domain_notes = {"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}}
+    # Дрейф структуры (версии watchdog/template на роутере vs встроенные) — для баннера «применить структуру».
+    try:
+        structure = _structure_drift_status() if outbounds else None
+    except Exception:
+        structure = None
     return render_template_string(
         XKEEN_TEMPLATE,
         outbounds=outbounds,
@@ -2464,6 +2626,7 @@ def xkeen_page():
         dashboard_version=get_dashboard_version(),
         domain_notes_json=json.dumps(domain_notes, ensure_ascii=False),  # v1.7.0
         cfg=cfg,  # доступ к EXTERNAL_DOMAIN/HOME_DOMAIN/LAN_HOST из config_local в шаблонах
+        structure=structure,  # дрейф версий watchdog/template — для баннера
     )
 
 
@@ -5821,6 +5984,17 @@ def api_keenetic_repair_tg_channel():
     return jsonify({"ok": True, "steps": steps, "foreign_ok": foreign_ok, "test_sent": test_sent, "summary": summary})
 
 
+@app.route("/api/keenetic/sync-structure", methods=["POST"])
+@requires_auth
+def api_keenetic_sync_structure():
+    """Применить актуальную структуру (watchdog.sh + routing template) на роутер с сохранением
+    кастомных IP и ПОЛНЫМ авто-откатом при поломке сети. См. keenetic_sync_structure()."""
+    try:
+        return jsonify(keenetic_sync_structure())
+    except Exception as ex:
+        return jsonify({"ok": False, "rolled_back": False, "error": str(ex)})
+
+
 @app.route("/api/keenetic/bootstrap-preview", methods=["GET"])
 @requires_auth
 def api_keenetic_bootstrap_preview():
@@ -8112,6 +8286,25 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   </ol>
   <a href="#section-router-config" style="display: inline-block; background: #e80; color: #fff; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-weight: 700; font-size: 1em;">👇 Перейти к настройке роутера</a>
   <span style="margin-left: 14px; color: #999; font-size: 0.9em;">или просто проскролль страницу в самый низ</span>
+</div>
+{% endif %}
+
+{% if structure and structure.outdated %}
+<!-- ===== БАННЕР: структура на роутере отстала ===== -->
+<div style="background:#fff3cd; border:2px solid #e6a817; border-radius:8px; padding:14px 18px; margin:14px 0; display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
+  <div style="flex:1 1 420px;">
+    <strong style="color:#7a5a00; font-size:1.05em;">⚠️ Структура на роутере отстала от панели</strong>
+    <div style="margin-top:6px; font-size:0.92em; color:#6a5200;">
+      {% if structure.watchdog.outdated %}🛡 watchdog: на роутере <strong>v{{ structure.watchdog.remote }}</strong> → в панели <strong>v{{ structure.watchdog.local }}</strong><br>{% endif %}
+      {% if structure.template.outdated %}🧭 routing-шаблон: на роутере <strong>v{{ structure.template.remote }}</strong> → в панели <strong>v{{ structure.template.local }}</strong><br>{% endif %}
+      <span style="color:#888;">«Применить структуру» — твои кастомные IP сохранятся; при поломке сети — авто-откат к рабочей версии.</span>
+    </div>
+  </div>
+  <div style="flex:0 0 auto;">
+    <button type="button" onclick="syncStructure(this)" class="btn-primary" style="background:#e6a817; color:#fff; font-weight:700;">⚙ Применить структуру</button>
+    <span id="sync-structure-status" class="mono" style="margin-left:8px; color:#666;"></span>
+  </div>
+  <div id="sync-structure-output" style="flex:1 1 100%;"></div>
 </div>
 {% endif %}
 
@@ -15230,6 +15423,31 @@ async function repairTgChannel() {
   } catch (e) {
     status.textContent = '❌ ' + e.message;
     result.innerHTML = `<div class="test-result-box bad">❌ ${escapeHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function syncStructure(btn) {
+  if (!confirm('Применить актуальную структуру (watchdog + routing-шаблон) на роутер?\n\nТвои кастомные IP сохранятся. Будет xkeen -restart (несколько секунд связь моргнёт). Если сеть сломается — автоматический откат к рабочей версии.')) return;
+  btn.disabled = true;
+  const status = document.getElementById('sync-structure-status');
+  const out = document.getElementById('sync-structure-output');
+  if (status) status.textContent = '⏳ применяю...';
+  if (out) out.innerHTML = '<div class="test-result-box" style="background:#fff6ec; border-color:#e6a817;">⏳ Применяю структуру (watchdog / routing-шаблон), проверяю сеть... это может занять до минуты.</div>';
+  try {
+    const r = await fetch('/api/keenetic/sync-structure', { method: 'POST' });
+    const j = await r.json();
+    const steps = (j.steps || []).map(s =>
+      `${s.ok ? '✅' : '❌'} ${escapeHtml(s.name)}${s.detail ? ' — ' + escapeHtml(s.detail) : ''}`
+    ).join('\n');
+    const cls = j.ok ? 'ok' : 'bad';
+    if (out) out.innerHTML = `<div class="test-result-box ${cls}"><strong>${escapeHtml(j.summary || j.error || 'Готово')}</strong>\n\n${steps}</div>`;
+    if (status) status.textContent = j.ok ? '✅ готово' : (j.rolled_back ? '⏮ откат' : '❌');
+    if (j.ok) setTimeout(() => location.reload(), 3000);  // баннер исчезнет — структура актуальна
+  } catch (e) {
+    if (status) status.textContent = '❌ ' + e.message;
+    if (out) out.innerHTML = `<div class="test-result-box bad">❌ ${escapeHtml(e.message)}</div>`;
   } finally {
     btn.disabled = false;
   }
