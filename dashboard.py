@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.49"
+_VERSION_FALLBACK = "1.0.50"
 
 
 def get_dashboard_version():
@@ -1358,9 +1358,63 @@ def _build_watchdog_config(d):
     return "\n".join(lines) + "\n"
 
 
+# ---- v1.0.50: авто-синхронизация watchdog.sh на роутере ----
+# Любое «Сохранить» в панели сначала сверяет версию watchdog.sh на роутере со встроенной в
+# панель и, если на роутере СТАРЕЕ — заливает свежую ПЕРЕД применением. Так роутер всегда
+# держится на актуальном safety-watchdog без ручного деплоя по SSH.
+WATCHDOG_REMOTE_PATH = "/opt/etc/xray/watchdog.sh"
+
+def _parse_watchdog_version(text):
+    """Целочисленная версия из заголовка '# XKeen failover watchdog vNN ...' (0 если не нашли)."""
+    m = re.search(r"watchdog\s+v(\d+)", text or "")
+    return int(m.group(1)) if m else 0
+
+def keenetic_ensure_watchdog_current():
+    """Подтянуть свежий watchdog.sh на роутер, если он старее встроенного в панель.
+    Best-effort: при любой проблеме (роутер недоступен / нет шаблона / sh -n не прошёл) —
+    существующий watchdog НЕ трогаем, вызывающий продолжает со старым.
+    Возврат: {"action": "current"|"upgraded"|"skip"|"failed", ...}."""
+    local_path = _bootstrap_find("watchdog.sh.cur")
+    if not local_path or not os.path.exists(local_path):
+        return {"action": "skip", "note": "встроенный watchdog.sh.cur не найден"}
+    try:
+        with open(local_path, "rb") as f:
+            local_bytes = f.read()
+    except Exception as e:
+        return {"action": "skip", "note": f"чтение шаблона: {e}"}
+    local_ver = _parse_watchdog_version(local_bytes.decode("utf-8", "replace"))
+    if local_ver == 0:
+        return {"action": "skip", "note": "не распознал версию встроенного watchdog"}
+    r = keenetic_ssh(f"head -40 {WATCHDOG_REMOTE_PATH} 2>/dev/null", timeout=8)
+    if not r["ok"]:
+        return {"action": "skip", "note": "роутер недоступен — watchdog не трогаю"}
+    remote_ver = _parse_watchdog_version(r.get("stdout", ""))
+    if remote_ver >= local_ver:
+        return {"action": "current", "remote_ver": remote_ver, "local_ver": local_ver}
+    # Апгрейд: залить во временный (base64 через stdin) → sh -n → бэкап → swap.
+    # При сбое sh -n/swap боевой watchdog.sh не трогается (остаётся старый рабочий).
+    b64 = base64.b64encode(local_bytes).decode("ascii")
+    up = keenetic_ssh(f"base64 -d > {WATCHDOG_REMOTE_PATH}.vnew", stdin_data=b64, timeout=25)
+    if not up["ok"]:
+        return {"action": "failed", "from": remote_ver, "to": local_ver, "note": "upload: " + (up.get("stderr", "")[:200])}
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    swap = keenetic_ssh(
+        f"sh -n {WATCHDOG_REMOTE_PATH}.vnew && "
+        f"cp {WATCHDOG_REMOTE_PATH} {WATCHDOG_REMOTE_PATH}.bak-{ts} && "
+        f"mv {WATCHDOG_REMOTE_PATH}.vnew {WATCHDOG_REMOTE_PATH} && chmod +x {WATCHDOG_REMOTE_PATH} && "
+        f"echo OK_SWAPPED || {{ rm -f {WATCHDOG_REMOTE_PATH}.vnew; echo SYNTAX_FAIL; }}",
+        timeout=15)
+    if "OK_SWAPPED" in (swap.get("stdout") or ""):
+        return {"action": "upgraded", "from": remote_ver, "to": local_ver}
+    return {"action": "failed", "from": remote_ver, "to": local_ver,
+            "note": "sh -n/swap: " + ((swap.get("stdout", "") + swap.get("stderr", ""))[:200])}
+
+
 def keenetic_write_watchdog_config(updates):
     """Прочитать текущий watchdog.config, применить updates, залить обратно.
     После заливки запускаем watchdog.sh — он применит изменения."""
+    # v1.0.50: сначала подтянуть свежий watchdog на роутер, если он старее встроенного в панель.
+    _wd_sync = keenetic_ensure_watchdog_current()
     cur = keenetic_read_watchdog_config()
     # Defaults если первый раз
     if "PRIMARY_TAG" not in cur: cur["PRIMARY_TAG"] = "vless-reality"
@@ -1399,10 +1453,16 @@ def keenetic_write_watchdog_config(updates):
         return {"ok": False, "stderr": f"write config failed: {r['stderr']}"}
     # Сразу применяем — запускаем watchdog.sh
     apply = keenetic_ssh("/opt/etc/xray/watchdog.sh", timeout=30)
+    _msg = "watchdog.config обновлён, watchdog.sh запущен (см. /opt/var/log/xray/watchdog.log)."
+    if _wd_sync.get("action") == "upgraded":
+        _msg = f"🔄 watchdog на роутере обновлён v{_wd_sync.get('from')} → v{_wd_sync.get('to')}. " + _msg
+    elif _wd_sync.get("action") == "failed":
+        _msg = f"⚠ авто-обновление watchdog не удалось ({_wd_sync.get('note', '')}) — применено существующим watchdog. " + _msg
     return {
         "ok": True,
-        "stdout": f"watchdog.config обновлён, watchdog.sh запущен (см. /opt/var/log/xray/watchdog.log).",
+        "stdout": _msg,
         "apply_stderr": apply.get("stderr", "")[:500],
+        "watchdog_sync": _wd_sync,
     }
 
 
