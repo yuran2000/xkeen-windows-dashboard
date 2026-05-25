@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.58"
+_VERSION_FALLBACK = "1.0.59"
 
 
 def _find_git():
@@ -9905,11 +9905,12 @@ Use this token to access the HTTP API:
         </div>
 
         <div style="margin:10px 0;">
-          <strong>3️⃣ Проверить, что применилось</strong>
+          <strong>3️⃣ ОБЯЗАТЕЛЬНО после обновления — открой «🔬 Диагностика XKeen»</strong>
           <ul style="margin:4px 0 0 18px; font-size:0.9em; line-height:1.5;">
-            <li><strong>«🔬 Диагностика XKeen»</strong> → строка <strong>«Версия watchdog на роутере»</strong> должна совпасть со встроенной в панель (✅).</li>
-            <li>Версия панели — бейдж <code>vX.Y.Z</code> в шапке (клик → последний релиз на GitHub).</li>
+            <li>Смотри строку <strong>«Версия watchdog на роутере»</strong>. Если она <strong>отстаёт</strong> от встроенной в панель (⚠) — значит в обновлении менялась и структура роутера, но она ещё НЕ применилась. Нажми <strong>«💾 Сохранить»</strong> или <strong>«🔧 Починить»</strong> → авто-синк догонит watchdog и перегенерит routing. Открой Диагностику ещё раз — должно стать ✅.</li>
+            <li>Версия панели — бейдж <code>vX.Y.Z</code> в шапке (клик → релиз на GitHub).</li>
           </ul>
+          <p style="margin:6px 0 0; font-size:0.86em; color:#777;">💡 Обновление кода (шаг 1) само по себе роутер НЕ трогает — структуру на роутере догоняет только «Сохранить»/«Починить» (шаг 2). Диагностика показывает, надо ли это сделать.</p>
         </div>
 
         <div style="background:#fff8e6; border-left:3px solid #e6a817; padding:8px 12px; margin-top:10px; font-size:0.88em;">

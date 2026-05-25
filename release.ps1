@@ -54,7 +54,12 @@ $msgFile   = Join-Path $env:TEMP "xkdash_commit_$Version.txt"
 $notesFile = Join-Path $env:TEMP "xkdash_notes_$Version.txt"
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($msgFile,   "${tag}: $Message", $utf8)
-[System.IO.File]::WriteAllText($notesFile, $Message, $utf8)
+# Release notes = the message + a standard "how to update" footer (kept in a UTF-8 .md so this
+# script stays ASCII-only and PowerShell 5.1 can't mangle the Cyrillic footer).
+$footer = ""
+$footerPath = Join-Path $repo "release_notes_footer.md"
+if (Test-Path $footerPath) { $footer = "`n`n" + [System.IO.File]::ReadAllText($footerPath) }
+[System.IO.File]::WriteAllText($notesFile, ($Message + $footer), $utf8)
 
 # --- 4. commit ---
 & git -C $repo commit -F $msgFile
