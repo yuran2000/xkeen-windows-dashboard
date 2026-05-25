@@ -35,7 +35,7 @@ echo === Starting task %TASKNAME% ===
 schtasks /Run /TN "%TASKNAME%"
 
 echo.
-echo === Verifying (ждём поднятия порта, до ~30с) ===
+echo === Verifying (waiting for port to come up, up to ~30s) ===
 powershell -NoProfile -Command ^
   "$port = %DPORT%; $l = $null; for ($i=0; $i -lt 15; $i++) { $l = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue; if ($l) { break }; Start-Sleep -Seconds 2 }; if ($l) { Write-Host ('Port ' + $port + ' LISTEN: OK (PID ' + ($l.OwningProcess -join ',') + ')') -Foreground Green } else { Write-Host ('ERROR: nothing listening on :' + $port + ' after ~30s - run start.bat in a cmd window to see the error') -Foreground Red }; $py = Get-Process pythonw -ErrorAction SilentlyContinue; if ($py) { Write-Host ('pythonw processes: ' + $py.Count + ' (normal = 2: launcher + interpreter per instance)') -Foreground Gray }"
 
