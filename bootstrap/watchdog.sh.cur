@@ -1,11 +1,13 @@
 #!/bin/sh
-# XKeen failover watchdog v13 (2026-05-25, socks-local TG-канал авто-следует за конфигом):
+# XKeen failover watchdog v14 (2026-05-25, socks-local TG-канал авто-следует за конфигом):
 #   Правило socks-local (через него watchdog/панель шлют TG-алерты к api.telegram.org) больше НЕ
-#   хардкодит outbound — watchdog переписывает его outboundTag на АКТУАЛЬНЫЙ зарубежный канал, где
-#   у юзера ходит Telegram (приоритет: FOREIGN_TAG → PRIMARY-если-не-direct → AI_TAG → первый
-#   не-direct из FAILOVER; YT_TAG НЕ берём — часто RU-выход, до Telegram не дойдёт). Фиксит
-#   протухание тега при переименовании outbounds (ресинк подписки): раньше socks-local → мёртвый
-#   тег (напр. vless-reality) → TG-алерты молча дохли (инцидент дома 2026-05-25). Логика в самом
+#   хардкодит outbound — watchdog переписывает его outboundTag на АКТУАЛЬНЫЙ канал, через который
+#   у юзера реально ходит Telegram. Приоритет: FOREIGN_TAG (загран) → YT_TAG (RU-каналы
+#   «YouTube/Instagram/Telegram» заточены под эти сервисы и пропускают api.telegram.org — на
+#   рабочем роутере с PRIMARY=direct это часто единственный рабочий путь) → PRIMARY → AI_TAG →
+#   первый не-direct из FAILOVER. (v13 ошибочно пропускал YT_TAG — отрезал бота там, где жив
+#   только RU-YT-канал.) Фиксит и протухание тега при переименовании outbounds (ресинк подписки):
+#   socks-local → мёртвый тег → TG-алерты молча дохли (инцидент дома 2026-05-25). Логика в самом
 #   watchdog → авто-синкается на все роутеры (v1.0.50), без ручного SSH, не повторяется.
 # XKeen failover watchdog v12 (2026-05-25, health-check + АВТО-ОТКАТ после apply):
 #   ПОСЛЕ применения нового routing + xkeen -restart проверяем РЕАЛЬНОЕ здоровье сети:
@@ -319,14 +321,17 @@ generate_routing() {
     { gsub(/__DEFAULT_TAG__/, dt); print }
   ' "$TEMPL" > "$CONFIG_DIR/05_routing.json.new"
 
-  # v13: socks-local-правило (через него watchdog/панель шлют TG-алерты к api.telegram.org) —
-  # переписываем outboundTag на АКТУАЛЬНЫЙ зарубежный канал, где у юзера ходит Telegram, вместо
-  # хардкода из шаблона. Хардкод (напр. vless-reality) ПРОТУХАЕТ при переименовании outbounds →
-  # socks указывает на несуществующий тег → TG-алерты молча дохнут (инцидент дома 2026-05-25).
-  # Приоритет: FOREIGN_TAG (Telegram обычно в FOREIGN-пресете) → PRIMARY → AI_TAG → первый
-  # не-direct из FAILOVER. YT_TAG НЕ берём (часто RU-выход — до api.telegram.org не дойдёт).
+  # v14: socks-local-правило (через него watchdog/панель шлют TG-алерты к api.telegram.org) —
+  # переписываем outboundTag на АКТУАЛЬНЫЙ канал, через который у юзера реально ходит Telegram,
+  # вместо хардкода из шаблона. Хардкод (напр. vless-reality) ПРОТУХАЕТ при переименовании
+  # outbounds → socks указывает в никуда → TG-алерты молча дохнут (инцидент дома 2026-05-25).
+  # Приоритет: FOREIGN_TAG (Telegram обычно в FOREIGN-пресете, загран) → YT_TAG (RU-каналы
+  # «YouTube/Instagram/Telegram» заточены под эти сервисы и пропускают api.telegram.org — на
+  # рабочем роутере с PRIMARY=direct часто единственный рабочий путь) → PRIMARY → AI_TAG →
+  # первый не-direct из FAILOVER. (v13 ошибочно пропускал YT_TAG → отрезал бота там, где жив
+  # только RU-YT-канал; факт: RU-VLESS-каналы для YT/IG/Telegram эти сервисы пропускают, а ИИ — нет.)
   local socks_tag="" _sc
-  for _sc in "$foreign_tag" "$default_tag" "$ai_tag"; do
+  for _sc in "$foreign_tag" "$yt_tag" "$default_tag" "$ai_tag"; do
     case "$_sc" in ""|direct|block) ;; *) socks_tag="$_sc"; break ;; esac
   done
   if [ -z "$socks_tag" ]; then
