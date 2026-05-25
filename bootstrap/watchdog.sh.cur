@@ -396,11 +396,13 @@ get_lan_ip() {
 # Поллим несколько раз — xray после рестарта поднимается не мгновенно.
 # Возврат: 0 = здорово, 1 = нет.
 health_check() {
-  local tries="${1:-6}" i=0 lan d
+  local tries="${1:-8}" i=0 lan d
   lan=$(get_lan_ip); [ -z "$lan" ] && lan=127.0.0.1
+  # Несколько популярных доменов — достаточно резолва ЛЮБОГО (значит DNS-путь жив, не подвис).
+  # Ретраи покрывают транзиентный холодный DoH-запрос (одиночная попытка может не успеть).
   while [ "$i" -lt "$tries" ]; do
     if ps w 2>/dev/null | grep -q '[x]ray run'; then
-      for d in dns.google cloudflare.com google.com; do
+      for d in github.com google.com cloudflare.com; do
         if nslookup "$d" "$lan" 2>/dev/null | grep -q '^Name:'; then
           return 0
         fi
@@ -408,7 +410,7 @@ health_check() {
     fi
     i=$((i+1)); sleep 3
   done
-  log "HEALTH FAIL: за $((tries*3))s xray не запущен ИЛИ DNS не резолвится через $lan"
+  log "HEALTH FAIL: за $((tries*3))s xray не запущен ИЛИ DNS не резолвится через $lan (github/google/cloudflare)"
   return 1
 }
 
@@ -630,7 +632,7 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
       /opt/sbin/xkeen -restart >/dev/null 2>&1
       # v12: health-check ПОСЛЕ применения — реально ли живы xray и клиентский DNS.
       # Ловит рантайм-обвалы, которые xray -test пропускает (валидный конфиг, но DNS подвис).
-      if health_check 6; then
+      if health_check 8; then
         cp "$CONFIG_DIR/05_routing.json" "$CONFIG_DIR/05_routing.json.lastgood" 2>/dev/null
         LAST_BAD_MD5=""   # успешное применение — снимаем «бракованную» метку
         if [ "$NEW_DEFAULT" != "$CUR_DEFAULT" ]; then
@@ -678,7 +680,7 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
         if [ -f "$CONFIG_DIR/05_routing.json.lastgood" ]; then
           cp "$CONFIG_DIR/05_routing.json.lastgood" "$CONFIG_DIR/05_routing.json"
           /opt/sbin/xkeen -restart >/dev/null 2>&1
-          if health_check 6; then
+          if health_check 8; then
             log "AUTO-ROLLBACK OK: новый routing уронил DNS/инет → откат на lastgood, сеть восстановлена. Битый кандидат → 05_routing.json.unhealthy-${_ts}"
             tg_alert "🛡️ <b>XKeen watchdog</b>: новая конфигурация уронила DNS/интернет — выполнен <b>авто-откат</b> на последнюю рабочую. Сеть восстановлена. Изменения НЕ применятся повторно, пока не сменишь настройки в панели."
           else
