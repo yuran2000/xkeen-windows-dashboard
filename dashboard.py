@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.51"
+_VERSION_FALLBACK = "1.0.52"
 
 
 def get_dashboard_version():
@@ -5912,9 +5912,18 @@ def api_xkeen_diagnose():
     )
 
     # ---- 3. xray config validity (test mode) ----
-    r = keenetic_ssh("/opt/sbin/xray run -test -confdir /opt/etc/xray/configs 2>&1 | tail -15", timeout=20)
-    test_out = ansi_re.sub('', r.get("stdout") or "")
-    is_config_valid = "Configuration OK" in test_out or ("Failed to start" not in test_out and "infra/conf" not in test_out)
+    # v1.0.52 фикс ложного critical: ОБЯЗАТЕЛЬНО задаём XRAY_LOCATION_ASSET=/opt/etc/xray/dat —
+    # иначе xray ищет geosite/geoip .dat в /opt/sbin/ (default), не находит и ложно ругается
+    # «failed to open geosite_v2fly.dat» при ЛЮБОМ ext:geosite_v2fly.dat:* правиле (хотя рабочий
+    # xray, запущенный XKeen с этим env, валиден). И НЕ пайпим через tail (тогда $? = tail's, а не
+    # xray; + при многих outbound'ах «Configuration OK» вылетал за tail-окно). Берём полный вывод:
+    # валидно = xray exit 0 ИЛИ присутствует «Configuration OK».
+    r = keenetic_ssh("XRAY_LOCATION_ASSET=/opt/etc/xray/dat /opt/sbin/xray run -test -confdir /opt/etc/xray/configs 2>&1", timeout=20)
+    test_out_full = ansi_re.sub('', r.get("stdout") or "")
+    is_config_valid = (r.get("code") == 0) or ("Configuration OK" in test_out_full)
+    # detail: последние непустые строки (вердикт в конце) — иначе UI заливают [Info] prepend-строки
+    _tl = [ln for ln in test_out_full.splitlines() if ln.strip()]
+    test_out = "\n".join(_tl[-12:]) if _tl else test_out_full
     _add(
         "config_valid", "xray-конфиги валидны", is_config_valid,
         "critical" if not is_config_valid else "info",
@@ -6054,7 +6063,7 @@ def api_xkeen_diagnose():
         )
     else:
         # Проверяем xray test на ошибку "code not found in geoip.dat"
-        r = keenetic_ssh("/opt/sbin/xray run -test -confdir /opt/etc/xray/configs 2>&1 | grep -iE 'code not found in geoip|failed to load GeoIP' | head -3", timeout=20)
+        r = keenetic_ssh("XRAY_LOCATION_ASSET=/opt/etc/xray/dat /opt/sbin/xray run -test -confdir /opt/etc/xray/configs 2>&1 | grep -iE 'code not found in geoip|failed to load GeoIP' | head -3", timeout=20)
         missing_out = ansi_re.sub('', r.get("stdout") or "")
         has_missing = bool(missing_out.strip())
         _add(
@@ -6498,7 +6507,7 @@ def api_xkeen_test_socks():
     w = keenetic_ssh(f"cat > {path}", stdin_data=content, timeout=15)
     if not w["ok"]:
         return jsonify({"ok": False, "error": "Запись не удалась: " + (w.get("stderr") or "")}), 200
-    test = keenetic_ssh(f'/opt/sbin/xray run -test -confdir {cfg.KEENETIC_XRAY_CONFIGS} 2>&1; echo "XRAYRC=$?"', timeout=30)
+    test = keenetic_ssh(f'XRAY_LOCATION_ASSET=/opt/etc/xray/dat /opt/sbin/xray run -test -confdir {cfg.KEENETIC_XRAY_CONFIGS} 2>&1; echo "XRAYRC=$?"', timeout=30)
     test_out = test.get("stdout") or ""
     valid = "XRAYRC=0" in test_out  # точная проверка по коду выхода xray (не по тексту)
     if not valid:
@@ -6602,10 +6611,10 @@ def api_xkeen_auto_fix():
         r = keenetic_ssh("/opt/etc/xray/watchdog.sh 2>&1 | tail -10", timeout=30)
         log_lines.append((r.get("stdout") or "") or "(watchdog отработал тихо)")
         # Тест конфига после
-        r2 = keenetic_ssh("/opt/sbin/xray run -test -confdir /opt/etc/xray/configs 2>&1 | tail -5", timeout=15)
+        r2 = keenetic_ssh("XRAY_LOCATION_ASSET=/opt/etc/xray/dat /opt/sbin/xray run -test -confdir /opt/etc/xray/configs 2>&1 | tail -5", timeout=15)
         log_lines.append("---")
         log_lines.append(r2.get("stdout") or "")
-        ok = "Configuration OK" in (r2.get("stdout") or "") or "Failed" not in (r2.get("stdout") or "")
+        ok = "Configuration OK" in (r2.get("stdout") or "")
 
     elif fix_id == "set_primary_direct":
         # Проверка что direct есть в outbounds — иначе нет смысла
