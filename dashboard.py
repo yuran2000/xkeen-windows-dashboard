@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.65"
+_VERSION_FALLBACK = "1.0.66"
 
 
 def _find_git():
@@ -8071,6 +8071,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   .wd-state { font-size: 1.4em; font-weight: 700; padding: 4px 14px; border-radius: 4px; }
   .wd-state.primary  { background: #d4eedd; color: #2a7; }
   .wd-state.failover { background: #fff4cc; color: #997300; }
+  .wd-state.transition { background: #dfe8ff; color: #1a55cc; }
   .wd-state.unknown  { background: #eee;    color: #888; }
   .toolbar { margin: 8px 0; }
   .toolbar > * { margin-right: 6px; }
@@ -8317,7 +8318,12 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <h3 class="subsec subsec-status">🎛 Каналы и текущее состояние watchdog</h3>
   <div style="margin-bottom: 12px;">
     Текущий режим watchdog:
+    {% if watchdog.current_default and watchdog.current_default != targets.primary_tag and watchdog.state != 'failover' %}
+    {# режим primary, но трафик ещё не на PRIMARY (переключение / авто-откат) — не показываем уверенный зелёный «всё на основном» #}
+    <span class="wd-state transition">{{ watchdog.state|upper }}<span style="font-size: 0.62em; font-weight: 600;">{% if watchdog.last_bad_md5 %} · 🛡 ОТКАТ{% else %} · ⏳ ПЕРЕКЛЮЧЕНИЕ{% endif %}</span></span>
+    {% else %}
     <span class="wd-state {{ watchdog.state }}">{{ watchdog.state|upper }}</span>
+    {% endif %}
     <span class="mono" style="margin-left: 8px; color: #888;">counter={{ watchdog.counter }}</span>
     <span class="mono" style="margin-left: 8px;">default сейчас → <strong style="color: {% if watchdog.current_default == targets.primary_tag %}#2a7{% else %}#e80{% endif %};">{{ watchdog.current_default or routing.default_outbound or '?' }}</strong></span>
     {% if watchdog.current_default and watchdog.current_default != targets.primary_tag %}
@@ -12006,6 +12012,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
 const WATCHDOG_CURRENT_DEFAULT = {{ watchdog.current_default|tojson }};
 const WATCHDOG_PRIMARY_TAG = {{ targets.primary_tag|tojson }};
+const WATCHDOG_STATE = {{ watchdog.state|tojson }};
+const WATCHDOG_LAST_BAD_MD5 = {{ watchdog.last_bad_md5|tojson }};
 const WATCHDOG_EFFECTIVE_AI = {{ watchdog.effective_ai|tojson }};
 const WATCHDOG_EFFECTIVE_YT = {{ watchdog.effective_yt|tojson }};
 const AI_FAIL_BLOCK = {{ targets.ai_fail_block|tojson }};
@@ -12121,9 +12129,18 @@ function refreshFailoverInfo() {
     label = '🛟 Голова цепочки резерва (сейчас default = block):';
     note = '<span style="color:#c33;">🚫 default=block — трафик дропается</span>';
   } else {
+    // current_default != PRIMARY и != block. ПОЧЕМУ именно так — зависит от watchdog.state,
+    // и обязано совпадать с верхним баннером, иначе UI противоречит сам себе (баннер «PRIMARY»,
+    // а тут «в failover» — баг, замечен 2026-05-26). Три варианта = три ветки баннера.
     activeTag = WATCHDOG_CURRENT_DEFAULT;
     label = '🎯 Сейчас в роутинге как default:';
-    note = '<span style="background:#ffe28a; color:#7a4d00; padding:1px 6px; border-radius:3px;">⚡ АКТИВЕН СЕЙЧАС (watchdog в failover)</span>';
+    if (WATCHDOG_STATE === 'failover') {
+      note = '<span style="background:#ffe28a; color:#7a4d00; padding:1px 6px; border-radius:3px;">⚡ АКТИВЕН СЕЙЧАС (watchdog в failover — PRIMARY недоступен)</span>';
+    } else if (WATCHDOG_LAST_BAD_MD5) {
+      note = '<span style="background:#fbd7d7; color:#c33; padding:1px 6px; border-radius:3px;">🛡 авто-откат: PRIMARY не прошёл проверку связи — держим рабочий канал</span>';
+    } else {
+      note = '<span style="background:#dfe8ff; color:#1a55cc; padding:1px 6px; border-radius:3px;">🔄 PRIMARY только что изменён — ещё применяется (обнови страницу через ~30 c)</span>';
+    }
   }
   const labelEl = document.getElementById('failover-active-label');
   if (labelEl) labelEl.textContent = label;
