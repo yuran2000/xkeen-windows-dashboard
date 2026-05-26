@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.67"
+_VERSION_FALLBACK = "1.0.68"
 
 
 def _find_git():
@@ -6092,7 +6092,7 @@ XKEEN_COMMANDS = {
     "status":         {"cmd": "xkeen -status 2>&1 | head -60",  "label": "📊 Статус",          "timeout": 15,  "stdin": None},
     "restart":        {"cmd": "xkeen -restart 2>&1 | tail -30", "label": "▶️ Restart",        "timeout": 90,  "stdin": None},
     # Аварийная остановка: снимает tproxy → трафик XKeen-устройств идёт НАПРЯМУЮ (без VPN).
-    # Возвращает интернет, если xray/XKeen сломался. ⚠ рвёт и RDP/WG до дома (он идёт через xray).
+    # Возвращает интернет, если xray/XKeen сломался. ⚠ рвёт и удалённый доступ через сам VPN (xray).
     "stop":           {"cmd": "xkeen -stop 2>&1 | tail -30",    "label": "⏹️ Остановить XKeen", "timeout": 60,  "stdin": None},
     # Перезапуск СО СБРОСОМ: stop → пауза 15с → start. Пауза даёт клиентскому DNS успокоиться
     # (на время stop он резолвится напрямую) и сбрасывает залипшие UDP-сокеты/conntrack — лечит
@@ -9678,8 +9678,8 @@ echo OK</pre>
   <div class="btn-row" style="display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0;">
     <button type="button" class="btn-primary" style="background:#36a; color:#fff;" onclick="xkeenCmd('status')">📊 Статус XKeen</button>
     <button type="button" class="btn-primary" style="background:#2a7; color:#fff;" onclick="xkeenCmd('restart')">▶️ Restart XKeen</button>
-    <button type="button" class="btn-primary" style="background:#e80; color:#fff;" title="Если xray завис: у XKeen-устройств пропал интернет/DNS, хотя xray вроде «запущен». Делает xkeen -stop → пауза 15с → xkeen -start. Пауза лечит затык :53, который обычный Restart не берёт. На ~25 сек пропадёт VPN и RDP до дома, потом вернётся." onclick="xkeenCmd('restart-clean')">🔧 Перезапуск со сбросом</button>
-    <button type="button" class="btn-primary" style="background:#d35; color:#fff;" title="Аварийно остановить XKeen (xkeen -stop): снимает tproxy → интернет идёт НАПРЯМУЮ, без VPN. Возвращает интернет, если VPN сломался намертво. ⚠ RDP/WG до дома тоже отвалится. Включить обратно — Restart." onclick="xkeenCmd('stop')">⏹️ Остановить XKeen</button>
+    <button type="button" class="btn-primary" style="background:#e80; color:#fff;" title="Если xray завис: у XKeen-устройств пропал интернет/DNS, хотя xray вроде «запущен». Делает xkeen -stop → пауза 15с → xkeen -start. Пауза лечит затык :53, который обычный Restart не берёт. На ~25 сек прервётся VPN (и удалённый доступ через него), потом восстановится." onclick="xkeenCmd('restart-clean')">🔧 Перезапуск со сбросом</button>
+    <button type="button" class="btn-primary" style="background:#d35; color:#fff;" title="Аварийно остановить XKeen (xkeen -stop): снимает tproxy → интернет идёт НАПРЯМУЮ, без VPN. Возвращает интернет, если VPN сломался намертво. ⚠ Удалённый доступ через сам VPN (RDP/SSH/туннель) тоже прервётся. Включить обратно — Restart." onclick="xkeenCmd('stop')">⏹️ Остановить XKeen</button>
     <button type="button" class="btn-primary" style="background:#74c; color:#fff;" title="Обновить xray-core до latest (включая pre-release)" onclick="xkeenCmd('update-xray')">🔄 Обновить Xray</button>
     <button type="button" class="btn-primary" style="background:#74c; color:#fff;" title="Обновить geosite.dat и geoip.dat от v2fly community" onclick="xkeenCmd('update-geofile')">🌐 Обновить GeoFile</button>
     <button type="button" class="btn-primary" style="background:#74c; color:#fff;" title="Обновить bash-обёртку xkeen до latest" onclick="xkeenCmd('update-xkeen')">🔄 Обновить XKeen</button>
@@ -9718,6 +9718,8 @@ echo OK</pre>
       <ul style="margin: 6px 0 6px 22px;">
         <li><strong>📊 Статус XKeen</strong> — <code>xkeen -status</code>. Показывает что запущено (xray, mihomo если есть), в каком режиме (Mixed/TPROXY).</li>
         <li><strong>▶️ Restart XKeen</strong> — <code>xkeen -restart</code>. Перезапускает xray-процесс на роутере (~2 сек, разрыв соединений). Watchdog не трогает — он отдельный cron-job.</li>
+        <li><strong>🔧 Перезапуск со сбросом</strong> — <code>xkeen -stop</code> → пауза 15с → <code>xkeen -start</code>. Когда xray завис (у XKeen-устройств пропал интернет/DNS, хотя xray «запущен»): пауза сбрасывает залипшие сокеты/conntrack и лечит затык DNS на <code>:53</code>, который обычный Restart не берёт. На ~25 сек VPN прервётся, потом восстановится.</li>
+        <li><strong>⏹️ Остановить XKeen</strong> — <code>xkeen -stop</code>. Аварийная остановка: снимает tproxy → трафик идёт НАПРЯМУЮ, без VPN. Возвращает интернет, если VPN сломался намертво. ⚠ Удалённый доступ через сам VPN тоже прервётся. Включить обратно — Restart.</li>
         <li><strong>🔄 Обновить Xray</strong> — <code>xkeen -ux</code>. Обновляет <strong>прокси-движок</strong> (новые фичи xray, баг-фиксы VLESS/Reality, perf). Релиз раз в 1-3 месяца. Долго (1-2 мин).</li>
         <li><strong>🌐 Обновить GeoFile</strong> — <code>xkeen -ug</code>. Обновляет <strong>списки доменов</strong>: <code>geosite.dat</code> + <code>geoip.dat</code> от <a href="https://github.com/v2fly/domain-list-community" target="_blank">v2fly community</a>. Релиз раз в 1-2 недели — туда добавляют новые AI/реклама/трекеры.</li>
         <li><strong>🔄 Обновить XKeen</strong> — <code>xkeen -uk</code>. Обновляет <strong>сам менеджер</strong> (bash-скрипт). Редко (~раз в полгода).</li>
@@ -16233,8 +16235,8 @@ async function xkeenCmd(cmd) {
   // Подтверждение для долгих/инвазивных команд
   const confirms = {
     'restart':        'Restart XKeen ~2 секунды (трафик прервётся на момент рестарта). Продолжить?',
-    'stop':           'Остановить XKeen (xkeen -stop)?\n\nИнтернет у XKeen-устройств пойдёт НАПРЯМУЮ, без VPN. ⚠ RDP/WG до дома тоже отвалится (он идёт через xray). Включить обратно — «▶️ Restart XKeen» или «🔧 Перезапуск со сбросом».',
-    'restart-clean':  'Перезапуск XKeen со сбросом: stop → пауза 15с → start (~25-30 сек).\n\nЛечит зависший xray/DNS, когда обычный Restart не помогает. На время паузы пропадёт VPN и RDP до дома, потом вернётся. Продолжить?',
+    'stop':           'Остановить XKeen (xkeen -stop)?\n\nИнтернет у XKeen-устройств пойдёт НАПРЯМУЮ, без VPN. ⚠ Удалённый доступ через сам VPN (RDP/SSH/туннель поверх xray) тоже прервётся. Включить обратно — «▶️ Restart XKeen» или «🔧 Перезапуск со сбросом».',
+    'restart-clean':  'Перезапуск XKeen со сбросом: stop → пауза 15с → start (~25-30 сек).\n\nЛечит зависший xray/DNS, когда обычный Restart не помогает. На время паузы прервётся VPN (и удалённый доступ через него), потом восстановится. Продолжить?',
     'update-xray':    'Обновить Xray-core до latest версии?\n\nБудет выбрана ПЕРВАЯ версия из списка релизов (может быть pre-release/бета!). Скачается ~30 MB, xray перезапустится (трафик прервётся ~5 сек).\n\nЕсли хочешь именно stable — используй TTY-SSH с ручным выбором номера версии.',
     'update-geofile': 'Обновить GeoFile (geosite.dat + geoip.dat)?\n\nЗагрузит свежие списки доменов от v2fly community. Безопасно — только списки, бинари не меняются. ~30-60 сек.',
     'update-xkeen':   'Обновить XKeen (bash-обёртку)?\n\nБудет выбрана первая (latest) версия. Сам xray не трогается, обновляется только менеджер.',
