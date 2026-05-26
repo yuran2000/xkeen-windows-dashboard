@@ -62,7 +62,7 @@ if not exist "config_local.py" (
     REM Python выводит ОДНО число, читаем напрямую через set /p (без for /f, проще).
     echo.
     echo [5b/7] Detecting free port...
-    ".venv\Scripts\python.exe" -c "import socket; ports=[p for p in range(5000,5020) if socket.socket().connect_ex(('127.0.0.1',p))!=0]; print(ports[0] if ports else 5000)" > _port.tmp
+    ".venv\Scripts\python.exe" setup_helper.py detect-port 5000 5020 > _port.tmp
     set "FREE_PORT="
     set /p FREE_PORT=<_port.tmp
     del _port.tmp
@@ -71,7 +71,7 @@ if not exist "config_local.py" (
     REM Показываем какие порты заняты — чтобы юзер видел почему 5000 не подошёл
     echo.
     echo  Текущие занятые порты в диапазоне 5000-5019:
-    ".venv\Scripts\python.exe" -c "import socket; busy=[p for p in range(5000,5020) if socket.socket().connect_ex(('127.0.0.1',p))==0]; print('    ' + (', '.join(str(p) for p in busy) if busy else '(нет занятых, все свободны)'))"
+    ".venv\Scripts\python.exe" setup_helper.py busy-ports 5000 5020
     echo.
     echo  Первый свободный: !FREE_PORT!
     echo.
@@ -86,7 +86,7 @@ if not exist "config_local.py" (
 
     if not "!FREE_PORT!"=="5000" (
         echo  Меняю DASHBOARD_PORT в config_local.py на !FREE_PORT!...
-        ".venv\Scripts\python.exe" -c "import re; p='config_local.py'; s=open(p,encoding='utf-8').read(); s=re.sub(r'DASHBOARD_PORT\s*=\s*\d+', 'DASHBOARD_PORT = !FREE_PORT!', s); open(p,'w',encoding='utf-8').write(s); print('  Done.')"
+        ".venv\Scripts\python.exe" setup_helper.py set-port !FREE_PORT!
     ) else (
         echo  Использую стандартный порт 5000 ^(ничего не меняю в config_local.py^).
     )
@@ -97,12 +97,12 @@ if not exist "config_local.py" (
 
 echo.
 echo [6/7] Auto-generating SECRET_KEY and SUBSCRIPTION_TOKEN (only placeholders)...
-".venv\Scripts\python.exe" -c "import re, secrets; p='config_local.py'; s=open(p,encoding='utf-8').read(); changed=False; new=re.sub(r'SECRET_KEY\s*=\s*\"ЗАМЕНИ_МЕНЯ_[^\"]*\"', 'SECRET_KEY = \"'+secrets.token_hex(32)+'\"', s); changed=changed or (new!=s); s=new; new=re.sub(r'SUBSCRIPTION_TOKEN\s*=\s*\"ЗАМЕНИ_МЕНЯ_[^\"]*\"', 'SUBSCRIPTION_TOKEN = \"'+secrets.token_urlsafe(24)+'\"', s); changed=changed or (new!=s); s=new; open(p,'w',encoding='utf-8').write(s); print('Done.' if changed else 'Already set, skipping.')"
+".venv\Scripts\python.exe" setup_helper.py gen-secrets
 
 REM Читаем итоговый порт
 echo.
 echo [7/7] Reading final port from config_local.py...
-for /f "delims=" %%p in ('".venv\Scripts\python.exe" -c "import config_local as c; print(getattr(c,'DASHBOARD_PORT',5000))" 2^>nul') do set "DPORT=%%p"
+for /f "delims=" %%p in ('".venv\Scripts\python.exe" setup_helper.py get-port 2^>nul') do set "DPORT=%%p"
 if "!DPORT!"=="" set "DPORT=5000"
 echo Port: !DPORT!
 
@@ -115,7 +115,7 @@ echo.
 REM Проверка PASSWORD — через Python (findstr не понимает UTF-8 русский текст).
 REM exit 0 = PASSWORD ещё placeholder (нужно открыть Notepad).
 REM exit 1 = PASSWORD задан юзером (Notepad не нужен).
-".venv\Scripts\python.exe" -c "import config_local as c, sys; sys.exit(0 if 'ЗАМЕНИ_МЕНЯ' in c.PASSWORD else 1)" >nul 2>&1
+".venv\Scripts\python.exe" setup_helper.py password-is-placeholder >nul 2>&1
 if not errorlevel 1 (
     echo  PASSWORD ещё placeholder — открываю config_local.py в Notepad.
     echo  Замени строку PASSWORD = "..." на свой пароль.
