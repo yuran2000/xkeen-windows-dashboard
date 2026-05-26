@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.66"
+_VERSION_FALLBACK = "1.0.67"
 
 
 def _find_git():
@@ -223,9 +223,15 @@ def get_dashboard_version():
             cwd=_resource_dir(),
             capture_output=True, text=True, timeout=2,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            # git describe возвращает напр. "v1.4.3" — снимаем "v" префикс
-            version = result.stdout.strip().lstrip("v")
+        if result.returncode == 0 and result.stdout:
+            # Вынимаем ТОЛЬКО номер версии (напр. "1.4.3") regex'ом, а не берём весь
+            # stdout. Иначе в строку версии протекает посторонний мусор: сторонние DLL
+            # (антивирус / EDR-хук) умеют писать диагностику дизассемблера ("ANOMALY:
+            # use of REX.w ...") прямо в stdout дочернего процесса git — .strip() его
+            # не убирает, и он вылезал в шапку панели рядом с версией.
+            m = re.search(r'\d+\.\d+\.\d+', result.stdout)
+            if m:
+                version = m.group(0)
     except Exception:
         pass
     get_dashboard_version._cache = (version, now)
@@ -6085,6 +6091,14 @@ def api_keenetic_bootstrap_apply():
 XKEEN_COMMANDS = {
     "status":         {"cmd": "xkeen -status 2>&1 | head -60",  "label": "📊 Статус",          "timeout": 15,  "stdin": None},
     "restart":        {"cmd": "xkeen -restart 2>&1 | tail -30", "label": "▶️ Restart",        "timeout": 90,  "stdin": None},
+    # Аварийная остановка: снимает tproxy → трафик XKeen-устройств идёт НАПРЯМУЮ (без VPN).
+    # Возвращает интернет, если xray/XKeen сломался. ⚠ рвёт и RDP/WG до дома (он идёт через xray).
+    "stop":           {"cmd": "xkeen -stop 2>&1 | tail -30",    "label": "⏹️ Остановить XKeen", "timeout": 60,  "stdin": None},
+    # Перезапуск СО СБРОСОМ: stop → пауза 15с → start. Пауза даёт клиентскому DNS успокоиться
+    # (на время stop он резолвится напрямую) и сбрасывает залипшие UDP-сокеты/conntrack — лечит
+    # затык xray на :53, который обычный `xkeen -restart` (пауза ≈0) НЕ берёт (инцидент 2026-05-26).
+    # Запуск через nohup, чтобы `start` выполнился даже если SSH-канал моргнёт во время `stop`.
+    "restart-clean":  {"cmd": "nohup sh -c 'xkeen -stop; sleep 15; xkeen -start' >/tmp/xkclean.log 2>&1 & echo 'Started: xkeen -stop -> pause 15s -> xkeen -start (background; finishes even if SSH blips)'; sleep 25; echo '===== log ====='; tail -30 /tmp/xkclean.log 2>/dev/null", "label": "🔧 Перезапуск со сбросом", "timeout": 60, "stdin": None},
     # update-* команды xkeen-installer показывают список релизов и ждут выбор номера.
     # Через non-interactive SSH с stdin="1\n" — выбирается первая (latest) версия.
     # Для xkeen -ug это no-op (она не интерактивная, просто обновляет все базы), но stdin не ломает.
@@ -9664,6 +9678,8 @@ echo OK</pre>
   <div class="btn-row" style="display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0;">
     <button type="button" class="btn-primary" style="background:#36a; color:#fff;" onclick="xkeenCmd('status')">📊 Статус XKeen</button>
     <button type="button" class="btn-primary" style="background:#2a7; color:#fff;" onclick="xkeenCmd('restart')">▶️ Restart XKeen</button>
+    <button type="button" class="btn-primary" style="background:#e80; color:#fff;" title="Если xray завис: у XKeen-устройств пропал интернет/DNS, хотя xray вроде «запущен». Делает xkeen -stop → пауза 15с → xkeen -start. Пауза лечит затык :53, который обычный Restart не берёт. На ~25 сек пропадёт VPN и RDP до дома, потом вернётся." onclick="xkeenCmd('restart-clean')">🔧 Перезапуск со сбросом</button>
+    <button type="button" class="btn-primary" style="background:#d35; color:#fff;" title="Аварийно остановить XKeen (xkeen -stop): снимает tproxy → интернет идёт НАПРЯМУЮ, без VPN. Возвращает интернет, если VPN сломался намертво. ⚠ RDP/WG до дома тоже отвалится. Включить обратно — Restart." onclick="xkeenCmd('stop')">⏹️ Остановить XKeen</button>
     <button type="button" class="btn-primary" style="background:#74c; color:#fff;" title="Обновить xray-core до latest (включая pre-release)" onclick="xkeenCmd('update-xray')">🔄 Обновить Xray</button>
     <button type="button" class="btn-primary" style="background:#74c; color:#fff;" title="Обновить geosite.dat и geoip.dat от v2fly community" onclick="xkeenCmd('update-geofile')">🌐 Обновить GeoFile</button>
     <button type="button" class="btn-primary" style="background:#74c; color:#fff;" title="Обновить bash-обёртку xkeen до latest" onclick="xkeenCmd('update-xkeen')">🔄 Обновить XKeen</button>
@@ -16217,6 +16233,8 @@ async function xkeenCmd(cmd) {
   // Подтверждение для долгих/инвазивных команд
   const confirms = {
     'restart':        'Restart XKeen ~2 секунды (трафик прервётся на момент рестарта). Продолжить?',
+    'stop':           'Остановить XKeen (xkeen -stop)?\n\nИнтернет у XKeen-устройств пойдёт НАПРЯМУЮ, без VPN. ⚠ RDP/WG до дома тоже отвалится (он идёт через xray). Включить обратно — «▶️ Restart XKeen» или «🔧 Перезапуск со сбросом».',
+    'restart-clean':  'Перезапуск XKeen со сбросом: stop → пауза 15с → start (~25-30 сек).\n\nЛечит зависший xray/DNS, когда обычный Restart не помогает. На время паузы пропадёт VPN и RDP до дома, потом вернётся. Продолжить?',
     'update-xray':    'Обновить Xray-core до latest версии?\n\nБудет выбрана ПЕРВАЯ версия из списка релизов (может быть pre-release/бета!). Скачается ~30 MB, xray перезапустится (трафик прервётся ~5 сек).\n\nЕсли хочешь именно stable — используй TTY-SSH с ручным выбором номера версии.',
     'update-geofile': 'Обновить GeoFile (geosite.dat + geoip.dat)?\n\nЗагрузит свежие списки доменов от v2fly community. Безопасно — только списки, бинари не меняются. ~30-60 сек.',
     'update-xkeen':   'Обновить XKeen (bash-обёртку)?\n\nБудет выбрана первая (latest) версия. Сам xray не трогается, обновляется только менеджер.',
