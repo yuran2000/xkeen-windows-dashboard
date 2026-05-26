@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.68"
+_VERSION_FALLBACK = "1.0.69"
 
 
 def _find_git():
@@ -1512,8 +1512,8 @@ def keenetic_write_watchdog_config(updates):
         # Когда юзер добавляет "telegram" — watchdog v10 сгенерит отдельное правило
         # {"ip": ["geoip:telegram"], "outboundTag": YT_TAG} в 05_routing.json.
         if "YT_GEOIP_CATEGORIES" not in cur: cur["YT_GEOIP_CATEGORIES"] = ""
-        # «📱 Заблокированные в РФ» канал (FOREIGN_*): Meta/IG/Telegram/Twitter/Discord — сервисы,
-        # заблокированные в РФ, требуют ЗАРУБЕЖНОГО exit (RU-выход блок НЕ обходит). Вынесены из YT.
+        # «📱 Зарубежные сервисы» канал (FOREIGN_*): Meta/IG/Telegram/Twitter/Discord — сервисы,
+        # недоступные напрямую, требуют ЗАРУБЕЖНОГО exit (RU-выход для них не подходит). Вынесены из YT.
         # Структура 1:1 как YT. Дефолты пустые — юзер выбирает домены/outbound в UI.
         if "FOREIGN_TAG" not in cur: cur["FOREIGN_TAG"] = ""
         if "FOREIGN_DOMAINS" not in cur: cur["FOREIGN_DOMAINS"] = ""
@@ -1585,7 +1585,7 @@ def keenetic_set_watchdog_target(role, new_tag):
         return keenetic_write_watchdog_config({"YT_TAG": new_tag})
 
     if role == "foreign":
-        # FOREIGN_TAG — sticky outbound для заблокированных в РФ (Meta/Telegram/Twitter/Discord).
+        # FOREIGN_TAG — sticky outbound для зарубежных сервисов (Meta/Telegram/Twitter/Discord).
         # Должен быть ЗАРУБЕЖНЫМ exit — RU-выход блокировку НЕ обходит.
         return keenetic_write_watchdog_config({"FOREIGN_TAG": new_tag})
 
@@ -1617,7 +1617,7 @@ def keenetic_remove_outbound(tag):
     if tag == targets.get("yt_tag"):
         return {"ok": False, "stderr": f"tag '{tag}' сейчас YouTube-sticky. Сначала смени YouTube на другой outbound."}
     if tag == targets.get("foreign_tag"):
-        return {"ok": False, "stderr": f"tag '{tag}' сейчас канал «Заблокированные в РФ». Сначала смени его на другой outbound."}
+        return {"ok": False, "stderr": f"tag '{tag}' сейчас канал «Зарубежные сервисы». Сначала смени его на другой outbound."}
     if tag in (targets.get("failover_tags") or []):
         return {"ok": False, "stderr": f"tag '{tag}' в списке FAILOVER. Сначала убери его оттуда (смени FAILOVER на другой)."}
     raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
@@ -1677,7 +1677,7 @@ def keenetic_remove_outbounds_bulk(tags):
         elif t == yt:
             skipped[t] = "сейчас YouTube-sticky"
         elif t == foreign:
-            skipped[t] = "сейчас «Заблокированные в РФ»"
+            skipped[t] = "сейчас «Зарубежные сервисы»"
         elif t in failover_set:
             skipped[t] = "в списке FAILOVER"
         else:
@@ -3629,7 +3629,7 @@ def api_xkeen_subscription_sync():
                 if t == targets.get("primary_tag"):  roles.append("PRIMARY")
                 if t == targets.get("ai_tag"):       roles.append("AI-sticky")
                 if t == targets.get("yt_tag"):       roles.append("YouTube-sticky")
-                if t == targets.get("foreign_tag"):  roles.append("«Заблокированные в РФ»")
+                if t == targets.get("foreign_tag"):  roles.append("«Зарубежные сервисы»")
                 if t in (targets.get("failover_tags") or []):
                     pos = (targets.get("failover_tags") or []).index(t) + 1
                     roles.append(f"FAILOVER цепочка #{pos}")
@@ -4373,7 +4373,7 @@ def api_xkeen_set_yt_geoip_categories():
 @app.route("/api/xkeen/set-foreign-domains", methods=["POST"])
 @requires_auth
 def api_xkeen_set_foreign_domains():
-    """Обновить домены канала «📱 Заблокированные в РФ» (Meta/Telegram/Twitter/...).
+    """Обновить домены канала «📱 Зарубежные сервисы» (Meta/Telegram/Twitter/...).
     Пустой список — правило выключено, эти домены идут через PRIMARY."""
     raw = request.form.get("domains", "").strip()
     domains = [d.strip() for d in re.split(r"[\s,]+", raw) if d.strip()]
@@ -4383,7 +4383,7 @@ def api_xkeen_set_foreign_domains():
 @app.route("/api/xkeen/set-foreign-fail-block", methods=["POST"])
 @requires_auth
 def api_xkeen_set_foreign_fail_block():
-    """Включить/выключить kill-switch канала «Заблокированные в РФ».
+    """Включить/выключить kill-switch канала «Зарубежные сервисы».
     Если ВКЛ и канал упал — трафик блокируется (не утекает через RU-выход, где он всё равно заблокирован).
     Body: enabled=1|0"""
     enabled = request.form.get("enabled", "0") == "1"
@@ -4393,7 +4393,7 @@ def api_xkeen_set_foreign_fail_block():
 @app.route("/api/xkeen/set-foreign-ext-categories", methods=["POST"])
 @requires_auth
 def api_xkeen_set_foreign_ext_categories():
-    """v2fly geosite-категории для канала «Заблокированные в РФ» (meta, twitter, ...).
+    """v2fly geosite-категории для канала «Зарубежные сервисы» (meta, twitter, ...).
     Body: categories=<строка через пробел/запятую>."""
     raw = request.form.get("categories", "").strip()
     categories = []
@@ -4410,7 +4410,7 @@ def api_xkeen_set_foreign_ext_categories():
 @app.route("/api/xkeen/set-foreign-geoip-categories", methods=["POST"])
 @requires_auth
 def api_xkeen_set_foreign_geoip_categories():
-    """geoip-категории для канала «Заблокированные в РФ» (telegram, discord, facebook, twitter).
+    """geoip-категории для канала «Зарубежные сервисы» (telegram, discord, facebook, twitter).
     Для IP-only приложений (Telegram Desktop коннектится к IP датацентров минуя DNS).
     Watchdog сгенерит ОТДЕЛЬНОЕ правило {"ip": ["geoip:NAME"], "outboundTag": FOREIGN_TAG}.
     Body: categories=<строка через пробел/запятую>, например "telegram"."""
@@ -6705,7 +6705,7 @@ def _channel_for_domain(host, tg):
     m = _domain_in_list(h, tg.get("yt_domains"))
     if m: return {"label": "📺 YouTube", "tag": tg.get("yt_tag"), "kind": "yt", "match": m}
     m = _domain_in_list(h, tg.get("foreign_domains"))
-    if m: return {"label": "📱 Заблокированные в РФ", "tag": tg.get("foreign_tag"), "kind": "foreign", "match": m}
+    if m: return {"label": "📱 Зарубежные сервисы", "tag": tg.get("foreign_tag"), "kind": "foreign", "match": m}
     return {"label": "🌍 Основной (PRIMARY)", "tag": tg.get("primary_tag"), "kind": "primary", "match": None}
 
 
@@ -8527,9 +8527,9 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           <div id="info-yt" class="outbound-info"></div>
           <p class="subtitle">Через какой канал идёт трафик к YouTube.</p>
           <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 11px; margin: 8px 0; font-size: 0.85em; color: #1a5276; border-radius: 4px;">
-            <strong>❓ Почему YouTube — отдельный канал, а не вместе с «📱 Заблокированными в РФ»?</strong><br>
-            YouTube в РФ <strong>не заблокирован</strong> — его только <strong>замедляют</strong>. Это лечится <strong>российским VPN</strong>: RU-сервер с хорошим пирингом до Google убирает троттлинг. Бонус — с РФ-IP YouTube крутит <strong>меньше рекламы</strong> (рекламная выдача гео-таргетится, google_ads на РФ-адрес почти не идёт). Поэтому сюда ставь <strong>🇷🇺 RU-выход</strong> (тег вида <code>..._YouTube</code>) — и быстро, и без рекламы.<br><br>
-            А <strong>Instagram/Meta, Telegram, Twitter/X, Discord</strong> — <strong>заблокированы РКН</strong>. Через российский выход их пускать бессмысленно: блокировку он не обходит, DPI режет TLS-handshake. Поэтому они вынесены в отдельный канал <strong>«📱 Заблокированные в РФ»</strong> с <strong>зарубежным</strong> выходом и собственными настройками (домены, пресеты, GeoIP для Telegram Desktop, свой kill-switch).
+            <strong>❓ Почему YouTube — отдельный канал, а не вместе с «📱 Зарубежными сервисами»?</strong><br>
+            YouTube в РФ <strong>не блокируют</strong> — только <strong>замедляют</strong>. Это лечится <strong>российским выходом</strong>: RU-сервер с хорошим пирингом до Google убирает троттлинг. Бонус — с РФ-IP YouTube крутит <strong>меньше рекламы</strong> (рекламная выдача гео-таргетится, google_ads на РФ-адрес почти не идёт). Поэтому сюда ставь <strong>🇷🇺 RU-выход</strong> (тег вида <code>..._YouTube</code>) — и быстро, и без рекламы.<br><br>
+            А <strong>Instagram/Meta, Telegram, Twitter/X, Discord</strong> — наоборот, <strong>требуют зарубежного выхода</strong>: через российский они не работают (DPI режет TLS-handshake). Поэтому они вынесены в отдельный канал <strong>«📱 Зарубежные сервисы»</strong> с <strong>зарубежным</strong> выходом и собственными настройками (домены, пресеты, GeoIP для Telegram Desktop, свой kill-switch).
           </div>
           <div class="failover-active-label">🎯 Сейчас в роутинге для YouTube:</div>
           <div id="info-yt-active" class="outbound-info"></div>
@@ -8670,11 +8670,11 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     </div>
   </div>
 
-  <!-- ===== «📱 Заблокированные в РФ» канал (FOREIGN_*) — Meta/Telegram/Twitter/Discord через ЗАГРАН-exit ===== -->
+  <!-- ===== «📱 Зарубежные сервисы» канал (FOREIGN_*) — Meta/Telegram/Twitter/Discord через ЗАГРАН-exit ===== -->
   <div class="row" style="margin-top: 16px;">
-    <div class="col" data-xk-sub="📱 Заблокированные в РФ">
+    <div class="col" data-xk-sub="📱 Зарубежные сервисы">
       <div class="channel-card">
-        <label class="col-header" style="color:#8e44ad;">📱 «Заблокированные в РФ» — sticky outbound <a href="#help-foreign" onclick="openHelpAnchor('help-foreign'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Открыть «📱 Заблокированные в РФ» в Помощи — зачем канал и какой выход выбирать">❓ помощь</a></label>
+        <label class="col-header" style="color:#8e44ad;">📱 «Зарубежные сервисы» — sticky outbound <a href="#help-foreign" onclick="openHelpAnchor('help-foreign'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Открыть «📱 Зарубежные сервисы» в Помощи — зачем канал и какой выход выбирать">❓ помощь</a></label>
         <div class="channel-card-body">
           <select id="select-foreign" style="width: 100%; padding: 7px; font-size: 0.95em; border: 1px solid #ccc; border-radius: 4px;">
             {% for grp in vless_option_groups %}
@@ -8687,7 +8687,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           </select>
           <button class="btn btn-sm" style="margin-top: 6px; background: #8e44ad;" onclick="setTarget('foreign')">Сохранить outbound</button>
           <div id="info-foreign" class="outbound-info"></div>
-          <p class="subtitle">Канал для сервисов, <strong>заблокированных в РФ</strong> (Meta/IG, Telegram, Twitter/X, Discord). ⚠️ Выбирай <strong>ЗАРУБЕЖНЫЙ</strong> выход (🇳🇱 Нидерланды и т.п.) — российский exit блокировку РКН <strong>не обходит</strong> (DPI режет TLS даже через RU-IP).</p>
+          <p class="subtitle">Канал для <strong>зарубежных сервисов</strong> (Meta/IG, Telegram, Twitter/X, Discord), которым нужен заграничный выход. ⚠️ Выбирай <strong>ЗАРУБЕЖНЫЙ</strong> выход (🇳🇱 Нидерланды и т.п.) — российский для них <strong>не подходит</strong>.</p>
           <div class="failover-active-label">🎯 Сейчас в роутинге:</div>
           <div id="info-foreign-active" class="outbound-info"></div>
 
@@ -8723,9 +8723,9 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         </div>
       </div>
 
-      <!-- Домены канала «Заблокированные в РФ» -->
+      <!-- Домены канала «Зарубежные сервисы» -->
       <div class="domain-section">
-        <h3 class="domain-section-header">📱 Список доменов «Заблокированные в РФ» <span class="subsec-hint">(через outbound выше)</span></h3>
+        <h3 class="domain-section-header">📱 Список доменов «Зарубежные сервисы» <span class="subsec-hint">(через outbound выше)</span></h3>
         <div class="domain-section-body">
           <p class="subtitle">Через пробел или с новой строки. Поддомены подхватываются автоматически (<code>domain:instagram.com</code> покрывает <code>www.instagram.com</code>). Пустой список = правило выключено, идут через PRIMARY.</p>
           <div style="margin-bottom: 8px;">
@@ -8748,7 +8748,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           <button class="btn" style="margin-top: 6px; background: #8e44ad;" onclick="saveForeignDomains()">💾 Сохранить домены</button>
           <p class="subtitle" style="margin: 4px 0 0; font-size: 0.85em;">Watchdog подхватит при следующем тике (≤1 мин).</p>
 
-          <!-- v2fly geosite-категории для канала «Заблокированные в РФ» -->
+          <!-- v2fly geosite-категории для канала «Зарубежные сервисы» -->
           <details style="margin-top: 14px; border-top: 1px dashed #ccc; padding-top: 10px;" {% if targets.foreign_ext_categories %}open{% endif %}>
             <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">🩻 v2fly категории <span style="color: #888; font-weight: 400; font-size: 0.88em;">— автообновляются с GeoFile</span> <a href="#help-v2fly-geoip" onclick="openHelpAnchor('help-v2fly-geoip'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; margin-left: 6px;" title="Открыть описание v2fly категорий в Помощи">❓ что это?</a></summary>
             <div style="margin-top: 8px;">
@@ -8909,7 +8909,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     <div class="domain-section-body">
       <div style="background: #eefbe5; border-left: 4px solid #2a7; padding: 8px 12px; margin: 0 0 12px; border-radius: 3px; font-size: 0.88em;">
         <strong style="color: #2a7;">🛡️ Безопасно для AI:</strong> кнопки ниже меняют <strong>только default-канал</strong> (общий трафик).
-        🤖 <strong>AI-sticky</strong> (<code>{{ targets.ai_tag }}</code>), 📺 <strong>YouTube-sticky</strong> (<code>{{ targets.yt_tag }}</code>) и 📱 <strong>«Заблокированные в РФ»</strong> (<code>{{ targets.foreign_tag }}</code>) <strong>не затрагиваются</strong> — продолжают идти через свои выбранные каналы.
+        🤖 <strong>AI-sticky</strong> (<code>{{ targets.ai_tag }}</code>), 📺 <strong>YouTube-sticky</strong> (<code>{{ targets.yt_tag }}</code>) и 📱 <strong>«Зарубежные сервисы»</strong> (<code>{{ targets.foreign_tag }}</code>) <strong>не затрагиваются</strong> — продолжают идти через свои выбранные каналы.
         Anthropic <strong>не увидит твой IP</strong> при нажатии FAILOVER — AI-трафик как шёл через <code>{{ targets.ai_tag }}</code>, так и идёт.
         Поменять AI/YT канал можно только через их собственные dropdown'ы выше в этом же разделе.
       </div>
@@ -10029,7 +10029,7 @@ Use this token to access the HTTP API:
             <li><strong>Unauthorized</strong> — токен неверный или бот удалён в BotFather.</li>
             <li><strong>bot was blocked</strong> — ты заблокировал бота в Telegram. Разблокируй и напиши /start.</li>
             <li><strong>Timeout / connection refused</strong> — роутер не может выйти на <code>api.telegram.org</code>. Проверь, что PRIMARY/FAILOVER канал работает (раздел ниже).</li>
-            <li><strong>curl: (7) Failed to connect to 127.0.0.1 port 10808</strong> — на этом роутере не поднят локальный SOCKS5-inbound (через него идут алерты в обход блокировки Telegram для RU-IP). Нажми появившуюся кнопку <strong>«🔧 Починить канал TG-алертов»</strong> — панель сама поднимет его и пропишет маршрут через зарубежный канал (с бэкапом и откатом). Если зарубежного канала на роутере нет — сначала добавь outbound и назначь ему роль «📱 Заблокированные в РФ» или AI.</li>
+            <li><strong>curl: (7) Failed to connect to 127.0.0.1 port 10808</strong> — на этом роутере не поднят локальный SOCKS5-inbound (через него идут алерты в обход блокировки Telegram для RU-IP). Нажми появившуюся кнопку <strong>«🔧 Починить канал TG-алертов»</strong> — панель сама поднимет его и пропишет маршрут через зарубежный канал (с бэкапом и откатом). Если зарубежного канала на роутере нет — сначала добавь outbound и назначь ему роль «📱 Зарубежные сервисы» или AI.</li>
           </ul>
         </div>
       </details>
@@ -10067,7 +10067,7 @@ Use this token to access the HTTP API:
       <ul>
         <li><strong>Подписки VPN</strong>: добавить subscription URL (любой VLESS-совместимый провайдер) — панель скачивает список серверов с провайдера, выкладывает их как outbounds на роутер. Группировка по подписке, дата истечения с цветной шкалой, ручное обновление кнопкой.</li>
         <li><strong>Outbounds</strong>: видеть, добавлять, удалять, переименовывать VPN-каналы (читает/пишет <code>04_outbounds.json</code> на роутере). Bulk-удаление через чекбоксы.</li>
-        <li><strong>Routing</strong>: куда какой трафик идёт — PRIMARY / FAILOVER / AI-sticky / YouTube-sticky / «Заблокированные в РФ» / DIRECT / BLOCK</li>
+        <li><strong>Routing</strong>: куда какой трафик идёт — PRIMARY / FAILOVER / AI-sticky / YouTube-sticky / «Зарубежные сервисы» / DIRECT / BLOCK</li>
         <li><strong>Watchdog</strong>: автоматический failover между каналами каждую минуту</li>
         <li><strong>Списки доменов</strong>: VK / Mail.ru / Yandex / банки (DIRECT), Windows Update / Adobe / телеметрия (BLOCK)</li>
         <li><strong>Бэкап</strong>: snapshot всех XKeen-настроек одним JSON, восстановление на новый роутер за один клик</li>
@@ -10238,10 +10238,10 @@ Use this token to access the HTTP API:
   </details>
 
   <details class="help-section">
-    <summary>📡 Каналы: PRIMARY · FAILOVER · AI · YouTube · «Заблокированные в РФ»</summary>
+    <summary>📡 Каналы: PRIMARY · FAILOVER · AI · YouTube · «Зарубежные сервисы»</summary>
     <div class="help-body">
       <h4>🟢 PRIMARY — основной канал</h4>
-      <p>Через него идёт <strong>весь трафик</strong> (кроме того что попадает под специальные правила: AI / YouTube / «Заблокированные в РФ» / DIRECT).
+      <p>Через него идёт <strong>весь трафик</strong> (кроме того что попадает под специальные правила: AI / YouTube / «Зарубежные сервисы» / DIRECT).
       Дефолт — <code>vless-reality</code> (твой собственный VPN-сервер). Watchdog раз в минуту пингует его через <code>https://&lt;your-vpn-domain&gt;:8444/</code>.
       Если 2 пинга подряд провалились → переключается на FAILOVER. Если потом 3 пинга подряд успешны → возвращается обратно.</p>
 
@@ -10254,19 +10254,19 @@ Use this token to access the HTTP API:
       <p><strong>Kill-switch (рекомендую включён)</strong>: если AI-канал упал — AI-домены идут в <code>block</code> (drop), а не через PRIMARY. Защита от засветки твоего RU-IP в Anthropic/OpenAI (после такого аккаунт могут заблокировать).</p>
 
       <h4>📺 YouTube-sticky outbound</h4>
-      <p>Sticky-канал для YouTube/Google-видео из списка <code>📺 Список YouTube-доменов</code>. Аналог AI-sticky. <em>(Instagram/Telegram/Twitter/Discord сюда НЕ кладём — они в отдельном канале «Заблокированные в РФ» ниже.)</em></p>
+      <p>Sticky-канал для YouTube/Google-видео из списка <code>📺 Список YouTube-доменов</code>. Аналог AI-sticky. <em>(Instagram/Telegram/Twitter/Discord сюда НЕ кладём — они в отдельном канале «Зарубежные сервисы» ниже.)</em></p>
       <p>Зачем: при просмотре YouTube через EU/US-VPN — <strong>лезет реклама</strong> (Google показывает по geo-IP) и видео могут тротлить. Если же канал — <strong>RU-exit</strong> (через российский IP), рекламы меньше и троттлинга нет (РКН-Google решение). Поэтому выбирай канал с бейджем <strong>📺 Ютуб</strong> в dropdown'е (это RU-exit без anti-DPI маскировки).</p>
       <p><strong>Kill-switch выключен по умолчанию</strong> — если YT-канал упал, YouTube идёт через PRIMARY (с рекламой, но работает).</p>
 
-      <h4>📱 «Заблокированные в РФ»-sticky outbound</h4>
-      <p>Sticky-канал для сервисов, <strong>заблокированных РКН</strong>: Meta/Instagram, WhatsApp, Telegram, Twitter/X, Discord (список <code>📱 Список доменов</code> в этом канале).</p>
+      <h4>📱 «Зарубежные сервисы»-sticky outbound</h4>
+      <p>Sticky-канал для <strong>зарубежных сервисов</strong>: Meta/Instagram, WhatsApp, Telegram, Twitter/X, Discord (список <code>📱 Список доменов</code> в этом канале).</p>
       <p>Зачем отдельно от YouTube: у них <strong>противоположные</strong> требования к выходу. YouTube хочет <strong>российский</strong> выход (де-троттл + меньше рекламы), а Meta/Telegram <strong>заблокированы</strong> — российский выход блокировку НЕ обходит (DPI режет TLS даже через RU-IP). Поэтому здесь выбирай <strong>заграничный</strong> выход (🇳🇱/🇩🇪/🇪🇪). <em>(Раньше Instagram сидел в YouTube-канале с RU-выходом и не открывался — «вместо сайта скачивался файл».)</em></p>
-      <p><strong>Kill-switch (рекомендую включён)</strong>: если загран-канал упал — эти сервисы идут в <code>block</code>, а не через PRIMARY. Иначе при RU-default они всё равно не откроются (РКН-блок), а реальный IP засветится. Подробнее — отдельная тема <a href="#help-foreign" onclick="openHelpAnchor('help-foreign'); return false;">«📱 Канал Заблокированные в РФ»</a>.</p>
+      <p><strong>Kill-switch (рекомендую включён)</strong>: если загран-канал упал — эти сервисы идут в <code>block</code>, а не через PRIMARY. Иначе при RU-default они всё равно не откроются (РКН-блок), а реальный IP засветится. Подробнее — отдельная тема <a href="#help-foreign" onclick="openHelpAnchor('help-foreign'); return false;">«📱 Канал Зарубежные сервисы»</a>.</p>
     </div>
   </details>
 
   <details class="help-section">
-    <summary>🌐 Маршрутизация по доменам — AI / YouTube / «Заблокированные в РФ» / DIRECT списки</summary>
+    <summary>🌐 Маршрутизация по доменам — AI / YouTube / «Зарубежные сервисы» / DIRECT списки</summary>
     <div class="help-body">
       <h4>Что такое «список доменов»</h4>
       <p>Это <strong>текстовое поле</strong> со списком доменов (через пробел или с новой строки). Watchdog генерирует правило xray: «<code>трафик к этим доменам → через выбранный outbound</code>».</p>
@@ -10276,11 +10276,11 @@ Use this token to access the HTTP API:
       <p>Домены AI-сервисов которые должны идти через AI-sticky outbound. Готовые пресеты-кнопки (🟣 Claude, 🟢 ChatGPT, 🔵 Gemini, …) добавляют известные домены сразу.</p>
 
       <h4>📺 Список YouTube-доменов (красная карточка)</h4>
-      <p>Домены YouTube/Google-видео (и подобных, которым хорош RU-выход) — идут через YouTube-sticky. <em>(Instagram/Telegram/Twitter/Discord теперь в отдельном канале «Заблокированные в РФ» — см. ниже.)</em></p>
+      <p>Домены YouTube/Google-видео (и подобных, которым хорош RU-выход) — идут через YouTube-sticky. <em>(Instagram/Telegram/Twitter/Discord теперь в отдельном канале «Зарубежные сервисы» — см. ниже.)</em></p>
       <p><strong>Пустой список = правило выключено</strong>, YouTube идёт через PRIMARY.</p>
 
-      <h4>📱 Список доменов «Заблокированные в РФ» (фиолетовая карточка)</h4>
-      <p>Домены сервисов, заблокированных РКН (Meta/Instagram, WhatsApp, Telegram, Twitter/X, Discord) — идут через заграничный канал «Заблокированные в РФ». Пресеты-кнопки добавляют известные домены сразу. <strong>Пустой список = правило выключено.</strong></p>
+      <h4>📱 Список доменов «Зарубежные сервисы» (фиолетовая карточка)</h4>
+      <p>Домены зарубежных сервисов (Meta/Instagram, WhatsApp, Telegram, Twitter/X, Discord) — идут через заграничный канал «Зарубежные сервисы». Пресеты-кнопки добавляют известные домены сразу. <strong>Пустой список = правило выключено.</strong></p>
 
       <h4>🚫 Сайты НАПРЯМУЮ без VPN — DIRECT (оранжевая карточка)</h4>
       <p>Домены которые идут <strong>через твоего обычного провайдера</strong> минуя VPN. Полезно для:</p>
@@ -10581,7 +10581,7 @@ Use this token to access the HTTP API:
       <h4>Причина</h4>
       <p>XKeen перехватывает трафик через <code>redirect</code>/<code>tproxy</code> — но <strong>только IPv4</strong>. Если домашний провайдер выдаёт ещё и <strong>IPv6</strong> (Ростелеком fiber, МГТС GPON и т.п.), браузер/приложение, получив <code>AAAA</code>-запись, идёт по IPv6 <strong>напрямую, мимо xray</strong>. Туннель не задействован → сервис видит реальный домашний IPv6.</p>
       <div style="background:#fff3cd; border-left:3px solid #f0c200; padding:8px 11px; margin:8px 0; font-size:0.92em; color:#6a4900;">
-        ⚠️ Бьёт по <strong>всем</strong> каналам, не только YouTube: <strong>AI</strong> (geo-jump → верификация/бан аккаунта), <strong>«Заблокированные в РФ»</strong> (Meta видит RU-IPv6), основной трафик. Поэтому это общесетевая проблема, а не «про ютуб».
+        ⚠️ Бьёт по <strong>всем</strong> каналам, не только YouTube: <strong>AI</strong> (geo-jump → верификация/бан аккаунта), <strong>«Зарубежные сервисы»</strong> (Meta видит RU-IPv6), основной трафик. Поэтому это общесетевая проблема, а не «про ютуб».
       </div>
 
       <h4>Проверка</h4>
@@ -10650,21 +10650,21 @@ nslookup instagram.com 8.8.8.8     # напрямую через Google — ес
   </details>
 
   <details class="help-section" id="help-foreign">
-    <summary>📱 Канал «Заблокированные в РФ» — Meta / Telegram / Twitter / Discord</summary>
+    <summary>📱 Канал «Зарубежные сервисы» — Meta / Telegram / Twitter / Discord</summary>
     <div class="help-body">
-      <p><strong>Что это</strong>: отдельный sticky-канал для сервисов, которые <strong>заблокированы РКН</strong> (Instagram/Meta, WhatsApp, Telegram, Twitter/X, Discord). Их домены принудительно идут через выбранный <strong>заграничный</strong> выход, отдельно от остального трафика.</p>
+      <p><strong>Что это</strong>: отдельный sticky-канал для <strong>зарубежных сервисов</strong> (Instagram/Meta, WhatsApp, Telegram, Twitter/X, Discord). Их домены принудительно идут через выбранный <strong>заграничный</strong> выход, отдельно от остального трафика.</p>
 
       <h4>Зачем отдельный канал (а не через YouTube)</h4>
-      <p>У YouTube и у заблокированных сервисов <strong>противоположные</strong> требования к выходу:</p>
+      <p>У YouTube и у зарубежных сервисов <strong>противоположные</strong> требования к выходу:</p>
       <ul>
         <li><strong>YouTube</strong> в РФ только <em>тормозят</em> (не блокируют) → ему хорош <strong>российский</strong> выход с де-троттлингом (быстрее + меньше рекламы).</li>
-        <li><strong>Meta/Telegram/Twitter</strong> <em>заблокированы</em> → российский выход блокировку <strong>НЕ обходит</strong> (DPI режет TLS даже через RU-IP). Нужен <strong>заграничный</strong> выход.</li>
+        <li><strong>Meta/Telegram/Twitter</strong> — российский выход для них <strong>НЕ подходит</strong>. Нужен <strong>заграничный</strong> выход.</li>
       </ul>
       <p>Поэтому Instagram и т.п. вынесены из YouTube-канала в этот отдельный — каждому свой тип выхода. <em>(Раньше Meta сидела в YouTube-канале с RU-выходом и не открывалась — «вместо сайта скачивался файл»: это огрызок TLS, который порезал DPI.)</em></p>
 
       <h4>Как настроить</h4>
       <ol>
-        <li>В разделе <strong>«🎯 Основное и резервное подключение» → «📱 Заблокированные в РФ»</strong> выбери <strong>заграничный</strong> outbound (🇳🇱 Нидерланды, 🇩🇪 Германия, 🇪🇪 Эстония и т.п.). <strong>НЕ</strong> российский (🇷🇺 — пометка «НЕ годится») и <strong>НЕ</strong> «Напрямую».</li>
+        <li>В разделе <strong>«🎯 Основное и резервное подключение» → «📱 Зарубежные сервисы»</strong> выбери <strong>заграничный</strong> outbound (🇳🇱 Нидерланды, 🇩🇪 Германия, 🇪🇪 Эстония и т.п.). <strong>НЕ</strong> российский (🇷🇺 — пометка «НЕ годится») и <strong>НЕ</strong> «Напрямую».</li>
         <li>Список доменов задаётся там же — есть пресеты (Meta, Telegram, Twitter/X, Discord). Можно добавлять свои.</li>
         <li><strong>GeoIP-категории</strong> — для приложений, которые ходят на IP <em>мимо DNS</em> (Telegram Desktop коннектится прямо к датацентрам). Доменные правила их не ловят — добавь <code>telegram</code> в GeoIP, чтобы и они шли через загран-выход.</li>
       </ol>
@@ -10759,7 +10759,7 @@ another-server.io   # ✏️</pre>
       </ul>
 
       <h4>Группировка в dropdown'ах</h4>
-      <p>Все 5 dropdown'ов каналов (PRIMARY/FAILOVER/AI/YT/«Заблокированные в РФ») группируют опции по подпискам через <code>&lt;optgroup&gt;</code>. Внутри каждой группы опции имеют пастельный фон цвета подписки (зелёный/синий/бежевый/фиолетовый — ротация 6 цветов).</p>
+      <p>Все 5 dropdown'ов каналов (PRIMARY/FAILOVER/AI/YT/«Зарубежные сервисы») группируют опции по подпискам через <code>&lt;optgroup&gt;</code>. Внутри каждой группы опции имеют пастельный фон цвета подписки (зелёный/синий/бежевый/фиолетовый — ротация 6 цветов).</p>
 
       <h4>Бейджи в опциях</h4>
       <ul>
@@ -12603,7 +12603,7 @@ function _xkShowReminderOnLoad() {
   flash(true,
     who + ' добавлено, но пока <b>НЕ задействовано</b> — трафик через него НЕ идёт.<br>' +
     'Чтобы включить: в разделе <b>«📋 Все outbounds»</b> найди его и нажми роль ' +
-    '(🟢 PRIMARY · 🟡 FAILOVER · 🤖 AI · 📺 YouTube · 📱 Заблокированные в РФ), ' +
+    '(🟢 PRIMARY · 🟡 FAILOVER · 🤖 AI · 📺 YouTube · 📱 Зарубежные сервисы), ' +
     'либо добавь в <b>«🎯 Цепочка резерва (FAILOVER)»</b>.');
 }
 try { setTimeout(_xkShowReminderOnLoad, 500); } catch (e) {}
@@ -14532,8 +14532,8 @@ function clearYTGeoipCats() {
 }
 async function saveYTGeoipCategories() { await _saveExtCategories('/api/xkeen/set-yt-geoip-categories', 'yt-geoip-categories', 'YT GeoIP'); }
 
-// ============== «📱 Заблокированные в РФ» (FOREIGN) — Meta/Telegram/Twitter/Discord через ЗАГРАН-exit ==============
-// Вынесено из YT: эти сервисы заблокированы в РФ, RU-выход блокировку НЕ обходит. Структура 1:1 как YT.
+// ============== «📱 Зарубежные сервисы» (FOREIGN) — Meta/Telegram/Twitter/Discord через ЗАГРАН-exit ==============
+// Вынесено из YT: зарубежные сервисы, RU-выход для них не подходит. Структура 1:1 как YT.
 const FOREIGN_PRESETS = {
   instagram: ['instagram.com', 'cdninstagram.com', 'fbcdn.net', 'fbsbx.com'],
   facebook:  ['facebook.com', 'fb.com', 'fb.watch', 'facebook.net', 'fbcdn.net', 'fbsbx.com'],
@@ -14571,7 +14571,7 @@ function addForeignPreset(name) {
 }
 function removeForeignPreset(name) { removePresetGeneric('foreign', name); }
 function clearForeignDomains() {
-  if (!confirm('Очистить весь список «Заблокированные в РФ»?\n\nПосле сохранения правило исчезнет, эти домены пойдут через PRIMARY.')) return;
+  if (!confirm('Очистить весь список «Зарубежные сервисы»?\n\nПосле сохранения правило исчезнет, эти домены пойдут через PRIMARY.')) return;
   setForeignDomainsArray([]);
   flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
 }
@@ -14587,7 +14587,7 @@ async function saveForeignDomains() {
   } else {
     const preview = domains.slice(0, 5).join('\n  • ');
     const more = domains.length > 5 ? `\n  ... и ещё ${domains.length - 5}` : '';
-    if (!confirm(`Сохранить ${domains.length} доменов канала «Заблокированные в РФ»?\n\n  • ${preview}${more}\n\nЭти домены пойдут через выбранный выше outbound. Watchdog перегенерит routing на следующем тике.`)) return;
+    if (!confirm(`Сохранить ${domains.length} доменов канала «Зарубежные сервисы»?\n\n  • ${preview}${more}\n\nЭти домены пойдут через выбранный выше outbound. Watchdog перегенерит routing на следующем тике.`)) return;
   }
   const fd = new FormData();
   fd.append('domains', domains.join(' '));
@@ -14615,14 +14615,14 @@ async function toggleForeignFailBlock(enabled) {
 }
 function addForeignExtCat(name) { _extCatAdd('foreign-ext-categories', name); }
 function clearForeignExtCats() {
-  if (!confirm('Очистить все v2fly категории канала «Заблокированные в РФ»? Останутся только ручные домены.')) return;
+  if (!confirm('Очистить все v2fly категории канала «Зарубежные сервисы»? Останутся только ручные домены.')) return;
   document.getElementById('foreign-ext-categories').value = '';
   flash(true, 'Категории очищены. Нажми «Сохранить».', null, {noScroll: true});
 }
 async function saveForeignExtCategories() { await _saveExtCategories('/api/xkeen/set-foreign-ext-categories', 'foreign-ext-categories', 'Заблок. в РФ'); }
 function addForeignGeoipCat(name) { _extCatAdd('foreign-geoip-categories', name); }
 function clearForeignGeoipCats() {
-  if (!confirm('Очистить все GeoIP-категории канала «Заблокированные в РФ»? IP-only приложения снова пойдут через PRIMARY.')) return;
+  if (!confirm('Очистить все GeoIP-категории канала «Зарубежные сервисы»? IP-only приложения снова пойдут через PRIMARY.')) return;
   document.getElementById('foreign-geoip-categories').value = '';
   flash(true, 'GeoIP-категории очищены. Нажми «Сохранить».', null, {noScroll: true});
 }
@@ -14687,7 +14687,7 @@ async function installExtendedGeoip() {
 async function setTarget(role) {
   const sel = document.getElementById('select-' + role);
   const tag = sel.value;
-  const labels = { primary: 'PRIMARY (основной)', failover: 'FAILOVER (резервный)', ai: 'AI-sticky', yt: 'YouTube-sticky', foreign: 'Заблокированные в РФ' };
+  const labels = { primary: 'PRIMARY (основной)', failover: 'FAILOVER (резервный)', ai: 'AI-sticky', yt: 'YouTube-sticky', foreign: 'Зарубежные сервисы' };
   // Подробное описание что произойдёт
   let msg = 'Применить изменение?\n\n';
   msg += 'Новый ' + labels[role] + ' = ' + tag + '\n';
@@ -14710,7 +14710,7 @@ async function setTarget(role) {
     msg += '\nYouTube-домены (youtube.com, googlevideo.com) будут идти через ' + tag;
     msg += '\nWatchdog перегенерит routing на следующем тике.';
   } else if (role === 'foreign') {
-    msg += '\nДомены «Заблокированные в РФ» (Meta/Telegram/Twitter/Discord) будут идти через ' + tag;
+    msg += '\nДомены «Зарубежные сервисы» (Meta/Telegram/Twitter/Discord) будут идти через ' + tag;
     msg += '\nWatchdog перегенерит routing на следующем тике.';
   }
   // Доп-предупреждение: anti-DPI / whitelist outbound в роли AI — почти наверняка RU exit-IP,
@@ -14725,11 +14725,11 @@ async function setTarget(role) {
       'Точно ставить «' + tag + '» как AI-канал?'
     )) return;
   }
-  // Канал «Заблокированные в РФ» через РОССИЙСКИЙ exit бессмысленен — RU-IP блок РКН не обходит.
+  // Канал «Зарубежные сервисы» через РОССИЙСКИЙ exit бессмысленен — RU-IP блок РКН не обходит.
   if (role === 'foreign' && ANTI_DPI_TAGS.has(tag)) {
     if (!confirm(
       '🚨 ВНИМАНИЕ: «' + tag + '» помечен как anti-DPI / whitelist — обычно это РОССИЙСКИЙ exit-IP.\n\n' +
-      'Канал «Заблокированные в РФ» (Meta/Telegram/Twitter) через РОССИЙСКИЙ выход НЕ обойдёт блокировку РКН — ' +
+      'Канал «Зарубежные сервисы» (Meta/Telegram/Twitter) через РОССИЙСКИЙ выход НЕ обойдёт блокировку РКН — ' +
       'DPI режет TLS даже с RU-IP, сервисы не откроются.\n\n' +
       'Нужен ЗАРУБЕЖНЫЙ выход (🇳🇱 Нидерланды, 🇩🇪 Германия, 🇫🇮 Финляндия).\n\n' +
       'Точно ставить «' + tag + '» для этого канала?'
@@ -15798,7 +15798,7 @@ function renderSiteCheck(j) {
   }
   html += '</tbody></table>';
   if (j.via_error) html += `<p style="color:#c33; font-size:0.85em; margin-top:8px;">⚠ ${escapeHtml(j.via_error)}</p>`;
-  html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">«Вердикт» — на каком уровне рвётся соединение (с этого ПК). TLS-DPI / DNS-блок лечатся включением нужного канала; «лежит / таймаут» может быть проблемой самого сайта.<br>🧭 <strong>«Идёт через»</strong> — в какой канал роутер направит домен <em>по твоим пресетам</em> (списки доменов в каналах). Удобно проверять настройки: например instagram должен идти через «📱 Заблокированные в РФ» на загран-выход. <em>Совпадения через geo-категории (geosite:) тут не отражаются — такой домен покажется как «Основной (PRIMARY)».</em></p>`;
+  html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">«Вердикт» — на каком уровне рвётся соединение (с этого ПК). TLS-DPI / DNS-блок лечатся включением нужного канала; «лежит / таймаут» может быть проблемой самого сайта.<br>🧭 <strong>«Идёт через»</strong> — в какой канал роутер направит домен <em>по твоим пресетам</em> (списки доменов в каналах). Удобно проверять настройки: например instagram должен идти через «📱 Зарубежные сервисы» на загран-выход. <em>Совпадения через geo-категории (geosite:) тут не отражаются — такой домен покажется как «Основной (PRIMARY)».</em></p>`;
   out.innerHTML = html;
 }
 
@@ -15944,7 +15944,7 @@ async function makeSiteReachable(btn) {
     // Категория РАЗДЕЛА (4 группы). Подпункты AI/YouTube/… вложены в свой раздел, не в категорию.
     const catFor = (title) => {
       const t = title.toLowerCase();
-      if (/основн|резерв|цепочк|failover|outbound|подписк|добав/.test(t)) return 'Каналы / VPN';
+      if (/основн|резерв|цепочк|failover|outbound|подписк|добав/.test(t)) return 'Каналы';
       if (/бэкап|роутер|управление xkeen/.test(t)) return 'Обслуживание';
       if (/алерт|восстановлен|диагност|telegram/.test(t)) return 'Диагностика';
       if (/помощь/.test(t)) return 'Помощь';
@@ -15986,8 +15986,8 @@ async function makeSiteReachable(btn) {
     });
 
     // Навигация: КАТЕГОРИЯ → разделы → (всегда видимые) подпункты. Клик по любому = своя страница.
-    const catOrder = ['Каналы / VPN', 'Обслуживание', 'Диагностика', 'Помощь', 'Прочее'];
-    const catIcon = { 'Каналы / VPN':'📡', 'Обслуживание':'🛠', 'Диагностика':'🚑', 'Помощь':'❓', 'Прочее':'📋' };
+    const catOrder = ['Каналы', 'Обслуживание', 'Диагностика', 'Помощь', 'Прочее'];
+    const catIcon = { 'Каналы':'📡', 'Обслуживание':'🛠', 'Диагностика':'🚑', 'Помощь':'❓', 'Прочее':'📋' };
     const mkBtn = (cls, idx, text, full) => {
       const b = document.createElement('button');
       b.type = 'button'; b.className = cls; b.dataset.page = idx; b.textContent = text;
