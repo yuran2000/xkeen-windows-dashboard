@@ -1,4 +1,9 @@
 #!/bin/sh
+# XKeen failover watchdog v18 (2026-05-27, канал «🌐 Через IPv6» для IPv6-only сайтов):
+#   Новый placeholder __IPV6_RULE_BLOCK__ в 05_routing.template.json (требует template v12+):
+#   домены IPV6_DOMAINS → через IPV6_TAG. Узел обязан: egress IPv6 + routeOnly:false на входе
+#   (иначе получит фейк-IP 198.18.0.1 и не откроет). Без kill-switch. generate_routing принимает
+#   5-й арг ipv6_tag=$IPV6_TAG. На старом template (без плейсхолдера) изменение безвредно.
 # XKeen failover watchdog v17 (2026-05-25, kill-switch FAIL-порог 2→3 — анти-дребезг при потерях пути):
 #   Путь до удалённого узла может давать короткие потери пакетов (таймауты connect) — это НЕ
 #   порт-специфичный DPI. При пороге 2 редкие 2-подряд false-down всё ещё роняли kill-switch
@@ -247,7 +252,7 @@ flush_outbox() {
 # Если AI_DOMAINS пуст ИЛИ только из пробелов → AI-sticky выключен: блок заменяется на пустую
 # строку, AI-сайты идут через PRIMARY как обычный трафик.
 generate_routing() {
-  local default_tag="$1" ai_tag="$2" yt_tag="$3" foreign_tag="$4"
+  local default_tag="$1" ai_tag="$2" yt_tag="$3" foreign_tag="$4" ipv6_tag="$5"
   [ -f "$TEMPL" ] || { log "ERROR: template $TEMPL not found"; return 1; }
 
   # v9 defensive: если default_tag пустой — fallback на 'direct' если есть в outbounds.
@@ -377,6 +382,23 @@ generate_routing() {
     log "WARN: FOREIGN_GEOIP_CATEGORIES задан, но FOREIGN_TAG пуст — GeoIP правило не генерируем"
   fi
 
+  # ---- IPv6 rule block (канал «🌐 Через IPv6»: IPv6-only сайты, напр. ntc.party) ----
+  # IPV6_DOMAINS → через IPV6_TAG. Узел обязан: egress IPv6 + routeOnly:false на входе (вернуть
+  # домен из fake-IP). Без kill-switch: если IPV6_TAG упал — домены идут через PRIMARY.
+  local clean_ipv6_domains
+  clean_ipv6_domains=$(echo "$IPV6_DOMAINS" | tr -d ' ,\t\n\r')
+  local ipv6_rule_block=""
+  if [ -n "$clean_ipv6_domains" ] && [ -n "$ipv6_tag" ]; then
+    local ipv6_domains_json
+    ipv6_domains_json=$(echo "$IPV6_DOMAINS" | tr ' ,' '\n' | grep -v '^$' | \
+      jq -R -s -c 'split("\n") | map(select(length>0)) | map("domain:" + .)' 2>/dev/null)
+    if [ -n "$ipv6_domains_json" ] && [ "$ipv6_domains_json" != "[]" ]; then
+      ipv6_rule_block='      { "inboundTag": ["redirect","tproxy"], "outboundTag": "'"$ipv6_tag"'", "type": "field", "domain": '"$ipv6_domains_json"' },'
+    fi
+  elif [ -n "$clean_ipv6_domains" ] && [ -z "$ipv6_tag" ]; then
+    log "WARN: IPV6_DOMAINS задан, но IPV6_TAG пуст — правило не генерируем"
+  fi
+
   # ---- BLOCK rule block ----
   # BLOCK_DOMAINS — список сайтов которые ПОЛНОСТЬЮ заблокированы (outbound `block`/blackhole).
   # Кейс: Windows Update, Adobe Genuine, телеметрия — отрезка на уровне роутера.
@@ -393,7 +415,7 @@ generate_routing() {
     fi
   fi
 
-  awk -v dt="$default_tag" -v ai_rule="$ai_rule_block" -v direct_rule="$direct_rule_block" -v yt_rule="$yt_rule_block" -v yt_geoip_rule="$yt_geoip_rule_block" -v foreign_rule="$foreign_rule_block" -v foreign_geoip_rule="$foreign_geoip_rule_block" -v block_rule="$block_rule_block" '
+  awk -v dt="$default_tag" -v ai_rule="$ai_rule_block" -v direct_rule="$direct_rule_block" -v yt_rule="$yt_rule_block" -v yt_geoip_rule="$yt_geoip_rule_block" -v foreign_rule="$foreign_rule_block" -v foreign_geoip_rule="$foreign_geoip_rule_block" -v ipv6_rule="$ipv6_rule_block" -v block_rule="$block_rule_block" '
     /__AI_RULE_BLOCK__/ {
       if (ai_rule == "") next
       else { gsub(/__AI_RULE_BLOCK__/, ai_rule); print; next }
@@ -413,6 +435,10 @@ generate_routing() {
     /__FOREIGN_RULE_GEOIP__/ {
       if (foreign_geoip_rule == "") next
       else { gsub(/__FOREIGN_RULE_GEOIP__/, foreign_geoip_rule); print; next }
+    }
+    /__IPV6_RULE_BLOCK__/ {
+      if (ipv6_rule == "") next
+      else { gsub(/__IPV6_RULE_BLOCK__/, ipv6_rule); print; next }
     }
     /__DIRECT_RULE_BLOCK__/ {
       if (direct_rule == "") next
@@ -767,7 +793,7 @@ PREV_FOREIGN=$(grep -o 'EFFECTIVE_FOREIGN=\S*' "$STATE_FILE" 2>/dev/null | cut -
 # Всегда генерим новый routing.json и сравниваем с текущим через md5.
 # Это позволяет триггерить пересборку не только при смене default_tag, но и при изменении
 # AI_DOMAINS / AI_TAG / YT_DOMAINS / YT_TAG / шаблона (юзер правит из дашборда).
-if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFFECTIVE_FOREIGN_TAG"; then
+if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFFECTIVE_FOREIGN_TAG" "$IPV6_TAG"; then
   if routing_changed; then
     NEW_MD5=$(md5sum < "$CONFIG_DIR/05_routing.json.new" 2>/dev/null | awk '{print $1}')
     if [ -n "$LAST_BAD_MD5" ] && [ "$NEW_MD5" = "$LAST_BAD_MD5" ]; then
