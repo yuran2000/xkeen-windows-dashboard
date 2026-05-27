@@ -1,4 +1,4 @@
-// Watchdog template v11 (2026-05-23): подменяются 8 placeholder'ов через watchdog.sh:
+// Watchdog template v12 (2026-05-27): подменяются 9 placeholder'ов через watchdog.sh:
 //   __DEFAULT_TAG__       — основной outbound для всего обычного трафика
 //   __BLOCK_RULE_BLOCK__  — block-правило с пользовательскими доменами (BLOCK_DOMAINS) — ПЕРВЫМ по приоритету
 //   __DIRECT_RULE_BLOCK__ — direct-правило с пользовательскими доменами (DIRECT_DOMAINS)
@@ -10,7 +10,9 @@
 //                           правила их не ловят.
 //   FOREIGN_RULE_BLOCK / FOREIGN_RULE_GEOIP — канал «Заблокированные в РФ» (Meta/Telegram/
 //                           Twitter/Discord) по доменам и по geoip; через FOREIGN_TAG (загран-выход).
-// Все списки (BLOCK_DOMAINS, DIRECT_DOMAINS, AI_DOMAINS, AI_TAG, YT_DOMAINS, YT_TAG, YT_GEOIP_CATEGORIES, FOREIGN_*) редактируются через дашборд /xkeen.
+//   __IPV6_RULE_BLOCK__   — канал «🌐 Через IPv6» (IPv6-only сайты, напр. ntc.party): IPV6_DOMAINS
+//                           через IPV6_TAG (узел с IPv6-egress + routeOnly:false). Перед catch-all.
+// Все списки (BLOCK_DOMAINS, DIRECT_DOMAINS, AI_DOMAINS, AI_TAG, YT_DOMAINS, YT_TAG, YT_GEOIP_CATEGORIES, FOREIGN_*, IPV6_*) редактируются через дашборд /xkeen.
 {
   "routing": {
     "rules": [
@@ -52,6 +54,7 @@ __YT_RULE_BLOCK__
 __YT_RULE_GEOIP__
 __FOREIGN_RULE_BLOCK__
 __FOREIGN_RULE_GEOIP__
+__IPV6_RULE_BLOCK__
 { "inboundTag": ["socks-local"], "outboundTag": "vless-reality", "type": "field" },
 { "inboundTag": ["redirect","tproxy"], "outboundTag": "__DEFAULT_TAG__", "type": "field" }
 ]

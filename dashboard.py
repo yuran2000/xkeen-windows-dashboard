@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.70"
+_VERSION_FALLBACK = "1.0.71"
 
 
 def _find_git():
@@ -863,7 +863,7 @@ def keenetic_read_domain_notes():
     Формат: {"ai": {"claude.ai": "📦 claude"}, "yt": {...}, "direct": {...}, "block": {...}}
     Если файла нет — возвращает пустую структуру (4 пустых namespace).
     """
-    empty = {"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}}
+    empty = {"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}, "ipv6": {}}
     raw = keenetic_read_file(KEENETIC_DOMAIN_NOTES_FILE)
     if not raw:
         return empty
@@ -886,7 +886,7 @@ def keenetic_write_domain_notes(notes_dict):
     """
     import time as _time
     # Нормализуем
-    safe = {"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}}
+    safe = {"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}, "ipv6": {}}
     for k in safe:
         v = notes_dict.get(k, {}) if isinstance(notes_dict, dict) else {}
         if isinstance(v, dict):
@@ -1333,6 +1333,8 @@ def keenetic_get_watchdog_targets():
     yt_domains_list = [d.strip() for d in re.split(r"[\s,]+", yt_domains_str) if d.strip()]
     foreign_domains_str = cfg_d.get("FOREIGN_DOMAINS", "")
     foreign_domains_list = [d.strip() for d in re.split(r"[\s,]+", foreign_domains_str) if d.strip()]
+    ipv6_domains_str = cfg_d.get("IPV6_DOMAINS", "")
+    ipv6_domains_list = [d.strip() for d in re.split(r"[\s,]+", ipv6_domains_str) if d.strip()]
     direct_domains_str = cfg_d.get("DIRECT_DOMAINS", "")
     direct_domains_list = [d.strip() for d in re.split(r"[\s,]+", direct_domains_str) if d.strip()]
     block_domains_str = cfg_d.get("BLOCK_DOMAINS", "")
@@ -1355,6 +1357,8 @@ def keenetic_get_watchdog_targets():
         "foreign_ext_categories": cfg_d.get("FOREIGN_EXT_CATEGORIES", "").strip(),
         "foreign_geoip_categories": cfg_d.get("FOREIGN_GEOIP_CATEGORIES", "").strip(),
         "foreign_fail_block": cfg_d.get("FOREIGN_FAIL_BLOCK", "0") == "1",
+        "ipv6_tag":     cfg_d.get("IPV6_TAG"),
+        "ipv6_domains": ipv6_domains_list,
         "direct_domains": direct_domains_list,
         "block_domains":  block_domains_list,
         "force_mode":   cfg_d.get("FORCE_MODE", "auto"),
@@ -1370,6 +1374,7 @@ def _build_watchdog_config(d):
         "AI_TAG", "AI_DOMAINS", "AI_EXT_CATEGORIES", "AI_FAIL_BLOCK",
         "YT_TAG", "YT_DOMAINS", "YT_EXT_CATEGORIES", "YT_GEOIP_CATEGORIES", "YT_FAIL_BLOCK",
         "FOREIGN_TAG", "FOREIGN_DOMAINS", "FOREIGN_EXT_CATEGORIES", "FOREIGN_GEOIP_CATEGORIES", "FOREIGN_FAIL_BLOCK",
+        "IPV6_TAG", "IPV6_DOMAINS",
         "DIRECT_DOMAINS",
         "BLOCK_DOMAINS",
         "PRIMARY_PROBE_URL", "FAIL_THRESHOLD", "PASS_THRESHOLD",
@@ -1520,6 +1525,10 @@ def keenetic_write_watchdog_config(updates):
         if "FOREIGN_EXT_CATEGORIES" not in cur: cur["FOREIGN_EXT_CATEGORIES"] = ""
         if "FOREIGN_GEOIP_CATEGORIES" not in cur: cur["FOREIGN_GEOIP_CATEGORIES"] = ""
         if "FOREIGN_FAIL_BLOCK" not in cur: cur["FOREIGN_FAIL_BLOCK"] = "0"
+        # «🌐 Через IPv6» канал (IPV6_*): домены IPv6-only сайтов → выходной узел с IPv6-egress.
+        # Узел обязан: (1) egress IPv6 (freedom не UseIPv4), (2) routeOnly:false на входе (вернуть домен из fake-IP).
+        if "IPV6_TAG" not in cur: cur["IPV6_TAG"] = ""
+        if "IPV6_DOMAINS" not in cur: cur["IPV6_DOMAINS"] = ""
         if "PRIMARY_PROBE_URL" not in cur: cur["PRIMARY_PROBE_URL"] = f"https://{getattr(cfg, 'EXTERNAL_DOMAIN', None) or 'your-vpn-domain.example'}:8444/"
         if "FAIL_THRESHOLD" not in cur: cur["FAIL_THRESHOLD"] = "2"
         if "PASS_THRESHOLD" not in cur: cur["PASS_THRESHOLD"] = "3"
@@ -1556,7 +1565,7 @@ def keenetic_set_watchdog_target(role, new_tag):
     - Новый PRIMARY убирается из FAILOVER_TAGS (если был)
     - PRIMARY_PROBE_URL переключается: vless-reality → HTTPS curl, остальные → TCP-probe (пусто)
     """
-    if role not in ("primary", "failover", "ai", "yt", "foreign"):
+    if role not in ("primary", "failover", "ai", "yt", "foreign", "ipv6"):
         return {"ok": False, "stderr": "invalid role"}
     cur = keenetic_read_watchdog_config()
     failover_str = cur.get("FAILOVER_TAGS", "")
@@ -1588,6 +1597,11 @@ def keenetic_set_watchdog_target(role, new_tag):
         # FOREIGN_TAG — sticky outbound для зарубежных сервисов (Meta/Telegram/Twitter/Discord).
         # Должен быть ЗАРУБЕЖНЫМ exit — RU-выход блокировку НЕ обходит.
         return keenetic_write_watchdog_config({"FOREIGN_TAG": new_tag})
+
+    if role == "ipv6":
+        # IPV6_TAG — sticky outbound для IPv6-only сайтов. Узел обязан егрессить IPv6
+        # (freedom не UseIPv4) и восстанавливать домен (routeOnly:false на входе).
+        return keenetic_write_watchdog_config({"IPV6_TAG": new_tag})
 
     # role == "failover": ставим new_tag первым в FAILOVER_TAGS, остальные сохраняем
     failover_list = [t for t in failover_list if t != new_tag]
@@ -2618,7 +2632,7 @@ def xkeen_page():
     try:
         domain_notes = keenetic_read_domain_notes()
     except Exception:
-        domain_notes = {"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}}
+        domain_notes = {"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}, "ipv6": {}}
     # Дрейф структуры (версии watchdog/template на роутере vs встроенные) — для баннера «применить структуру».
     try:
         structure = _structure_drift_status() if outbounds else None
@@ -4426,6 +4440,54 @@ def api_xkeen_set_foreign_geoip_categories():
     return jsonify(keenetic_write_watchdog_config({"FOREIGN_GEOIP_CATEGORIES": " ".join(categories)}))
 
 
+@app.route("/api/xkeen/set-ipv6-domains", methods=["POST"])
+@requires_auth
+def api_xkeen_set_ipv6_domains():
+    """Обновить домены канала «🌐 Через IPv6» (IPv6-only сайты).
+    POST domains=<список>           → заменить весь список.
+    POST action=add  domain=<host>  → добавить один домен к текущему (кнопка «В канал
+                                       «Через IPv6»» из диагностики «Почему не работает сайт»).
+    Для каждого домена ставим fake-IP (ndm `ip host` → 198.18.0.1), чтобы IPv4-only клиент
+    дошёл до xray; иначе IPv6-only сайт (нет A-записи) вообще не резолвится у клиента.
+    Возвращаем текущий IPV6_TAG — фронт предупредит, если узел канала ещё не выбран."""
+    cur = keenetic_read_watchdog_config()
+    old_domains = [d.strip() for d in re.split(r"[\s,]+", cur.get("IPV6_DOMAINS", "")) if d.strip()]
+    action = (request.form.get("action") or "").strip()
+    force_remove = set()
+    if action == "add":
+        one = (request.form.get("domain", "") or "").strip().lower().rstrip(".")
+        if not _IPHOST_DOMAIN_RE.match(one):
+            return jsonify({"ok": False, "error": f"Невалидный домен: {one!r}"}), 400
+        domains = old_domains + ([one] if one not in old_domains else [])
+    elif action == "remove":
+        one = (request.form.get("domain", "") or "").strip().lower().rstrip(".")
+        domains = [d for d in old_domains if d.lower().rstrip(".") != one]
+        force_remove = {one}  # снять fake-IP даже если домена уже не было в списке (осиротевший)
+    else:
+        raw = request.form.get("domains", "").strip()
+        domains = [d.strip() for d in re.split(r"[\s,]+", raw) if d.strip()]
+    res = keenetic_write_watchdog_config({"IPV6_DOMAINS": " ".join(domains)})
+    # fake-IP синхронизируется с членством в канале: ставим для текущих, снимаем для выбывших.
+    new_set = {d.lower().rstrip(".") for d in domains}
+    old_set = {d.lower().rstrip(".") for d in old_domains}
+    set_hosts, removed_hosts, changed = [], [], False
+    for dd in new_set:
+        if _IPHOST_DOMAIN_RE.match(dd):
+            keenetic_ssh(f'ndmc -c "ip host {dd} {_FAKE_IP_FOR_V6ONLY}"', timeout=15)
+            set_hosts.append(dd); changed = True
+    for dd in ((old_set - new_set) | force_remove):
+        if dd and _IPHOST_DOMAIN_RE.match(dd):
+            keenetic_ssh(f'ndmc -c "no ip host {dd} {_FAKE_IP_FOR_V6ONLY}"', timeout=15)
+            removed_hosts.append(dd); changed = True
+    if changed:
+        keenetic_ssh('ndmc -c "system configuration save"', timeout=15)
+    if isinstance(res, dict):
+        res["fake_ip_set"] = set_hosts
+        res["fake_ip_removed"] = removed_hosts
+        res["ipv6_tag"] = (cur.get("IPV6_TAG") or "").strip()
+    return jsonify(res)
+
+
 @app.route("/api/xkeen/set-failover-chain", methods=["POST"])
 @requires_auth
 def api_xkeen_set_failover_chain():
@@ -5450,7 +5512,7 @@ FORCE_MODE="auto"
 # Минимальные пустые meta-файлы (если ещё нет — создаём пустыми)
 EMPTY_OUTBOUND_META = "{}\n"
 EMPTY_SUBSCRIPTION_META = "{}\n"
-EMPTY_DOMAIN_NOTES = '{"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}}\n'  # v1.7.0
+EMPTY_DOMAIN_NOTES = '{"ai": {}, "yt": {}, "direct": {}, "block": {}, "foreign": {}, "ipv6": {}}\n'  # v1.7.0
 
 # Минимальный 04_outbounds.json с двумя стандартными outbound'ами:
 # - "direct" (freedom) — для виртуального канала «🌐 Напрямую без VPN» в PRIMARY/FAILOVER/AI/YT
@@ -6689,7 +6751,7 @@ def _domain_in_list(host, domain_list):
 
 def _channel_for_domain(host, tg):
     """В какой канал попадёт домен ПО ПРЕСЕТАМ (watchdog.config). Приоритет = как в watchdog:
-    BLOCK > DIRECT(список) > RU-домен(.ru/.su/.рф) > AI > YT > FOREIGN > PRIMARY (по умолчанию).
+    BLOCK > DIRECT(список) > RU-домен(.ru/.su/.рф) > AI > YT > FOREIGN > IPv6 > PRIMARY (по умолчанию).
     ⚠ Geo-категории (ext:geosite:...) НЕ учитываются (на хосте панели нет geo-БД) — домен,
     попадающий в канал ТОЛЬКО через geo-категорию, тут покажется как PRIMARY (см. note во фронте).
     tg = keenetic_get_watchdog_targets(). Возвращает {label, tag, kind, match}."""
@@ -6706,6 +6768,8 @@ def _channel_for_domain(host, tg):
     if m: return {"label": "📺 YouTube", "tag": tg.get("yt_tag"), "kind": "yt", "match": m}
     m = _domain_in_list(h, tg.get("foreign_domains"))
     if m: return {"label": "📱 Зарубежные сервисы", "tag": tg.get("foreign_tag"), "kind": "foreign", "match": m}
+    m = _domain_in_list(h, tg.get("ipv6_domains"))
+    if m: return {"label": "🌐 Через IPv6", "tag": tg.get("ipv6_tag"), "kind": "ipv6", "match": m}
     return {"label": "🌍 Основной (PRIMARY)", "tag": tg.get("primary_tag"), "kind": "primary", "match": None}
 
 
@@ -8792,6 +8856,51 @@ XKEEN_TEMPLATE = r"""<!doctype html>
               <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Требует расширенный geoip.dat (см. кнопку выше).</p>
             </div>
           </details>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== «🌐 Через IPv6» канал (IPV6_*) — IPv6-only сайты через узел с IPv6-выходом ===== -->
+  <div class="row" style="margin-top: 16px;">
+    <div class="col" data-xk-sub="🌐 Через IPv6">
+      <div class="channel-card">
+        <label class="col-header" style="color:#2980b9;">🌐 «Через IPv6» — sticky outbound</label>
+        <div class="channel-card-body">
+          <select id="select-ipv6" style="width: 100%; padding: 7px; font-size: 0.95em; border: 1px solid #ccc; border-radius: 4px;">
+            {% for grp in vless_option_groups %}
+            <optgroup label="📦 {{ grp.name }}">
+              {% for opt in grp.options %}
+              <option value="{{ opt.tag }}" {% if opt.tag == targets.ipv6_tag %}selected{% endif %} style="background-color: {{ grp.bg }};">{% if opt.is_direct %}🌐 Напрямую без VPN (НЕ годится — у роутера нет IPv6){% else %}{{ grp.name }} · {{ opt.tag }}{% endif %}</option>
+              {% endfor %}
+            </optgroup>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm" style="margin-top: 6px; background: #2980b9;" onclick="setTarget('ipv6')">Сохранить outbound</button>
+          <div id="info-ipv6" class="outbound-info"></div>
+          <p class="subtitle">Канал для <strong>IPv6-only сайтов</strong> (есть только AAAA-запись, напр. <code>ntc.party</code>). Роутер выдаёт таким доменам fake-IP <code>198.18.0.1</code> и заворачивает сюда, а выбранный <strong>узел открывает реальный IPv6</strong>.</p>
+          <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 10px; margin: 6px 0 0; font-size: 0.85em; color: #1a5276;">
+            ⚠️ Узел обязан уметь <strong>IPv6-выход</strong> (egress IPv6) и восстанавливать домен из fake-IP (sniffing <code>routeOnly:false</code>). Надёжнее всего — <strong>свой VPS</strong>. Сторонние RU-узлы и «Напрямую» здесь не сработают.
+          </div>
+          <button class="btn btn-sm" style="margin-top: 8px; background: #16a085;" onclick="checkIpv6Node()" title="Проверить по реальному маршруту с этого ПК, открывает ли выбранный узел IPv6-only сайт (ntc.party или домены из списка ниже). Запускай ПОСЛЕ «Сохранить outbound» и «Сохранить домены» (≤1 мин на применение).">🔎 Проверить, открывает ли узел IPv6</button>
+          <div id="ipv6-check-result" style="margin-top: 4px;"></div>
+        </div>
+      </div>
+
+      <!-- Домены канала «Через IPv6» -->
+      <div class="domain-section">
+        <h3 class="domain-section-header">🌐 Список доменов «Через IPv6» <span class="subsec-hint">(через outbound выше)</span></h3>
+        <div class="domain-section-body">
+          <p class="subtitle">IPv6-only сайты (только AAAA). Через пробел или с новой строки. При сохранении каждому домену ставится fake-IP <code>198.18.0.1</code> на роутере (чтобы IPv4-клиент дошёл до xray). Пустой список = правило выключено, домены идут через PRIMARY.</p>
+          <div style="margin-bottom: 8px;">
+            <strong style="font-size: 0.85em; color: #555;">Готовые пресеты:</strong><br>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #2980b9;" onclick="addIpv6Preset('ntc')">🛰 ntc.party</button>
+            <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearIpv6Domains()">🗑 Очистить</button>
+          </div>
+          <textarea id="ipv6-domains" style="width: 100%; min-height: 80px; font-family: Consolas, monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">{% for d in targets.ipv6_domains %}{{ d }}
+{% endfor %}</textarea>
+          <button class="btn" style="margin-top: 6px; background: #2980b9;" onclick="saveIpv6Domains()">💾 Сохранить домены</button>
+          <p class="subtitle" style="margin: 4px 0 0; font-size: 0.85em;">Watchdog подхватит при следующем тике (≤1 мин).</p>
         </div>
       </div>
     </div>
@@ -11598,7 +11707,7 @@ window.PC_LAN_HOST = "{{ cfg.LAN_HOST or '' }}";
 // При save — JS парсит строки, домены идут в watchdog.config, notes в sidecar JSON.
 let WINDOW_DOMAIN_NOTES = {{ domain_notes_json|safe }};
 // Гарантируем что все 4 namespace есть (если backend вернул битую структуру)
-['ai', 'yt', 'foreign', 'direct', 'block'].forEach(k => {
+['ai', 'yt', 'foreign', 'ipv6', 'direct', 'block'].forEach(k => {
   if (!WINDOW_DOMAIN_NOTES[k] || typeof WINDOW_DOMAIN_NOTES[k] !== 'object') {
     WINDOW_DOMAIN_NOTES[k] = {};
   }
@@ -11611,6 +11720,7 @@ const DOMAIN_SECTIONS = {
   ai:     { taId: 'ai-domains',     getPresets: () => (typeof AI_PRESETS     !== 'undefined') ? AI_PRESETS     : null, label: 'AI'      },
   yt:     { taId: 'yt-domains',     getPresets: () => (typeof YT_PRESETS     !== 'undefined') ? YT_PRESETS     : null, label: 'YT'      },
   foreign:{ taId: 'foreign-domains',getPresets: () => (typeof FOREIGN_PRESETS !== 'undefined') ? FOREIGN_PRESETS : null, label: 'Заблок. в РФ' },
+  ipv6:   { taId: 'ipv6-domains',   getPresets: () => (typeof IPV6_PRESETS    !== 'undefined') ? IPV6_PRESETS    : null, label: 'Через IPv6' },
   direct: { taId: 'direct-domains', getPresets: () => (typeof DIRECT_PRESETS !== 'undefined') ? DIRECT_PRESETS : null, label: 'DIRECT'  },
   block:  { taId: 'block-domains',  getPresets: () => (typeof BLOCK_PRESETS  !== 'undefined') ? BLOCK_PRESETS  : null, label: 'BLOCK'   },
 };
@@ -11830,9 +11940,10 @@ function highlightDuplicatesBadge(sectionKey) {
 // Сохраняет notes в sidecar JSON на роутере. Вызывается ПОСЛЕ saveXDomains (которая обновила
 // watchdog.config). Notes для несуществующих доменов фильтруются (cleanup осиротевших).
 async function saveDomainNotesSidecar() {
-  // Собираем актуальные notes для всех 4 секций (только для доменов которые реально в textarea)
-  const allNotes = { ai: {}, yt: {}, direct: {}, block: {} };
+  // Собираем актуальные notes для всех секций каналов (только для доменов которые реально в textarea)
+  const allNotes = {};
   Object.keys(DOMAIN_SECTIONS).forEach(sectionKey => {
+    allNotes[sectionKey] = {};
     const sec = readSection(sectionKey);
     sec.items.forEach(it => {
       if (it.note) allNotes[sectionKey][it.domain] = it.note;
@@ -11853,10 +11964,12 @@ async function saveDomainNotesSidecar() {
 
 // Имя add-функции и remove-функции для каждой секции (используется для UI injection).
 const _SECTION_FN_MAP = {
-  ai:     { add: 'addPreset',       remove: 'removePreset'       },
-  yt:     { add: 'addYTPreset',     remove: 'removeYTPreset'     },
-  direct: { add: 'addDirectPreset', remove: 'removeDirectPreset' },
-  block:  { add: 'addBlockPreset',  remove: 'removeBlockPreset'  },
+  ai:     { add: 'addPreset',        remove: 'removePreset'        },
+  yt:     { add: 'addYTPreset',      remove: 'removeYTPreset'      },
+  foreign:{ add: 'addForeignPreset', remove: 'removeForeignPreset' },
+  ipv6:   { add: 'addIpv6Preset',    remove: 'removeIpv6Preset'    },
+  direct: { add: 'addDirectPreset',  remove: 'removeDirectPreset'  },
+  block:  { add: 'addBlockPreset',   remove: 'removeBlockPreset'   },
 };
 
 // Инжектит UI-controls (поиск + сортировка + бейдж дублей) НАД каждой textarea + кнопки 🧹
@@ -14601,6 +14714,117 @@ async function saveForeignDomains() {
     flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
   }
 }
+// ============== «🌐 Через IPv6» (IPV6_*) — IPv6-only сайты через узел с IPv6-выходом ==============
+const IPV6_PRESETS = {
+  ntc: ['ntc.party'],
+};
+IPV6_PRESETS.all_ipv6 = [].concat(...Object.entries(IPV6_PRESETS).filter(([k]) => !k.startsWith('all_')).map(([,v]) => v));
+function getIpv6DomainsArray() { return readSection('ipv6').domains; }
+function setIpv6DomainsArray(arr) {
+  const oldItems = readSection('ipv6').items;
+  const oldNotesMap = {};
+  oldItems.forEach(it => { if (it.note) oldNotesMap[it.domain] = it.note; });
+  const items = arr.map(d => ({ domain: d, note: oldNotesMap[d] || '' }));
+  writeSection('ipv6', items);
+}
+function addIpv6Preset(name) {
+  const preset = IPV6_PRESETS[name];
+  if (!preset) return;
+  addPresetGeneric('ipv6', name, preset);
+}
+function removeIpv6Preset(name) { removePresetGeneric('ipv6', name); }
+function clearIpv6Domains() {
+  if (!confirm('Очистить список «Через IPv6»?\n\nПосле сохранения правило исчезнет, эти домены пойдут через PRIMARY.')) return;
+  setIpv6DomainsArray([]);
+  flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
+}
+async function saveIpv6Domains() {
+  const domains = getIpv6DomainsArray();
+  if (domains.length === 0) {
+    if (!confirm('Список пустой. После сохранения правило исчезнет, эти домены пойдут через PRIMARY. Продолжить?')) return;
+  } else {
+    const preview = domains.slice(0, 5).join('\n  • ');
+    const more = domains.length > 5 ? `\n  ... и ещё ${domains.length - 5}` : '';
+    if (!confirm(`Сохранить ${domains.length} доменов канала «Через IPv6»?\n\n  • ${preview}${more}\n\nКаждому домену панель поставит fake-IP (ip host → 198.18.0.1), чтобы IPv4-клиент дошёл до xray. Watchdog перегенерит routing на следующем тике.`)) return;
+  }
+  const fd = new FormData();
+  fd.append('domains', domains.join(' '));
+  flash(true, `Сохраняю ${domains.length} доменов + ставлю fake-IP...`);
+  const res = await apiCall('/api/xkeen/set-ipv6-domains', fd);
+  if (res.ok) {
+    flash(true, res.stdout || 'Сохранено. Watchdog подхватит при следующем тике (≤1 мин).');
+    setTimeout(() => location.reload(), 1800);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+
+// Проверка «умеет ли выбранный узел IPv6»: прогоняем IPv6-домены (или ntc.party) через ЖИВОЙ
+// маршрут с хоста панели (fake-IP → tproxy → текущий IPV6_TAG → узел). tls_ok=true ⟹ узел
+// реально открыл IPv6-сайт. Активный тест «через произвольный outbound» (socks-test) отключён
+// (ронял VPN), поэтому проверяем по фактической доступности — честно и безопасно.
+async function checkIpv6Node() {
+  const out = document.getElementById('ipv6-check-result');
+  let domains = getIpv6DomainsArray();
+  if (!domains.length) domains = ['ntc.party'];
+  out.innerHTML = '<span style="color:#888; font-style:italic; font-size:0.85em;">Проверяю через текущий узел по реальному маршруту с этого ПК...</span>';
+  try {
+    const res = await fetch('/api/diagnose/site?domains=' + encodeURIComponent(domains.join(',')));
+    const j = await res.json();
+    if (!j || !j.results) { out.innerHTML = '<span style="color:#c33; font-size:0.85em;">Не удалось проверить (роутер/панель недоступны).</span>'; return; }
+    let html = '';
+    for (const r of j.results) {
+      const opens = !!r.tls_ok;
+      html += `<div style="margin-top:6px; padding:6px 10px; border-radius:4px; background:${opens ? '#e9f7ef' : '#fff4e0'}; color:${opens ? '#1a5a1a' : '#8a5a00'}; font-size:0.86em;">`
+            + `<strong>${escapeHtml(r.name)}</strong> — `
+            + (opens ? '✅ узел отдаёт IPv6 (TLS прошёл)'
+                     : '⚠ через текущий узел НЕ открывается (TLS не прошёл) — выбери узел с IPv6-выходом, надёжнее свой VPS')
+            + `</div>`;
+    }
+    html += `<div style="font-size:0.78em; color:#999; margin-top:4px;">Проверка по реальному маршруту с этого ПК. Запускай ПОСЛЕ «Сохранить outbound» + «Сохранить домены» (watchdog применяет ≤1 мин).</div>`;
+    out.innerHTML = html;
+  } catch (e) {
+    out.innerHTML = `<span style="color:#c33; font-size:0.85em;">Ошибка: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+// «➕ В канал «Через IPv6»» из диагностики: добавляет домен в IPV6_DOMAINS + ставит fake-IP
+// одним вызовом (endpoint action=add). Закрывает ловушку «fake-IP есть, а маршрут мимо узла».
+async function addToIpv6Channel(domain) {
+  if (!confirm(`Перенести «${domain}» в канал «🌐 Через IPv6»?\n\nДомен пойдёт через узел этого канала (с IPv6-выходом) и ему сразу поставится fake-IP (198.18.0.1).\nЕсли узел в канале ещё не выбран — выбери его в секции «🌐 Через IPv6» (надёжнее всего свой VPS), иначе домен пойдёт через PRIMARY.`)) return;
+  const fd = new FormData();
+  fd.append('action', 'add');
+  fd.append('domain', domain);
+  flash(true, `Переношу «${domain}» в «Через IPv6» + ставлю fake-IP...`);
+  const res = await apiCall('/api/xkeen/set-ipv6-domains', fd);
+  if (res.ok) {
+    let m = res.stdout || 'Готово.';
+    if (res.ipv6_tag) m += ' Идёт через ' + res.ipv6_tag + '. Watchdog применит ≤1 мин.';
+    else m += ' ⚠ Узел в канале «Через IPv6» НЕ выбран — открой секцию канала и выбери узел с IPv6-выходом, иначе домен пойдёт через PRIMARY.';
+    flash(true, m);
+    setTimeout(() => location.reload(), 2000);
+  } else {
+    flash(false, 'Ошибка', res.stderr || res.error || JSON.stringify(res));
+  }
+}
+
+// Убрать домен из канала «Через IPv6» — снимает И членство в канале, И fake-IP (синхронно).
+// Для IPv6-only сайта это возврат в исходное состояние (с IPv4-клиента снова не откроется).
+async function removeFromIpv6Channel(domain) {
+  if (!confirm(`Убрать «${domain}» из канала «🌐 Через IPv6»?\n\nСнимется И членство в канале, И fake-IP (ip host). Для IPv6-only сайта это значит, что с IPv4-устройств он снова перестанет открываться — возврат в исходное состояние.`)) return;
+  const fd = new FormData();
+  fd.append('action', 'remove');
+  fd.append('domain', domain);
+  flash(true, `Убираю «${domain}» из «Через IPv6» + снимаю fake-IP...`);
+  const res = await apiCall('/api/xkeen/set-ipv6-domains', fd);
+  if (res.ok) {
+    flash(true, res.stdout || 'Убрано: домен вышел из канала, fake-IP снят. Watchdog применит ≤1 мин.');
+    setTimeout(() => location.reload(), 2000);
+  } else {
+    flash(false, 'Ошибка', res.stderr || res.error || JSON.stringify(res));
+  }
+}
+
 async function toggleForeignFailBlock(enabled) {
   const fd = new FormData();
   fd.append('enabled', enabled ? '1' : '0');
@@ -14687,7 +14911,7 @@ async function installExtendedGeoip() {
 async function setTarget(role) {
   const sel = document.getElementById('select-' + role);
   const tag = sel.value;
-  const labels = { primary: 'PRIMARY (основной)', failover: 'FAILOVER (резервный)', ai: 'AI-sticky', yt: 'YouTube-sticky', foreign: 'Зарубежные сервисы' };
+  const labels = { primary: 'PRIMARY (основной)', failover: 'FAILOVER (резервный)', ai: 'AI-sticky', yt: 'YouTube-sticky', foreign: 'Зарубежные сервисы', ipv6: 'Через IPv6' };
   // Подробное описание что произойдёт
   let msg = 'Применить изменение?\n\n';
   msg += 'Новый ' + labels[role] + ' = ' + tag + '\n';
@@ -14711,6 +14935,10 @@ async function setTarget(role) {
     msg += '\nWatchdog перегенерит routing на следующем тике.';
   } else if (role === 'foreign') {
     msg += '\nДомены «Зарубежные сервисы» (Meta/Telegram/Twitter/Discord) будут идти через ' + tag;
+    msg += '\nWatchdog перегенерит routing на следующем тике.';
+  } else if (role === 'ipv6') {
+    msg += '\nIPv6-only домены (напр. ntc.party) будут идти через ' + tag;
+    msg += '\n⚠ Узел должен уметь IPv6-выход, иначе сайт не откроется.';
     msg += '\nWatchdog перегенерит routing на следующем тике.';
   }
   // Доп-предупреждение: anti-DPI / whitelist outbound в роли AI — почти наверняка RU exit-IP,
@@ -15763,14 +15991,25 @@ function renderSiteCheck(j) {
       const alreadySet = !!(j.iphost && j.iphost[r.name]);
       html += `<td style="padding:6px 10px; color:${v.fg};"><strong>🔵 IPv6-only сайт</strong>`;
       if (alreadySet) {
-        html += ` <span style="font-size:0.8em; color:#1a5a1a;">✅ уже доступен на всех устройствах</span>`
-              + `<div style="font-size:0.82em; color:#555; margin-top:3px; line-height:1.5;">Роутер уже выдаёт <code>${escapeHtml(r.name)}</code> → <code>${fip}</code> и пускает через VPN-сервер. Менять ничего не нужно.</div>`
-              + `<button data-domain="${escapeHtml(r.name)}" data-action="remove" onclick="makeSiteReachable(this)" style="margin-top:6px; padding:4px 10px; background:#eee; color:#666; border:1px solid #ccc; border-radius:4px; cursor:pointer; font-size:0.82em;">✖ убрать fake-IP</button>`;
+        // Честная проверка: fake-IP стоит — но РЕАЛЬНО ли узел открывает IPv6? Замер с хоста
+        // панели идёт по живой цепочке (fake-IP → tproxy → текущий канал → узел). tls_ok=true
+        // означает, что TLS до настоящего origin прошёл → узел егрессит IPv6 и восстановил домен.
+        // tls_ok=false при стоящем fake-IP = узел НЕ тянет IPv6 (или не вернул домен из фейк-IP).
+        const opensNow = !!r.tls_ok;
+        if (opensNow) {
+          html += ` <span style="font-size:0.8em; color:#1a5a1a;">✅ открывается — узел отдаёт IPv6</span>`
+                + `<div style="font-size:0.82em; color:#555; margin-top:3px; line-height:1.5;">fake-IP стоит (<code>${escapeHtml(r.name)}</code> → <code>${fip}</code>) и выбранный узел реально открыл сайт по IPv6 (TLS прошёл). Менять ничего не нужно.</div>`;
+        } else {
+          html += ` <span style="font-size:0.85em; color:#8a5a00; font-weight:600;">⚠ fake-IP стоит, но через узел НЕ открывается</span>`
+                + `<div style="font-size:0.82em; color:#8a5a00; margin-top:3px; line-height:1.5;">Роутер выдаёт <code>${escapeHtml(r.name)}</code> → <code>${fip}</code> и заворачивает в VPN, <strong>но TLS не прошёл</strong> — текущий узел <strong>не отдаёт IPv6</strong> (или не восстанавливает домен из fake-IP). Заведи домен в канал <strong>«🌐 Через IPv6»</strong> и выбери там узел с IPv6-выходом — надёжнее всего <strong>свой VPS</strong> (сторонний RU-узел и «Напрямую» не подойдут).</div>`
+                + `<button onclick="addToIpv6Channel('${escapeHtml(r.name)}')" style="margin-top:6px; margin-right:6px; padding:5px 12px; background:#2980b9; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:0.86em;">➕ В канал «Через IPv6»</button>`;
+        }
+        html += `<button onclick="removeFromIpv6Channel('${escapeHtml(r.name)}')" style="margin-top:6px; padding:4px 10px; background:#eee; color:#666; border:1px solid #ccc; border-radius:4px; cursor:pointer; font-size:0.82em;">✖ убрать из «Через IPv6» (+ fake-IP)</button>`;
       } else {
         const okNow = (r.verdict === 'OK');
         html += (okNow ? ` <span style="font-size:0.8em; color:#1a5a1a;">✅ сейчас открывается с этого ПК</span>` : '')
-              + `<div style="font-size:0.82em; color:#555; margin-top:3px; line-height:1.5;">У сайта только IPv6-адрес, а на роутере IPv6 выключен. Чтобы открывался у <strong>всех устройств дома</strong> — задай ему рабочий IPv4 (<code>${fip}</code>) на роутере: клиент пойдёт через VPN-сервер, а тот откроет IPv6 сам. <strong>Только DNS, без перезапуска VPN.</strong></div>`
-              + `<button data-domain="${escapeHtml(r.name)}" data-action="add" onclick="makeSiteReachable(this)" style="margin-top:6px; padding:5px 12px; background:#1a73e8; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:0.86em;">✅ Сделать доступным (на весь дом)</button>`;
+              + `<div style="font-size:0.82em; color:#555; margin-top:3px; line-height:1.5;">У сайта только IPv6-адрес, а на роутере IPv6 выключен. Чтобы открывался у <strong>всех устройств дома</strong> — перенеси его в канал <strong>«🌐 Через IPv6»</strong>: он направит домен на узел с IPv6-выходом <strong>и сразу поставит fake-IP</strong> (<code>${fip}</code>). <span style="color:#8a5a00;">Просто fake-IP без правильного узла не поможет — домен уйдёт через PRIMARY и может не открыться.</span></div>`
+              + `<button onclick="addToIpv6Channel('${escapeHtml(r.name)}')" style="margin-top:6px; padding:5px 12px; background:#2980b9; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:0.86em;">➕ В канал «Через IPv6» (+ fake-IP)</button>`;
       }
       html += `<span class="mk-reachable-msg" style="font-size:0.83em;"></span></td>`;
     } else if (rejected) {
