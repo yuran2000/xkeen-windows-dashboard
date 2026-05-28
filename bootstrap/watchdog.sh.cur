@@ -1,4 +1,20 @@
 #!/bin/sh
+# XKeen failover watchdog v21 (2026-05-28, штатное исключение DNS из XKeen-проксирования):
+#   Гарантируем, что `/opt/etc/xkeen/port_exclude.lst` содержит строку `53` — это уводит DNS
+#   клиентов в штатный ndnproxy роутера (порт 41103) минуя xray-tproxy. Иначе DNS-сокет xray
+#   может залипнуть под UDP-нагрузкой (Recv-Q→потолок буфера, xray перестаёт читать UDP).
+#   Идемпотентно: на повторных тиках silent; при первом добавлении один раз делаем
+#   `xkeen -restart` (детачем) чтобы XKeen перечитал список. На уже настроенных роутерах
+#   (где DNS уже исключён) — no-op. Бекап файла перед правкой.
+# XKeen failover watchdog v20 (2026-05-27, фикс времени в TG-алертах + снимок UDP-залипания):
+#   (1) Время в префиксе TG считалось через TZ='Europe/Moscow', но на роутере без tzdata это
+#       отдаёт UTC (а подпись «МСК») — время уезжало на -3ч. Фикс: TZ='MSK-3' (фикс. UTC+3,
+#       работает на busybox без tzdata; Москва без перехода на лето).
+#   (2) При входе в залипание (1-й тик выше порога) — снимок диагностики в
+#       /opt/var/log/xray/udp-stall-capture.log (какой сокет, sockstat, top UDP src/dport, жив ли
+#       TCP xray) ДО перезапуска, чтобы по след. инциденту вскрыть первопричину.
+#   (3) Быстрый путь: если Recv-Q упёрся в потолок буфера (RECVQ_HARD=100000) — сброс уже на 1-м
+#       тике (однозначное «намертво»), не ждём 2 тика. Обычный порог 10000 — по-прежнему 2 тика.
 # XKeen failover watchdog v19 (2026-05-27, conntrack-потолок + авто-починка залипшего UDP):
 #   Защита от каскадного обвала сети: UDP-tproxy xray (:1181) может залипнуть, тогда Recv-Q
 #   растёт лавиной, каждый застрявший пакет = попытка вставить запись в conntrack, и таблица
@@ -198,7 +214,7 @@ _tg_prefix() {
   ip=$(get_lan_ip); [ -z "$ip" ] && ip="?"
   hn=$(hostname 2>/dev/null); [ -z "$hn" ] && hn=$(cat /proc/sys/kernel/hostname 2>/dev/null)
   [ -z "$hn" ] && hn="роутер"
-  now=$(TZ='Europe/Moscow' date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+  now=$(TZ='MSK-3' date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
   [ -z "$now" ] && now=$(date '+%Y-%m-%d %H:%M:%S')
   printf '\360\237\233\260 <b>%s</b> (%s)\n\360\237\225\222 %s \320\234\320\241\320\232\n\n' "$hn" "$ip" "$now"
 }
@@ -609,6 +625,7 @@ flush_outbox
 #     залипания); conntrack% — лишь для лога/алерта, сам по себе xray не перезапускает (чтобы
 #     не дёргать рестартом при честной высокой нагрузке).
 RECVQ_THRESHOLD=${RECVQ_THRESHOLD:-10000}
+RECVQ_HARD=${RECVQ_HARD:-100000}
 STALL_FAIL_NEED=${STALL_FAIL_NEED:-2}
 STALL_COOLDOWN=${STALL_COOLDOWN:-300}
 STALL_STATE=/opt/etc/xray/watchdog.udpstall
@@ -633,6 +650,19 @@ if [ "${_ct_target:-0}" -gt 0 ] 2>/dev/null && [ -w "$_CT_MAX_F" ]; then
   fi
 fi
 
+# ---------- v21: гарантия исключения DNS (порт 53) из XKeen-проксирования ----------
+# Без этого DNS клиентов идёт через xray-tproxy и его сокет может залипнуть под UDP-нагрузкой
+# (наблюдалось на гостевых XKeen-устройствах: Recv-Q→потолок буфера, xray перестаёт читать UDP,
+# симптомом → каскад на остальной трафик). port_exclude.lst — штатный механизм XKeen; добавление
+# `53` уводит DNS в ndnproxy (порт 41103). Идемпотентно: на повторных тиках silent.
+PORT_EXCLUDE_FILE=/opt/etc/xkeen/port_exclude.lst
+if [ -f "$PORT_EXCLUDE_FILE" ] && ! grep -qxE '^53$' "$PORT_EXCLUDE_FILE" 2>/dev/null; then
+  cp "$PORT_EXCLUDE_FILE" "$PORT_EXCLUDE_FILE.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null
+  printf '53\n' >> "$PORT_EXCLUDE_FILE"
+  log "port_exclude.lst: +53 (DNS уведён мимо xray-tproxy в ndnproxy) → xkeen -restart"
+  /opt/sbin/xkeen -restart >/dev/null 2>&1 &
+fi
+
 # максимальный Recv-Q по всем udp-сокетам процесса xray (ловит и listen :1181, и tproxy-потоки)
 _recvq=$(netstat -anup 2>/dev/null | awk '$NF ~ /xray/ {if($2+0>m)m=$2+0} END{print m+0}')
 [ -z "$_recvq" ] && _recvq=0
@@ -644,21 +674,46 @@ if [ "$_recvq" -ge 1000 ] 2>/dev/null || [ "$_ctpct" -ge 70 ] 2>/dev/null; then
   log "udp-watch: recvq(xray)=$_recvq conntrack=$_ctcnt/$_ctmax2 (${_ctpct}%)"
 fi
 
+# Снимок «кто топит UDP» при ВХОДЕ в залипание (один раз за эпизод, на 1-м тике выше порога) —
+# чтобы по следующему инциденту вскрыть первопричину, ПОКА xray ещё не перезапущен. Один дамп
+# conntrack в переменную. Деградирует тихо, если conntrack не установлен (у части юзеров его нет).
+capture_udp_stall() {
+  CAPLOG=/opt/var/log/xray/udp-stall-capture.log
+  _ct=$(conntrack -L -p udp 2>/dev/null)
+  {
+    echo "===== $(TZ='MSK-3' date '+%F %T') МСК | recvq=$_recvq conntrack=$_ctcnt/$_ctmax2 ====="
+    echo "-- xray sockets (Recv-Q Local Foreign):"; netstat -anp 2>/dev/null | grep '[x]ray' | awk '{print $2, $4, $5}' | sort -rn | head -15
+    echo "-- /proc/net/sockstat:"; cat /proc/net/sockstat 2>/dev/null
+    echo "-- udp conntrack flows:"; printf '%s\n' "$_ct" | grep -c .
+    echo "-- top udp src (LAN-сторона):"; printf '%s\n' "$_ct" | awk '{for(i=1;i<=NF;i++) if($i ~ /^src=/){print $i; break}}' | sort | uniq -c | sort -rn | head -8
+    echo "-- top udp dport:"; printf '%s\n' "$_ct" | grep -oE 'dport=[0-9]+' | sort | uniq -c | sort -rn | head -8
+    echo "-- xray tcp :1181 (жив ли процесс целиком):"; curl -s -o /dev/null --connect-timeout 3 --max-time 4 http://127.0.0.1:1181; echo "curl_rc=$?"
+  } >> "$CAPLOG" 2>&1
+  [ "$(wc -l < "$CAPLOG" 2>/dev/null || echo 0)" -gt 1500 ] && { tail -800 "$CAPLOG" > "$CAPLOG.t" 2>/dev/null && mv "$CAPLOG.t" "$CAPLOG"; }
+}
+
 _SCTR=0; _SLAST=0
 [ -f "$STALL_STATE" ] && read _SCTR _SLAST < "$STALL_STATE"
 [ -z "$_SCTR" ] && _SCTR=0
 [ -z "$_SLAST" ] && _SLAST=0
 if [ "$_recvq" -ge "$RECVQ_THRESHOLD" ] 2>/dev/null; then
   _SCTR=$((_SCTR+1))
+  [ "$_SCTR" -eq 1 ] 2>/dev/null && capture_udp_stall
 else
   _SCTR=0
 fi
 
-if [ "$_SCTR" -ge "$STALL_FAIL_NEED" ] 2>/dev/null; then
+# Сброс: либо залипание подтвердилось STALL_FAIL_NEED тиками, либо Recv-Q упёрся в потолок буфера
+# (RECVQ_HARD) — это однозначное «намертво» уже на 1-м тике, ждать 2-й незачем.
+_do_recover=0
+[ "$_SCTR" -ge "$STALL_FAIL_NEED" ] 2>/dev/null && _do_recover=1
+[ "$_recvq" -ge "$RECVQ_HARD" ] 2>/dev/null && [ "$_SCTR" -ge 1 ] 2>/dev/null && _do_recover=1
+
+if [ "$_do_recover" -eq 1 ] 2>/dev/null; then
   _now=$(date +%s)
   if [ $((_now - _SLAST)) -ge "$STALL_COOLDOWN" ] 2>/dev/null; then
     echo "0 $_now" > "$STALL_STATE"
-    log "UDP-STALL: xray Recv-Q=$_recvq >= $RECVQ_THRESHOLD ($_SCTR тика подряд), conntrack=$_ctcnt/$_ctmax2 -> авто stop->пауза->start"
+    log "UDP-STALL: xray Recv-Q=$_recvq (ctr=$_SCTR, hard=$RECVQ_HARD), conntrack=$_ctcnt/$_ctmax2 -> авто stop->пауза->start"
     tg_alert "🩹 авто-починка: UDP-канал залип (Recv-Q=$_recvq, conntrack=$_ctcnt/$_ctmax2). Делаю перезапуск со сбросом — у клиентов ~20с без сети, потом восстановится."
     # nohup-детачем (как кнопка «Перезапуск со сбросом» в панели): доживает, даже если cron/скрипт
     # прибьют посреди процесса. xkeen -stop временно рвёт удалённый доступ через сам xray, но start
@@ -667,7 +722,7 @@ if [ "$_SCTR" -ge "$STALL_FAIL_NEED" ] 2>/dev/null; then
     exit 0
   else
     echo "$_SCTR $_SLAST" > "$STALL_STATE"
-    log "UDP-STALL подтверждён, но кулдаун ($((_now - _SLAST))s < ${STALL_COOLDOWN}s) — повторно не перезапускаю"
+    log "UDP-STALL подтверждён (Recv-Q=$_recvq), но кулдаун ($((_now - _SLAST))s < ${STALL_COOLDOWN}s) — повторно не перезапускаю"
   fi
 else
   echo "$_SCTR $_SLAST" > "$STALL_STATE"
