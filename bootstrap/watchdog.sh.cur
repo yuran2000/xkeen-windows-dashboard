@@ -1,4 +1,15 @@
 #!/bin/sh
+# XKeen failover watchdog v22 (2026-05-29, авто-починка fd-залипа xray "too many open files"):
+#   Класс отказа: xray исчерпывает лимит файловых дескрипторов и начинает сыпать в error.log
+#   "accept4: too many open files" на tproxy/redirect-инбаундах. PID жив, `xkeen -status`=зелёный,
+#   socks-local отвечает (старые сокеты уже приняты) — но НОВЫЕ TCP-соединения от клиентов LAN
+#   не принимаются. Симптом у пользователя: «не работает Telegram/мессенджер у клиентов»,
+#   потому что мобильные приложения постоянно открывают новые сокеты. Watchdog v17-v21 этого
+#   НЕ ловил (мониторили только UDP-залип). Фикс: каждый тик считаем строки "too many open files"
+#   в error.log; если за минуту прибавилось ≥ FD_DELTA_THRESHOLD строк — `xkeen -restart`
+#   (детачем) + TG-алерт. Подтверждение 1 тика (1 минута фактических ошибок = «намертво»).
+#   Cooldown FD_STALL_COOLDOWN=600s (анти-флап). Инцидент: дом 2026-05-29, xray держал залип
+#   ~3ч до ручного рестарта (fd=1303 у старого процесса; новый стартует с лимитом 10000).
 # XKeen failover watchdog v21 (2026-05-28, штатное исключение DNS из XKeen-проксирования):
 #   Гарантируем, что `/opt/etc/xkeen/port_exclude.lst` содержит строку `53` — это уводит DNS
 #   клиентов в штатный ndnproxy роутера (порт 41103) минуя xray-tproxy. Иначе DNS-сокет xray
@@ -728,6 +739,65 @@ else
   echo "$_SCTR $_SLAST" > "$STALL_STATE"
 fi
 # ---------- /v19 ----------
+
+# ---------- v22: авто-починка fd-залипа xray ("too many open files") ----------
+# Класс отказа: xray исчерпывает лимит file descriptors → accept4 на tproxy/redirect-инбаундах
+# падает с "too many open files" → новые TCP-соединения клиентов LAN не принимаются. PID жив,
+# `xkeen -status`=зелёный, socks-local OK (старые сокеты приняты) — но Telegram/мессенджеры у
+# клиентов не работают (мобильные приложения постоянно открывают новые сокеты).
+# Детект: считаем строки "too many open files" в error.log; за минуту прибавилось ≥ FD_DELTA_THRESHOLD
+# → залип. Подтверждение 1 тика. Recovery: `xkeen -restart` (детачем; новый xray стартует с
+# чистым лимитом 10000 fd от XKeen init-скрипта). UDP-stall-style stop→пауза→start здесь НЕ нужен —
+# проблема в process-local fd-таблице, не в conntrack/буферах ядра.
+FD_DELTA_THRESHOLD=${FD_DELTA_THRESHOLD:-5}
+FD_STALL_COOLDOWN=${FD_STALL_COOLDOWN:-600}
+FD_STALL_STATE=/opt/etc/xray/watchdog.fdstall
+XRAY_ERR_LOG=/opt/var/log/xray/error.log
+
+_fd_now=0
+# grep -c всегда печатает число (даже 0), exit-code 1 на zero-match не страшен — fallback `|| echo 0`
+# тут НЕ нужен (давал бы "0\n0" и ломал арифметику ниже).
+[ -f "$XRAY_ERR_LOG" ] && _fd_now=$(grep -c 'too many open files' "$XRAY_ERR_LOG" 2>/dev/null)
+[ -z "$_fd_now" ] && _fd_now=0
+
+_FD_PREV=0; _FD_LAST=0
+[ -f "$FD_STALL_STATE" ] && read _FD_PREV _FD_LAST < "$FD_STALL_STATE"
+[ -z "$_FD_PREV" ] && _FD_PREV=0
+[ -z "$_FD_LAST" ] && _FD_LAST=0
+
+# Reset: если после рестарта xray файл error.log опустошён (счётчик упал) — это не залип, это новая
+# жизнь процесса. Сбрасываем базу к текущему значению, не считаем delta отрицательной.
+if [ "$_fd_now" -lt "$_FD_PREV" ] 2>/dev/null; then
+  _FD_PREV="$_fd_now"
+fi
+
+_fd_delta=$((_fd_now - _FD_PREV))
+[ "$_fd_delta" -lt 0 ] 2>/dev/null && _fd_delta=0
+
+if [ "$_fd_delta" -ge "$FD_DELTA_THRESHOLD" ] 2>/dev/null; then
+  _now=$(date +%s)
+  if [ $((_now - _FD_LAST)) -ge "$FD_STALL_COOLDOWN" ] 2>/dev/null; then
+    _xpid=$(pidof xray 2>/dev/null)
+    _fdcount=0; _fdlimit="?"
+    if [ -n "$_xpid" ]; then
+      _fdcount=$(ls "/proc/$_xpid/fd" 2>/dev/null | wc -l)
+      _fdlimit=$(awk '/Max open files/ {print $4; exit}' "/proc/$_xpid/limits" 2>/dev/null)
+    fi
+    log "FD-STALL: xray fd=$_fdcount/$_fdlimit, ошибок 'too many open files' +$_fd_delta за тик (всего $_fd_now) -> xkeen -restart"
+    tg_alert "🩹 авто-починка: xray исчерпал лимит файловых дескрипторов (fd=$_fdcount/$_fdlimit, +$_fd_delta ошибок/мин). Перезапускаю — у клиентов LAN ~10с без сети, потом восстановится. Симптом: не открывались Telegram/мессенджеры."
+    # Записываем стейт ДО рестарта, чтобы сразу зафиксировать cooldown. После рестарта error.log
+    # обычно ротируется/обнуляется XKeen — следующий тик увидит низкий _fd_now и сбросит _FD_PREV.
+    echo "$_fd_now $_now" > "$FD_STALL_STATE"
+    /opt/sbin/xkeen -restart >/tmp/xkeen_fdstall.log 2>&1 &
+    exit 0
+  else
+    log "FD-STALL подтверждён (+$_fd_delta ошибок), но кулдаун ($((_now - _FD_LAST))s < ${FD_STALL_COOLDOWN}s) — повторно не перезапускаю"
+    echo "$_fd_now $_FD_LAST" > "$FD_STALL_STATE"
+  fi
+else
+  echo "$_fd_now $_FD_LAST" > "$FD_STALL_STATE"
+fi
+# ---------- /v22 ----------
 
 # ---------- State ----------
 # Формат state: "<current_state> <counter> <current_default_tag>"
