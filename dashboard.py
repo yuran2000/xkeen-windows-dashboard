@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.74"
+_VERSION_FALLBACK = "1.0.75"
 
 
 def _find_git():
@@ -8685,13 +8685,12 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             <div style="margin-top: 8px;">
               <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">Дополнительно к ручному списку выше. Полезно для youtube/tiktok — новые домены сервисов добавляются автоматически после <code>xkeen -ug</code>.</p>
               <div style="background: #fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin: 0 0 8px; font-size: 0.82em; color: #6a4900;">
-                ⚠️ <strong>Категория должна подходить к каналу</strong>. Если YT-канал = российский (типа «🇷🇺_Россия_YouTube» для DPI-обхода) — добавляй только <code>youtube</code>, <code>tiktok</code>, <code>discord</code>. Категории <code>facebook</code> / <code>instagram</code> / <code>twitter</code> через RU-канал <strong>не пробьют РКН-блокировку Meta/X</strong> — Instagram сломается, xray зависнет в retries. Для Meta/X нужен <strong>зарубежный</strong> канал (Нидерланды, Германия и т.п.) или вынести их в отдельное правило с другим outbound.
+                ⚠️ <strong>В этом разделе — только YouTube и видео-CDN.</strong> Здесь подойдут <code>youtube</code> и (для EU/US-канала) <code>tiktok</code>. Категории <code>telegram</code> / <code>discord</code> / <code>facebook</code> / <code>instagram</code> / <code>twitter</code> сюда добавлять <strong>не нужно</strong> — для них есть отдельная секция «📱 Зарубежные сервисы» ниже (она использует заведомо заграничный outbound, который пробивает РКН-блокировку Meta/X и не ломает Telegram/Discord, идущие через российский IP).
               </div>
               <div style="margin-bottom: 6px;">
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('youtube')" title="Добавить категорию youtube (все домены YouTube из geosite_v2fly.dat). Безопасно через любой канал. Автоподхват новых поддоменов после xkeen -ug.">📺 youtube</button>
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('google')" title="🌐 Добавить категорию google — ВСЕ Google-домены (gstatic.com, googleapis.com, googleusercontent.com, 1e100.net, gmail.com, drive.google.com, и т.д.). ⚠ ВНИМАНИЕ: ВКЛЮЧАЕТ Gmail/Drive/Photos/Search/Maps — все они пойдут через YT-канал. Используй ТОЛЬКО если YT-канал = EU/US (Нидерланды, Германия и т.п.). На RU-канале (Россия_YouTube) — Google может пометить твой аккаунт как 'подозрительный регион' для Gmail/Drive. КОГДА НУЖНО: если YouTube показывает reCAPTCHA «Мы зарегистрировали подозрительный трафик» с двумя разными IP — это значит YT-страница использует gstatic/googleapis/googleusercontent (не покрытые категорией youtube) → они идут через PRIMARY вместо YT-канала → Google видит mismatch. Альтернатива для RU-канала: вместо google добавь в YT-домены руками: 1e100.net, googleusercontent.com, gstatic.com, googleapis.com (узко, без Gmail/Drive).">🌐 google</button>
-                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('tiktok')" title="Добавить категорию tiktok (все домены TikTok). Безопасно через любой канал.">🎵 tiktok</button>
-                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('discord')" title="Добавить категорию discord (все домены Discord). Безопасно через любой канал.">💬 discord</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('tiktok')" title="Добавить категорию tiktok (все домены TikTok). На RU-канале TikTok не открывается (блокирован в РФ) — используй только если YT-канал = EU/US. Для RU-сценария TikTok лучше через «📱 Зарубежные сервисы» (тоже EU/US).">🎵 tiktok</button>
                 <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearYTExtCats()" title="Очистить все v2fly-категории YT. Ручные домены в textarea выше не трогаются.">🗑 Очистить</button>
               </div>
               <input id="yt-ext-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.yt_ext_categories or '' }}" placeholder="через пробел: youtube tiktok instagram" />
@@ -8710,7 +8709,10 @@ XKEEN_TEMPLATE = r"""<!doctype html>
                 Генерируется как <strong>отдельное правило</strong> с <code>"ip": ["geoip:NAME"]</code>, outbound = YT_TAG (тот же что и для доменов).
               </p>
               <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 6px 10px; margin: 0 0 8px; font-size: 0.82em; color: #1a5276;">
-                💡 <strong>Когда нужно</strong>: если приложение через VPN не подключается (зависает на «Connecting…»), а через браузер тот же сервис работает — это IP-only-проблема. Добавь нужную категорию (например <code>telegram</code>) — трафик пойдёт через YT-канал по IP, не по доменам.
+                💡 <strong>Когда нужно в этом разделе</strong>: только если YT-смарт-TV-плеер или embedded-клиент видеосервиса коннектится по IP минуя DNS. Категорий <code>telegram</code> / <code>discord</code> здесь <strong>не должно быть</strong> — для них в RU-схеме нужен заграничный outbound (секция «📱 Зарубежные сервисы» ниже → её собственные GeoIP-категории).
+              </div>
+              <div style="background: #fde8e8; border-left: 3px solid #c33; padding: 6px 10px; margin: 0 0 8px; font-size: 0.82em; color: #6a1b1b;">
+                🔴 <strong>Опасная грабля (исправлено в v1.0.75)</strong>: до этой версии тут были кнопки <code>telegram</code> и <code>discord</code>. Если YT-канал = российский, активная категория <code>telegram</code> заворачивала Telegram-IP в RU-outbound, и Telegram <strong>переставал открываться</strong> на iPhone (с RU-IP MTProto-DC не отвечают). Если у тебя в textarea ниже есть <code>telegram</code> или <code>discord</code> — нажми «🗑 Очистить» и «💾 Сохранить GeoIP-категории», затем добавь эти категории в секции «📱 Зарубежные сервисы» → «🌍 GeoIP-категории».
               </div>
               <div style="background: #fff3cd; border-left: 3px solid #f0c200; padding: 8px 10px; margin: 0 0 10px; font-size: 0.85em; color: #6a4900;">
                 ⚠️ <strong>Требует расширенный <code>geoip.dat</code></strong>. XKeen-installer ставит только базы со странами (geoip_refilter, geoip_zkeen) — категорий сервисов вроде <code>telegram</code> в них <strong>нет</strong>. Если xkeen после сохранения уходит в режим Mixed <strong>И в <code>error.log</code> есть <code>code not found</code>/<code>failed to load</code></strong> — значит категория действительно не найдена. Нажми кнопку ниже один раз. <span style="color:#666; font-size:0.9em;">(Mixed без ошибок в error.log — валидный режим, VPN работает; проверить через <code>https://checkip.amazonaws.com</code>.)</span>
@@ -8720,11 +8722,10 @@ XKEEN_TEMPLATE = r"""<!doctype html>
                 </div>
               </div>
               <div style="margin-bottom: 6px;">
-                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTGeoipCat('telegram')" title="Добавить категорию telegram (IP-диапазоны датацентров Telegram: 149.154.x.x, 91.108.x.x и др.). Нужно для Telegram Desktop — он коннектится по IP минуя DNS.">📱 telegram</button>
-                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTGeoipCat('discord')" title="Добавить категорию discord (IP-диапазоны серверов Discord). Нужно для Discord native client при IP-only-блокировках.">💬 discord</button>
-                <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearYTGeoipCats()" title="Очистить все GeoIP-категории. IP-only приложения снова пойдут через PRIMARY-канал.">🗑 Очистить</button>
+                <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearYTGeoipCats()" title="Очистить все GeoIP-категории YT. IP-only приложения снова пойдут через PRIMARY-канал.">🗑 Очистить</button>
+                <span style="font-size: 0.82em; color: #888; margin-left: 6px;">Кнопок-пресетов нет: GeoIP-категории сюда добавлять не нужно (см. красную плашку выше). Если есть smart-TV-плеер на YT по IP — впиши имя категории руками.</span>
               </div>
-              <input id="yt-geoip-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.yt_geoip_categories or '' }}" placeholder="через пробел: telegram discord" />
+              <input id="yt-geoip-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.yt_geoip_categories or '' }}" placeholder="обычно пусто" />
               <button class="btn" style="margin-top: 6px; background: #c33;" onclick="saveYTGeoipCategories()" title="Записать GeoIP-категории в watchdog.config. Watchdog подхватит при следующем тике (≤1 мин). После сохранения проверь что xkeen не ушёл в режим Mixed — если ушёл, нужно установить расширенный geoip.dat кнопкой выше.">💾 Сохранить GeoIP-категории</button>
               <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Без префиксов — только имя категории. Требует watchdog v10+ и расширенный geoip.dat (см. кнопку выше).</p>
             </div>
@@ -8822,6 +8823,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignExtCat('instagram')">📷 instagram</button>
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignExtCat('twitter')">🐦 twitter</button>
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignExtCat('telegram')">💌 telegram</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignExtCat('discord')" title="Все домены Discord. В РФ Discord блокируется — заграничный outbound обязателен.">💬 discord</button>
                 <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearForeignExtCats()">🗑 Очистить</button>
               </div>
               <input id="foreign-ext-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.foreign_ext_categories or '' }}" placeholder="через пробел: facebook instagram twitter" />
