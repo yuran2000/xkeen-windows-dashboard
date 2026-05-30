@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.75"
+_VERSION_FALLBACK = "1.0.76"
 
 
 def _find_git():
@@ -8699,37 +8699,12 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             </div>
           </details>
 
-          <!-- v1.6.0 (2026-05-18): GeoIP-категории для IP-only приложений (Telegram Desktop, Discord). -->
-          <details style="margin-top: 14px; border-top: 1px dashed #ccc; padding-top: 10px;" {% if targets.yt_geoip_categories %}open{% endif %}>
-            <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">🌍 GeoIP-категории <span style="color: #888; font-weight: 400; font-size: 0.88em;">— для IP-only приложений типа Telegram Desktop</span> <a href="#help-v2fly-geoip" onclick="openHelpAnchor('help-v2fly-geoip'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; margin-left: 6px;" title="Открыть подробное описание GeoIP-категорий в разделе «Помощь»">❓ что это?</a></summary>
-            <div style="margin-top: 8px;">
-              <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">
-                Доменные правила не ловят трафик приложений, которые коннектятся напрямую к IP датацентров минуя DNS — Telegram Desktop, Discord native client.
-                GeoIP-категории матчат по IP-диапазонам из <code>geoip.dat</code>.
-                Генерируется как <strong>отдельное правило</strong> с <code>"ip": ["geoip:NAME"]</code>, outbound = YT_TAG (тот же что и для доменов).
-              </p>
-              <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 6px 10px; margin: 0 0 8px; font-size: 0.82em; color: #1a5276;">
-                💡 <strong>Когда нужно в этом разделе</strong>: только если YT-смарт-TV-плеер или embedded-клиент видеосервиса коннектится по IP минуя DNS. Категорий <code>telegram</code> / <code>discord</code> здесь <strong>не должно быть</strong> — для них в RU-схеме нужен заграничный outbound (секция «📱 Зарубежные сервисы» ниже → её собственные GeoIP-категории).
-              </div>
-              <div style="background: #fde8e8; border-left: 3px solid #c33; padding: 6px 10px; margin: 0 0 8px; font-size: 0.82em; color: #6a1b1b;">
-                🔴 <strong>Опасная грабля (исправлено в v1.0.75)</strong>: до этой версии тут были кнопки <code>telegram</code> и <code>discord</code>. Если YT-канал = российский, активная категория <code>telegram</code> заворачивала Telegram-IP в RU-outbound, и Telegram <strong>переставал открываться</strong> на iPhone (с RU-IP MTProto-DC не отвечают). Если у тебя в textarea ниже есть <code>telegram</code> или <code>discord</code> — нажми «🗑 Очистить» и «💾 Сохранить GeoIP-категории», затем добавь эти категории в секции «📱 Зарубежные сервисы» → «🌍 GeoIP-категории».
-              </div>
-              <div style="background: #fff3cd; border-left: 3px solid #f0c200; padding: 8px 10px; margin: 0 0 10px; font-size: 0.85em; color: #6a4900;">
-                ⚠️ <strong>Требует расширенный <code>geoip.dat</code></strong>. XKeen-installer ставит только базы со странами (geoip_refilter, geoip_zkeen) — категорий сервисов вроде <code>telegram</code> в них <strong>нет</strong>. Если xkeen после сохранения уходит в режим Mixed <strong>И в <code>error.log</code> есть <code>code not found</code>/<code>failed to load</code></strong> — значит категория действительно не найдена. Нажми кнопку ниже один раз. <span style="color:#666; font-size:0.9em;">(Mixed без ошибок в error.log — валидный режим, VPN работает; проверить через <code>https://checkip.amazonaws.com</code>.)</span>
-                <div style="margin-top: 8px;">
-                  <button type="button" class="btn btn-sm" style="background:#4a4; color:#fff; margin: 2px;" onclick="installExtendedGeoip()" title="Скачать расширенный geoip.dat от Loyalsoldier (~18MB) — содержит и страны, и сервисы (telegram, discord). Текущий файл будет в .bak-&lt;timestamp&gt;. После скачивания xkeen перезапустится автоматически. Делается один раз на роутер.">📥 Установить расширенный geoip.dat (Loyalsoldier)</button>
-                  <span style="font-size: 0.78em; color: #6a4900; margin-left: 4px;">~18MB с GitHub. Текущий файл сохранится в .bak-&lt;timestamp&gt;. xkeen перезапустится автоматически.</span>
-                </div>
-              </div>
-              <div style="margin-bottom: 6px;">
-                <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearYTGeoipCats()" title="Очистить все GeoIP-категории YT. IP-only приложения снова пойдут через PRIMARY-канал.">🗑 Очистить</button>
-                <span style="font-size: 0.82em; color: #888; margin-left: 6px;">Кнопок-пресетов нет: GeoIP-категории сюда добавлять не нужно (см. красную плашку выше). Если есть smart-TV-плеер на YT по IP — впиши имя категории руками.</span>
-              </div>
-              <input id="yt-geoip-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.yt_geoip_categories or '' }}" placeholder="обычно пусто" />
-              <button class="btn" style="margin-top: 6px; background: #c33;" onclick="saveYTGeoipCategories()" title="Записать GeoIP-категории в watchdog.config. Watchdog подхватит при следующем тике (≤1 мин). После сохранения проверь что xkeen не ушёл в режим Mixed — если ушёл, нужно установить расширенный geoip.dat кнопкой выше.">💾 Сохранить GeoIP-категории</button>
-              <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Без префиксов — только имя категории. Требует watchdog v10+ и расширенный geoip.dat (см. кнопку выше).</p>
-            </div>
-          </details>
+          <!-- GeoIP-категории для YT-канала удалены в v1.0.76: у YouTube/смарт-TV нет IP-only клиентов
+               (всё резолвится через DNS → ловится domain-rule), а единственный практический use-case
+               (Telegram/Discord по IP) принадлежит каналу «📱 Зарубежные сервисы». Backend-endpoint
+               /api/xkeen/set-yt-geoip-categories оставлен для backward-compat, но через UI больше не
+               управляется. Watchdog при тике автоматически очищает YT_GEOIP_CATEGORIES если оно
+               непустое (миграция для роутеров, где раздел использовался). -->
         </div>
       </div>
     </div>
