@@ -1,4 +1,14 @@
 #!/bin/sh
+# XKeen failover watchdog v23 (2026-05-29, авто-очистка YT_GEOIP_CATEGORIES):
+#   Очищает поле YT_GEOIP_CATEGORIES в watchdog.config если оно непустое и однократно
+#   делает xkeen -restart. Причина: раздел «🌍 GeoIP-категории» в YT-секции панели удалён
+#   в v1.0.76 (у YouTube/смарт-TV нет IP-only клиентов; единственный практический use-case —
+#   Telegram/Discord по IP — принадлежит каналу «📱 Зарубежные сервисы», у которого собственный
+#   FOREIGN_GEOIP_CATEGORIES). До v1.0.76 в YT-секции были кнопки «📱 telegram» / «💬 discord»,
+#   и если YT-канал был российский (для DPI-обхода YouTube), активные категории заворачивали
+#   Telegram-IP в RU-outbound → MTProto не отвечал с RU-IP → IP-only мобильный Telegram
+#   переставал открываться. Эта миграция чинит роутеры, где такие категории были сохранены.
+#   Идемпотентно: на пустом поле silent; повторные тики тоже silent (бэкап один раз).
 # XKeen failover watchdog v22 (2026-05-29, авто-починка fd-залипа xray "too many open files"):
 #   Класс отказа: xray исчерпывает лимит файловых дескрипторов и начинает сыпать в error.log
 #   "accept4: too many open files" на tproxy/redirect-инбаундах. PID жив, `xkeen -status`=зелёный,
@@ -672,6 +682,28 @@ if [ -f "$PORT_EXCLUDE_FILE" ] && ! grep -qxE '^53$' "$PORT_EXCLUDE_FILE" 2>/dev
   printf '53\n' >> "$PORT_EXCLUDE_FILE"
   log "port_exclude.lst: +53 (DNS уведён мимо xray-tproxy в ndnproxy) → xkeen -restart"
   /opt/sbin/xkeen -restart >/dev/null 2>&1 &
+fi
+
+# ---------- v23: авто-очистка YT_GEOIP_CATEGORIES (раздел удалён из UI в v1.0.76) ----------
+# Если в watchdog.config поле YT_GEOIP_CATEGORIES не пустое — обнуляем его и делаем xkeen -restart
+# один раз. Это починит роутеры, у которых раньше через UI были сохранены `telegram`/`discord`
+# в YT-секции и пользователь даже не знал, что они там — а они ломали мобильный Telegram через
+# RU-канал. На свежих установках (поле пустое) — silent. После обнуления routing.json при
+# следующей регенерации перестаёт содержать правило `geoip:NAME → YT_TAG`.
+_WD_CFG=/opt/etc/xray/watchdog.config
+if [ -f "$_WD_CFG" ]; then
+  # Считываем raw-значение поля (с кавычками если есть)
+  _yt_geoip_raw=$(grep -E '^YT_GEOIP_CATEGORIES=' "$_WD_CFG" 2>/dev/null | head -1 | cut -d= -f2-)
+  # Снимаем окружающие кавычки и пробелы — проверяем что реально непустое
+  _yt_geoip_val=$(printf '%s' "$_yt_geoip_raw" | sed 's/^["'\'' ]*//; s/["'\'' ]*$//')
+  if [ -n "$_yt_geoip_val" ]; then
+    cp "$_WD_CFG" "$_WD_CFG.bak-yt-geoip-$(date +%Y%m%d-%H%M%S)" 2>/dev/null
+    # Заменяем строку на пустое значение. Используем awk чтобы не зависеть от GNU sed.
+    awk 'BEGIN{done=0} /^YT_GEOIP_CATEGORIES=/ && !done {print "YT_GEOIP_CATEGORIES=\"\""; done=1; next} {print}' \
+      "$_WD_CFG" > "$_WD_CFG.tmp-v23" && mv "$_WD_CFG.tmp-v23" "$_WD_CFG"
+    log "v23 migration: YT_GEOIP_CATEGORIES очищено (раздел удалён в v1.0.76, было: $_yt_geoip_val) → xkeen -restart"
+    /opt/sbin/xkeen -restart >/dev/null 2>&1 &
+  fi
 fi
 
 # максимальный Recv-Q по всем udp-сокетам процесса xray (ловит и listen :1181, и tproxy-потоки)
