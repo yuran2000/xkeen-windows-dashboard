@@ -1,4 +1,19 @@
 #!/bin/sh
+# XKeen failover watchdog v24 (2026-05-31, AI exit-IP probe — детект утечки AI-канала в RU/CN):
+#   AI-канал (AI_TAG) проксирует трафик claude.ai/anthropic.com/openai.com и т.п. У Anthropic
+#   жёсткий anti-fraud: если IP в подозрительной стране (RU/CN/IR/BY/KP/SY) или сильный geo-
+#   mismatch с биллингом — 403 Request not allowed → бан аккаунта. Имя outbound-tag-а («🇳🇱_NL»)
+#   НЕ гарантирует exit-IP: коммерческие VPN-провайдеры часто гоняют через другие датацентры
+#   (NL-входной узел → DE-exit). После ресинка подписки tag может вообще указать на новый узел.
+#   Watchdog v24 раз в AI_PROBE_INTERVAL секунд (по умолчанию 600 = 10 мин) делает HTTP-запрос
+#   через выделенный socks-inbound 127.0.0.1:AI_PROBE_PORT с принудительным routing на AI_TAG,
+#   парсит country из ipinfo.io. Если страна попадает в AI_PROBE_BAD_COUNTRIES (по умолчанию
+#   RU BY CN IR KP SY) — TG-алерт «AI-канал светит $COUNTRY IP» с подсказкой сменить узел.
+#   Self-heal: при первом тике добавляет inbound socks-ai-check в 03_inbounds.json и встраивает
+#   правило socks-ai-check → AI_TAG в генерируемый routing.json (без правки template, идемпотент).
+#   Анти-флап: AI_PROBE_ALERT_COOLDOWN=3600s — повтор алерта только при смене страны или раз/час.
+#   Восстановление back в безопасную страну тоже алертится один раз (без cooldown ограничения).
+#   Если AI_TAG пуст — секция silent (AI отключен, проверять нечего).
 # XKeen failover watchdog v23 (2026-05-29, авто-очистка YT_GEOIP_CATEGORIES):
 #   Очищает поле YT_GEOIP_CATEGORIES в watchdog.config если оно непустое и однократно
 #   делает xkeen -restart. Причина: раздел «🌍 GeoIP-категории» в YT-секции панели удалён
@@ -523,6 +538,22 @@ generate_routing() {
     sed -i 's|\("inboundTag":[[:space:]]*\["socks-local"[^]]*\][[:space:]]*,[[:space:]]*"outboundTag":[[:space:]]*\)"[^"]*"|\1"'"$_se"'"|g' "$CONFIG_DIR/05_routing.json.new"
   fi
 
+  # v24: добавить правило socks-ai-check → AI_TAG (для exit-IP probe). Только если AI_TAG задан
+  # И inbound socks-ai-check уже существует (создаётся в self-heal секции v24 выше). Правило
+  # ставится первым в rules — inboundTag матчится точечно, никаких side-effects на tproxy/redirect.
+  # Template НЕ модифицируем (старые роутеры с template v12 продолжат работать без правки).
+  if [ -n "$ai_tag" ] && [ -f "$CONFIG_DIR/03_inbounds.json" ] && \
+     grep -q '"socks-ai-check"' "$CONFIG_DIR/03_inbounds.json" 2>/dev/null && \
+     command -v jq >/dev/null 2>&1; then
+    # split header (// comments) and JSON body; jq не умеет JSONC
+    sed -n '1,/^{/p' "$CONFIG_DIR/05_routing.json.new" | sed '$d' > /tmp/r24.head 2>/dev/null
+    sed -n '/^{/,$p' "$CONFIG_DIR/05_routing.json.new" > /tmp/r24.body 2>/dev/null
+    if jq --arg t "$ai_tag" '.routing.rules = [{"inboundTag":["socks-ai-check"],"outboundTag":$t,"type":"field"}] + .routing.rules' /tmp/r24.body > /tmp/r24.body.new 2>/dev/null; then
+      cat /tmp/r24.head /tmp/r24.body.new > "$CONFIG_DIR/05_routing.json.new" 2>/dev/null
+    fi
+    rm -f /tmp/r24.head /tmp/r24.body /tmp/r24.body.new 2>/dev/null
+  fi
+
   # v9: валидация JSON перед возвратом. Если awk/template/sed где-то сгенерили
   # битый JSON (например trailing comma, пустой outboundTag) — не применять.
   # Сегодня юзер ловил оба этих кейса.
@@ -706,6 +737,59 @@ if [ -f "$_WD_CFG" ]; then
   fi
 fi
 
+# ---------- v24: self-heal socks-ai-check inbound (для AI exit-IP probe) ----------
+# Идемпотентно: если AI_TAG задан и в 03_inbounds.json ещё нет tag "socks-ai-check" —
+# добавляем inbound на 127.0.0.1:AI_PROBE_PORT (по умолчанию 10818) и делаем xkeen -restart
+# один раз. Это даёт watchdog'у канал для curl-проверки exit-IP именно через AI-outbound.
+# Сам routing-rule добавляется в generate_routing() (post-template hook).
+AI_PROBE_PORT=${AI_PROBE_PORT:-10818}
+AI_PROBE_INTERVAL=${AI_PROBE_INTERVAL:-600}
+AI_PROBE_ALERT_COOLDOWN=${AI_PROBE_ALERT_COOLDOWN:-3600}
+AI_PROBE_BAD_COUNTRIES="${AI_PROBE_BAD_COUNTRIES:-RU BY CN IR KP SY}"
+AI_PROBE_STATE=/opt/etc/xray/watchdog.aiprobe
+_INB_FILE=/opt/etc/xray/configs/03_inbounds.json
+if [ -n "$AI_TAG" ] && [ -f "$_INB_FILE" ] && command -v jq >/dev/null 2>&1; then
+  if ! grep -q '"socks-ai-check"' "$_INB_FILE" 2>/dev/null; then
+    cp "$_INB_FILE" "$_INB_FILE.bak-v24-$(date +%Y%m%d-%H%M%S)" 2>/dev/null
+    if jq --argjson p "$AI_PROBE_PORT" '.inbounds += [{"tag":"socks-ai-check","listen":"127.0.0.1","port":$p,"protocol":"socks","settings":{"auth":"noauth","udp":false},"sniffing":{"enabled":true,"destOverride":["http","tls"]}}]' "$_INB_FILE" > "$_INB_FILE.tmp-v24" 2>/dev/null; then
+      mv "$_INB_FILE.tmp-v24" "$_INB_FILE"
+      log "v24: добавлен inbound socks-ai-check на 127.0.0.1:$AI_PROBE_PORT (AI exit-IP probe) → xkeen -restart"
+      /opt/sbin/xkeen -restart >/dev/null 2>&1 &
+      # Выходим из тика — даём xray подняться с новым inbound. Следующий тик уже
+      # сможет генерить routing с socks-ai-check rule и делать probe.
+      exit 0
+    else
+      rm -f "$_INB_FILE.tmp-v24" 2>/dev/null
+      log "v24 WARN: jq не смог добавить socks-ai-check inbound — пропускаю (probe выключен этот тик)"
+    fi
+  fi
+fi
+
+# v24: self-heal LIVE 05_routing.json — добавить правило socks-ai-check → AI_TAG если его там нет.
+# Хук в generate_routing() покрывает случай регенерации (изменилась подписка/настройки), но
+# на обычных тиках routing не перегенерируется (md5 не менялся). Делаем независимый патч живого
+# файла, идемпотентно: пока grep "socks-ai-check" не найдёт совпадения. После патча → xkeen -restart.
+_RT_FILE=/opt/etc/xray/configs/05_routing.json
+if [ -n "$AI_TAG" ] && [ -f "$_RT_FILE" ] && [ -f "$_INB_FILE" ] && \
+   grep -q '"socks-ai-check"' "$_INB_FILE" 2>/dev/null && \
+   ! grep -q '"socks-ai-check"' "$_RT_FILE" 2>/dev/null && \
+   command -v jq >/dev/null 2>&1; then
+  cp "$_RT_FILE" "$_RT_FILE.bak-v24-$(date +%Y%m%d-%H%M%S)" 2>/dev/null
+  # split header (// comments) and JSON body — jq не умеет JSONC
+  sed -n '1,/^{/p' "$_RT_FILE" | sed '$d' > /tmp/r24h.head 2>/dev/null
+  sed -n '/^{/,$p' "$_RT_FILE" > /tmp/r24h.body 2>/dev/null
+  if jq --arg t "$AI_TAG" '.routing.rules = [{"inboundTag":["socks-ai-check"],"outboundTag":$t,"type":"field"}] + .routing.rules' /tmp/r24h.body > /tmp/r24h.body.new 2>/dev/null; then
+    cat /tmp/r24h.head /tmp/r24h.body.new > "$_RT_FILE" 2>/dev/null
+    log "v24: добавлено routing-правило socks-ai-check → $AI_TAG в живой 05_routing.json → xkeen -restart"
+    /opt/sbin/xkeen -restart >/dev/null 2>&1 &
+    rm -f /tmp/r24h.head /tmp/r24h.body /tmp/r24h.body.new 2>/dev/null
+    exit 0
+  fi
+  rm -f /tmp/r24h.head /tmp/r24h.body /tmp/r24h.body.new 2>/dev/null
+  log "v24 WARN: jq не смог добавить routing-rule socks-ai-check — probe этот тик не сработает"
+fi
+# ---------- /v24 self-heal ----------
+
 # максимальный Recv-Q по всем udp-сокетам процесса xray (ловит и listen :1181, и tproxy-потоки)
 _recvq=$(netstat -anup 2>/dev/null | awk '$NF ~ /xray/ {if($2+0>m)m=$2+0} END{print m+0}')
 [ -z "$_recvq" ] && _recvq=0
@@ -830,6 +914,75 @@ else
   echo "$_fd_now $_FD_LAST" > "$FD_STALL_STATE"
 fi
 # ---------- /v22 ----------
+
+# ---------- v24: AI exit-IP probe + RU-leak alert ----------
+# Каждые AI_PROBE_INTERVAL секунд делаем HTTP-запрос через socks-ai-check (принудительный
+# routing через AI_TAG, см. self-heal выше). Парсим country из ipinfo.io/country и сравниваем
+# со списком AI_PROBE_BAD_COUNTRIES. Алерт с cooldown AI_PROBE_ALERT_COOLDOWN.
+# Состояние в файле: TS|COUNTRY|LAST_ALERT_TS (одна строка, разделитель '|').
+#
+# Зачем: имя outbound-tag-а («🇳🇱_NL») не гарантирует exit-IP — коммерческие VPN-провайдеры
+# гоняют через другие датацентры, после ресинка подписки tag может вообще указать на новый узел
+# в RU. Anthropic блокирует с 403 при RU/CN IP даже если billing-карта Spain. Этот probe ловит
+# такие утечки.
+if [ -n "$AI_TAG" ] && [ -f "$AI_PROBE_STATE.skip" ]; then
+  : # skip-marker (для отладки)
+elif [ -n "$AI_TAG" ]; then
+  _AI_TS=0; _AI_PREV_C=""; _AI_LAST_A=0
+  if [ -f "$AI_PROBE_STATE" ]; then
+    IFS='|' read _AI_TS _AI_PREV_C _AI_LAST_A < "$AI_PROBE_STATE" 2>/dev/null
+  fi
+  [ -z "$_AI_TS" ] && _AI_TS=0
+  [ -z "$_AI_LAST_A" ] && _AI_LAST_A=0
+  _ai_now=$(date +%s)
+  if [ $((_ai_now - _AI_TS)) -ge "$AI_PROBE_INTERVAL" ] 2>/dev/null; then
+    # ipinfo.io/country возвращает строку вида "DE\n" (2-буквенный ISO-код). Лёгкий endpoint,
+    # без auth. Если не отвечает — пробуем ifconfig.me/country.
+    _ai_country=$(curl -s --max-time 8 --socks5-hostname "127.0.0.1:$AI_PROBE_PORT" https://ipinfo.io/country 2>/dev/null | head -1 | tr -d '\r\n\t ')
+    if [ -z "$_ai_country" ] || [ "${#_ai_country}" -gt 4 ]; then
+      _ai_country=$(curl -s --max-time 8 --socks5-hostname "127.0.0.1:$AI_PROBE_PORT" https://ifconfig.me/country_code 2>/dev/null | head -1 | tr -d '\r\n\t ')
+    fi
+    if [ -n "$_ai_country" ] && [ "${#_ai_country}" -le 4 ]; then
+      _ai_bad=0
+      for _bc in $AI_PROBE_BAD_COUNTRIES; do
+        [ "$_ai_country" = "$_bc" ] && _ai_bad=1 && break
+      done
+      if [ "$_ai_bad" -eq 1 ] 2>/dev/null; then
+        # Алерт: смена страны (новая утечка) ИЛИ cooldown прошёл (напомнить раз/час пока висит).
+        _need_alert=0
+        [ "$_ai_country" != "$_AI_PREV_C" ] && _need_alert=1
+        [ $((_ai_now - _AI_LAST_A)) -ge "$AI_PROBE_ALERT_COOLDOWN" ] 2>/dev/null && _need_alert=1
+        if [ "$_need_alert" -eq 1 ] 2>/dev/null; then
+          tg_alert "🚨 <b>AI-канал светит $_ai_country IP!</b> Канал <code>$AI_TAG</code> выходит через страну <code>$_ai_country</code> — Anthropic/OpenAI флагают такой трафик, до бана аккаунта недалеко. Смени AI-узел в панели (вкладка «🧠 AI»)."
+          _AI_LAST_A="$_ai_now"
+          log "AI-probe ALERT: AI_TAG=$AI_TAG exit-country=$_ai_country (BAD)"
+        else
+          log "AI-probe: AI_TAG=$AI_TAG exit-country=$_ai_country (BAD, в cooldown $((AI_PROBE_ALERT_COOLDOWN - (_ai_now - _AI_LAST_A)))s)"
+        fi
+      else
+        # Восстановление: вернулся в безопасную страну после плохой. Алертим один раз.
+        _was_bad=0
+        for _bc in $AI_PROBE_BAD_COUNTRIES; do
+          [ "$_AI_PREV_C" = "$_bc" ] && _was_bad=1 && break
+        done
+        if [ "$_was_bad" -eq 1 ] 2>/dev/null && [ -n "$_AI_PREV_C" ]; then
+          tg_alert "✅ <b>AI-канал в безопасной стране</b>: <code>$_AI_PREV_C</code> → <code>$_ai_country</code>. Утечка устранена."
+          log "AI-probe RECOVER: AI_TAG=$AI_TAG exit-country: $_AI_PREV_C → $_ai_country"
+        else
+          # Тихий тик — лог только при смене страны (минус шум)
+          [ "$_ai_country" != "$_AI_PREV_C" ] && log "AI-probe: AI_TAG=$AI_TAG exit-country=$_ai_country (OK)"
+        fi
+      fi
+      printf '%s|%s|%s\n' "$_ai_now" "$_ai_country" "$_AI_LAST_A" > "$AI_PROBE_STATE"
+    else
+      # Probe не сработал (curl timeout / socks-ai-check ещё не слушает / AI kill-switch заблокировал).
+      # Обновляем только TS чтобы не молотить каждую минуту; страну и last_alert не трогаем.
+      printf '%s|%s|%s\n' "$_ai_now" "$_AI_PREV_C" "$_AI_LAST_A" > "$AI_PROBE_STATE"
+      log "AI-probe: запрос не вернул country (timeout/empty) — пропускаю тик"
+    fi
+  fi
+fi
+# ---------- /v24 ----------
 
 # ---------- State ----------
 # Формат state: "<current_state> <counter> <current_default_tag>"
