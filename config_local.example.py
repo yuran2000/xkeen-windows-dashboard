@@ -99,7 +99,7 @@ NAT_FORWARDS = [
 KEENETIC_HOST = "192.168.1.1"           # IP роутера (стандарт для Keenetic)
 KEENETIC_PORT = 222                     # SSH-порт dropbear из Entware
 KEENETIC_USER = "root"
-KEENETIC_SSH_KEY = r"D:\path\to\id_ed25519"   # ЗАМЕНИ путём к своему ключу
+KEENETIC_SSH_KEY = r"C:\Users\<твоё-имя-пользователя>\.ssh\id_ed25519"   # ЗАМЕНИ путём к своему ключу (по умолчанию OpenSSH кладёт ключи в %USERPROFILE%\.ssh\)
 # Удалённые пути на роутере — стандартные для XKeen, обычно менять не нужно
 KEENETIC_XRAY_CONFIGS  = "/opt/etc/xray/configs"
 KEENETIC_XRAY_BAK_DIR  = "/opt/etc/xray/configs.bak"
