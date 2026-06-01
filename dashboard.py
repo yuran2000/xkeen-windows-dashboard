@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.77"
+_VERSION_FALLBACK = "1.0.78"
 
 
 def _find_git():
@@ -3458,9 +3458,17 @@ def api_xkeen_subscription_preview():
             "sni": sni,
             "is_anti_dpi": is_anti_dpi,
         })
+    # «orphans_local» = outbound'ы которые ПРИНАДЛЕЖАТ ИМЕННО ЭТОЙ ПОДПИСКЕ
+    # (meta.sub_url == sub_url), но в свежескачанной выгрузке их нет — т.е. провайдер их убрал.
+    # ВАЖНО: фильтруем по meta.sub_url, иначе orphans_local захватит outbound'ы соседних
+    # подписок (других провайдеров) — и галка «Удалить отсутствующие» в UI попыталась бы их
+    # снести. Outbound'ы без записанного meta.sub_url (legacy/ручной импорт) тоже НЕ
+    # считаем orphan'ами — безопаснее не трогать.
+    _meta = keenetic_read_meta()
+    this_sub_local_tags = {t for t in local_tags if (_meta.get(t, {}).get("sub_url") or "") == sub_url}
     orphans_local = [
         {"tag": t, "host": f"{local_by_tag[t]['host']}:{local_by_tag[t]['port']}"}
-        for t in (local_tags - sub_tags)
+        for t in (this_sub_local_tags - sub_tags)
     ]
 
     # Детект конфликта: если в подписке есть expire, и у группы уже задана другая
@@ -3566,8 +3574,10 @@ def api_xkeen_subscription_sync():
     Body:
       url=<subscription URL>
       add_new=1  — добавить outbound'ы которые есть в подписке но нет у тебя
-      remove_orphans=1 — удалить outbound'ы которые есть у тебя но НЕТ в подписке
-                         (только если они НЕ в активной роли watchdog)
+      remove_orphans=1 — удалить outbound'ы которые ПРИНАДЛЕЖАТ ЭТОЙ ПОДПИСКЕ
+                         (meta.sub_url == sub_url) но НЕТ в свежескачанной выгрузке.
+                         Outbound'ы соседних подписок и legacy без meta.sub_url НЕ трогаются.
+                         Активные в watchdog (PRIMARY/FAILOVER/AI/YT/FOREIGN) НЕ трогаются.
     """
     sub_url = request.form.get("url", "").strip()
     if not sub_url or not sub_url.startswith(("http://", "https://")):
@@ -3631,10 +3641,19 @@ def api_xkeen_subscription_sync():
     removed_tags = []
     skipped_removal = []
 
+    # «orphans» = outbound'ы которые ПРИНАДЛЕЖАТ ИМЕННО ЭТОЙ ПОДПИСКЕ (meta.sub_url == sub_url),
+    # но провайдер их больше не отдаёт. Без фильтра по meta.sub_url orphan'ами считалось бы
+    # ВСЁ что не в подписке — включая outbound'ы соседних провайдеров. До фикса pre-check
+    # ниже ловил только те, что были в активных ролях watchdog; outbound'ы из других подписок
+    # «вне ролей» молча удалялись бы. Outbound'ы без meta.sub_url (legacy/ручной импорт)
+    # тоже НЕ считаем orphan'ами — безопаснее не трогать.
+    _meta_for_orphans = keenetic_read_meta() if remove_orphans else {}
+    this_sub_local_tags = {t for t in local_tags if (_meta_for_orphans.get(t, {}).get("sub_url") or "") == sub_url}
+
     # 0. PRE-CHECK: если remove_orphans=1, есть ли среди orphans активные в watchdog?
     #    Если да — ничего не делаем, чтобы не получить частично-применённое состояние.
     if remove_orphans:
-        orphans = local_tags - sub_tags - {"direct", "block"}
+        orphans = this_sub_local_tags - sub_tags - {"direct", "block"}
         conflicts = orphans & active_tags
         if conflicts:
             roles_msg = []
@@ -3696,8 +3715,9 @@ def api_xkeen_subscription_sync():
 
     # 3. REMOVE ORPHANS: если remove_orphans=1 — удаляем outbound'ы которых нет в подписке.
     # Pre-check выше уже гарантировал что в orphans нет active_tags, так что удаляем без проверок.
+    # Фильтр this_sub_local_tags ↑ ограничивает удаление ТОЛЬКО outbound'ами этой подписки.
     if remove_orphans:
-        orphans = local_tags - sub_tags - {"direct", "block"}
+        orphans = this_sub_local_tags - sub_tags - {"direct", "block"}
         keep = []
         for ob in outbounds:
             tag = ob.get("tag")
@@ -9386,8 +9406,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
       <span class="subtitle" style="color:#888;">— безопасно, по умолчанию включено</span>
     </label>
     <label style="display: block; cursor: pointer; margin-bottom: 4px;">
-      <input type="checkbox" id="sub-remove-orphans"> 🗑 <strong>Удалить отсутствующие</strong> outbound'ы которые у тебя есть, но провайдер их убрал
-      <span class="subtitle" style="color:#a55;">— потенциально destructive, осознанная галка. Защита: активные в watchdog PRIMARY/FAILOVER/AI/цепочке НЕ удалятся</span>
+      <input type="checkbox" id="sub-remove-orphans"> 🗑 <strong>Удалить отсутствующие</strong> outbound'ы <strong>из этой подписки</strong>, которые провайдер убрал
+      <span class="subtitle" style="color:#a55;">— потенциально destructive, осознанная галка. Сверка по <code>meta.sub_url</code>: outbound'ы соседних подписок и импортированные вручную (без записанного sub_url) НЕ трогаются. Защита: активные в watchdog PRIMARY/FAILOVER/AI/цепочке тоже НЕ удалятся</span>
     </label>
     <label style="display: block; cursor: pointer;">
       <input type="checkbox" id="sub-update-expires" checked> 📅 <strong>Автоматически обновлять дату истечения</strong>
@@ -12870,9 +12890,12 @@ async function previewSubscription() {
     html += `</tbody></table>`;
   }
 
-  // Локальные без пары
+  // Локальные без пары — текст label'а зависит от галки «Удалить отсутствующие»:
+  // галка стоит → красный «БУДУТ УДАЛЕНЫ»; снята → серый «останутся как есть».
+  // Listener на чекбокс ниже обновляет label на лету, если юзер тогглит галку
+  // ПОСЛЕ предпросмотра.
   if (res.orphans_local && res.orphans_local.length > 0) {
-    html += `<br><strong style="color:#888;">📋 У тебя, но НЕ в подписке (останутся как есть):</strong><ul style="margin:6px 0 0 18px;">`;
+    html += `<br><strong id="orphans-local-label"></strong><ul style="margin:6px 0 0 18px;">`;
     res.orphans_local.forEach(o => {
       html += `<li class="mono">${o.tag} — ${o.host}</li>`;
     });
@@ -12881,6 +12904,28 @@ async function previewSubscription() {
 
   html += `</div>`;
   preview.innerHTML = html;
+
+  // Динамический label секции orphans_local — отражает что произойдёт при «Скачать и обновить»
+  // в зависимости от чекбокса «Удалить отсутствующие».
+  if (res.orphans_local && res.orphans_local.length > 0) {
+    const cb = document.getElementById('sub-remove-orphans');
+    const lbl = document.getElementById('orphans-local-label');
+    const updateLbl = () => {
+      if (cb && cb.checked) {
+        lbl.innerHTML = '🗑 <span style="color:#c44">У тебя, но НЕ в подписке — БУДУТ УДАЛЕНЫ</span> при «Скачать и обновить» <span style="font-weight:400;color:#888;">(кроме тех что в активных ролях watchdog — те sync отменит с просьбой сначала сменить роль):</span>';
+      } else {
+        lbl.innerHTML = '📋 <span style="color:#888">У тебя, но НЕ в подписке (останутся как есть — галка «🗑 Удалить отсутствующие» снята):</span>';
+      }
+    };
+    updateLbl();
+    if (cb && !cb.dataset.orphanLblHooked) {
+      cb.addEventListener('change', () => {
+        const curLbl = document.getElementById('orphans-local-label');
+        if (curLbl) updateLbl();
+      });
+      cb.dataset.orphanLblHooked = '1';
+    }
+  }
 }
 
 // === Выборочный импорт orphans_in_sub (с чекбоксами) ===
@@ -12977,7 +13022,7 @@ async function syncSubscription() {
 
   const actions = ['🔄 Обновить совпадающие'];
   if (addNew) actions.push('➕ Добавить новые');
-  if (removeOrphans) actions.push('🗑 Удалить отсутствующие (только не-активные)');
+  if (removeOrphans) actions.push('🗑 Удалить отсутствующие из этой подписки (только не-активные, только с meta.sub_url=этот URL)');
   if (!confirm(
     `Скачать подписку и применить:\n\n  • ${actions.join('\n  • ')}\n\n` +
     `URL: ${url}\n\n` +
