@@ -219,7 +219,7 @@ config_local.example.py (defaults, embedded в exe)
 
 ```powershell
 cd C:\
-git clone https://github.com/yuran2000/xkeen-windows-dashboard.git
+git clone https://github.com/yuran2000/xkeen-windows-dashboard.git xray-dashboard
 cd xray-dashboard
 ```
 

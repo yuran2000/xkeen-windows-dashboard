@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.78"
+_VERSION_FALLBACK = "1.0.79"
 
 
 def _find_git():
@@ -734,8 +734,6 @@ def collect_dynamic_data():
 
 # ============== XKEEN MANAGEMENT (Phase 1) ==============
 # Управление xray на Кинетике (192.168.1.1) через SSH.
-# Помощь PowerShell-скриптов из <scripts-path>\:
-#   - Add-XKeenOutbound.ps1 — добавить outbound в существующий 04_outbounds.json
 
 def _ssh_args(extra_cmd=None):
     """Базовые SSH-аргументы для роутера.
@@ -3386,6 +3384,26 @@ def api_xkeen_subscription_preview():
     local_by_tag = {o.get("tag"): _extract_full(o)
                     for o in cur_outbounds if o.get("protocol") == "vless"}
 
+    # Helpers для роль-бейджей в matches и orphans_local. Один источник истины,
+    # чтобы UI всегда показывал согласованную картинку: одно и то же распределение
+    # ролей в строках «Будут обновлены» и в строках «У тебя, но НЕ в подписке».
+    _targets_preview = keenetic_get_watchdog_targets() or {}
+    _failover_list = list(_targets_preview.get("failover_tags") or [])
+    _failover_pos = {t: i + 1 for i, t in enumerate(_failover_list)}
+    # 6 «уникальных» ролей — у каждой ровно один tag через dropdown в секции
+    # «🎯 Основное и резервное подключение». В matches (обновление) бейдж
+    # 🎯 — информационный («это твой PRIMARY/AI/...», обновление НЕ ломает роль).
+    # В orphans_local (удаление) тот же tag → бейдж ⛔ — блокирующий (sync отменит).
+    _critical_roles = {
+        _targets_preview.get("primary_tag"):  "PRIMARY",
+        _targets_preview.get("failover_tag"): "Резервное (FAILOVER #1)",
+        _targets_preview.get("ai_tag"):       "AI",
+        _targets_preview.get("yt_tag"):       "YouTube",
+        _targets_preview.get("foreign_tag"):  "Зарубежные сервисы",
+        _targets_preview.get("ipv6_tag"):     "Через IPv6",
+    }
+    _critical_roles.pop(None, None)
+
     sub_tags = {p["tag"] for p in parsed}
     matches = []
     for p in parsed:
@@ -3399,6 +3417,8 @@ def api_xkeen_subscription_preview():
             pbk_change = bool(new_pbk and old_pbk and new_pbk != old_pbk)
             sni_change = bool(new_sni and old_sni and new_sni != old_sni)
             different_provider = pbk_change  # pbk = Reality identity провайдера, главный сигнал
+            critical_role = _critical_roles.get(p["tag"])
+            failover_pos = _failover_pos.get(p["tag"])
             matches.append({
                 "tag": p["tag"],
                 "sub_host": f"{p['host']}:{p['port']}",
@@ -3412,6 +3432,12 @@ def api_xkeen_subscription_preview():
                 "new_pbk_short": (new_pbk[:10] + "…") if new_pbk else "",
                 "old_sni": old_sni,
                 "new_sni": new_sni,
+                # Информационные роль-теги для бейджей в UI. UPDATE не ломает роль
+                # (tag остаётся, меняются только UUID/Reality-ключи внутри outbound'а),
+                # поэтому бейдж только информирует, не блокирует.
+                "critical_role": critical_role,
+                "in_failover_only": bool(failover_pos and not critical_role),
+                "failover_position": failover_pos,
             })
     orphans_in_sub = []
     # Эвристика «anti-DPI / антиглушилка / обход / белые списки» — для подсветки в UI:
@@ -3464,12 +3490,23 @@ def api_xkeen_subscription_preview():
     # подписок (других провайдеров) — и галка «Удалить отсутствующие» в UI попыталась бы их
     # снести. Outbound'ы без записанного meta.sub_url (legacy/ручной импорт) тоже НЕ
     # считаем orphan'ами — безопаснее не трогать.
+    # _targets_preview / _failover_pos / _critical_roles уже определены выше
+    # (общий источник истины для бейджей matches + orphans_local).
     _meta = keenetic_read_meta()
     this_sub_local_tags = {t for t in local_tags if (_meta.get(t, {}).get("sub_url") or "") == sub_url}
-    orphans_local = [
-        {"tag": t, "host": f"{local_by_tag[t]['host']}:{local_by_tag[t]['port']}"}
-        for t in (this_sub_local_tags - sub_tags)
-    ]
+    orphans_local = []
+    for t in (this_sub_local_tags - sub_tags):
+        critical_role = _critical_roles.get(t)  # None если t не в уникальной dropdown-роли
+        failover_pos = _failover_pos.get(t)     # None если t не в FAILOVER-списке
+        # in_failover_only = t в FAILOVER #2..#N (НЕ head, НЕ уникальная роль) → удаляется
+        # безопасно с автоматической чисткой из FAILOVER_TAGS в watchdog.config.
+        orphans_local.append({
+            "tag": t,
+            "host": f"{local_by_tag[t]['host']}:{local_by_tag[t]['port']}",
+            "critical_role": critical_role,
+            "in_failover_only": bool(failover_pos and not critical_role),
+            "failover_position": failover_pos,
+        })
 
     # Детект конфликта: если в подписке есть expire, и у группы уже задана другая
     # дата — собираем предупреждение. Ключ subscription_meta: sub_url (если выгрузка
@@ -3627,19 +3664,13 @@ def api_xkeen_subscription_sync():
     sub_tags = set(parsed_by_tag.keys())
     local_tags = {o.get("tag") for o in outbounds if o.get("protocol") == "vless"}
 
-    # Для защиты при remove_orphans — список активных tags из watchdog.config
+    # Активные роли watchdog нужны pre-check'у remove_orphans (см. ниже): critical-роли
+    # блокируют удаление, хвост FAILOVER пропускается + чистится из watchdog.config.
     targets = keenetic_get_watchdog_targets()
-    active_tags = set()
-    if targets.get("primary_tag"): active_tags.add(targets["primary_tag"])
-    if targets.get("ai_tag"): active_tags.add(targets["ai_tag"])
-    if targets.get("yt_tag"): active_tags.add(targets["yt_tag"])
-    if targets.get("foreign_tag"): active_tags.add(targets["foreign_tag"])
-    active_tags.update(targets.get("failover_tags") or [])
 
     updated_tags = []
     added_tags = []
     removed_tags = []
-    skipped_removal = []
 
     # «orphans» = outbound'ы которые ПРИНАДЛЕЖАТ ИМЕННО ЭТОЙ ПОДПИСКЕ (meta.sub_url == sub_url),
     # но провайдер их больше не отдаёт. Без фильтра по meta.sub_url orphan'ами считалось бы
@@ -3650,31 +3681,42 @@ def api_xkeen_subscription_sync():
     _meta_for_orphans = keenetic_read_meta() if remove_orphans else {}
     this_sub_local_tags = {t for t in local_tags if (_meta_for_orphans.get(t, {}).get("sub_url") or "") == sub_url}
 
-    # 0. PRE-CHECK: если remove_orphans=1, есть ли среди orphans активные в watchdog?
-    #    Если да — ничего не делаем, чтобы не получить частично-применённое состояние.
+    # 0. PRE-CHECK: разделяем активные роли watchdog на ДВА класса по UX-важности:
+    #   critical = 6 уникальных ролей-dropdown'ов из секции «🎯 Основное и резервное
+    #     подключение»: PRIMARY, FAILOVER head (первый в цепочке = явное «Резервное»),
+    #     AI, YouTube, Зарубежные сервисы, Через IPv6. У каждой ровно ОДИН tag.
+    #     Удалить выбранный = поломать роль → БЛОКИРУЕМ sync, юзер сначала меняет роль.
+    #   failover_only = только в FAILOVER #2..#N (хвост цепочки резерва). Удаление
+    #     одного просто сокращает цепочку → РАЗРЕШАЕМ; ниже после xkeen -restart
+    #     автоматически чистим FAILOVER_TAGS в watchdog.config, чтобы не оставить
+    #     «зомби»-tag в цепочке резерва.
     if remove_orphans:
         orphans = this_sub_local_tags - sub_tags - {"direct", "block"}
-        conflicts = orphans & active_tags
-        if conflicts:
+        critical_roles_map = {
+            targets.get("primary_tag"):  "PRIMARY",
+            targets.get("failover_tag"): "Резервное (FAILOVER #1)",
+            targets.get("ai_tag"):       "AI",
+            targets.get("yt_tag"):       "YouTube",
+            targets.get("foreign_tag"):  "Зарубежные сервисы",
+            targets.get("ipv6_tag"):     "Через IPv6",
+        }
+        critical_roles_map.pop(None, None)
+        critical_conflicts = orphans & set(critical_roles_map.keys())
+        if critical_conflicts:
             roles_msg = []
-            for t in conflicts:
-                roles = []
-                if t == targets.get("primary_tag"):  roles.append("PRIMARY")
-                if t == targets.get("ai_tag"):       roles.append("AI-sticky")
-                if t == targets.get("yt_tag"):       roles.append("YouTube-sticky")
-                if t == targets.get("foreign_tag"):  roles.append("«Зарубежные сервисы»")
-                if t in (targets.get("failover_tags") or []):
-                    pos = (targets.get("failover_tags") or []).index(t) + 1
-                    roles.append(f"FAILOVER цепочка #{pos}")
-                roles_msg.append(f"  • {t} → {', '.join(roles)}")
+            for t in critical_conflicts:
+                roles_msg.append(f"  • {t} → {critical_roles_map[t]}")
             return jsonify({
                 "ok": False,
                 "stderr": (
-                    "⛔ Удаление отменено: эти outbound'ы используются в активных ролях watchdog. "
-                    "Sync вообще не выполнен — сначала сними роли через dropdown'ы выше:\n\n"
+                    "⛔ Удаление отменено: эти outbound'ы выбраны в УНИКАЛЬНЫХ dropdown'ах "
+                    "секции «🎯 Основное и резервное подключение». Sync вообще не выполнен — "
+                    "сначала смени роль через соответствующий dropdown:\n\n"
                     + "\n".join(roles_msg) +
-                    "\n\nКонкретно нужно: для каждого выбрать ДРУГОЙ outbound в PRIMARY / FAILOVER / AI / "
-                    "цепочке резерва. Потом снова запустить sync."
+                    "\n\nПотом снова запустить sync.\n\n"
+                    "💡 Подсказка: outbound'ы которые ТОЛЬКО в хвосте FAILOVER-цепочки "
+                    "(позиции #2..#N, без уникальной роли) теперь удаляются спокойно — "
+                    "панель автоматически уберёт их из FAILOVER_TAGS в watchdog.config."
                 ),
             })
 
@@ -3714,8 +3756,12 @@ def api_xkeen_subscription_sync():
         cfg_json["outbounds"] = outbounds
 
     # 3. REMOVE ORPHANS: если remove_orphans=1 — удаляем outbound'ы которых нет в подписке.
-    # Pre-check выше уже гарантировал что в orphans нет active_tags, так что удаляем без проверок.
-    # Фильтр this_sub_local_tags ↑ ограничивает удаление ТОЛЬКО outbound'ами этой подписки.
+    # Pre-check выше пропустил critical-роли (PRIMARY/Резервное/AI/YT/Зарубежные/IPv6) — если
+    # хоть один orphan совпал с уникальной dropdown-ролью, sync уже вернул error и сюда не
+    # попал. Хвост FAILOVER (#2..#N) pre-check намеренно пропускает — эти tag'и удалятся
+    # сейчас, и блок ниже (после xkeen -restart) автоматически уберёт их из FAILOVER_TAGS
+    # в watchdog.config. Фильтр this_sub_local_tags ↑ ограничивает удаление ТОЛЬКО
+    # outbound'ами этой подписки.
     if remove_orphans:
         orphans = this_sub_local_tags - sub_tags - {"direct", "block"}
         keep = []
@@ -3744,6 +3790,30 @@ def api_xkeen_subscription_sync():
         # xray не поднялся на новых outbounds (например битый vless из подписки) — откат к бэкапу
         keenetic_ssh(f"cp {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.bak-pre-sync-{ts} {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json && xkeen -restart")
         return jsonify({"ok": False, "stderr": f"xkeen -restart упал после синка — откатил 04_outbounds.json к бэкапу (xray восстановлен). Детали: {restart['stderr'][:200]}"})
+
+    # Автоматическая чистка FAILOVER_TAGS в watchdog.config от удалённых orphan'ов.
+    # Если orphan был в хвосте FAILOVER-цепочки (#2..#N) — pre-check его пропустил,
+    # outbound уже удалён из 04_outbounds.json, теперь убираем его из списка резерва
+    # в watchdog.config, чтобы watchdog не пытался регенерить routing-rule на
+    # несуществующий tag. Head цепочки (#1) сюда не попадает — он защищён pre-check'ом.
+    removed_from_failover = []
+    failover_cleanup_error = ""
+    if remove_orphans and removed_tags:
+        failover_list_current = list(targets.get("failover_tags") or [])
+        removed_set = set(removed_tags)
+        failover_after = [t for t in failover_list_current if t not in removed_set]
+        if failover_after != failover_list_current:
+            removed_from_failover = [t for t in failover_list_current if t in removed_set]
+            # write_watchdog_config возвращает {"ok": bool, ...}. Если SSH-запись или запуск
+            # watchdog.sh провалится — outbound уже удалён из 04_outbounds.json, но tag-зомби
+            # остаётся в FAILOVER_TAGS. Watchdog в следующий тик попытается регенерить
+            # routing-rule на несуществующий tag → xray error. Поэтому ловим failure и сообщаем.
+            try:
+                _wd_result = keenetic_write_watchdog_config({"FAILOVER_TAGS": " ".join(failover_after)})
+                if not (isinstance(_wd_result, dict) and _wd_result.get("ok")):
+                    failover_cleanup_error = (_wd_result or {}).get("stderr", "write watchdog.config failed")[:200] if isinstance(_wd_result, dict) else "watchdog.config write returned no status"
+            except Exception as _ex:
+                failover_cleanup_error = f"watchdog.config update raised: {_ex}"[:200]
 
     # Записываем sub_url в meta для всех обновлённых/добавленных
     affected = list(updated_tags) + list(added_tags)
@@ -3822,6 +3892,16 @@ def api_xkeen_subscription_sync():
     if updated_tags: parts.append(f"🔄 Обновлено {len(updated_tags)}: {', '.join(updated_tags)}")
     if added_tags:   parts.append(f"➕ Добавлено {len(added_tags)}: {', '.join(added_tags)}")
     if removed_tags: parts.append(f"🗑 Удалено {len(removed_tags)}: {', '.join(removed_tags)}")
+    if removed_from_failover:
+        if failover_cleanup_error:
+            parts.append(
+                f"⚠️ FAILOVER-цепочка watchdog: попытался убрать {len(removed_from_failover)} tag'ов "
+                f"({', '.join(removed_from_failover)}), но запись watchdog.config упала: "
+                f"{failover_cleanup_error}. Outbound'ы уже удалены, но tag-зомби остались в "
+                f"FAILOVER_TAGS — watchdog может ошибаться. Поправь вручную через UI."
+            )
+        else:
+            parts.append(f"🔗 Также убраны из FAILOVER-цепочки watchdog ({len(removed_from_failover)}): {', '.join(removed_from_failover)}")
     # Сообщения о sub_meta-изменениях
     for u in sub_meta_updates:
         if u["action"] == "set":
@@ -3839,6 +3919,7 @@ def api_xkeen_subscription_sync():
         "added_tags": added_tags,
         "updated_tags": updated_tags,
         "removed_tags": removed_tags,
+        "removed_from_failover": removed_from_failover,
     }
     if added_tags or removed_tags:
         sync = _auto_sync_template_ips_silent()
@@ -5493,10 +5574,9 @@ def api_keenetic_test_connection():
 # ============== BOOTSTRAP CLEAN XKEEN ==============
 # Развёртывание watchdog/routing/cron/log-dir на свежеустановленном XKeen.
 # Файлы-шаблоны (watchdog.sh, 05_routing.template.json) лежат рядом с dashboard.py
-# в подкаталоге bootstrap/ либо в <scripts-path>\ (живые копии).
+# в подкаталоге bootstrap/.
 BOOTSTRAP_SEARCH_DIRS = [
     os.path.join(_resource_dir(), "bootstrap"),
-    r"<scripts-path>",
 ]
 
 def _bootstrap_find(filename):
@@ -9407,7 +9487,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     </label>
     <label style="display: block; cursor: pointer; margin-bottom: 4px;">
       <input type="checkbox" id="sub-remove-orphans"> 🗑 <strong>Удалить отсутствующие</strong> outbound'ы <strong>из этой подписки</strong>, которые провайдер убрал
-      <span class="subtitle" style="color:#a55;">— потенциально destructive, осознанная галка. Сверка по <code>meta.sub_url</code>: outbound'ы соседних подписок и импортированные вручную (без записанного sub_url) НЕ трогаются. Защита: активные в watchdog PRIMARY/FAILOVER/AI/цепочке тоже НЕ удалятся</span>
+      <span class="subtitle" style="color:#a55;">— потенциально destructive, осознанная галка. Сверка по <code>meta.sub_url</code>: outbound'ы соседних подписок и импортированные вручную (без записанного sub_url) НЕ трогаются. Защита: выбранные в уникальных dropdown'ах «🎯 Основное и резервное подключение» (PRIMARY / Резервное / AI / YouTube / Зарубежные / Через IPv6) НЕ удалятся — sync отменится с просьбой сменить роль. В хвосте FAILOVER-цепочки (#2..#N) удаляются спокойно — tag сам уйдёт из <code>FAILOVER_TAGS</code> в watchdog.config</span>
     </label>
     <label style="display: block; cursor: pointer;">
       <input type="checkbox" id="sub-update-expires" checked> 📅 <strong>Автоматически обновлять дату истечения</strong>
@@ -10173,7 +10253,7 @@ Use this token to access the HTTP API:
       <ul>
         <li><strong>Подписки VPN</strong>: добавить subscription URL (любой VLESS-совместимый провайдер) — панель скачивает список серверов с провайдера, выкладывает их как outbounds на роутер. Группировка по подписке, дата истечения с цветной шкалой, ручное обновление кнопкой.</li>
         <li><strong>Outbounds</strong>: видеть, добавлять, удалять, переименовывать VPN-каналы (читает/пишет <code>04_outbounds.json</code> на роутере). Bulk-удаление через чекбоксы.</li>
-        <li><strong>Routing</strong>: куда какой трафик идёт — PRIMARY / FAILOVER / AI-sticky / YouTube-sticky / «Зарубежные сервисы» / DIRECT / BLOCK</li>
+        <li><strong>Routing</strong>: куда какой трафик идёт — PRIMARY / FAILOVER / 🤖 AI / 📺 YouTube / 📱 «Зарубежные сервисы» / 🌐 «Через IPv6» / DIRECT / BLOCK</li>
         <li><strong>Watchdog</strong>: автоматический failover между каналами каждую минуту</li>
         <li><strong>Списки доменов</strong>: VK / Mail.ru / Yandex / банки (DIRECT), Windows Update / Adobe / телеметрия (BLOCK)</li>
         <li><strong>Бэкап</strong>: snapshot всех XKeen-настроек одним JSON, восстановление на новый роутер за один клик</li>
@@ -10367,12 +10447,24 @@ Use this token to access the HTTP API:
       <h4>📱 «Зарубежные сервисы»-sticky outbound</h4>
       <p>Sticky-канал для <strong>зарубежных сервисов</strong>: Meta/Instagram, WhatsApp, Telegram, Twitter/X, Discord (список <code>📱 Список доменов</code> в этом канале).</p>
       <p>Зачем отдельно от YouTube: у них <strong>противоположные</strong> требования к выходу. YouTube хочет <strong>российский</strong> выход (де-троттл + меньше рекламы), а Meta/Telegram <strong>заблокированы</strong> — российский выход блокировку НЕ обходит (DPI режет TLS даже через RU-IP). Поэтому здесь выбирай <strong>заграничный</strong> выход (🇳🇱/🇩🇪/🇪🇪). <em>(Раньше Instagram сидел в YouTube-канале с RU-выходом и не открывался — «вместо сайта скачивался файл».)</em></p>
+      <p><strong>GeoIP-категория <code>telegram</code> обязательна</strong> в этом канале для iOS — iPhone-Telegram бьёт по IP минуя DNS, без неё MTProto-соединения улетят в PRIMARY, и если PRIMARY=RU — Telegram зависнет в «Connecting» (на ПК работает через DNS-домен, поэтому проблема ловит только iOS). На «Зарубежные сервисы» эту категорию ставит UI-кнопка в подсекции «🌍 GeoIP-категории». Опционально — <code>discord</code>/<code>facebook</code>/<code>twitter</code>.</p>
       <p><strong>Kill-switch (рекомендую включён)</strong>: если загран-канал упал — эти сервисы идут в <code>block</code>, а не через PRIMARY. Иначе при RU-default они всё равно не откроются (РКН-блок), а реальный IP засветится. Подробнее — отдельная тема <a href="#help-foreign" onclick="openHelpAnchor('help-foreign'); return false;">«📱 Канал Зарубежные сервисы»</a>.</p>
+
+      <h4>🌐 «Через IPv6» — sticky outbound</h4>
+      <p>Sticky-канал для <strong>IPv6-only сайтов</strong> — у которых нет A-записи в DNS, только AAAA. Самый известный пример — <code>ntc.party</code>; есть и др. независимые форумы/блоги/научные ресурсы.</p>
+      <p><strong>Зачем отдельный канал.</strong> На IPv4-only Windows-ПК (IPv6 в адаптере выключен ради anti-leak — см. отдельный help-сценарий) браузер не может подключиться к IPv6-only сайту напрямую. Решение: роутер выдаёт <strong>fake-IP</strong> (<code>198.18.0.1</code> из RFC2544-резерва) → клиент идёт на этот fake-IP → xray ловит TPROXY, через sniffing TLS/SNI восстанавливает домен → отправляет домен на узел канала. <strong>Узел делает финальный AAAA-резолв и открывает по IPv6</strong>.</p>
+      <p><strong>Двойное требование к узлу</strong> (оба обязательны, иначе сайт не откроется):</p>
+      <ul>
+        <li><strong>Egress IPv6</strong> — freedom-outbound на узле должен быть <code>UseIPv4v6</code>, не <code>UseIPv4</code> (иначе xray форсит A-lookup, а у IPv6-only сайта A-записи нет → fail).</li>
+        <li><strong><code>sniffing.routeOnly=false</code> на входе узла</strong> — иначе узел набирает мёртвый <code>198.18.0.1</code>, который ему прислал роутер, вместо восстановленного домена. Симптом: TCP проходит, TLS виснет.</li>
+      </ul>
+      <p><strong>Что НЕ подойдёт в качестве узла</strong>: «Напрямую без VPN» (роутер с выключенным IPv6 → тупик), сторонние коммерческие VPN-ноды (часто не егрессят IPv6 — пример: BravaVLESS-Амстердам не отдаёт IPv6, ntc.party не открывается). <strong>Самое надёжное</strong> — свой VPS с обоими слоями настройки. У дашборда есть кнопка <strong>«🔎 Проверить, открывает ли узел IPv6»</strong> которая гоняет пробный домен через выбранный канал и показывает <code>tls_ok</code>: <code>✅ узел отдаёт IPv6</code> либо <code>⚠ fake-IP стоит, но узел не тянет</code>.</p>
+      <p>Список доменов хранится в <code>IPV6_DOMAINS</code> (watchdog.config), routing-правило генерится из placeholder <code>__IPV6_RULE_BLOCK__</code> (template v12+, watchdog v18+). При добавлении/удалении домена через панель — fake-IP-маппинги (<code>ip host &lt;d&gt; 198.18.0.1</code>) синхронизируются автоматически.</p>
     </div>
   </details>
 
   <details class="help-section">
-    <summary>🌐 Маршрутизация по доменам — AI / YouTube / «Зарубежные сервисы» / DIRECT списки</summary>
+    <summary>🌐 Маршрутизация по доменам — AI / YouTube / «Зарубежные сервисы» / «Через IPv6» / DIRECT / BLOCK списки</summary>
     <div class="help-body">
       <h4>Что такое «список доменов»</h4>
       <p>Это <strong>текстовое поле</strong> со списком доменов (через пробел или с новой строки). Watchdog генерирует правило xray: «<code>трафик к этим доменам → через выбранный outbound</code>».</p>
@@ -10387,6 +10479,9 @@ Use this token to access the HTTP API:
 
       <h4>📱 Список доменов «Зарубежные сервисы» (фиолетовая карточка)</h4>
       <p>Домены зарубежных сервисов (Meta/Instagram, WhatsApp, Telegram, Twitter/X, Discord) — идут через заграничный канал «Зарубежные сервисы». Пресеты-кнопки добавляют известные домены сразу. <strong>Пустой список = правило выключено.</strong></p>
+
+      <h4>🌐 Список доменов «Через IPv6» (синяя карточка)</h4>
+      <p>Домены <strong>IPv6-only сайтов</strong> (нет A-записи, только AAAA) — идут через канал «Через IPv6». При добавлении домена сюда панель автоматически прописывает <strong>fake-IP</strong> <code>198.18.0.1</code> на роутере (<code>ip host &lt;domain&gt; 198.18.0.1</code>) — это нужно чтобы IPv4-only клиент (например ПК с выключенным IPv6) смог дотянуться до xray, а xray восстановил домен из SNI и отправил на узел канала. При удалении домена fake-IP снимается тоже. Пресет — <code>ntc.party</code>. <strong>Пустой список = правило выключено.</strong></p>
 
       <h4>🚫 Сайты НАПРЯМУЮ без VPN — DIRECT (оранжевая карточка)</h4>
       <p>Домены которые идут <strong>через твоего обычного провайдера</strong> минуя VPN. Полезно для:</p>
@@ -10789,7 +10884,7 @@ nslookup instagram.com 8.8.8.8     # напрямую через Google — ес
     <summary>💬 Примечания у доменов (v1.7.0) — кто откуда, как навести порядок</summary>
     <div class="help-body">
       <h4>Зачем</h4>
-      <p>В секциях <strong>AI / YT / DIRECT / BLOCK</strong> часто накапливается куча доменов из разных пресетов вперемешку с ручными добавлениями. Чтобы не путаться — каждый домен помечается заметкой:</p>
+      <p>Во всех 6 секциях доменов (<strong>AI / YT / «Зарубежные сервисы» / «Через IPv6» / DIRECT / BLOCK</strong>) часто накапливается куча доменов из разных пресетов вперемешку с ручными добавлениями. Чтобы не путаться — каждый домен помечается заметкой:</p>
       <ul>
         <li><strong>📦 &lt;имя пресета&gt;</strong> — добавлен через кнопку-пресет (например <code>📦 youtube</code>, <code>📦 whatsapp</code>)</li>
         <li><strong>✏️ &lt;твоё описание&gt;</strong> — добавлен вручную, можно подписать (или оставить пустым)</li>
@@ -10836,7 +10931,7 @@ another-server.io   # ✏️</pre>
         <li>Пингует PRIMARY (через <code>curl https://{{ cfg.EXTERNAL_DOMAIN or '&lt;your-vpn-domain&gt;' }}:8444/</code>) — fail/up</li>
         <li>Считает счётчик подряд: если 2 fail подряд → переключается на FAILOVER (выбирает первый живой из цепочки)</li>
         <li>Если в режиме FAILOVER пингует PRIMARY 3 раза подряд успешно → возвращается на PRIMARY</li>
-        <li>Генерирует новый <code>05_routing.json</code> из template — подменяет placeholder'ы (<code>__DEFAULT_TAG__</code>, AI-rule, YT-rule, DIRECT-rule)</li>
+        <li>Генерирует новый <code>05_routing.json</code> из template — подменяет placeholder'ы (<code>__DEFAULT_TAG__</code>, <code>__AI_RULE_BLOCK__</code>, <code>__YT_RULE_BLOCK__</code>, <code>__FOREIGN_RULE_BLOCK__</code>, <code>__IPV6_RULE_BLOCK__</code>, <code>__DIRECT_RULE_BLOCK__</code>), вставляет служебные socks-инбаунды (включая <code>socks-ai-check:10818</code> для AI exit-IP probe v24)</li>
         <li>Сравнивает с текущим routing.json через md5 — если отличается → <code>xkeen -restart</code> (~2 сек)</li>
       </ol>
 
@@ -10865,7 +10960,7 @@ another-server.io   # ✏️</pre>
       </ul>
 
       <h4>Группировка в dropdown'ах</h4>
-      <p>Все 5 dropdown'ов каналов (PRIMARY/FAILOVER/AI/YT/«Зарубежные сервисы») группируют опции по подпискам через <code>&lt;optgroup&gt;</code>. Внутри каждой группы опции имеют пастельный фон цвета подписки (зелёный/синий/бежевый/фиолетовый — ротация 6 цветов).</p>
+      <p>Все 6 dropdown'ов каналов (PRIMARY/FAILOVER/AI/YouTube/«Зарубежные сервисы»/«Через IPv6») группируют опции по подпискам через <code>&lt;optgroup&gt;</code>. Внутри каждой группы опции имеют пастельный фон цвета подписки (зелёный/синий/бежевый/фиолетовый — ротация 6 цветов).</p>
 
       <h4>Бейджи в опциях</h4>
       <ul>
@@ -10891,9 +10986,19 @@ another-server.io   # ✏️</pre>
       <p>Чекбоксы:</p>
       <ul>
         <li><strong>➕ Добавлять новые</strong> — outbound'ы которые есть в подписке но нет у тебя (по умолчанию вкл)</li>
-        <li><strong>🗑 Удалять отсутствующие</strong> — если провайдер убрал сервер, удалить и у тебя (потенциально опасно — выкл по умолчанию, активные роли защищены)</li>
+        <li><strong>🗑 Удалять отсутствующие</strong> — если провайдер убрал сервер, удалить и у тебя (потенциально опасно — выкл по умолчанию). Сверка по <code>meta.sub_url</code>: outbound'ы соседних подписок и импортированные вручную (без записанного <code>sub_url</code>) <strong>не трогаются</strong> — нет шанса случайно снести outbound'ы другого провайдера, обновляя подписку первого. Поведение для тех что попали в orphan'ы — см. бейджи ниже.</li>
         <li><strong>📅 Автоматически обновлять дату истечения</strong> — если провайдер шлёт header <code>Subscription-Userinfo: expire=&lt;ts&gt;</code> (Provider B умеет, Provider A нет)</li>
       </ul>
+
+      <h4>Бейджи в превью — что они значат</h4>
+      <p>При нажатии «🔍 Предпросмотр» панель сверяет outbound'ы из подписки с твоей конфигурацией и активными ролями watchdog (секция <strong>«🎯 Основное и резервное подключение»</strong>). Рядом с каждым tag'ом может появиться бейдж:</p>
+      <ul>
+        <li><span style="background:#e0eef8;color:#1a5490;border:1px solid #a0c8e8;border-radius:3px;padding:1px 6px;font-weight:600;">🎯 PRIMARY</span> / <span style="background:#e0eef8;color:#1a5490;border:1px solid #a0c8e8;border-radius:3px;padding:1px 6px;font-weight:600;">🎯 AI</span> / <span style="background:#e0eef8;color:#1a5490;border:1px solid #a0c8e8;border-radius:3px;padding:1px 6px;font-weight:600;">🎯 YouTube</span> и т.д. (голубой) — <strong>в таблице «Будут обновлены»</strong>: outbound выбран в одном из 6 уникальных dropdown'ов «🎯 Основное и резервное подключение» (PRIMARY / Резервное / AI / YouTube / Зарубежные / Через IPv6). Это <strong>информационный</strong> бейдж: обновление не ломает роль — обновятся только UUID/Reality-ключи, tag и его участие в watchdog остаются. Hover мышью → tooltip с пояснением.</li>
+        <li><span style="background:#fff4d4;color:#a8801c;border:1px solid #e8c878;border-radius:3px;padding:1px 6px;font-weight:600;">🔗 FAILOVER #N</span> (жёлтый) — outbound в хвосте цепочки резерва (позиция #2..#N). В таблице «Будут обновлены» это информационно (обновление не влияет на цепочку). В секции «У тебя, но НЕ в подписке» при включённой галке «🗑 Удалить отсутствующие» — outbound будет удалён + панель <strong>автоматически уберёт</strong> tag из <code>FAILOVER_TAGS</code> в <code>watchdog.config</code>, цепочка просто сократится на 1.</li>
+        <li><span style="background:#fde0e0;color:#c44;border:1px solid #f4b0b0;border-radius:3px;padding:1px 6px;font-weight:600;">⛔ &lt;роль&gt;</span> (красный) — <strong>только в секции «У тебя, но НЕ в подписке»</strong>: orphan выбран в уникальном dropdown'е (PRIMARY / Резервное / AI / YouTube / Зарубежные / Через IPv6). При включённой галке «🗑 Удалить отсутствующие» <strong>sync целиком отменится</strong> с просьбой сначала сменить роль через соответствующий dropdown. Защита от случайного breakage — нельзя удалить outbound который держит активную роль, иначе watchdog ляжет.</li>
+        <li>Без бейджа — обычный outbound, ни в одной активной роли watchdog не задействован. В «Будут обновлены» — просто обновится; в «orphan» — при галке «Удалить отсутствующие» просто удалится из конфига.</li>
+      </ul>
+      <p>Label секции «У тебя, но НЕ в подписке» <strong>динамический</strong>: переключается между «🗑 БУДУТ УДАЛЕНЫ» (галка стоит, красный) и «📋 останутся как есть» (галка снята, серый) на лету, как только тогглишь чекбокс.</p>
 
       <h4>Tag (имя outbound'а)</h4>
       <p>Tag берётся из URL после символа <code>#</code>. Группировка по подпискам делается по <strong>tag-префиксу</strong> (до первого <code>-</code>) ИЛИ по pbk Reality identity. Поэтому: <code>provider-a-de1</code>, <code>provider-a-nl</code> → группа «Provider A».</p>
@@ -10911,7 +11016,9 @@ another-server.io   # ✏️</pre>
         <li>🚦 <strong>FAILOVER → PRIMARY</strong> — &lt;your-vpn&gt; ожил, вернулись</li>
         <li>🛡️ <strong>AI kill-switch активен</strong> — AI-канал упал, AI-домены заблокированы (если включён kill-switch)</li>
         <li>✅ <strong>AI kill-switch снят</strong> — AI-канал восстановился</li>
-        <li>📺 <strong>YT kill-switch активен/snят</strong> — то же для YouTube (если включён)</li>
+        <li>📺 <strong>YT kill-switch активен/снят</strong> — то же для YouTube (если включён)</li>
+        <li>📱 <strong>FOREIGN kill-switch активен/снят</strong> — то же для канала «Зарубежные сервисы» (если включён <code>FOREIGN_FAIL_BLOCK</code>)</li>
+        <li>🤖 <strong>AI exit-IP светит небезопасной страной</strong> — раз в 10 мин watchdog probe'ит реальный exit-IP AI-канала через изолированный <code>socks-ai-check:10818</code> на роутере и спрашивает <code>ipinfo.io/country</code>. Если страна в чёрном списке (<code>AI_PROBE_BAD_COUNTRIES</code>, по умолчанию <code>RU BY CN IR KP SY</code>) — TG-алерт с просьбой сменить узел в разделе «🤖 AI». При возврате в безопасную страну — отдельный алерт о восстановлении. Это защита от ситуации когда коммерческий VPN маршрутизирует через резервный exit в санкционной стране — Anthropic/OpenAI режут такие IP («App unavailable», «403 Request not allowed»). Период тишины между алертами — <code>AI_PROBE_ALERT_COOLDOWN</code>.</li>
         <li>⚠️ <strong>Failover-каналов мало (≤2 живых)</strong> — резерв под угрозой</li>
         <li>✅ <strong>Failover-каналы восстановились</strong> — резерв снова в норме</li>
         <li>🚨 <strong>Полный отказ</strong> — PRIMARY И ВСЕ failover мертвы (катастрофа)</li>
@@ -12822,7 +12929,10 @@ async function previewSubscription() {
     </div>`;
   }
 
-  // Совпадения
+  // Совпадения. Информационный бейдж 🎯/🔗 рядом с tag'ом если этот outbound выбран
+  // в одной из 6 уникальных dropdown-ролей или в хвосте FAILOVER. UPDATE не ломает роль
+  // (меняются только UUID/Reality-ключи, tag остаётся), так что бейдж только информирует —
+  // в отличие от ⛔ в секции orphans_local, который сигнализирует «sync отменит удаление».
   if (res.matches && res.matches.length > 0) {
     html += `<strong style="color:#2a7;">✅ Будут обновлены (${res.matches.length}):</strong><table style="margin-top:6px; font-size:0.85em;">`;
     html += `<tr><th>tag</th><th>host:port в подписке</th><th>host:port у тебя</th><th>изменится?</th><th>pbk / SNI</th></tr>`;
@@ -12837,7 +12947,16 @@ async function previewSubscription() {
       } else {
         identity = '<span style="color:#2a7;" title="Тот же провайдер">✓ тот же</span>';
       }
-      html += `<tr style="${rowStyle}"><td class="mono"><strong>${m.tag}</strong></td><td class="mono">${m.sub_host}</td><td class="mono">${m.local_host}</td><td>${chg}</td><td style="font-size:0.85em;">${identity}</td></tr>`;
+      // Информационный бейдж роли. Backtick (template literal) ОБЯЗАТЕЛЬНО — внутри title
+      // встречается апостроф (`dropdown'е`), single-quoted строка бы оборвалась и SyntaxError
+      // снёс бы весь inline-script вместе с sidebar.
+      let roleBadge = '';
+      if (m.critical_role) {
+        roleBadge = ` <span title="Этот outbound выбран в уникальном dropdown'е «${m.critical_role}» секции «🎯 Основное и резервное подключение». Обновление подписки НЕ ломает роль — поменяются только UUID/Reality-ключи, tag остаётся, watchdog продолжит его использовать." style="background:#e0eef8;color:#1a5490;border:1px solid #a0c8e8;border-radius:3px;padding:1px 6px;font-size:0.9em;font-weight:600;margin-left:4px;">🎯 ${m.critical_role}</span>`;
+      } else if (m.in_failover_only) {
+        roleBadge = ` <span title="Этот outbound находится в хвосте FAILOVER-цепочки (позиция #${m.failover_position}). Обновление НЕ влияет на роль — tag остаётся в FAILOVER_TAGS." style="background:#fff4d4;color:#a8801c;border:1px solid #e8c878;border-radius:3px;padding:1px 6px;font-size:0.9em;font-weight:600;margin-left:4px;">🔗 FAILOVER #${m.failover_position}</span>`;
+      }
+      html += `<tr style="${rowStyle}"><td class="mono"><strong>${m.tag}</strong>${roleBadge}</td><td class="mono">${m.sub_host}</td><td class="mono">${m.local_host}</td><td>${chg}</td><td style="font-size:0.85em;">${identity}</td></tr>`;
     });
     html += `</table>`;
   } else {
@@ -12893,11 +13012,21 @@ async function previewSubscription() {
   // Локальные без пары — текст label'а зависит от галки «Удалить отсутствующие»:
   // галка стоит → красный «БУДУТ УДАЛЕНЫ»; снята → серый «останутся как есть».
   // Listener на чекбокс ниже обновляет label на лету, если юзер тогглит галку
-  // ПОСЛЕ предпросмотра.
+  // ПОСЛЕ предпросмотра. Каждый orphan дополнительно помечается badge:
+  //   ⛔ <role> — выбран в уникальной dropdown-роли «🎯 Основное и резервное подключение»
+  //              → sync отменит весь блок удаления, попросит сначала сменить роль;
+  //   🔗 FAILOVER #N — только в хвосте цепочки резерва (#2..#N) → удаляется безопасно,
+  //              tag автоматически уберётся из FAILOVER_TAGS в watchdog.config.
   if (res.orphans_local && res.orphans_local.length > 0) {
     html += `<br><strong id="orphans-local-label"></strong><ul style="margin:6px 0 0 18px;">`;
     res.orphans_local.forEach(o => {
-      html += `<li class="mono">${o.tag} — ${o.host}</li>`;
+      let badge = '';
+      if (o.critical_role) {
+        badge = ` <span title="Выбран в уникальном dropdown'е «${o.critical_role}» секции «🎯 Основное и резервное подключение». Sync с галкой «Удалить отсутствующие» будет отменён — сначала смени роль в dropdown'е." style="background:#fde0e0;color:#c44;border:1px solid #f4b0b0;border-radius:3px;padding:1px 6px;font-size:0.82em;font-weight:600;margin-left:6px;">⛔ ${o.critical_role}</span>`;
+      } else if (o.in_failover_only) {
+        badge = ` <span title="Только в хвосте FAILOVER-цепочки (позиция #${o.failover_position}). При удалении панель автоматически уберёт tag из FAILOVER_TAGS в watchdog.config — цепочка просто сократится на 1." style="background:#fff4d4;color:#a8801c;border:1px solid #e8c878;border-radius:3px;padding:1px 6px;font-size:0.82em;font-weight:600;margin-left:6px;">🔗 FAILOVER #${o.failover_position}</span>`;
+      }
+      html += `<li class="mono">${o.tag} — ${o.host}${badge}</li>`;
     });
     html += `</ul>`;
   }
@@ -12906,13 +13035,28 @@ async function previewSubscription() {
   preview.innerHTML = html;
 
   // Динамический label секции orphans_local — отражает что произойдёт при «Скачать и обновить»
-  // в зависимости от чекбокса «Удалить отсутствующие».
+  // в зависимости от чекбокса «Удалить отсутствующие». Подстрока про FAILOVER появляется
+  // только если в orphans есть хотя бы один с in_failover_only — иначе подсказка не нужна.
   if (res.orphans_local && res.orphans_local.length > 0) {
     const cb = document.getElementById('sub-remove-orphans');
     const lbl = document.getElementById('orphans-local-label');
+    const hasCritical = res.orphans_local.some(o => o.critical_role);
+    const hasFailoverOnly = res.orphans_local.some(o => o.in_failover_only);
     const updateLbl = () => {
       if (cb && cb.checked) {
-        lbl.innerHTML = '🗑 <span style="color:#c44">У тебя, но НЕ в подписке — БУДУТ УДАЛЕНЫ</span> при «Скачать и обновить» <span style="font-weight:400;color:#888;">(кроме тех что в активных ролях watchdog — те sync отменит с просьбой сначала сменить роль):</span>';
+        let hint = '';
+        if (hasCritical && hasFailoverOnly) {
+          hint = ' <span style="font-weight:400;color:#888;">(помеченные ⛔ — sync отменит с просьбой сначала сменить роль; помеченные 🔗 — удалятся + автоматически уйдут из FAILOVER_TAGS в watchdog.config):</span>';
+        } else if (hasCritical) {
+          // Backtick (template literal) — single quote был бы оборван апострофом в `dropdown'е`,
+          // и SyntaxError рушит весь inline-script (sidebar пропадает, всё в одну колонку).
+          hint = ` <span style="font-weight:400;color:#888;">(помеченные ⛔ — sync отменит с просьбой сначала сменить роль в dropdown'е):</span>`;
+        } else if (hasFailoverOnly) {
+          hint = ' <span style="font-weight:400;color:#888;">(помеченные 🔗 — также автоматически уйдут из FAILOVER_TAGS в watchdog.config):</span>';
+        } else {
+          hint = ':';
+        }
+        lbl.innerHTML = '🗑 <span style="color:#c44">У тебя, но НЕ в подписке — БУДУТ УДАЛЕНЫ</span> при «Скачать и обновить»' + hint;
       } else {
         lbl.innerHTML = '📋 <span style="color:#888">У тебя, но НЕ в подписке (останутся как есть — галка «🗑 Удалить отсутствующие» снята):</span>';
       }
@@ -13022,7 +13166,10 @@ async function syncSubscription() {
 
   const actions = ['🔄 Обновить совпадающие'];
   if (addNew) actions.push('➕ Добавить новые');
-  if (removeOrphans) actions.push('🗑 Удалить отсутствующие из этой подписки (только не-активные, только с meta.sub_url=этот URL)');
+  // Template literal (backtick) — нужно потому что Python хранит этот JS в raw-строке
+  // (r-prefix), где `\\` НЕ интерпретируется. Single-quoted JS с апострофом в `dropdown'е`
+  // ломал inline-script на парсе и убивал sidebar.
+  if (removeOrphans) actions.push(`🗑 Удалить отсутствующие из этой подписки (meta.sub_url=этот URL; выбранные в уникальных dropdown'ах PRIMARY/Резервное/AI/YT/Зарубежные/IPv6 НЕ трогаем — sync отменим. Из хвоста FAILOVER-цепочки уберём + автоматически почистим FAILOVER_TAGS в watchdog.config)`);
   if (!confirm(
     `Скачать подписку и применить:\n\n  • ${actions.join('\n  • ')}\n\n` +
     `URL: ${url}\n\n` +
