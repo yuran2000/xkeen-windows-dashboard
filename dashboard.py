@@ -189,7 +189,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.79"
+_VERSION_FALLBACK = "1.0.80"
 
 
 def _find_git():
@@ -927,9 +927,20 @@ def keenetic_write_sub_meta(subs):
 
 
 def keenetic_set_sub_meta(pbk, **fields):
-    """Merge не-None полей для подписки с этим pbk."""
+    """Merge не-None полей для подписки с этим pbk.
+
+    Если ключ pbk — это sub_url (http(s)://...) и в fields передан expires_at,
+    автоматически синкает expires_at + updated_at во ВСЕ per-pbk записи с тем же
+    sub_url. Иначе sub_expiry_notifier (10:00 МСК) продолжает алертить по
+    «теням» одной подписки: групповая запись по sub_url с новой датой, а
+    per-pbk записи (по одной на каждый outbound из подписки) — со старой.
+
+    Возвращает dict: {"ok": bool, "synced_pbks": [список ключей которые
+    были засинканы]}. Раньше возвращал bool — single call-site в
+    api_xkeen_sub_meta обновлён под новый формат.
+    """
     if not pbk:
-        return False
+        return {"ok": False, "synced_pbks": []}
     subs = keenetic_read_sub_meta()
     entry = dict(subs.get(pbk, {}))
     changed = False
@@ -945,11 +956,48 @@ def keenetic_set_sub_meta(pbk, **fields):
             if k in entry:
                 entry.pop(k, None)
                 changed = True
-    if not changed and pbk in subs:
-        return True
-    entry["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-    subs[pbk] = entry
-    return keenetic_write_sub_meta(subs)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if changed:
+        entry["updated_at"] = now_str
+        subs[pbk] = entry
+
+    # Авто-синк expires_at во все per-pbk записи с тем же sub_url.
+    # Срабатывает когда ключ записи сам является sub_url (http(s)://...)
+    # и в этом вызове передавался expires_at (включая пустую строку — это
+    # явный сброс через UI, тоже надо синкнуть). Делается ВСЕГДА (не только
+    # при changed=True), чтобы повторное «Сохранить» с уже актуальной датой
+    # в основной записи всё равно подтянуло устаревшие pbk-тени.
+    synced_pbks = []
+    if pbk.startswith(("http://", "https://")) and "expires_at" in fields:
+        new_expires = fields.get("expires_at")
+        if isinstance(new_expires, str):
+            new_expires = new_expires.strip()
+        for other_key, other_entry in subs.items():
+            if other_key == pbk:
+                continue
+            if not isinstance(other_entry, dict):
+                continue
+            if (other_entry.get("sub_url") or "").strip() != pbk:
+                continue
+            entry_changed = False
+            if new_expires:
+                if other_entry.get("expires_at") != new_expires:
+                    other_entry["expires_at"] = new_expires
+                    entry_changed = True
+            else:
+                if "expires_at" in other_entry:
+                    other_entry.pop("expires_at", None)
+                    entry_changed = True
+            if entry_changed:
+                other_entry["updated_at"] = now_str
+                synced_pbks.append(other_key)
+
+    # Если ни основная запись не менялась, ни pbk-тени не синкались — не пишем.
+    if not changed and not synced_pbks:
+        return {"ok": True, "synced_pbks": []}
+
+    ok = keenetic_write_sub_meta(subs)
+    return {"ok": ok, "synced_pbks": synced_pbks}
 
 # ============== OUTBOUND LIVENESS PROBES ==============
 # Кэш статусов outbound'ов: {tag: {"ok": bool, "ts": epoch, "host": str, "port": int, "ms": int}}
@@ -2780,8 +2828,19 @@ def api_xkeen_sub_meta():
             fields[k] = request.form.get(k, "")
     if not fields:
         return jsonify({"ok": False, "stderr": "нет полей для сохранения"})
-    ok = keenetic_set_sub_meta(pbk, **fields)
-    return jsonify({"ok": ok, "stdout": "Сохранено" if ok else "", "stderr": "" if ok else "write failed"})
+    result = keenetic_set_sub_meta(pbk, **fields)
+    ok = result["ok"]
+    synced = result.get("synced_pbks", [])
+    if ok and synced:
+        msg = f"Сохранено · засинкано expires_at в {len(synced)} pbk-записях этой подписки"
+    else:
+        msg = "Сохранено" if ok else ""
+    return jsonify({
+        "ok": ok,
+        "stdout": msg,
+        "stderr": "" if ok else "write failed",
+        "synced_pbks_count": len(synced),
+    })
 
 
 @app.route("/api/xkeen/watchdog/<mode>", methods=["POST"])
@@ -3885,6 +3944,37 @@ def api_xkeen_subscription_sync():
             if changed:
                 entry["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
                 sub_meta[pbk] = entry
+
+        # Авто-синк expires_at в per-pbk записи с тем же sub_url. Аналогично логике
+        # в keenetic_set_sub_meta — после sync через подписку sub_url-запись получает
+        # свежий expires_at, а per-pbk-копии (по одной на каждый outbound из подписки)
+        # остаются с протухшей датой → sub_expiry_notifier (10:00 МСК) шлёт ложные
+        # «ИСТЕКЛА N дн. назад». Срабатывает только при sync с sub_url и только
+        # на той же подписке (фильтр pbk_entry.sub_url == sub_url).
+        if sub_url and sub_url in sub_meta:
+            group_expires = (sub_meta[sub_url].get("expires_at") or "").strip()
+            if group_expires:
+                synced_pbk_count = 0
+                _now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                for pbk_key, pbk_entry in sub_meta.items():
+                    if pbk_key == sub_url:
+                        continue
+                    if not isinstance(pbk_entry, dict):
+                        continue
+                    if (pbk_entry.get("sub_url") or "").strip() != sub_url:
+                        continue
+                    if pbk_entry.get("expires_at") != group_expires:
+                        pbk_entry["expires_at"] = group_expires
+                        pbk_entry["updated_at"] = _now_str
+                        synced_pbk_count += 1
+                if synced_pbk_count:
+                    sub_meta_updates.append({
+                        "pbk_short": "",
+                        "action": "synced_to_pbks",
+                        "old": "",
+                        "new": str(synced_pbk_count),
+                    })
+
         if sub_meta_updates:
             keenetic_write_sub_meta(sub_meta)
 
@@ -3912,6 +4002,8 @@ def api_xkeen_subscription_sync():
             parts.append(f"🏷 Название подписки из Profile-Title: «{u['new']}»")
         elif u["action"] == "skip":
             parts.append(f"⚠️ У подписки {u['pbk_short']} стояла дата {u['old']}, в URL — {u['new']}. Оставил твою (включи 'Обновить дату истечения' чтобы перетереть)")
+        elif u["action"] == "synced_to_pbks":
+            parts.append(f"📅 Дата истечения также подтянута в {u['new']} pbk-записях этой подписки")
     response_payload = {
         "ok": True,
         "stdout": "✅ Sync завершён.\n" + "\n".join(parts) + f"\n\nБэкап: 04_outbounds.json.bak-pre-sync-{ts}",
