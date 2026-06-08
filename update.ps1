@@ -92,6 +92,45 @@ if ($needStash) {
         exit 1
     }
 }
+# Divergent history detect - temporary block, will be removed ~2026-06-16.
+# Triggered when local main diverged from origin/main (typically after the
+# 2026-06-08 history rewrite). Offers an interactive reset to origin/main.
+elseif ($LASTEXITCODE -ne 0 -and ($pullOutput -match 'unrelated histories' -or
+                                   $pullOutput -match 'non-fast-forward' -or
+                                   $pullOutput -match 'Not possible to fast-forward' -or
+                                   $pullOutput -match 'diverged' -or
+                                   $pullOutput -match 'divergent branches')) {
+    Write-Host ""
+    Write-Host "[INFO] Local main has DIVERGED from origin/main." -ForegroundColor Yellow
+    Write-Host "       Likely cause: history rewrite on the remote on 2026-06-08." -ForegroundColor Gray
+    Write-Host "       Fix: hard-reset local main to origin/main." -ForegroundColor Gray
+    Write-Host "       Your gitignored files (config_local.py, .venv, runtime_settings.json," -ForegroundColor Gray
+    Write-Host "       backups\, *.key) will NOT be touched - git reset only touches tracked files." -ForegroundColor Gray
+    Write-Host "       Details: https://github.com/yuran2000/xkeen-windows-dashboard/issues/1" -ForegroundColor Gray
+    Write-Host ""
+    $answer = Read-Host "  Run 'git fetch origin + git reset --hard origin/main + git fetch --tags --force' now? [y/N]"
+    if ($answer -eq 'y' -or $answer -eq 'Y') {
+        Write-Host "  Resetting ..." -ForegroundColor Yellow
+        git fetch origin
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ERROR] git fetch failed - aborted, dashboard left RUNNING." -ForegroundColor Red
+            Read-Host "Press Enter to exit"
+            exit 1
+        }
+        git reset --hard origin/main
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ERROR] git reset failed - aborted, dashboard left RUNNING." -ForegroundColor Red
+            Read-Host "Press Enter to exit"
+            exit 1
+        }
+        git fetch --tags --force
+        Write-Host "  [OK] Local main reset to origin/main - continuing with update." -ForegroundColor Green
+    } else {
+        Write-Host "[INFO] Skipped. Run those 3 commands manually, then re-run update.bat." -ForegroundColor Yellow
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
+}
 elseif ($LASTEXITCODE -ne 0) {
     Write-Host ""
     Write-Host "[ERROR] git pull failed - update aborted, dashboard left RUNNING (not touched)." -ForegroundColor Red
