@@ -2125,8 +2125,8 @@ SOCKS_LOCAL_PORT = 10808
 
 def _socks_local_inbound():
     """Эталонный socks-local inbound: локальный SOCKS5 на 127.0.0.1:10808.
-    Через него watchdog/панель шлют TG-алерты к api.telegram.org (РКН блокирует его для
-    RU-IP с самого роутера; socks-local идёт через VPN-выход → доходит). Слушает ТОЛЬКО
+    Через него watchdog/панель шлют TG-алерты к api.telegram.org (он недоступен напрямую
+    для RU-IP с самого роутера; socks-local идёт через VPN-выход → доходит). Слушает ТОЛЬКО
     loopback — в LAN не виден, с tproxy-перехватом не конфликтует."""
     return {
         "tag": SOCKS_LOCAL_TAG,
@@ -3750,9 +3750,9 @@ def api_xkeen_subscription_preview():
         "билайн",
         "мегафон",
         "теле2",
-        "тспу",           # ТСПУ — российская система DPI; «обход ТСПУ» = anti-DPI
+        "тспу",           # ТСПУ — российская система DPI; маркер anti-DPI-узла
         "tspu",
-        "ркн",            # Роскомнадзор
+        "ркн",            # маркер «RU-связанного» узла в имени (для тегов anti-DPI)
         # RU-exit маркеры (2026-05-15): профили которые в имени указывают на Россию —
         # exit-IP внутри РФ → AI/streaming геоблокируют. Например Provider C «🇷🇺 Россия YouTube».
         "россия",          # Cyrillic
@@ -6365,7 +6365,7 @@ def api_keenetic_tg_test():
         "Если ты это видишь — TG-алерты watchdog'а будут работать."
     )
     # Запрос через роутер + ОБЯЗАТЕЛЬНО через SOCKS5-inbound xray (127.0.0.1:10808) — так же как
-    # watchdog'овский tg_alert. Прямой curl с роутера к api.telegram.org заблокирован РКН для RU-IP
+    # watchdog'овский tg_alert. Прямой curl с роутера к api.telegram.org заблокирован для RU-IP
     # (timeout 28), а socks-local идёт через VPN-выход → доходит. Если socks-inbound не поднят
     # (нет :10808, curl rc 7) — тест честно падает с подсказкой, что канал TG-алертов не настроен.
     import shlex
@@ -6555,8 +6555,8 @@ def api_keenetic_bootstrap_apply():
         log.append({"key": "first_run", "ok": r["ok"], "msg": "первый запуск watchdog: " + (r["stdout"] or r["stderr"])[:300]})
 
     # socks-local inbound для TG-алертов watchdog. На чистом роутере его нет (XKeen-installer
-    # кладёт только redirect/tproxy) → watchdog/панель не достучатся до api.telegram.org (РКН
-    # блокирует для RU-IP, обход — локальный SOCKS5 через VPN-выход). Idempotent + бэкап +
+    # кладёт только redirect/tproxy) → watchdog/панель не достучатся до api.telegram.org (он
+    # недоступен напрямую для RU-IP, обход — локальный SOCKS5 через VPN-выход). Idempotent + бэкап +
     # xray-test + откат; bootstrap не валим, если не получилось (алерты — не критичный компонент).
     if overall_ok and "watchdog_sh" in selected_keys:
         try:
@@ -9235,7 +9235,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             <div style="margin-top: 8px;">
               <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">Дополнительно к ручному списку выше. Категория = весь набор доменов сервиса из <code>geosite_v2fly.dat</code>. После <code>xkeen -ug</code> новые поддомены подхватываются автоматически.</p>
               <div style="background: #e8f5e9; border-left: 3px solid #2e7d32; padding: 6px 10px; margin: 0 0 8px; font-size: 0.82em; color: #1b4d1f;">
-                ℹ️ AI-категории <strong>безопасны через любой VPN-канал</strong> — нет блокировок РКН. <strong>Но AI-канал должен быть зарубежным</strong> (Нидерланды/Германия/...) — через RU-IP OpenAI/Anthropic банят аккаунты. Настраивается в dropdown «🤖 AI-sticky outbound» выше.
+                ℹ️ AI-категории <strong>безопасны через любой VPN-канал</strong> — нет региональных блокировок на стороне сети. <strong>Но AI-канал должен быть зарубежным</strong> (Нидерланды/Германия/...) — через RU-IP OpenAI/Anthropic банят аккаунты. Настраивается в dropdown «🤖 AI-sticky outbound» выше.
               </div>
               <div style="margin-bottom: 6px;">
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIExtCat('openai')" title="Добавить категорию openai (все домены ChatGPT/OpenAI из geosite_v2fly.dat). Автоподхват новых поддоменов после xkeen -ug.">🟢 openai</button>
@@ -9363,7 +9363,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             <div style="margin-top: 8px;">
               <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">Дополнительно к ручному списку выше. Полезно для youtube/tiktok — новые домены сервисов добавляются автоматически после <code>xkeen -ug</code>.</p>
               <div style="background: #fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin: 0 0 8px; font-size: 0.82em; color: #6a4900;">
-                ⚠️ <strong>В этом разделе — только YouTube и видео-CDN.</strong> Здесь подойдут <code>youtube</code> и (для EU/US-канала) <code>tiktok</code>. Категории <code>telegram</code> / <code>discord</code> / <code>facebook</code> / <code>instagram</code> / <code>twitter</code> сюда добавлять <strong>не нужно</strong> — для них есть отдельная секция «📱 Зарубежные сервисы» ниже (она использует заведомо заграничный outbound, который пробивает РКН-блокировку Meta/X и не ломает Telegram/Discord, идущие через российский IP).
+                ⚠️ <strong>В этом разделе — только YouTube и видео-CDN.</strong> Здесь подойдут <code>youtube</code> и (для EU/US-канала) <code>tiktok</code>. Категории <code>telegram</code> / <code>discord</code> / <code>facebook</code> / <code>instagram</code> / <code>twitter</code> сюда добавлять <strong>не нужно</strong> — для них есть отдельная секция «📱 Зарубежные сервисы» ниже (она использует заведомо заграничный outbound, который пробивает блокировку Meta/X для RU-IP и не ломает Telegram/Discord, идущие через российский IP).
               </div>
               <div style="margin-bottom: 6px;">
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('youtube')" title="Добавить категорию youtube (все домены YouTube из geosite_v2fly.dat). Безопасно через любой канал. Автоподхват новых поддоменов после xkeen -ug.">📺 youtube</button>
@@ -11092,14 +11092,14 @@ Use this token to access the HTTP API:
 
       <h4>📺 YouTube-sticky outbound</h4>
       <p>Sticky-канал для YouTube/Google-видео из списка <code>📺 Список YouTube-доменов</code>. Аналог AI-sticky. <em>(Instagram/Telegram/Twitter/Discord сюда НЕ кладём — они в отдельном канале «Зарубежные сервисы» ниже.)</em></p>
-      <p>Зачем: при просмотре YouTube через EU/US-VPN — <strong>лезет реклама</strong> (Google показывает по geo-IP) и видео могут тротлить. Если же канал — <strong>RU-exit</strong> (через российский IP), рекламы меньше и троттлинга нет (РКН-Google решение). Поэтому выбирай канал с бейджем <strong>📺 Ютуб</strong> в dropdown'е (это RU-exit без anti-DPI маскировки).</p>
+      <p>Зачем: при просмотре YouTube через EU/US-VPN — <strong>лезет реклама</strong> (Google показывает по geo-IP) и видео могут тротлить. Если же канал — <strong>RU-exit</strong> (через российский IP), рекламы меньше и троттлинга нет (специфика политики Google для RU-аудитории). Поэтому выбирай канал с бейджем <strong>📺 Ютуб</strong> в dropdown'е (это RU-exit без anti-DPI маскировки).</p>
       <p><strong>Kill-switch выключен по умолчанию</strong> — если YT-канал упал, YouTube идёт через PRIMARY (с рекламой, но работает).</p>
 
       <h4>📱 «Зарубежные сервисы»-sticky outbound</h4>
       <p>Sticky-канал для <strong>зарубежных сервисов</strong>: Meta/Instagram, WhatsApp, Telegram, Twitter/X, Discord (список <code>📱 Список доменов</code> в этом канале).</p>
       <p>Зачем отдельно от YouTube: у них <strong>противоположные</strong> требования к выходу. YouTube хочет <strong>российский</strong> выход (де-троттл + меньше рекламы), а Meta/Telegram <strong>заблокированы</strong> — российский выход блокировку НЕ обходит (DPI режет TLS даже через RU-IP). Поэтому здесь выбирай <strong>заграничный</strong> выход (🇳🇱/🇩🇪/🇪🇪). <em>(Раньше Instagram сидел в YouTube-канале с RU-выходом и не открывался — «вместо сайта скачивался файл».)</em></p>
       <p><strong>GeoIP-категория <code>telegram</code> обязательна</strong> в этом канале для iOS — iPhone-Telegram бьёт по IP минуя DNS, без неё MTProto-соединения улетят в PRIMARY, и если PRIMARY=RU — Telegram зависнет в «Connecting» (на ПК работает через DNS-домен, поэтому проблема ловит только iOS). На «Зарубежные сервисы» эту категорию ставит UI-кнопка в подсекции «🌍 GeoIP-категории». Опционально — <code>discord</code>/<code>facebook</code>/<code>twitter</code>.</p>
-      <p><strong>Kill-switch (рекомендую включён)</strong>: если загран-канал упал — эти сервисы идут в <code>block</code>, а не через PRIMARY. Иначе при RU-default они всё равно не откроются (РКН-блок), а реальный IP засветится. Подробнее — отдельная тема <a href="#help-foreign" onclick="openHelpAnchor('help-foreign'); return false;">«📱 Канал Зарубежные сервисы»</a>.</p>
+      <p><strong>Kill-switch (рекомендую включён)</strong>: если загран-канал упал — эти сервисы идут в <code>block</code>, а не через PRIMARY. Иначе при RU-default они всё равно не откроются (Meta/X недоступны для RU-IP), а реальный IP засветится. Подробнее — отдельная тема <a href="#help-foreign" onclick="openHelpAnchor('help-foreign'); return false;">«📱 Канал Зарубежные сервисы»</a>.</p>
 
       <h4>🌐 «Через IPv6» — sticky outbound</h4>
       <p>Sticky-канал для <strong>IPv6-only сайтов</strong> — у которых нет A-записи в DNS, только AAAA. Самый известный пример — <code>ntc.party</code>; есть и др. независимые форумы/блоги/научные ресурсы.</p>
@@ -11166,7 +11166,7 @@ Use this token to access the HTTP API:
 
       <h4>🩻 v2fly категории — когда ломается</h4>
       <ol>
-        <li><strong>Категория несовместима с каналом</strong>. Если YT-канал = российский (для DPI-обхода YouTube без рекламы) — <code>facebook</code> / <code>instagram</code> / <code>twitter</code> через него <strong>не пробьют РКН-блокировку Meta/X</strong>. Instagram сломается, xray зависнет в retries. <strong>Через RU-канал безопасно</strong>: только <code>youtube</code>, <code>tiktok</code>, <code>discord</code>.</li>
+        <li><strong>Категория несовместима с каналом</strong>. Если YT-канал = российский (для DPI-обхода YouTube без рекламы) — <code>facebook</code> / <code>instagram</code> / <code>twitter</code> через него <strong>не пробьют блокировку Meta/X для RU-IP</strong>. Instagram сломается, xray зависнет в retries. <strong>Через RU-канал безопасно</strong>: только <code>youtube</code>, <code>tiktok</code>, <code>discord</code>.</li>
         <li><strong>Опечатка в имени</strong> (<code>youtub</code> вместо <code>youtube</code>) → xray не найдёт в <code>geosite_v2fly.dat</code> → упадёт с <code>code not found</code> → xkeen уйдёт в Mixed mode. Точные имена — в репо v2fly community (ссылка выше).</li>
         <li><strong>Слишком жирная категория</strong> (например <code>google</code>) — перехватит дофига сайтов, что-то неожиданное сломается. Лучше использовать узкие категории.</li>
       </ol>
@@ -11206,7 +11206,7 @@ Use this token to access the HTTP API:
       <details open style="margin: 10px 0; padding: 10px 14px; background: #f0f9ff; border-left: 4px solid #0288d1; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #01579b;">📺 Сценарий 1: VPN только для YouTube / Instagram / Telegram, остальное напрямую</summary>
         <div style="margin-top: 8px;">
-          <p><strong>Цель</strong>: обычный трафик идёт быстро через провайдера (банки, Госуслуги, Яндекс, рабочие сайты), а через VPN — только то что иначе не работает: YouTube (без рекламы или вообще не открывается), Instagram (РКН), Telegram Desktop (IP-блокировка провайдера).</p>
+          <p><strong>Цель</strong>: обычный трафик идёт быстро через провайдера (банки, Госуслуги, Яндекс, рабочие сайты), а через VPN — только то что иначе не работает: YouTube (без рекламы или вообще не открывается), Instagram (недоступен напрямую), Telegram Desktop (IP-блокировка провайдера).</p>
 
           <p><strong>Что получаешь:</strong></p>
           <ul>
@@ -11227,7 +11227,7 @@ Use this token to access the HTTP API:
               <tr>
                 <td style="border:1px solid #ccc; padding:6px 10px;">🇷🇺 RU-канал с DPI-обходом (бейдж 📺 в dropdown)</td>
                 <td style="border:1px solid #ccc; padding:6px 10px;">✅ <strong>без рекламы</strong></td>
-                <td style="border:1px solid #ccc; padding:6px 10px;">❌ <strong>сломается</strong> (РКН блокирует Meta)</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">❌ <strong>сломается</strong> (Meta недоступна для RU-IP)</td>
                 <td style="border:1px solid #ccc; padding:6px 10px;">✅ работает</td>
               </tr>
               <tr>
@@ -11257,7 +11257,7 @@ Use this token to access the HTTP API:
           <h4 style="margin: 12px 0 6px;">Шаг 4. v2fly категории (для автоподхвата новых доменов)</h4>
           <p>Под YT-доменами раскрой <strong>«🩻 v2fly категории»</strong> → добавь <strong>📺 youtube</strong>. Это нужно чтобы новые поддомены YouTube (которые Google запустит завтра) автоматически попадали через VPN после <code>xkeen -ug</code> без правок руками.</p>
           <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin: 4px 0; font-size: 0.9em;">
-            ⚠ Если YT-канал = <strong>RU</strong> — НЕ добавляй <code>facebook</code> / <code>instagram</code> / <code>twitter</code>: РКН блокирует Meta на выходе, Instagram перестанет работать. Если YT-канал = <strong>EU/DE</strong> — можно добавить <code>instagram</code>.
+            ⚠ Если YT-канал = <strong>RU</strong> — НЕ добавляй <code>facebook</code> / <code>instagram</code> / <code>twitter</code>: Meta/X недоступны через RU-IP, Instagram перестанет работать. Если YT-канал = <strong>EU/DE</strong> — можно добавить <code>instagram</code>.
           </div>
           <p>Жми <strong>«💾 Сохранить категории»</strong>.</p>
 
@@ -11360,7 +11360,7 @@ Use this token to access the HTTP API:
               <ul>
                 <li>Нажми <strong>📺 youtube</strong> ← авто-обновление новых поддоменов YouTube через <code>xkeen -ug</code></li>
                 <li><strong>НЕ нажимай</strong> <code>🌐 google</code> — потянет за собой Gmail/Drive (см. выше)</li>
-                <li><strong>НЕ нажимай</strong> <code>facebook</code> / <code>instagram</code> / <code>twitter</code> — РКН блокирует Meta/X, через RU-канал не пробьёшь</li>
+                <li><strong>НЕ нажимай</strong> <code>facebook</code> / <code>instagram</code> / <code>twitter</code> — Meta/X недоступны для RU-IP, через RU-канал не пробьёшь</li>
                 <li>Нажми <strong>«💾 Сохранить категории»</strong></li>
               </ul>
             </li>
@@ -11398,7 +11398,7 @@ Use this token to access the HTTP API:
               <tr><td style="border:1px solid #ccc; padding:6px 10px;">YouTube</td><td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ без рекламы (DPI-обход)</td><td style="border:1px solid #ccc; padding:6px 10px;">⚠ с рекламой</td></tr>
               <tr><td style="border:1px solid #ccc; padding:6px 10px;">reCAPTCHA</td><td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ решается 4 узкими доменами</td><td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ решается категорией <code>google</code></td></tr>
               <tr><td style="border:1px solid #ccc; padding:6px 10px;">Gmail / Drive</td><td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ через PRIMARY (не задеты)</td><td style="border:1px solid #ccc; padding:6px 10px;">⚠ через YT-канал (EU/US, безопасно)</td></tr>
-              <tr><td style="border:1px solid #ccc; padding:6px 10px;">Instagram</td><td style="border:1px solid #ccc; padding:6px 10px; color:#c33;">❌ сломан (РКН блокирует Meta)</td><td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ работает</td></tr>
+              <tr><td style="border:1px solid #ccc; padding:6px 10px;">Instagram</td><td style="border:1px solid #ccc; padding:6px 10px; color:#c33;">❌ сломан (Meta недоступна для RU-IP)</td><td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ работает</td></tr>
               <tr><td style="border:1px solid #ccc; padding:6px 10px;">Сколько кликов</td><td style="border:1px solid #ccc; padding:6px 10px;">2 кнопки в YT-доменах + 1 в v2fly = 3 клика + 2 сохранки</td><td style="border:1px solid #ccc; padding:6px 10px;">1 кнопка в YT-доменах + 1 в v2fly = 2 клика + 2 сохранки</td></tr>
             </tbody>
           </table>
@@ -11522,7 +11522,7 @@ nslookup instagram.com 8.8.8.8     # напрямую через Google — ес
       </ol>
 
       <h4>🛡️ Kill-switch (защита от утечки)</h4>
-      <p>Если включён (<code>FOREIGN_FAIL_BLOCK=1</code>) и заграничный выход <strong>упадёт</strong> — трафик Meta/Telegram <strong>блокируется</strong>, а не уходит через провайдера напрямую. Зачем: иначе при падении канала сервисы всё равно не откроются (РКН-блок), а твой <strong>реальный IP засветится</strong>. Лучше временно заблокировать до восстановления канала. Восстанавливается автоматически, как только выход оживёт.</p>
+      <p>Если включён (<code>FOREIGN_FAIL_BLOCK=1</code>) и заграничный выход <strong>упадёт</strong> — трафик Meta/Telegram <strong>блокируется</strong>, а не уходит через провайдера напрямую. Зачем: иначе при падении канала сервисы всё равно не откроются (Meta/Telegram недоступны для RU-IP), а твой <strong>реальный IP засветится</strong>. Лучше временно заблокировать до восстановления канала. Восстанавливается автоматически, как только выход оживёт.</p>
 
       <div style="background: #f6f0fb; border-left: 3px solid #8e44ad; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #5b2c6f;">
         💡 <strong>Совет по надёжности</strong>: если выбрать для этого канала <strong>тот же сервер</strong>, что и основной (PRIMARY), то при его падении ляжет и инстаграм. Для независимого резерва выбери <strong>другой</strong> заграничный узел.
@@ -15773,11 +15773,11 @@ async function setTarget(role) {
       'Точно ставить «' + tag + '» как AI-канал?'
     )) return;
   }
-  // Канал «Зарубежные сервисы» через РОССИЙСКИЙ exit бессмысленен — RU-IP блок РКН не обходит.
+  // Канал «Зарубежные сервисы» через РОССИЙСКИЙ exit бессмысленен — RU-IP блокировку Meta не обходит.
   if (role === 'foreign' && ANTI_DPI_TAGS.has(tag)) {
     if (!confirm(
       '🚨 ВНИМАНИЕ: «' + tag + '» помечен как anti-DPI / whitelist — обычно это РОССИЙСКИЙ exit-IP.\n\n' +
-      'Канал «Зарубежные сервисы» (Meta/Telegram/Twitter) через РОССИЙСКИЙ выход НЕ обойдёт блокировку РКН — ' +
+      'Канал «Зарубежные сервисы» (Meta/Telegram/Twitter) через РОССИЙСКИЙ выход НЕ обойдёт блокировку Meta/X для RU-IP — ' +
       'DPI режет TLS даже с RU-IP, сервисы не откроются.\n\n' +
       'Нужен ЗАРУБЕЖНЫЙ выход (🇳🇱 Нидерланды, 🇩🇪 Германия, 🇫🇮 Финляндия).\n\n' +
       'Точно ставить «' + tag + '» для этого канала?'
