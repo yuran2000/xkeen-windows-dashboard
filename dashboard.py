@@ -11023,6 +11023,58 @@ Use this token to access the HTTP API:
   </details>
 
   <details class="help-section">
+    <summary>🔄 Обновление панели и синхронизация структуры с роутером</summary>
+    <div class="help-body">
+      <h4>Как обновлять панель</h4>
+      <ul>
+        <li><strong>Через Git</strong> (если ставил через <code>git clone</code>): <code>cd C:\xray-dashboard</code> + <code>.\update.bat</code> — стянет последний релиз с GitHub, поставит новые зависимости из <code>requirements.txt</code> если он изменился, перезапустит панель в фоне.</li>
+        <li><strong>Без Git</strong> (если ставил из ZIP): скачать свежий ZIP с GitHub → остановить панель (<code>stop.bat</code>) → распаковать архив поверх <code>C:\xray-dashboard</code> с заменой файлов (твои <code>config_local.py</code>, <code>.venv</code>, <code>backups\</code> в архиве нет — не перезапишутся) → <code>install.bat</code> для обновления зависимостей → <code>start-bg.bat</code>.</li>
+      </ul>
+
+      <h4>Что синхронизируется на роутер автоматически</h4>
+      <ul>
+        <li>📜 <strong><code>watchdog.sh</code></strong> — обновляется автоматически при первом «Сохранить» любой настройки в UI (PRIMARY / FAILOVER / AI / YT и т.д.). Перед заменой делается <code>sh -n</code> валидация и бэкап старой версии (<code>.bak-timestamp</code>). Если новая версия не парсится — апгрейд откатывается, остаётся рабочий старый watchdog.</li>
+        <li>🐍 <strong>Python-зависимости</strong> — <code>install.bat</code> и <code>update.bat</code> сравнивают <code>requirements.txt</code> до/после обновления и переустанавливают пакеты если файл изменился (например, после v1.0.83 добавился <code>curl-cffi</code> для Chrome-fingerprint probe).</li>
+        <li>🔑 <strong>Новые ключи <code>watchdog.config</code></strong> (FOREIGN_TAG, IPv6, AI_EXT_CATEGORIES и т.п.) — добавляются с дефолтными значениями при первой записи через UI. То есть переход с старой версии не требует ручной правки конфига на роутере.</li>
+      </ul>
+
+      <h4>⚠ Что НЕ синхронизируется автоматически</h4>
+      <p>Файл <code>05_routing.template.json</code> на роутере — это <strong>шаблон роутинга</strong> с placeholder'ами вида <code>__AI_RULE_BLOCK__</code>, <code>__YT_RULE_BLOCK__</code>, <code>__FOREIGN_RULE_BLOCK__</code>, <code>__IPV6_RULE_BLOCK__</code>, которые watchdog подставляет реальными правилами при каждом запуске. Новые каналы добавлялись в template постепенно:</p>
+      <ul>
+        <li>v1.0.23 — добавлен <code>__FOREIGN_RULE_BLOCK__</code> (канал «Зарубежные сервисы»)</li>
+        <li>v1.0.71 — добавлен <code>__IPV6_RULE_BLOCK__</code> (канал «Через IPv6»)</li>
+        <li>Если в template старая версия — новые правила <strong>молча не сгенерируются</strong> в <code>05_routing.json</code> (без падений, но новые каналы не работают)</li>
+      </ul>
+
+      <h4>🟡 Кнопка «⚙ Применить структуру»</h4>
+      <p>В разделе <strong>«🔧 Подключение к роутеру»</strong> на странице <code>/xkeen</code> (в самом низу страницы) есть кнопка <strong>⚙ Применить структуру</strong>. Она нужна когда структура на роутере отстала от встроенной в свежую панель — обычно после пропуска нескольких релизов.</p>
+      <p>Что она делает по шагам (полностью с откатом):</p>
+      <ol>
+        <li><strong>Бэкап</strong> — копирует <code>watchdog.sh</code> + <code>05_routing.template.json</code> + <code>05_routing.json</code> с суффиксом <code>.syncbak-YYYYMMDD-HHMMSS</code>. Если что-то пойдёт не так — откат к этим бэкапам автоматический.</li>
+        <li><strong>watchdog → актуальный</strong> — заливает свежую версию <code>watchdog.sh</code> на роутер (если ещё не подтянулся при «Сохранить»).</li>
+        <li><strong>template → актуальный</strong> — заливает свежий <code>05_routing.template.json</code> + <strong>пересинкивает IP-адреса</strong> из текущих outbounds (твои кастомные IP сохраняются, не теряются после overwrite).</li>
+        <li><strong>Прогон watchdog</strong> — запускает <code>watchdog.sh</code>, который перегенерирует <code>05_routing.json</code> из новых watchdog/template.</li>
+        <li><strong>Валидация</strong> — <code>xray -test</code> на новом конфиге (с обязательным <code>XRAY_LOCATION_ASSET=/opt/etc/xray/dat</code>).</li>
+        <li><strong>Применение</strong> — <code>xkeen -restart</code> + <strong>health-check</strong>: проверка что процесс <code>xray run</code> жив И DNS резолвится через LAN-IP роутера (до 6 попыток с интервалом 3 секунды).</li>
+        <li><strong>🔴 АВТО-ОТКАТ</strong> — если health-check провалился (xray не запустился или сеть не отвечает), панель автоматически возвращает все три файла из бэкапов и делает <code>xkeen -restart</code>. То есть в худшем сценарии всё вернётся в рабочее состояние без вмешательства.</li>
+      </ol>
+
+      <h4>Когда нажимать</h4>
+      <ul>
+        <li>После обновления панели через несколько версий подряд (например с v1.0.50 на v1.0.84).</li>
+        <li>Если на странице <code>/xkeen</code> появился жёлтый баннер «структура отстала» — это автодетект из <code>_structure_drift_status()</code>, который сравнивает версии watchdog/template на роутере с встроенными в панель.</li>
+        <li>Если новые каналы (📱 Зарубежные сервисы / 🌐 Через IPv6 и т.п.) добавлены в UI, но трафик через них всё равно идёт через PRIMARY — значит template на роутере без свежих placeholder'ов, нужно применить структуру.</li>
+      </ul>
+
+      <h4>Когда НЕ нажимать</h4>
+      <ul>
+        <li>На свежем релизе сразу после первой установки — здесь структура и так актуальна (баннера не будет, кнопка вернёт «Структура уже актуальна, применять нечего»).</li>
+        <li>Если только что вручную правил <code>watchdog.sh</code> или <code>05_routing.template.json</code> на роутере под себя — кнопка перезапишет твои изменения свежей версией из панели. Сохрани свою копию заранее.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details class="help-section">
     <summary>📡 Каналы: PRIMARY · FAILOVER · AI · YouTube · «Зарубежные сервисы»</summary>
     <div class="help-body">
       <h4>🟢 PRIMARY — основной канал</h4>
