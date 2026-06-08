@@ -10530,10 +10530,10 @@ echo OK</pre>
       <div style="margin-top: 24px; border-top: 1px dashed #e6e6e6; padding-top: 16px;">
         <h3 style="margin: 0 0 6px; font-size: 1.02em; color: #2e7d32;">🔍 Найти домен или IP в GeoFile-базах</h3>
         <p style="margin: 0 0 10px; font-size: 0.9em; color: #555;">
-          Введите домен (<code>claude.ai</code>) или IP (<code>8.8.8.8</code>) — панель покажет, в каких категориях он есть. Поиск идёт по локальному кэшу; при первом запросе базы скачиваются с роутера (geoip-файлы крупные, до 30 секунд).
+          Введите домен (например <code>example.com</code>) или IP (<code>8.8.8.8</code>) — панель покажет, в каких категориях он есть. Поиск идёт по локальному кэшу; при первом запросе базы скачиваются с роутера (geoip-файлы крупные, до 30 секунд).
         </p>
         <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
-          <input type="text" id="dat-lookup-input" placeholder="claude.ai или 8.8.8.8"
+          <input type="text" id="dat-lookup-input" placeholder="example.com или 8.8.8.8"
                  style="flex: 1; min-width: 200px; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px;"
                  onkeydown="if(event.key==='Enter'){event.preventDefault(); runDatLookup();}" />
           <select id="dat-lookup-kind" style="padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px;">
@@ -15748,7 +15748,7 @@ async function setTarget(role) {
     msg += '\nСтарый порядок FAILOVER_TAGS сохранится, ' + tag + ' встанет первым.';
     msg += '\nWatchdog перегенерит routing если сейчас в failover-режиме.';
   } else if (role === 'ai') {
-    msg += '\nAI-домены (claude.ai, openai.com, etc) будут идти через ' + tag;
+    msg += '\nAI-домены из списка ниже будут идти через ' + tag;
     msg += '\nWatchdog перегенерит routing на следующем тике.';
   } else if (role === 'yt') {
     msg += '\nYouTube-домены (youtube.com, googlevideo.com) будут идти через ' + tag;
