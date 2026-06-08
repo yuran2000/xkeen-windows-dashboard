@@ -7203,9 +7203,9 @@ def _channel_for_domain(host, tg):
     m = _domain_in_list(h, tg.get("block_domains"))
     if m: return {"label": "⛔ Блокировать", "tag": "block", "kind": "block", "match": m}
     m = _domain_in_list(h, tg.get("direct_domains"))
-    if m: return {"label": "🚫 Напрямую", "tag": "direct", "kind": "direct", "match": m}
+    if m: return {"label": "↪️ Напрямую", "tag": "direct", "kind": "direct", "match": m}
     if _RU_TLD_RE.search(h):
-        return {"label": "🚫 Напрямую", "tag": "direct", "kind": "direct", "match": "RU-домен (.ru/.su/.рф)"}
+        return {"label": "↪️ Напрямую", "tag": "direct", "kind": "direct", "match": "RU-домен (.ru/.su/.рф)"}
     m = _domain_in_list(h, tg.get("ai_domains"))
     if m: return {"label": "🤖 AI", "tag": tg.get("ai_tag"), "kind": "ai", "match": m}
     m = _domain_in_list(h, tg.get("yt_domains"))
@@ -9565,8 +9565,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <div class="row" style="gap: 16px; margin-top: 16px;">
   <div class="col" style="flex: 1 1 460px; min-width: 0;">
   <!-- DIRECT домены — сайты идут напрямую без VPN -->
-  <div class="domain-section ds-direct" data-xk-sub="🚫 Напрямую">
-    <h3 class="domain-section-header">🚫 Сайты НАПРЯМУЮ без VPN <span class="subsec-hint">(DIRECT — пойдут через провайдера, без VPN)</span> <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.7em; color: #468; text-decoration: none; margin-left: 8px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — там объяснение когда нужны DIRECT-домены (банки, Госуслуги, российские сервисы которые блокируют не-RU IP)">❓ помощь</a></h3>
+  <div class="domain-section ds-direct" data-xk-sub="↪️ Напрямую">
+    <h3 class="domain-section-header">↪️ Сайты НАПРЯМУЮ без VPN <span class="subsec-hint">(DIRECT — пойдут через провайдера, без VPN)</span> <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.7em; color: #468; text-decoration: none; margin-left: 8px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — там объяснение когда нужны DIRECT-домены (банки, Госуслуги, российские сервисы которые блокируют не-RU IP)">❓ помощь</a></h3>
     <div class="domain-section-body">
       <p class="subtitle">
         Эти домены пойдут через твоего обычного провайдера (без VPN). Полезно: банки/Госуслуги (требуют RU IP),
@@ -11134,7 +11134,7 @@ Use this token to access the HTTP API:
       <h4>🌐 Список доменов «Через IPv6» (синяя карточка)</h4>
       <p>Домены <strong>IPv6-only сайтов</strong> (нет A-записи, только AAAA) — идут через канал «Через IPv6». При добавлении домена сюда панель автоматически прописывает <strong>fake-IP</strong> <code>198.18.0.1</code> на роутере (<code>ip host &lt;domain&gt; 198.18.0.1</code>) — это нужно чтобы IPv4-only клиент (например ПК с выключенным IPv6) смог дотянуться до xray, а xray восстановил домен из SNI и отправил на узел канала. При удалении домена fake-IP снимается тоже. Пресет — <code>ntc.party</code>. <strong>Пустой список = правило выключено.</strong></p>
 
-      <h4>🚫 Сайты НАПРЯМУЮ без VPN — DIRECT (оранжевая карточка)</h4>
+      <h4>↪️ Сайты НАПРЯМУЮ без VPN — DIRECT (оранжевая карточка)</h4>
       <p>Домены которые идут <strong>через твоего обычного провайдера</strong> минуя VPN. Полезно для:</p>
       <ul>
         <li>Банков (Сбер/ВТБ/Альфа/Тинькофф) — они проверяют RU-IP, через VPN могут не пустить</li>
