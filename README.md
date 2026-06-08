@@ -9,12 +9,12 @@
 
 ## 💡 Что это и кому нужно
 
-**В двух словах:** удобный графический интерфейс в браузере для управления **VPN (КВН)**-туннелем на роутере **Keenetic** — вместо ручной правки JSON-конфигов через SSH/терминал. Помогает с **обходом блокировок и DPI-фильтров сети** (анти-DPI-протокол VLESS+Reality маскируется под обычный HTTPS-трафик), даёт доступ к недоступным напрямую сайтам — claude.ai / ChatGPT / Instagram / YouTube без замедления.
+**В двух словах:** удобный графический интерфейс в браузере для управления **VPN (КВН)**-туннелем на роутере **Keenetic** — вместо ручной правки JSON-конфигов через SSH/терминал. Помогает с **обходом блокировок и DPI-фильтров сети** (анти-DPI-протокол VLESS+Reality маскируется под обычный HTTPS-трафик), даёт доступ к недоступным напрямую сайтам и сервисам.
 
 **Это нужно тебе если:**
 - 🏠 У тебя дома **роутер Keenetic** (KN-1xxx / KN-2xxx, Hopper / Giga / Ultra и т.п.)
 - 🌐 Хочешь чтобы **КВН работал на всех домашних устройствах** (телефон, телевизор, ноутбук) — без установки приложений на каждое
-- 🚫 Хочешь чтобы **обходились блокировки сайтов**: claude.ai / chatgpt / instagram / facebook / youtube без троттлинга / telegram через КВН — каждый сервис через свой канал
+- 🚫 Хочешь чтобы **открывались недоступные сайты и сервисы** (соцсети, видеохостинги, AI-сервисы) — каждая категория через свой канал, через свой выход
 - 🎯 **КВН только для нужных сайтов**, а банки / госуслуги / российские сайты — напрямую через провайдера (без замедления)
 - 🛠 Не хочешь каждый раз лезть в SSH и править JSON-файлы вручную — нужен GUI
 
@@ -27,8 +27,6 @@
 - **xray** = «движок КВН на роутере» (как WireGuard, но с маскировкой под обычный HTTPS-трафик — анти-DPI)
 - **XKeen** = установщик/менеджер xray для Keenetic-роутеров (open-source, [Corvus-Malus/XKeen](https://github.com/Corvus-Malus/XKeen))
 - **xray-dashboard (эта панель)** = веб-морда, ходит к роутеру по SSH и даёт удобный GUI вместо правки JSON-конфигов руками
-
-**Ключевые слова для поиска:** Keenetic VPN КВН, XKeen GUI, обход блокировок и DPI-фильтров, анти-DPI Reality, VLESS Reality Windows, не открывается claude.ai, заблокированные сайты на роутере, установка XKeen с нуля на роутер.
 
 ---
 
@@ -44,7 +42,7 @@
 
 ---
 
-![Скриншот: «🔎 Почему не работает сайт?» — проверка claude.ai с auto-enrichment категориями из geosite (geosite:anthropic, geosite:category-ai-chat-!cn и т.д.), вердикт с TCP/TLS/HTTP-замерами и кнопкой «Открыть в браузере»](docs/screenshot-diagnose.png)
+![Скриншот: «🔎 Почему не работает сайт?» — проверка домена с auto-enrichment категориями из geosite (geosite:anthropic, geosite:category-ai-chat-!cn и т.д.), вердикт с TCP/TLS/HTTP-замерами и кнопкой «Открыть в браузере»](docs/screenshot-diagnose.png)
 
 <p align="center"><sub>🔎 <b>Диагностика «Почему не работает сайт?»</b> — послойная проверка DNS→TCP→TLS→HTTP + auto-enrichment geosite-категориями + Chrome-fingerprint fallback для AI-сервисов</sub></p>
 
@@ -235,7 +233,7 @@ config_local.example.py (defaults, embedded в exe)
 
 ### 🩺 Диагностика и наблюдаемость
 - **🔎 «Почему не работает сайт?»** — послойная проверка DNS→TCP→TLS→HTTP с классификацией отказа (DNS-блок / TLS-DPI по SNI / TCP-reset / HTTP-заглушка / IPv6-only / 4xx от сервиса)
-- **🤖 Auto-fallback через Chrome-fingerprint** для AI-сервисов (claude.ai / openai / anthropic / gemini / perplexity и др.) — отличает «отказ Cloudflare нашему Python-клиенту» от реальной блокировки IP. С warm-up retry (CF challenge в той же сессии)
+- **🤖 Auto-fallback через Chrome-fingerprint** для AI-сервисов с агрессивной anti-bot защитой — отличает «отказ Cloudflare нашему Python-клиенту» от реальной блокировки IP. С warm-up retry (CF challenge в той же сессии)
 - **🩻 GeoFile-сканер** — поиск домена/IP по содержимому `.dat`-баз с роутера (geosite_v2fly, geosite_refilter, zkeen, geoip_*). Tooltip-описания категорий, кликабельный «+N ещё», ext-ссылки для копирования
 - **📍 «Где применяются GeoFile-базы»** — обратный вид: показывает в каких правилах routing.json используются категории `ext:geosite_*.dat:...` и в какой outbound они идут
 - **🟢 Header-status** — индикатор xray в шапке (TPROXY / Mixed / Redirect / error / stopped / unreachable), tooltip с режимом и последним error.log
