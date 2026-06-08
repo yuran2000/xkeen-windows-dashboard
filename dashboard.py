@@ -51,6 +51,21 @@ except Exception as _geo_exc:  # noqa: BLE001
     _GEOSITE_OK = False
     _GEOSITE_ERR = repr(_geo_exc)
 
+# ── curl-cffi (Chrome-fingerprint fallback для anti-bot сайтов) ──
+# Anthropic/OpenAI/etc. отдают 403 на запросы с Python TLS-fingerprint, даже
+# когда IP не блокирован. curl-cffi имитирует JA3/HTTP/2 настройки Chrome →
+# обходим этот false-positive. Используется в /api/diagnose/site как
+# опциональный второй проход для anti-bot-чувствительных доменов.
+# Тот же пакет используется в tg_bot.py для /reels.
+try:
+    from curl_cffi import requests as _ccffi_requests
+    _CCFFI_OK = True
+    _CCFFI_ERR = ""
+except Exception as _ccffi_exc:  # noqa: BLE001
+    _ccffi_requests = None
+    _CCFFI_OK = False
+    _CCFFI_ERR = repr(_ccffi_exc)
+
 # ============== БАЗОВЫЕ ПАПКИ ПРИЛОЖЕНИЯ (portable-aware) ==============
 # _app_base_dir() — папка для EXTERNAL данных (config_local.py / config.ini, runtime_settings.json,
 #                   backups/, .ssh/). В dev-режиме = папка с dashboard.py. В portable-режиме
@@ -202,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.81"
+_VERSION_FALLBACK = "1.0.82"
 
 
 def _find_git():
@@ -939,6 +954,94 @@ def _get_dat_cache():
                     fetch_callback=_fetch_dat_via_ssh,
                 )
     return _DAT_CACHE_INSTANCE
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Anti-bot fallback: Chrome-fingerprint probe через curl-cffi.
+# Anthropic/OpenAI/Perplexity и др. возвращают 403 на запросы с не-Chrome TLS
+# fingerprint'ом даже если IP не в bot-defense. Чтобы отличить «реально IP
+# забанен» от «нашему Python-клиенту просто отказали» — повторяем запрос
+# через curl-cffi с impersonate='chrome120'.
+# ──────────────────────────────────────────────────────────────────────────
+
+# Список доменов где Anthropic/OpenAI-style bot-defense типичен.
+# Match: точное совпадение OR суффикс с точкой. Расширять по мере обнаружения.
+_ANTI_BOT_SENSITIVE_HOSTS = (
+    "claude.ai",
+    "anthropic.com",
+    "openai.com",
+    "chatgpt.com",
+    "chat.openai.com",
+    "platform.openai.com",
+    "gemini.google.com",
+    "bard.google.com",
+    "makersuite.google.com",
+    "aistudio.google.com",
+    "perplexity.ai",
+    "character.ai",
+    "huggingface.co",
+    "midjourney.com",
+    "copilot.microsoft.com",
+    "poe.com",
+    "you.com",
+)
+
+# HTTP-статусы которые типичны для anti-bot отказа (не сетевые ошибки)
+_ANTI_BOT_STATUS_CODES = frozenset((401, 403, 429))
+
+
+def _is_anti_bot_sensitive(host):
+    """Точное совпадение или поддомен (a.example.com → matches example.com)."""
+    h = (host or "").lower().strip().rstrip(".")
+    if not h:
+        return False
+    for s in _ANTI_BOT_SENSITIVE_HOSTS:
+        if h == s or h.endswith("." + s):
+            return True
+    return False
+
+
+def _chrome_fp_probe(url, timeout=8):
+    """HTTP HEAD через curl-cffi с Chrome-impersonation. Возвращает dict.
+
+    {ok: bool, status_code: int|None, ms: int|None, error: str|None}
+    Использует HEAD чтобы не качать тело — статус-код важен, контент нет.
+    Если HEAD не поддерживается (некоторые сайты), fallback на GET.
+    """
+    if not _CCFFI_OK:
+        return {"ok": False, "status_code": None, "ms": None,
+                "error": "curl-cffi недоступен: " + _CCFFI_ERR}
+    t0 = _time_mod.time()
+    try:
+        with _ccffi_requests.Session(impersonate="chrome120") as s:
+            try:
+                resp = s.head(url, timeout=timeout, allow_redirects=True)
+                # Если HEAD не разрешён (405) — пробуем GET
+                if resp.status_code == 405:
+                    resp = s.get(url, timeout=timeout, allow_redirects=True, stream=True)
+                    resp.close()
+            except Exception:
+                # Некоторые серверы не любят HEAD вообще — fallback на GET
+                resp = s.get(url, timeout=timeout, allow_redirects=True, stream=True)
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+            ms = int((_time_mod.time() - t0) * 1000)
+            return {
+                "ok": resp.status_code < 400,
+                "status_code": resp.status_code,
+                "ms": ms,
+                "error": None,
+            }
+    except Exception as ex:  # noqa: BLE001
+        ms = int((_time_mod.time() - t0) * 1000)
+        return {
+            "ok": False,
+            "status_code": None,
+            "ms": ms,
+            "error": str(ex)[:200],
+        }
 
 
 KEENETIC_META_FILE = "/opt/etc/xray/outbound_meta.json"
@@ -7205,6 +7308,28 @@ def api_diagnose_site():
                 out["results_via"] = _run(proxy_url)
             except Exception as exc:  # noqa: BLE001
                 out["via_error"] = "Проверка через узел не удалась: " + repr(exc)
+
+    # 🤖 Anti-bot fallback: для AI-сервисов с 401/403/429 — повторить через curl-cffi
+    # с Chrome-fingerprint. Это отличает «реально IP в bot-defense» от «нашему
+    # Python-клиенту отказали из-за TLS-fingerprint'а».
+    # Делаем для каждого результата индивидуально, только если applicable.
+    if _CCFFI_OK and out.get("results"):
+        for r in out["results"]:
+            try:
+                host = r.get("name") or ""
+                status = r.get("status_code")
+                # Условия для probe: anti-bot домен AND отказ-статус (или статуса нет
+                # вообще = network-level failure уже диагностирован, не лезем)
+                if not _is_anti_bot_sensitive(host):
+                    continue
+                if status not in _ANTI_BOT_STATUS_CODES:
+                    continue
+                target_url = urls.get(host) or f"https://{host}"
+                r["chrome_fp"] = _chrome_fp_probe(target_url, timeout=8)
+            except Exception:  # noqa: BLE001
+                # Один сбойный probe не должен валить весь ответ
+                pass
+
     return jsonify(out)
 
 
@@ -16623,12 +16748,40 @@ function renderSiteCheck(j) {
       html += `<span class="mk-reachable-msg" style="font-size:0.83em;"></span></td>`;
     } else if (rejected) {
       const ch = (j.channels && j.channels[r.name]) ? j.channels[r.name] : null;
-      const isAI = (ch && ch.kind === 'ai') || /claude|anthropic|openai|chatgpt/i.test(r.name);
-      html += `<td style="padding:6px 10px; color:${v.fg};"><strong>⚠️ HTTP ${r.status_code} — сайт отклонил запрос</strong>`
-            + `<div style="font-size:0.82em; color:#6a4a00; margin-top:3px; line-height:1.5;">Сеть дошла (TLS ок) — это <strong>не</strong> DPI/блокировка сети, запрос отклонил сам сервис.`
-            + (isAI ? ` У AI-сервисов (Anthropic/OpenAI) это обычно <strong>VPN/датацентр-IP в бане</strong> → смени AI-выход на другой/менее общий узел (в идеале <strong>резидентный</strong>); иногда помогает рестарт xray.` : ` Часто = IP в чёрном списке сервиса, попробуй другой выход.`)
-            + ` <span style="color:#999;">NB: 403 бывает и обычной анти-бот-защитой на не-браузерную проверку — тогда это не про твой IP.</span>`
-            + `</div></td>`;
+      const isAI = (ch && ch.kind === 'ai') || /claude|anthropic|openai|chatgpt|gemini|perplexity/i.test(r.name);
+      const cfp = r.chrome_fp || null;
+      html += `<td style="padding:6px 10px; color:${v.fg};"><strong>⚠️ HTTP ${r.status_code} — сайт отклонил запрос</strong>`;
+      html += `<div style="font-size:0.82em; color:#6a4a00; margin-top:3px; line-height:1.5;">Сеть дошла (TLS ок) — это <strong>не</strong> DPI/блокировка сети, запрос отклонил сам сервис.`;
+      // Auto-fallback вердикт через curl-cffi (Chrome JA3-fingerprint)
+      if (cfp && cfp.ok) {
+        // Через Chrome-fp работает → значит наш Python-проверщик был отвергнут не за IP,
+        // а за fingerprint. Реальный браузер откроет сайт нормально.
+        html += `</div><div style="margin-top:8px; padding:8px 10px; background:#e8f5e9; border-left:3px solid #2e7d32; border-radius:3px; font-size:0.84em; color:#1a4a1a; line-height:1.5;">`
+              + `<strong>🟢 Через Chrome-fingerprint открывается (HTTP ${cfp.status_code}, ${cfp.ms} мс).</strong> `
+              + `Это значит IP текущего выхода <strong>не в bot-defense</strong> — сервис отказал нашему Python-клиенту из-за TLS-fingerprint'а, а не из-за IP. `
+              + `Реальный браузер на этом узле откроет сайт без проблем.`
+              + `</div>`;
+      } else if (cfp && cfp.status_code) {
+        // Chrome-fp тоже отверг → реальная блокировка IP
+        html += `</div><div style="margin-top:8px; padding:8px 10px; background:#fde8e8; border-left:3px solid #c33; border-radius:3px; font-size:0.84em; color:#6a1a1a; line-height:1.5;">`
+              + `<strong>🔴 Через Chrome-fingerprint тоже HTTP ${cfp.status_code} (${cfp.ms} мс).</strong> `
+              + `IP текущего выхода действительно в bot-defense у этого сервиса. `
+              + (isAI ? `Смени AI-канал на другой outbound (по возможности — личный VPS вместо shared commercial-VPN).` : `Попробуй другой outbound.`)
+              + `</div>`;
+      } else if (cfp && cfp.error) {
+        // Chrome-fp вообще не дозвонился (сеть/timeout)
+        html += `</div><div style="margin-top:8px; padding:8px 10px; background:#fff8e1; border-left:3px solid #f0c200; border-radius:3px; font-size:0.84em; color:#6a4a00; line-height:1.5;">`
+              + `<span style="color:#888;">Chrome-fingerprint probe не дошёл: ${escapeHtml(cfp.error)}</span>`
+              + `</div>`;
+      } else {
+        // Auto-fallback не делался (curl-cffi выключен или домен не AI-чувствительный)
+        html += (isAI ? ` У AI-сервисов (Anthropic/OpenAI) это обычно <strong>VPN/датацентр-IP в бане</strong> → смени AI-выход на другой/менее общий узел (в идеале <strong>резидентный</strong>); иногда помогает рестарт xray.` : ` Часто = IP в чёрном списке сервиса, попробуй другой выход.`)
+              + ` <span style="color:#999;">NB: 403 бывает и обычной анти-бот-защитой на не-браузерную проверку — тогда это не про твой IP.</span>`
+              + `</div>`;
+      }
+      // Кнопка-ссылка «Открыть в браузере» — самый надёжный sanity-чек
+      html += `<div style="margin-top:6px;"><a href="https://${encodeURIComponent(r.name)}/" target="_blank" rel="noopener noreferrer" style="display:inline-block; padding:4px 10px; background:#1a5a99; color:#fff; text-decoration:none; border-radius:3px; font-size:0.84em;">🌐 Открыть «${escapeHtml(r.name)}» в браузере</a></div>`;
+      html += `</td>`;
     } else {
       html += `<td style="padding:6px 10px; color:${v.fg};"><strong>${v.icon} ${escapeHtml(v.text)}</strong> <span style="font-size:0.82em; color:#888;">(уверенность: ${escapeHtml(conf)})</span>`;
       const notes = (r.notes || []).filter(Boolean);
