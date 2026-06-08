@@ -6,3 +6,7 @@ qrcode[pil]>=7.4
 # а в portable-EXE фича не соберётся (PyInstaller бандлит только то, что стоит в venv).
 requests>=2.31
 PySocks>=1.7
+# curl-cffi — Chrome-fingerprint fallback для anti-bot сайтов (claude.ai/openai/anthropic):
+# 403 на Python TLS JA3 ≠ блокировка IP, через chrome120-impersonate сайт открывается.
+# Используется в /api/diagnose/site как second-pass для anti-bot-чувствительных доменов.
+curl-cffi>=0.7
