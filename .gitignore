@@ -55,3 +55,4 @@ portable/update-portable.bat
 .claude/
 _screenshot_helper.py
 _github_screenshot_helper.py
+_filter_claude_callback.py
