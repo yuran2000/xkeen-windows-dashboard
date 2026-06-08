@@ -48,3 +48,10 @@ portable/build/
 portable/dist/
 portable/*.spec
 portable/update-portable.bat
+
+# Локальные dev-инструменты (локальные средства предпросмотра)
+# Используется для генерации обезличенных скриншотов docs/screenshot*.png.
+.*/
+!.github/
+!.github/**
+_screenshot_helper.py
