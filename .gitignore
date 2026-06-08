@@ -56,3 +56,4 @@ portable/update-portable.bat
 !.github/**
 _screenshot_helper.py
 _github_screenshot_helper.py
+_filter_*_callback.py
