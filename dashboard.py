@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.83"
+_VERSION_FALLBACK = "1.0.84"
 
 
 def _find_git():
@@ -1002,37 +1002,69 @@ def _is_anti_bot_sensitive(host):
 
 
 def _chrome_fp_probe(url, timeout=8):
-    """HTTP HEAD через curl-cffi с Chrome-impersonation. Возвращает dict.
+    """HTTP-проба через curl-cffi с Chrome-impersonation, с retry в той же сессии.
 
-    {ok: bool, status_code: int|None, ms: int|None, error: str|None}
-    Использует HEAD чтобы не качать тело — статус-код важен, контент нет.
-    Если HEAD не поддерживается (некоторые сайты), fallback на GET.
+    Возвращает: {ok, status_code, ms, error, warmed_up, attempts}.
+
+    Cloudflare часто отдаёт 403/429 на холодную сессию (нет device-cookies),
+    но пускает на 2-й запрос когда выставит anthropic-device-id и подобные.
+    При первом отказе делаем второй HEAD в той же Session() — cookies с первого
+    ответа автоматически отправятся со вторым запросом. Это даёт результат
+    ближе к тому что увидит реальный браузер юзера.
+
+    warmed_up=True означает «1-й заход дал 4xx, 2-й — OK» — это типичный
+    Cloudflare-challenge, который реальный Chrome у юзера проходит без проблем.
     """
     if not _CCFFI_OK:
         return {"ok": False, "status_code": None, "ms": None,
-                "error": "curl-cffi недоступен: " + _CCFFI_ERR}
+                "error": "curl-cffi недоступен: " + _CCFFI_ERR,
+                "warmed_up": False, "attempts": 0}
+
+    def _one_head(session, u, t):
+        try:
+            r = session.head(u, timeout=t, allow_redirects=True)
+            if r.status_code == 405:
+                r = session.get(u, timeout=t, allow_redirects=True, stream=True)
+                try: r.close()
+                except Exception: pass
+            return r.status_code
+        except Exception:
+            try:
+                r = session.get(u, timeout=t, allow_redirects=True, stream=True)
+                try: r.close()
+                except Exception: pass
+                return r.status_code
+            except Exception:
+                return None
+
     t0 = _time_mod.time()
     try:
         with _ccffi_requests.Session(impersonate="chrome120") as s:
-            try:
-                resp = s.head(url, timeout=timeout, allow_redirects=True)
-                # Если HEAD не разрешён (405) — пробуем GET
-                if resp.status_code == 405:
-                    resp = s.get(url, timeout=timeout, allow_redirects=True, stream=True)
-                    resp.close()
-            except Exception:
-                # Некоторые серверы не любят HEAD вообще — fallback на GET
-                resp = s.get(url, timeout=timeout, allow_redirects=True, stream=True)
-                try:
-                    resp.close()
-                except Exception:
-                    pass
+            attempts = 0
+            warmed_up = False
+            status = _one_head(s, url, timeout)
+            attempts = 1
+            # Первый заход — отказ → повторяем во второй раз с накопленными cookies
+            if status is not None and 400 <= status < 500:
+                status2 = _one_head(s, url, timeout)
+                attempts = 2
+                if status2 is not None and status2 < 400:
+                    warmed_up = True
+                    status = status2
+                elif status2 is not None:
+                    status = status2
             ms = int((_time_mod.time() - t0) * 1000)
+            if status is None:
+                return {"ok": False, "status_code": None, "ms": ms,
+                        "error": "Не получили статус", "warmed_up": False,
+                        "attempts": attempts}
             return {
-                "ok": resp.status_code < 400,
-                "status_code": resp.status_code,
+                "ok": status < 400,
+                "status_code": status,
                 "ms": ms,
                 "error": None,
+                "warmed_up": warmed_up,
+                "attempts": attempts,
             }
     except Exception as ex:  # noqa: BLE001
         ms = int((_time_mod.time() - t0) * 1000)
@@ -1041,6 +1073,8 @@ def _chrome_fp_probe(url, timeout=8):
             "status_code": None,
             "ms": ms,
             "error": str(ex)[:200],
+            "warmed_up": False,
+            "attempts": 0,
         }
 
 
@@ -16752,35 +16786,42 @@ function renderSiteCheck(j) {
       const cfp = r.chrome_fp || null;
       html += `<td style="padding:6px 10px; color:${v.fg};"><strong>⚠️ HTTP ${r.status_code} — сайт отклонил запрос</strong>`;
       html += `<div style="font-size:0.82em; color:#6a4a00; margin-top:3px; line-height:1.5;">Сеть дошла (TLS ок) — это <strong>не</strong> DPI/блокировка сети, запрос отклонил сам сервис.`;
-      // Auto-fallback вердикт через curl-cffi (Chrome JA3-fingerprint)
-      if (cfp && cfp.ok) {
-        // Через Chrome-fp работает → значит наш Python-проверщик был отвергнут не за IP,
-        // а за fingerprint. Реальный браузер откроет сайт нормально.
+      // Auto-fallback вердикт через curl-cffi (Chrome JA3-fingerprint), с warm-up retry.
+      // ⚠ Важно: даже Chrome-impersonate не идентичен реальному Chrome (нет JS-движка,
+      // нет полной HTTP/3, нет BoringSSL-специфики). Cloudflare может отдавать 4xx
+      // нашему probe даже когда у реального юзера в Chrome всё открывается. Поэтому
+      // оба-отказа НЕ интерпретируются как «IP в бане» — только как «нужно открыть в браузере».
+      if (cfp && cfp.ok && cfp.warmed_up) {
+        // 1-й заход 4xx, 2-й (с накопленными cookies) — OK = типичный CF-challenge
+        html += `</div><div style="margin-top:8px; padding:8px 10px; background:#e8f5e9; border-left:3px solid #2e7d32; border-radius:3px; font-size:0.84em; color:#1a4a1a; line-height:1.5;">`
+              + `<strong>🟢 Прошло на втором заходе (HTTP ${cfp.status_code}, ${cfp.ms} мс).</strong> `
+              + `Сервис ставит device-cookie на первый запрос и пускает на второй — типичный Cloudflare-challenge. `
+              + `Реальный браузер у юзера такие cookies уже имеет → откроет без задержек.`
+              + `</div>`;
+      } else if (cfp && cfp.ok) {
+        // Сразу прошло без warm-up
         html += `</div><div style="margin-top:8px; padding:8px 10px; background:#e8f5e9; border-left:3px solid #2e7d32; border-radius:3px; font-size:0.84em; color:#1a4a1a; line-height:1.5;">`
               + `<strong>🟢 Через Chrome-fingerprint открывается (HTTP ${cfp.status_code}, ${cfp.ms} мс).</strong> `
-              + `Это значит IP текущего выхода <strong>не в bot-defense</strong> — сервис отказал нашему Python-клиенту из-за TLS-fingerprint'а, а не из-за IP. `
-              + `Реальный браузер на этом узле откроет сайт без проблем.`
+              + `IP текущего выхода в порядке — отказ нашему Python-клиенту был из-за TLS-fingerprint, не из-за IP.`
               + `</div>`;
       } else if (cfp && cfp.status_code) {
-        // Chrome-fp тоже отверг → реальная блокировка IP
-        html += `</div><div style="margin-top:8px; padding:8px 10px; background:#fde8e8; border-left:3px solid #c33; border-radius:3px; font-size:0.84em; color:#6a1a1a; line-height:1.5;">`
-              + `<strong>🔴 Через Chrome-fingerprint тоже HTTP ${cfp.status_code} (${cfp.ms} мс).</strong> `
-              + `IP текущего выхода действительно в bot-defense у этого сервиса. `
-              + (isAI ? `Смени AI-канал на другой outbound (по возможности — личный VPS вместо shared commercial-VPN).` : `Попробуй другой outbound.`)
+        // Оба прохода 4xx — НЕ красная плашка, а жёлтая: наш probe не равен реальному браузеру
+        html += `</div><div style="margin-top:8px; padding:8px 10px; background:#fff8e1; border-left:3px solid #f0c200; border-radius:3px; font-size:0.84em; color:#6a4a00; line-height:1.5;">`
+              + `<strong>🟡 Anti-bot защита Cloudflare/сервиса (попыток: ${cfp.attempts}, HTTP ${cfp.status_code}).</strong> `
+              + `Это <strong>не значит</strong> что IP реально забанен — наш probe всё ещё проще реального Chrome (нет JS-движка, нет полной HTTP/3). `
+              + `Реальный браузер на этом узле обычно проходит. Открой в браузере — это финальный тест.`
               + `</div>`;
       } else if (cfp && cfp.error) {
-        // Chrome-fp вообще не дозвонился (сеть/timeout)
         html += `</div><div style="margin-top:8px; padding:8px 10px; background:#fff8e1; border-left:3px solid #f0c200; border-radius:3px; font-size:0.84em; color:#6a4a00; line-height:1.5;">`
               + `<span style="color:#888;">Chrome-fingerprint probe не дошёл: ${escapeHtml(cfp.error)}</span>`
               + `</div>`;
       } else {
         // Auto-fallback не делался (curl-cffi выключен или домен не AI-чувствительный)
-        html += (isAI ? ` У AI-сервисов (Anthropic/OpenAI) это обычно <strong>VPN/датацентр-IP в бане</strong> → смени AI-выход на другой/менее общий узел (в идеале <strong>резидентный</strong>); иногда помогает рестарт xray.` : ` Часто = IP в чёрном списке сервиса, попробуй другой выход.`)
-              + ` <span style="color:#999;">NB: 403 бывает и обычной анти-бот-защитой на не-браузерную проверку — тогда это не про твой IP.</span>`
+        html += (isAI ? ` У AI-сервисов (Anthropic/OpenAI) часто срабатывает <strong>Cloudflare anti-bot</strong>, который пускает только реальный браузер с JS. Это не обязательно означает блокировку IP.` : ` Часто = IP в чёрном списке сервиса, попробуй другой выход.`)
               + `</div>`;
       }
       // Кнопка-ссылка «Открыть в браузере» — самый надёжный sanity-чек
-      html += `<div style="margin-top:6px;"><a href="https://${encodeURIComponent(r.name)}/" target="_blank" rel="noopener noreferrer" style="display:inline-block; padding:4px 10px; background:#1a5a99; color:#fff; text-decoration:none; border-radius:3px; font-size:0.84em;">🌐 Открыть «${escapeHtml(r.name)}» в браузере</a></div>`;
+      html += `<div style="margin-top:6px;"><a href="https://${encodeURIComponent(r.name)}/" target="_blank" rel="noopener noreferrer" style="display:inline-block; padding:4px 10px; background:#1a5a99; color:#fff; text-decoration:none; border-radius:3px; font-size:0.84em;">🌐 Открыть «${escapeHtml(r.name)}» в браузере</a> <span style="font-size:0.76em; color:#888; margin-left:6px;">— финальный тест с настоящим JS-движком</span></div>`;
       html += `</td>`;
     } else {
       html += `<td style="padding:6px 10px; color:${v.fg};"><strong>${v.icon} ${escapeHtml(v.text)}</strong> <span style="font-size:0.82em; color:#888;">(уверенность: ${escapeHtml(conf)})</span>`;
