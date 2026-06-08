@@ -48,3 +48,9 @@ portable/build/
 portable/dist/
 portable/*.spec
 portable/update-portable.bat
+
+# Локальные dev-инструменты (Claude Preview MCP + Playwright screenshot helper)
+# Используется для генерации обезличенных скриншотов docs/screenshot*.png.
+# См. memory/screenshot_helper.md — там инструкция как запускать при обновлении UI.
+.claude/
+_screenshot_helper.py

@@ -159,19 +159,45 @@ config_local.example.py (defaults, embedded в exe)
 
 ## Возможности
 
-- **Подписки**: добавить subscription URL → панель скачивает список серверов с провайдера, выкладывает их как outbounds на роутер. Группировка по подписке, отображение даты истечения с цветной шкалой, ручное обновление кнопкой
-- Видеть, добавлять, удалять, переименовывать outbounds в `/opt/etc/xray/configs/04_outbounds.json`
+### 🔌 Управление XKeen и outbounds
+- **Подписки VLESS**: добавить subscription URL → панель скачивает список серверов с провайдера, выкладывает как outbounds на роутер. Группировка по подписке, отображение даты истечения с цветной шкалой, ручное обновление кнопкой + auto-sync по расписанию
+- Видеть / добавлять / удалять / переименовывать outbounds в `/opt/etc/xray/configs/04_outbounds.json`
 - Bulk-удаление outbound'ов через чекбоксы (с защитой от удаления активных в watchdog)
-- Переключать PRIMARY/FAILOVER каналы вручную и через watchdog (каждую минуту автоматически)
-- Sticky-каналы: AI-сервисы · YouTube · «Зарубежные сервисы» (Meta/Instagram, Telegram, Twitter/X, Discord)
-- DIRECT-список доменов (идут напрямую)
-- BLOCK-список доменов (заблокированы — Windows Update / Adobe Genuine / телеметрия и т.п.)
-- Виртуальный канал **🌐 Напрямую** — для сценария «всё напрямую, через туннель только YT/AI»
-- **👥 Клиенты в политике XKeen** — список устройств LAN с разметкой кто идёт через xray (метка fwmark от Keenetic-политики) и кто напрямую. **Смена политики через dropdown прямо в таблице** — без захода в Keenetic Web UI. Видны порты `xkeen -cp/-cpe` и содержимое `/opt/etc/xkeen/*.lst`.
-- Бэкап и восстановление всех XKeen-настроек одним JSON-файлом
-- Telegram-алерты при падениях (опционально)
-- Bootstrap чистого XKeen — заливает watchdog + cron + routing template одной кнопкой
-- Multi-instance — несколько копий панели на одном PC для управления несколькими роутерами
+
+### 🎯 Sticky-каналы (роутинг по сервисам)
+- **🟢 PRIMARY** / **🟡 FAILOVER** — основной и резервный канал, watchdog переключает каждую минуту по health-check
+- **🤖 AI** — sticky-канал для Anthropic / OpenAI / Claude / ChatGPT и т.д. (часто требует EU-узла с белыми IP)
+- **📺 YouTube** — отдельный канал для Google/YouTube (RU-узел лечит троттлинг)
+- **📱 Foreign** — «Зарубежные сервисы» для заблокированных в РФ (Meta/Instagram, Telegram, X, Discord)
+- **🌐 IPv6-only** — для сайтов с AAAA-only записями (роутер ставит fake-IP через ndm + переадресует в outbound с IPv6-выходом)
+- **🌐 Напрямую** — виртуальный канал «через провайдера без VPN» для конкретных доменов
+- **DIRECT / BLOCK** — списки доменов которые идут напрямую (банки/госуслуги) или вообще блокируются (Windows Update, Adobe Genuine, телеметрия)
+- В каждом sticky-канале — селектор outbound'а с счётчиком вариантов и latency-бейджами (🟢 <300мс / 🟡 <800мс / 🟠 >800мс) рядом с каждым узлом
+
+### 🩺 Диагностика и наблюдаемость
+- **🔎 «Почему не работает сайт?»** — послойная проверка DNS→TCP→TLS→HTTP с классификацией отказа (DNS-блок / TLS-DPI по SNI / TCP-reset / HTTP-заглушка / IPv6-only / 4xx от сервиса)
+- **🤖 Auto-fallback через Chrome-fingerprint** для AI-сервисов (claude.ai / openai / anthropic / gemini / perplexity и др.) — отличает «отказ Cloudflare нашему Python-клиенту» от реальной блокировки IP. С warm-up retry (CF challenge в той же сессии)
+- **🩻 GeoFile-сканер** — поиск домена/IP по содержимому `.dat`-баз с роутера (geosite_v2fly, geosite_refilter, zkeen, geoip_*). Tooltip-описания категорий, кликабельный «+N ещё», ext-ссылки для копирования
+- **📍 «Где применяются GeoFile-базы»** — обратный вид: показывает в каких правилах routing.json используются категории `ext:geosite_*.dat:...` и в какой outbound они идут
+- **🟢 Header-status** — индикатор xray в шапке (TPROXY / Mixed / Redirect / error / stopped / unreachable), tooltip с режимом и последним error.log
+- **🔔 Browser-алерт + 🍞 Windows toast** при падении xray (beep через Web Audio API + favicon-swap + title-мигание + системная toast-уведомление через daemon)
+- **🌐 Кнопка «Открыть в браузере»** при любом 4xx-вердикте — финальный тест с реальным JS-движком
+
+### 👥 Клиенты политики XKeen
+- Список устройств LAN с разметкой кто идёт через xray (по fwmark от Keenetic-политики) и кто напрямую
+- **Смена политики через dropdown прямо в таблице** — без захода в Keenetic Web UI
+- Видны порты `xkeen -cp/-cpe` и содержимое `/opt/etc/xkeen/*.lst`
+
+### 🚀 Развёртывание и бэкап
+- **Bootstrap чистого XKeen** — заливает `watchdog.sh` + `cron` + `05_routing.template.json` + `06_socks_local.json` одной кнопкой на роутер где XKeen ещё не настроен
+- **Бэкап и восстановление** всех XKeen-настроек одним JSON-файлом
+- **🔁 Синхронизация IP-адресов** template с подпиской — при изменении IP узлов в подписке
+- **🚑 Восстановление и диагностика** — auto-fix частых поломок (libnghttp2, conntrack-tools, socks-local) через UI без SSH-команд
+
+### 📡 Прочее
+- **Telegram-алерты** (опционально) — падение xray, истечение подписок, отказы AI-канала
+- **Multi-instance** — несколько копий панели на одном PC для управления несколькими роутерами (разные DASHBOARD_PORT в config_local.py)
+- Все настройки через web UI без правки JSON руками
 
 ## 📘 Полная пошаговая инструкция (для тех кто впервые)
 
