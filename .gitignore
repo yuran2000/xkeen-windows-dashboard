@@ -54,3 +54,4 @@ portable/update-portable.bat
 # См. memory/screenshot_helper.md — там инструкция как запускать при обновлении UI.
 .claude/
 _screenshot_helper.py
+_github_screenshot_helper.py
