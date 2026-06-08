@@ -38,6 +38,19 @@ except Exception as _rkn_exc:  # noqa: BLE001
     _RKN_OK = False
     _RKN_ERR = repr(_rkn_exc)
 
+# ── geosite_scanner (см. geosite_scanner.py рядом) ──
+# Парсер protobuf-файлов /opt/etc/xray/dat/*.dat (geosite_*/geoip_*) для поиска
+# домена/IP по содержимому категорий. Импорт защищён: если модуль повреждён —
+# фича "Поиск в GeoFile-базах" покажет ошибку, остальная панель не падает.
+try:
+    import geosite_scanner as _geosite_scanner  # noqa: F401
+    _GEOSITE_OK = True
+    _GEOSITE_ERR = ""
+except Exception as _geo_exc:  # noqa: BLE001
+    _geosite_scanner = None
+    _GEOSITE_OK = False
+    _GEOSITE_ERR = repr(_geo_exc)
+
 # ============== БАЗОВЫЕ ПАПКИ ПРИЛОЖЕНИЯ (portable-aware) ==============
 # _app_base_dir() — папка для EXTERNAL данных (config_local.py / config.ini, runtime_settings.json,
 #                   backups/, .ssh/). В dev-режиме = папка с dashboard.py. В portable-режиме
@@ -189,7 +202,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.80"
+_VERSION_FALLBACK = "1.0.81"
 
 
 def _find_git():
@@ -845,6 +858,87 @@ def keenetic_tail_log(remote_path, n=30, timeout=10):
     """Tail последних N строк лога с роутера. Возвращает list строк (пустой если файл/ошибка)."""
     r = keenetic_ssh(f"tail -n {n} {remote_path} 2>/dev/null || true", timeout=timeout)
     return (r.get("stdout") or "").splitlines()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# DAT-кэш (geosite_*.dat / geoip_*.dat с роутера на локальный ПК).
+# Используется для поиска домена/IP по содержимому категорий. Парсер —
+# geosite_scanner.py. Cache invalidation по mtime, скачка через base64-over-SSH
+# (binary-safe — обычный cat ломал бы UTF-8 декодирование stdout в keenetic_ssh).
+# ──────────────────────────────────────────────────────────────────────────
+
+_DAT_CACHE_INSTANCE = None
+_DAT_CACHE_LOCK = _threading.Lock()
+_DAT_REMOTE_DIR = "/opt/etc/xray/dat"
+
+
+def _fetch_dat_via_ssh(remote_path):
+    """Скачать бинарный dat-файл с роутера через SSH+base64. Возвращает bytes или None.
+
+    timeout 180s — geoip_v2fly.dat ~19MB в base64 ~25MB, на 100 Mbps канале ~3-5с;
+    запас на медленные подключения.
+    """
+    r = keenetic_ssh(f"base64 < {remote_path}", timeout=180)
+    if not r["ok"]:
+        return None
+    raw = (r.get("stdout") or "").strip()
+    if not raw:
+        return None
+    try:
+        return base64.b64decode(raw)
+    except Exception:
+        return None
+
+
+def _list_remote_dat():
+    """Список dat-файлов на роутере: [{name, size, mtime}, ...].
+
+    Резолвит симлинки (geosite_zkeen.dat → zkeen.dat) — итог по реальным именам.
+    Игнорирует *.bak-* (старые бэкапы).
+    """
+    r = keenetic_ssh(
+        f"for f in {_DAT_REMOTE_DIR}/*.dat; do "
+        "  base=$(basename \"$(readlink -f \"$f\")\"); "
+        "  case \"$base\" in *.bak-*) continue;; esac; "
+        "  size=$(wc -c < \"$f\" 2>/dev/null || echo 0); "
+        "  mtime=$(date -r \"$f\" +%s 2>/dev/null || echo 0); "
+        "  echo \"$base|$size|$mtime\"; "
+        "done | sort -u",
+        timeout=10,
+    )
+    if not r["ok"]:
+        return []
+    out = []
+    seen = set()
+    for line in (r.get("stdout") or "").strip().splitlines():
+        parts = line.split("|")
+        if len(parts) != 3:
+            continue
+        name = parts[0]
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            out.append({"name": name, "size": int(parts[1]), "mtime": int(parts[2])})
+        except ValueError:
+            continue
+    return out
+
+
+def _get_dat_cache():
+    """Lazy singleton DatCache. None если модуль geosite_scanner не загружен."""
+    global _DAT_CACHE_INSTANCE
+    if not _GEOSITE_OK:
+        return None
+    if _DAT_CACHE_INSTANCE is None:
+        with _DAT_CACHE_LOCK:
+            if _DAT_CACHE_INSTANCE is None:
+                cache_dir = os.path.join(_app_base_dir(), "backups", "dat_cache")
+                _DAT_CACHE_INSTANCE = _geosite_scanner.DatCache(
+                    cache_dir=cache_dir,
+                    fetch_callback=_fetch_dat_via_ssh,
+                )
+    return _DAT_CACHE_INSTANCE
 
 
 KEENETIC_META_FILE = "/opt/etc/xray/outbound_meta.json"
@@ -6540,7 +6634,28 @@ V2FLY_KNOWN_CATEGORIES = [
     {"name": "amazon",                "desc": "Amazon (AWS, Prime, Twitch, etc)"},
     {"name": "akamai",                "desc": "Akamai CDN"},
     {"name": "fastly",                "desc": "Fastly CDN"},
+    # RU-блок-листы (refilter — единая категория в geosite_refilter.dat)
+    {"name": "refilter",              "desc": "Список доменов заблокированных в РФ (refilter, RKN-список)"},
+    # Композитные v2fly-категории
+    {"name": "category-ai-!cn",       "desc": "AI-сервисы (все, кроме китайских) — собирательная"},
+    {"name": "category-ai-chat-!cn",  "desc": "AI-чаты не-китайские (ChatGPT/Claude/Gemini и т.п.)"},
+    {"name": "category-social-media-!cn", "desc": "Соцсети не-китайские"},
+    {"name": "category-messaging-!cn", "desc": "Мессенджеры не-китайские"},
+    {"name": "category-video-!cn",    "desc": "Видеохостинги не-китайские"},
+    {"name": "geolocation-!cn",       "desc": "Не-китайская геолокация (большая собирательная)"},
+    {"name": "geolocation-cn",        "desc": "Китайская геолокация (большая собирательная)"},
+    {"name": "tld-!cn",               "desc": "Не-китайские TLD-домены (regex по доменным зонам)"},
+    {"name": "tld-cn",                "desc": "Китайские TLD-домены"},
+    # ZKeen (RU-специфика)
+    {"name": "bypass",                "desc": "Список доменов в обход VPN (zkeen)"},
+    {"name": "domains",               "desc": "Базовый список доменов (zkeen)"},
+    {"name": "politic",               "desc": "Политически чувствительные домены (zkeen)"},
+    {"name": "other",                 "desc": "Прочие домены (zkeen)"},
 ]
+
+# Lookup map категория → описание (case-insensitive). Используется dat-lookup
+# endpoint'ом для обогащения результатов и подсказок в UI.
+V2FLY_DESC_BY_NAME = {c["name"].lower(): c["desc"] for c in V2FLY_KNOWN_CATEGORIES}
 
 
 # ============== SELF-HEALING / DIAGNOSE / AUTO-REPAIR (v1.5.1) ==============
@@ -7564,6 +7679,218 @@ def api_xkeen_dat_categories():
         "known": V2FLY_KNOWN_CATEGORIES,
         "dat_files": dat_files,
         "note": "Полный список категорий: https://github.com/v2fly/domain-list-community/tree/master/data",
+    })
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# DAT lookup — поиск домена/IP по СОДЕРЖИМОМУ .dat-файлов на роутере.
+# Дополняет /api/xkeen/dat-categories (которая показывает обратное: где
+# категории применяются в routing.json). Сначала синхронизирует локальный кэш
+# с роутером (по mtime), затем парсит и ищет полностью локально.
+# Парсер — geosite_scanner.py (protobuf low-level decode, без зависимостей).
+# ──────────────────────────────────────────────────────────────────────────
+
+def _dat_sync_files(cache, want_kind=None, force=False):
+    """Синхронизировать локальный кэш с роутером для нужного типа (geosite/geoip).
+
+    want_kind: 'geosite' | 'geoip' | None (любой).
+    force: всегда перекачать.
+    Возвращает (synced: [files], errors: [{file, reason}]).
+    """
+    remote = _list_remote_dat()
+    if not remote:
+        return [], [{"file": "*", "reason": "Роутер недоступен или /opt/etc/xray/dat пуст"}]
+    synced = []
+    errors = []
+    for entry in remote:
+        name = entry["name"]
+        # эвристика по имени файла — пропускаем нерелевантный тип
+        lname = name.lower()
+        if want_kind == "geosite" and "geoip" in lname:
+            continue
+        if want_kind == "geoip" and "geosite" in lname:
+            continue
+        # zkeen.dat — geosite, zkeenip.dat — geoip (по имени)
+        if want_kind == "geosite" and lname == "zkeenip.dat":
+            continue
+        if want_kind == "geoip" and lname == "zkeen.dat":
+            continue
+        local = cache.ensure(name, remote_mtime=entry["mtime"], force=force)
+        if local:
+            synced.append(name)
+        else:
+            errors.append({"file": name, "reason": "не удалось скачать"})
+    return synced, errors
+
+
+@app.route("/api/xkeen/dat/lookup", methods=["GET"])
+@requires_auth
+def api_xkeen_dat_lookup():
+    """Поиск домена/IP по СОДЕРЖИМОМУ geosite/geoip .dat-файлов.
+
+    Query:
+      target: домен или IP (обязательно).
+      kind:   'auto' (default) | 'domain' | 'ip' — override авто-детекции.
+
+    Returns:
+      ok: bool
+      target, type: что искали и в каких файлах (geosite vs geoip)
+      results: [{file, size, mtime, categories: [str], ext_refs: [str]}]
+      errors:  [{file, reason}] — что не получилось скачать/распарсить
+      elapsed_ms: чистое время поиска
+    """
+    if not _GEOSITE_OK:
+        return jsonify({"ok": False, "error": f"geosite_scanner не доступен: {_GEOSITE_ERR}"}), 503
+    target = (request.args.get("target") or "").strip()
+    if not target:
+        return jsonify({"ok": False, "error": "Параметр target обязателен"}), 400
+    kind = (request.args.get("kind") or "auto").lower()
+
+    # Авто-детект domain vs IP
+    if kind == "auto":
+        try:
+            import ipaddress as _ipa
+            _ipa.ip_address(target)
+            kind = "ip"
+        except ValueError:
+            kind = "domain"
+    if kind not in ("domain", "ip"):
+        return jsonify({"ok": False, "error": "kind должен быть auto|domain|ip"}), 400
+
+    cache = _get_dat_cache()
+    if not cache:
+        return jsonify({"ok": False, "error": "DatCache не инициализирован"}), 503
+
+    want_kind = "geosite" if kind == "domain" else "geoip"
+    t0 = _time_mod.time()
+    synced, errors = _dat_sync_files(cache, want_kind=want_kind, force=False)
+
+    results = []
+    for filename in synced:
+        local_path = cache.local_path(filename)
+        try:
+            detected = _geosite_scanner.detect_dat_type(local_path)
+        except Exception as ex:  # noqa: BLE001
+            errors.append({"file": filename, "reason": f"detect failed: {ex}"})
+            continue
+        if detected != want_kind:
+            continue  # скип несовпадающего типа (страховка от эвристики по имени)
+        try:
+            if kind == "domain":
+                cats = _geosite_scanner.lookup_domain(local_path, target)
+            else:
+                cats = _geosite_scanner.lookup_ip(local_path, target)
+        except Exception as ex:  # noqa: BLE001
+            errors.append({"file": filename, "reason": f"lookup failed: {ex}"})
+            continue
+        # Нормализуем категории к lowercase (xray-core case-insensitive,
+        # в наших правилах routing.json — обычно lower)
+        cats_lc = sorted({c.lower() for c in cats})
+        if not cats_lc:
+            continue
+        try:
+            st = os.stat(local_path)
+            size, mtime = st.st_size, int(st.st_mtime)
+        except OSError:
+            size, mtime = 0, 0
+        results.append({
+            "file": filename,
+            "size": size,
+            "mtime": mtime,
+            "categories": cats_lc,
+            "ext_refs": [f"ext:{filename}:{c}" for c in cats_lc],
+        })
+
+    elapsed = int((_time_mod.time() - t0) * 1000)
+    # Собираем descriptions всех уникальных категорий (для tooltip'ов в UI)
+    all_cats = set()
+    for r in results:
+        for c in r.get("categories", []):
+            all_cats.add(c)
+    descriptions = {c: V2FLY_DESC_BY_NAME[c] for c in all_cats if c in V2FLY_DESC_BY_NAME}
+    return jsonify({
+        "ok": True,
+        "target": target,
+        "type": kind,
+        "results": results,
+        "errors": errors,
+        "elapsed_ms": elapsed,
+        "category_descriptions": descriptions,
+    })
+
+
+@app.route("/api/xkeen/dat/refresh-cache", methods=["POST"])
+@requires_auth
+def api_xkeen_dat_refresh():
+    """Принудительно перекачать .dat-кэш с роутера.
+
+    Body (опц.): {"files": ["name1.dat", ...]} — конкретные файлы. Пусто = все.
+    Returns: {ok, refreshed: [names], errors: [{file, reason}]}
+    """
+    if not _GEOSITE_OK:
+        return jsonify({"ok": False, "error": f"geosite_scanner не доступен: {_GEOSITE_ERR}"}), 503
+    cache = _get_dat_cache()
+    if not cache:
+        return jsonify({"ok": False, "error": "DatCache не инициализирован"}), 503
+    body = request.get_json(silent=True) or {}
+    requested = body.get("files") or []
+    remote = _list_remote_dat()
+    if not remote:
+        return jsonify({"ok": False, "error": "Роутер недоступен"}), 503
+
+    refreshed = []
+    errors = []
+    targets = remote if not requested else [e for e in remote if e["name"] in requested]
+    for entry in targets:
+        local = cache.ensure(entry["name"], remote_mtime=entry["mtime"], force=True)
+        if local:
+            refreshed.append(entry["name"])
+        else:
+            errors.append({"file": entry["name"], "reason": "не удалось скачать"})
+    return jsonify({"ok": True, "refreshed": refreshed, "errors": errors})
+
+
+@app.route("/api/xkeen/dat/cache-status", methods=["GET"])
+@requires_auth
+def api_xkeen_dat_cache_status():
+    """Состояние локального кэша + текущее состояние на роутере + diff.
+
+    Returns:
+      ok: bool
+      cached:  [{name, size, mtime}, ...] — что в локальном кэше
+      remote:  [{name, size, mtime}, ...] — что сейчас на роутере (если доступен)
+      stale:   [name] — файлы, локальный кэш которых устарел
+      missing: [name] — файлы на роутере без локального кэша
+    """
+    if not _GEOSITE_OK:
+        return jsonify({"ok": False, "error": f"geosite_scanner не доступен: {_GEOSITE_ERR}"}), 503
+    cache = _get_dat_cache()
+    if not cache:
+        return jsonify({"ok": False, "error": "DatCache не инициализирован"}), 503
+
+    cached = cache.cached_files()
+    cached_by_name = {f["name"]: f for f in cached}
+
+    remote = _list_remote_dat()  # пустой если роутер недоступен — это ок
+    remote_by_name = {f["name"]: f for f in remote}
+
+    stale = []
+    missing = []
+    for name, ri in remote_by_name.items():
+        ci = cached_by_name.get(name)
+        if not ci:
+            missing.append(name)
+            continue
+        if ci["mtime"] < ri["mtime"]:
+            stale.append(name)
+
+    return jsonify({
+        "ok": True,
+        "cached": cached,
+        "remote": remote,
+        "stale": stale,
+        "missing": missing,
+        "cache_dir": cache.cache_dir,
     })
 
 
@@ -10039,6 +10366,27 @@ echo OK</pre>
       <p style="margin: 0 0 10px;">Кнопка ниже покажет — какие категории у тебя <strong>сейчас задействованы</strong> в <code>05_routing.json</code>, в какое правило и куда направляется трафик (BLOCK / DIRECT / VPN-канал):</p>
       <button type="button" class="btn-primary" style="background:#2e7d32; color:#fff; margin: 8px 0;" onclick="scanDatCategories()">🩻 Просканировать — где применяются GeoFile-базы</button>
       <div id="dat-categories-output" style="margin-top: 12px;"></div>
+
+      <!-- ====== 🔍 ПОИСК ДОМЕНА / IP В GEOFILE-БАЗАХ (v1.0.81) ====== -->
+      <div style="margin-top: 24px; border-top: 1px dashed #e6e6e6; padding-top: 16px;">
+        <h3 style="margin: 0 0 6px; font-size: 1.02em; color: #2e7d32;">🔍 Найти домен или IP в GeoFile-базах</h3>
+        <p style="margin: 0 0 10px; font-size: 0.9em; color: #555;">
+          Введите домен (<code>claude.ai</code>) или IP (<code>8.8.8.8</code>) — панель покажет, в каких категориях он есть. Поиск идёт по локальному кэшу; при первом запросе базы скачиваются с роутера (geoip-файлы крупные, до 30 секунд).
+        </p>
+        <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
+          <input type="text" id="dat-lookup-input" placeholder="claude.ai или 8.8.8.8"
+                 style="flex: 1; min-width: 200px; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px;"
+                 onkeydown="if(event.key==='Enter'){event.preventDefault(); runDatLookup();}" />
+          <select id="dat-lookup-kind" style="padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px;">
+            <option value="auto">Авто (домен/IP)</option>
+            <option value="domain">Только домен (geosite)</option>
+            <option value="ip">Только IP (geoip)</option>
+          </select>
+          <button type="button" class="btn-primary" style="background:#2e7d32; color:#fff;" onclick="runDatLookup()">🔎 Найти</button>
+          <button type="button" style="background:#666; color:#fff; padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer;" onclick="refreshDatCache()" title="Принудительно перекачать кэш с роутера (если базы обновились)">🔄 Обновить кэш</button>
+        </div>
+        <div id="dat-lookup-output" style="margin-top: 10px;"></div>
+      </div>
     </div>
   </details>
 </div>
@@ -16298,8 +16646,84 @@ function renderSiteCheck(j) {
   }
   html += '</tbody></table>';
   if (j.via_error) html += `<p style="color:#c33; font-size:0.85em; margin-top:8px;">⚠ ${escapeHtml(j.via_error)}</p>`;
-  html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">«Вердикт» — на каком уровне рвётся соединение (с этого ПК). TLS-DPI / DNS-блок лечатся включением нужного канала; «лежит / таймаут» может быть проблемой самого сайта.<br>🧭 <strong>«Идёт через»</strong> — в какой канал роутер направит домен <em>по твоим пресетам</em> (списки доменов в каналах). Удобно проверять настройки: например instagram должен идти через «📱 Зарубежные сервисы» на загран-выход. <em>Совпадения через geo-категории (geosite:) тут не отражаются — такой домен покажется как «Основной (PRIMARY)».</em></p>`;
+  html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">«Вердикт» — на каком уровне рвётся соединение (с этого ПК). TLS-DPI / DNS-блок лечатся включением нужного канала; «лежит / таймаут» может быть проблемой самого сайта.<br>🧭 <strong>«Идёт через»</strong> — в какой канал роутер направит домен <em>по твоим пресетам</em> (списки доменов в каналах). Удобно проверять настройки: например instagram должен идти через «📱 Зарубежные сервисы» на загран-выход. <em>Совпадения через geo-категории (<code>geosite:*</code>) подгружаются ниже в столбце «Идёт через» — фоном после загрузки таблицы.</em></p>`;
   out.innerHTML = html;
+  // Параллельный enrichment категориями из dat-сканера (v1.0.81) — не блокирует основную таблицу
+  enrichSiteCheckWithDatCategories(j).catch(() => {});
+}
+
+// ───────── Enrichment ячеек «Идёт через» категориями из geosite_*.dat (v1.0.81) ─────────
+// После основного рендера renderSiteCheck() параллельно дёргаем /api/xkeen/dat/lookup
+// и добавляем в ячейку «Идёт через» строку с найденными geosite-категориями.
+// Это закрывает пробел: «Идёт через» по умолчанию не разворачивает geosite:* ссылки
+// в правилах роутинга — теперь юзер видит, в каких категориях лежит его домен.
+// Рендер одного geosite-бейджа с tooltip (если description есть в карте)
+function _geositeBadgeHtml(cat, descriptions) {
+  const desc = (descriptions && descriptions[cat]) ? descriptions[cat] : '';
+  const titleAttr = desc ? ` title="${escapeHtml(desc)}"` : '';
+  const style = 'background:#f0e8ff; color:#5a3a99; padding:1px 6px; border-radius:3px; margin-right:3px; font-size:0.95em; cursor:' + (desc ? 'help' : 'default') + ';';
+  return `<code style="${style}"${titleAttr}>geosite:${escapeHtml(cat)}</code>`;
+}
+
+async function _enrichOneSiteRow(rowName) {
+  try {
+    const res = await fetch('/api/xkeen/dat/lookup?target=' + encodeURIComponent(rowName) + '&kind=domain');
+    const j = await res.json();
+    if (!j.ok || !j.results || j.results.length === 0) return;
+    // Уникальные категории (без дубликатов между файлами)
+    const cats = [];
+    const seen = new Set();
+    for (const r of j.results) {
+      for (const c of (r.categories || [])) {
+        if (seen.has(c)) continue;
+        seen.add(c);
+        cats.push(c);
+      }
+    }
+    if (cats.length === 0) return;
+    const descriptions = j.category_descriptions || {};
+    // Ищем строку таблицы с именем = rowName
+    const rows = document.querySelectorAll('#site-check-output tbody tr');
+    for (const row of rows) {
+      const first = row.querySelector('td:first-child strong');
+      if (!first || first.textContent.trim() !== rowName) continue;
+      const cells = row.querySelectorAll('td');
+      if (cells.length < 2) return;
+      const cell = cells[1];
+      if (cell.querySelector('.dat-categories-enrichment')) return;
+      const block = document.createElement('div');
+      block.className = 'dat-categories-enrichment';
+      block.style.cssText = 'margin-top: 6px; font-size: 0.78em; line-height: 1.6;';
+
+      const visible = cats.slice(0, 6);
+      const hidden = cats.slice(6);
+      const visibleHtml = visible.map(c => _geositeBadgeHtml(c, descriptions)).join('');
+      const moreSpan = hidden.length > 0
+        ? ` <span class="dat-cats-more" style="color:#888; cursor:pointer; text-decoration: underline dotted;" title="Показать остальные">+${hidden.length} ещё</span>`
+        : '';
+      const hiddenHtml = hidden.length > 0
+        ? `<span class="dat-cats-hidden" style="display:none;">${hidden.map(c => _geositeBadgeHtml(c, descriptions)).join('')}</span>`
+        : '';
+      block.innerHTML = `<span style="color:#888;">📚 geosite:</span> ${visibleHtml}${hiddenHtml}${moreSpan}`;
+      // Кликабельность "+N ещё"
+      const moreEl = block.querySelector('.dat-cats-more');
+      const hiddenEl = block.querySelector('.dat-cats-hidden');
+      if (moreEl && hiddenEl) {
+        moreEl.addEventListener('click', () => {
+          hiddenEl.style.display = 'inline';
+          moreEl.remove();
+        });
+      }
+      cell.appendChild(block);
+      return;
+    }
+  } catch (e) { /* silent — enrichment не критичен */ }
+}
+
+async function enrichSiteCheckWithDatCategories(j) {
+  if (!j || !j.results || j.results.length === 0) return;
+  // Параллельно для всех доменов; ограничение конкурентности на сервере (one-shot in-memory cache)
+  await Promise.all(j.results.map(r => _enrichOneSiteRow(r.name)));
 }
 
 // «✅ Сделать доступным» для IPv6-only сайта: ставит на роутере fake-IPv4 (ndm `ip host`)
@@ -16856,6 +17280,218 @@ async function scanDatCategories() {
     out.innerHTML = '<p style="color:#c33;">❌ ' + escapeHtml(e.message) + '</p>';
   }
 }
+
+// ───────── Поиск домена/IP в GeoFile-базах (v1.0.81) ─────────
+
+function _datLookupRenderHtml(j) {
+  let html = '';
+  const checked = (j.results ? j.results.length : 0) + (j.errors ? j.errors.length : 0);
+  const descriptions = j.category_descriptions || {};
+  html += `<p style="margin: 0 0 8px; font-size: 0.92em;">Запрос: <strong>${escapeHtml(j.target)}</strong> — тип <code>${escapeHtml(j.type)}</code>, ${j.elapsed_ms} мс. Проверено файлов: ${checked}.</p>`;
+
+  if (!j.results || j.results.length === 0) {
+    const kindLabel = j.type === 'ip' ? 'IP-адрес' : 'домен';
+    html += `<p style="color:#888; padding: 10px 14px; background: #fff8e6; border-left: 3px solid #f0c200; margin: 0;">Этот ${kindLabel} не найден ни в одной категории кэшированных GeoFile-баз.</p>`;
+  } else {
+    html += '<table style="border-collapse: collapse; font-size: 0.9em; width: 100%; max-width: 900px;">';
+    html += '<tr style="background: #f5f5f5;"><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Файл базы</th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Категории <span style="font-weight:400; color:#888; font-size:0.9em;">(наведи для описания)</span></th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">ext-ссылки (клик — копировать)</th></tr>';
+    for (const r of j.results) {
+      html += '<tr style="border-bottom: 1px solid #eee;">';
+      html += `<td style="padding: 6px 10px; font-family: monospace; color: #888; white-space: nowrap; vertical-align: top;">${escapeHtml(r.file)}</td>`;
+      html += '<td style="padding: 6px 10px; vertical-align: top;">';
+      for (const c of (r.categories || [])) {
+        const desc = descriptions[c] || '';
+        const titleAttr = desc ? ` title="${escapeHtml(desc)}"` : '';
+        const cursor = desc ? 'help' : 'default';
+        html += `<span style="background:#e8f5e9; color:#2e7d32; padding: 2px 8px; border-radius: 3px; margin: 0 4px 4px 0; font-family: monospace; font-size: 0.88em; display: inline-block; cursor: ${cursor};"${titleAttr}>${escapeHtml(c)}</span>`;
+      }
+      html += '</td>';
+      html += '<td style="padding: 6px 10px; vertical-align: top; font-size: 0.82em;">';
+      for (const ref of (r.ext_refs || [])) {
+        const safe = escapeHtml(ref).replaceAll("'", '&#39;');
+        html += `<code style="display:block; color: #74c; padding: 1px 0; cursor: pointer;" title="Кликни для копирования" onclick="navigator.clipboard.writeText(this.textContent); this.style.background='#e8f5e9'; setTimeout(()=>{this.style.background='';}, 800);">${safe}</code>`;
+      }
+      html += '</td></tr>';
+    }
+    html += '</table>';
+  }
+
+  if (j.errors && j.errors.length > 0) {
+    html += `<details style="margin-top: 10px; font-size: 0.85em;"><summary style="color: #c80; cursor: pointer;">⚠ Не удалось обработать файлов: ${j.errors.length}</summary>`;
+    html += '<ul style="margin: 6px 0 0 24px;">';
+    for (const e of j.errors) {
+      html += `<li><code>${escapeHtml(e.file)}</code> — ${escapeHtml(e.reason || '')}</li>`;
+    }
+    html += '</ul></details>';
+  }
+  return html;
+}
+
+async function runDatLookup() {
+  const inp = document.getElementById('dat-lookup-input');
+  const kindSel = document.getElementById('dat-lookup-kind');
+  const out = document.getElementById('dat-lookup-output');
+  if (!inp || !out) return;
+  const target = (inp.value || '').trim();
+  if (!target) {
+    out.innerHTML = '<p style="color:#888; font-style:italic;">Введите домен или IP-адрес.</p>';
+    return;
+  }
+  out.innerHTML = '<p style="color:#888; font-style:italic;">🔄 Поиск в базах… (первый запрос может занять до 30 секунд — кэш скачивается с роутера)</p>';
+  try {
+    const url = '/api/xkeen/dat/lookup?target=' + encodeURIComponent(target) + '&kind=' + encodeURIComponent(kindSel ? kindSel.value : 'auto');
+    const res = await fetch(url);
+    const j = await res.json();
+    if (!j.ok) {
+      out.innerHTML = '<p style="color:#c33;">❌ ' + escapeHtml(j.error || 'Неизвестная ошибка') + '</p>';
+      return;
+    }
+    out.innerHTML = _datLookupRenderHtml(j);
+  } catch (e) {
+    out.innerHTML = '<p style="color:#c33;">❌ ' + escapeHtml(e.message) + '</p>';
+  }
+}
+
+async function refreshDatCache() {
+  const out = document.getElementById('dat-lookup-output');
+  if (!out) return;
+  out.innerHTML = '<p style="color:#888; font-style:italic;">🔄 Перекачиваю кэш с роутера…</p>';
+  try {
+    const res = await fetch('/api/xkeen/dat/refresh-cache', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const j = await res.json();
+    if (!j.ok) {
+      out.innerHTML = '<p style="color:#c33;">❌ ' + escapeHtml(j.error || 'Неизвестная ошибка') + '</p>';
+      return;
+    }
+    let html = `<p style="color: #2e7d32; margin: 0 0 6px;">✅ Перекачано файлов: ${j.refreshed.length}`;
+    if (j.refreshed.length > 0) {
+      html += ' — <code>' + j.refreshed.map(escapeHtml).join('</code>, <code>') + '</code>';
+    }
+    html += '</p>';
+    if (j.errors && j.errors.length > 0) {
+      html += `<p style="color: #c80; margin: 0;">⚠ Ошибки: ${j.errors.length}</p>`;
+    }
+    out.innerHTML = html;
+  } catch (e) {
+    out.innerHTML = '<p style="color:#c33;">❌ ' + escapeHtml(e.message) + '</p>';
+  }
+}
+
+// ───────── UX-улучшения селекторов: счётчик вариантов (v1.0.81) ─────────
+// Добавляет «(N вариантов)» в заголовок каждого канала AI/YT/FOREIGN/IPv6.
+// Чистая клиентская обработка DOM — без правок Jinja. Идемпотентно
+// (повторный вызов не дублирует бейдж).
+function injectSelectorCounters() {
+  const roles = ['primary', 'failover', 'ai', 'yt', 'foreign', 'ipv6'];
+  for (const role of roles) {
+    const sel = document.getElementById('select-' + role);
+    if (!sel) continue;
+    const count = sel.querySelectorAll('option').length;
+    const card = sel.closest('.channel-card');
+    if (!card) continue;
+    const header = card.querySelector('.col-header');
+    if (!header) continue;
+    if (header.querySelector('.outbound-count')) continue;
+    const badge = document.createElement('span');
+    badge.className = 'outbound-count';
+    badge.style.cssText = 'font-size: 0.72em; color: #888; margin-left: 8px; font-weight: 400; vertical-align: middle;';
+    const word = (count % 10 === 1 && count % 100 !== 11) ? 'вариант'
+               : ((count % 10 >= 2 && count % 10 <= 4 && (count % 100 < 10 || count % 100 >= 20)) ? 'варианта' : 'вариантов');
+    badge.textContent = '(' + count + ' ' + word + ')';
+    header.appendChild(badge);
+  }
+}
+document.addEventListener('DOMContentLoaded', injectSelectorCounters);
+
+// ───────── UX: latency-бейджи + карточки вместо dropdown (v1.0.81) ─────────
+// 1. Дёргает /api/xkeen/probe-status?force=0 — берёт уже-измеренные значения
+//    из серверного кэша (TTL 60с). Если кэш пуст, бейджи появятся при
+//    следующем рендере после первого probe (кнопка «🔄 Проверить статус»
+//    или background-probe watchdog'а наполняют кэш).
+// 2. Если в селекторе ≤6 опций — рисует grid карточек, скрывает <select>.
+//    Клик по карточке через setTarget() работает как обычный change select.
+const _LATENCY_ROLES = ['primary', 'failover', 'ai', 'yt', 'foreign', 'ipv6'];
+const _CARDS_THRESHOLD = 6;
+
+function _latencyBadge(status) {
+  if (!status) return '';
+  if (!status.ok) return ' · 🔴 нет связи';
+  const ms = typeof status.ms === 'number' ? status.ms : null;
+  if (ms === null) return '';
+  const emoji = ms < 300 ? '🟢' : (ms < 800 ? '🟡' : '🟠');
+  return ' · ' + emoji + ' ' + ms + ' мс';
+}
+
+function _applyLatencyToOptions(statuses) {
+  for (const role of _LATENCY_ROLES) {
+    const sel = document.getElementById('select-' + role);
+    if (!sel) continue;
+    for (const opt of sel.querySelectorAll('option')) {
+      const tag = opt.value;
+      if (!tag || opt.dataset.latencyApplied === '1') continue;
+      const badge = _latencyBadge(statuses[tag]);
+      if (!badge) continue;
+      opt.textContent = opt.textContent + badge;
+      opt.dataset.latencyApplied = '1';
+    }
+  }
+}
+
+function _convertSelectorsToCards() {
+  for (const role of _LATENCY_ROLES) {
+    const sel = document.getElementById('select-' + role);
+    if (!sel || sel.dataset.cardified === '1') continue;
+    const opts = Array.from(sel.querySelectorAll('option'));
+    if (opts.length === 0 || opts.length > _CARDS_THRESHOLD) continue;
+
+    const grid = document.createElement('div');
+    grid.className = 'outbound-card-grid';
+    grid.dataset.role = role;
+    grid.style.cssText = 'display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; margin: 4px 0 8px;';
+
+    function paint(card, isSelected) {
+      card.style.border = '2px solid ' + (isSelected ? '#2e7d32' : '#d0d0d0');
+      card.style.background = isSelected ? '#e8f5e9' : '#fff';
+      card.style.fontWeight = isSelected ? '600' : '400';
+      if (isSelected) card.classList.add('outbound-card-selected');
+      else card.classList.remove('outbound-card-selected');
+    }
+
+    for (const opt of opts) {
+      const card = document.createElement('button');
+      card.type = 'button';
+      card.className = 'outbound-card';
+      card.dataset.tag = opt.value;
+      card.style.cssText = 'padding: 10px 12px; border-radius: 6px; cursor: pointer; text-align: left; font-size: 0.88em; line-height: 1.35; transition: all 0.12s; word-break: break-word;';
+      card.textContent = opt.textContent;
+      paint(card, opt.selected);
+      card.addEventListener('click', () => {
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event('change'));
+        for (const c of grid.children) paint(c, c.dataset.tag === opt.value);
+      });
+      grid.appendChild(card);
+    }
+
+    sel.style.display = 'none';
+    sel.parentNode.insertBefore(grid, sel.nextSibling);
+    sel.dataset.cardified = '1';
+  }
+}
+
+async function injectLatencyAndCards() {
+  let statuses = {};
+  try {
+    const res = await fetch('/api/xkeen/probe-status?force=0', { method: 'GET' });
+    const j = await res.json();
+    if (j && j.ok && j.statuses) statuses = j.statuses;
+  } catch (e) { /* latency не критичен */ }
+  _applyLatencyToOptions(statuses);
+  _convertSelectorsToCards();
+}
+document.addEventListener('DOMContentLoaded', () => {
+  setTimeout(injectLatencyAndCards, 600);
+});
 </script>
 
 <footer class="xk-footer" style="margin:30px 0 12px;padding:16px;border-top:1px solid #e2e2e2;text-align:center;color:#777;font-size:0.9em;">
