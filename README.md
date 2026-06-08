@@ -11,6 +11,10 @@
 
 ![Скриншот панели: каналы PRIMARY / FAILOVER / AI / YouTube / «Зарубежные сервисы» и переключение watchdog](docs/screenshot.png)
 
+![Скриншот: «📍 Где применяются GeoFile-базы» — таблица категорий (youtube, google, openai, anthropic, instagram, telegram) с указанием в какой канал направляется трафик и описанием каждой категории](docs/screenshot-geofile.png)
+
+![Скриншот: «🔎 Почему не работает сайт?» — проверка claude.ai с auto-enrichment категориями из geosite (geosite:anthropic, geosite:category-ai-chat-!cn и т.д.), вердикт с TCP/TLS/HTTP-замерами и кнопкой «Открыть в браузере»](docs/screenshot-diagnose.png)
+
 Веб-панель для управления **XKeen** (xray-клиент на роутере **Keenetic**) с **Windows**-PC через SSH.
 
 **Если XKeen ещё НЕ установлен** — панель не оставит тебя один на один с инструкцией:
