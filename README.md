@@ -113,6 +113,16 @@ cd C:\xray-dashboard
 ```
 Стянет последний релиз с GitHub, поставит новые зависимости если нужно, перезапустит панель в фоне.
 
+> 🚨 **Если клон был сделан ДО 2026-06-08** — `update.bat` упадёт с `fatal: refusing to merge unrelated histories` (или `Not possible to fast-forward, divergent branches`). 8 июня в репо была переписана git-история (разовая чистка trailer'ов из старых коммитов). Лечение — один раз сделать reset на свежий remote:
+> ```powershell
+> cd C:\xray-dashboard
+> git fetch origin
+> git reset --hard origin/main
+> git fetch --tags --force
+> .\update.bat
+> ```
+> `config_local.py`, `.venv\`, `runtime_settings.json`, `backups\` — gitignored, **не** затронутся. Также `update.bat` теперь сам детектит эту ситуацию и предлагает сделать reset с подтверждением `y/N`. Подробности — [Issue #1](https://github.com/yuran2000/xkeen-windows-dashboard/issues/1). _Эта секция уберётся через ~неделю (2026-06-16) когда основная масса клонов мигрирует._
+
 > 💡 **Если пропустил несколько версий** — после обновления зайди в панель: на странице `/xkeen` появится баннер «структура отстала» (если она реально отстала). Жми **«⚙ Применить структуру»** в разделе «🔧 Подключение к роутеру» — панель сама зальёт свежие `watchdog.sh` + `05_routing.template.json` на роутер, перегенерит routing, сделает `xray -test` + health-check, и **автоматически откатится** к бэкапу если сеть после применения сломается. Кастомные IP из подписки сохранятся.
 
 **Что дальше — первый запуск:**
