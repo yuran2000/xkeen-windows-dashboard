@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.84"
+_VERSION_FALLBACK = "1.0.85"
 
 
 def _find_git():
@@ -1646,6 +1646,11 @@ def _build_watchdog_config(d):
     """Сериализует dict обратно в shell config-формат.
     Все поля из d сохраняются (даже неизвестные) — иначе любое изменение
     через дашборд стирает AI_DOMAINS / DIRECT_DOMAINS / etc."""
+    def _esc(v):
+        # watchdog.config на роутере подключается через '. config' (source):
+        # неэкранированные спецсимволы в значении ломают config (тихая смерть
+        # watchdog) либо дают инъекцию команд. Экранируем под double-quoted sh.
+        return re.sub(r'([\\"$`])', r'\\\1', str(v))
     keys_order = [
         "PRIMARY_TAG", "FAILOVER_TAGS",
         "AI_TAG", "AI_DOMAINS", "AI_EXT_CATEGORIES", "AI_FAIL_BLOCK",
@@ -1662,12 +1667,12 @@ def _build_watchdog_config(d):
     written = set()
     for k in keys_order:
         v = d.get(k, "")
-        lines.append(f'{k}="{v}"')
+        lines.append(f'{k}="{_esc(v)}"')
         written.add(k)
     # Дописываем любые поля что были в config но не в keys_order — чтобы ничего не потерять
     for k, v in d.items():
         if k not in written:
-            lines.append(f'{k}="{v}"')
+            lines.append(f'{k}="{_esc(v)}"')
     return "\n".join(lines) + "\n"
 
 
