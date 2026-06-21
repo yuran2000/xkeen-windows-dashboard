@@ -1,4 +1,18 @@
 #!/bin/sh
+# XKeen failover watchdog v25 (2026-06-12, детект «глухого» AI-канала + авто-лечение рестартом):
+#   TCP-health видит сервер живым, а туннель к нему может залипнуть (стейл-сессии) — v24-проба
+#   в этом случае возвращала пусто, и тик просто пропускался: канал глух часами, алертов нет
+#   (инцидент 2026-06-12: 9 пустых проб подряд = 1.5 часа, Chromium-клиенты ловили
+#   ERR_CONNECTION_CLOSED, kill-switch не видел — его health-проба TCP-уровня проходила).
+#   v25 считает ПОДРЯД идущие пустые AI-пробы (поля 4/5 в watchdog.aiprobe: EMPTYCNT|DEAFSTAGE):
+#   - EMPTYCNT ≥ AI_DEAF_THRESHOLD (по умолчанию 3 = ~30 мин) → TG-алерт + авто-`xkeen -restart`
+#     (рестарт сбрасывает залипшие сессии — типовое лечение; AI_DEAF_AUTORESTART=0 отключает
+#     рестарт, остаются только алерты с рекомендациями);
+#   - ещё столько же пустых ПОСЛЕ рестарта → второй алерт «рестарт не помог — смени AI-узел»
+#     и тишина до восстановления (DEAFSTAGE=2, без рестарт-петли и спама);
+#   - первая успешная проба → recovery-алерт с длительностью глухоты, счётчики в ноль.
+#   Если AI kill-switch активен (AI_BLOCKED=1 в watchdog.state) — пустая проба ОЖИДАЕМА
+#   (blackhole), глухоту не считаем. Старый 3-полевой watchdog.aiprobe читается без миграции.
 # XKeen failover watchdog v24 (2026-05-31, AI exit-IP probe — детект утечки AI-канала в RU/CN):
 #   AI-канал (AI_TAG) проксирует трафик claude.ai/anthropic.com/openai.com и т.п. У Anthropic
 #   жёсткий anti-fraud: если IP в подозрительной стране (RU/CN/IR/BY/KP/SY) или сильный geo-
@@ -747,6 +761,9 @@ AI_PROBE_INTERVAL=${AI_PROBE_INTERVAL:-600}
 AI_PROBE_ALERT_COOLDOWN=${AI_PROBE_ALERT_COOLDOWN:-3600}
 AI_PROBE_BAD_COUNTRIES="${AI_PROBE_BAD_COUNTRIES:-RU BY CN IR KP SY}"
 AI_PROBE_STATE=/opt/etc/xray/watchdog.aiprobe
+# v25: детект глухого AI-канала (N подряд пустых проб) + авто-лечение рестартом
+AI_DEAF_THRESHOLD=${AI_DEAF_THRESHOLD:-3}
+AI_DEAF_AUTORESTART=${AI_DEAF_AUTORESTART:-1}
 _INB_FILE=/opt/etc/xray/configs/03_inbounds.json
 if [ -n "$AI_TAG" ] && [ -f "$_INB_FILE" ] && command -v jq >/dev/null 2>&1; then
   if ! grep -q '"socks-ai-check"' "$_INB_FILE" 2>/dev/null; then
@@ -919,7 +936,8 @@ fi
 # Каждые AI_PROBE_INTERVAL секунд делаем HTTP-запрос через socks-ai-check (принудительный
 # routing через AI_TAG, см. self-heal выше). Парсим country из ipinfo.io/country и сравниваем
 # со списком AI_PROBE_BAD_COUNTRIES. Алерт с cooldown AI_PROBE_ALERT_COOLDOWN.
-# Состояние в файле: TS|COUNTRY|LAST_ALERT_TS (одна строка, разделитель '|').
+# Состояние в файле: TS|COUNTRY|LAST_ALERT_TS|EMPTYCNT|DEAFSTAGE (одна строка, разделитель '|';
+# v25 добавил два последних поля — счётчик подряд пустых проб и стадию глухоты 0/1/2).
 #
 # Зачем: имя outbound-tag-а («🇳🇱_NL») не гарантирует exit-IP — коммерческие VPN-провайдеры
 # гоняют через другие датацентры, после ресинка подписки tag может вообще указать на новый узел
@@ -928,12 +946,14 @@ fi
 if [ -n "$AI_TAG" ] && [ -f "$AI_PROBE_STATE.skip" ]; then
   : # skip-marker (для отладки)
 elif [ -n "$AI_TAG" ]; then
-  _AI_TS=0; _AI_PREV_C=""; _AI_LAST_A=0
+  _AI_TS=0; _AI_PREV_C=""; _AI_LAST_A=0; _AI_EMPTY=0; _AI_DEAF=0
   if [ -f "$AI_PROBE_STATE" ]; then
-    IFS='|' read _AI_TS _AI_PREV_C _AI_LAST_A < "$AI_PROBE_STATE" 2>/dev/null
+    IFS='|' read _AI_TS _AI_PREV_C _AI_LAST_A _AI_EMPTY _AI_DEAF < "$AI_PROBE_STATE" 2>/dev/null
   fi
   [ -z "$_AI_TS" ] && _AI_TS=0
   [ -z "$_AI_LAST_A" ] && _AI_LAST_A=0
+  [ -z "$_AI_EMPTY" ] && _AI_EMPTY=0
+  [ -z "$_AI_DEAF" ] && _AI_DEAF=0
   _ai_now=$(date +%s)
   if [ $((_ai_now - _AI_TS)) -ge "$AI_PROBE_INTERVAL" ] 2>/dev/null; then
     # ipinfo.io/country возвращает строку вида "DE\n" (2-буквенный ISO-код). Лёгкий endpoint,
@@ -943,6 +963,12 @@ elif [ -n "$AI_TAG" ]; then
       _ai_country=$(curl -s --max-time 8 --socks5-hostname "127.0.0.1:$AI_PROBE_PORT" https://ifconfig.me/country_code 2>/dev/null | head -1 | tr -d '\r\n\t ')
     fi
     if [ -n "$_ai_country" ] && [ "${#_ai_country}" -le 4 ]; then
+      # v25: канал снова пропускает трафик — если была зафиксирована глухота, recovery-алерт
+      if [ "$_AI_DEAF" -ge 1 ] 2>/dev/null; then
+        tg_alert "✅ <b>AI-канал снова пропускает трафик</b> (exit <code>$_ai_country</code>). Глухота длилась ~$((_AI_EMPTY * AI_PROBE_INTERVAL / 60)) мин."
+        log "AI-probe DEAF-RECOVER: канал ожил после $_AI_EMPTY пустых проб (exit=$_ai_country)"
+      fi
+      _AI_EMPTY=0; _AI_DEAF=0
       _ai_bad=0
       for _bc in $AI_PROBE_BAD_COUNTRIES; do
         [ "$_ai_country" = "$_bc" ] && _ai_bad=1 && break
@@ -973,16 +999,41 @@ elif [ -n "$AI_TAG" ]; then
           [ "$_ai_country" != "$_AI_PREV_C" ] && log "AI-probe: AI_TAG=$AI_TAG exit-country=$_ai_country (OK)"
         fi
       fi
-      printf '%s|%s|%s\n' "$_ai_now" "$_ai_country" "$_AI_LAST_A" > "$AI_PROBE_STATE"
+      printf '%s|%s|%s|%s|%s\n' "$_ai_now" "$_ai_country" "$_AI_LAST_A" "$_AI_EMPTY" "$_AI_DEAF" > "$AI_PROBE_STATE"
     else
       # Probe не сработал (curl timeout / socks-ai-check ещё не слушает / AI kill-switch заблокировал).
-      # Обновляем только TS чтобы не молотить каждую минуту; страну и last_alert не трогаем.
-      printf '%s|%s|%s\n' "$_ai_now" "$_AI_PREV_C" "$_AI_LAST_A" > "$AI_PROBE_STATE"
-      log "AI-probe: запрос не вернул country (timeout/empty) — пропускаю тик"
+      # v25: считаем ПОДРЯД идущие пустые пробы — серия = глухой туннель при живом TCP-сервере.
+      _ai_ks=$(grep -o 'AI_BLOCKED=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2)
+      if [ "$_ai_ks" = "1" ]; then
+        # AI kill-switch активен → AI-трафик в blackhole, пустая проба ОЖИДАЕМА. Не считаем.
+        printf '%s|%s|%s|%s|%s\n' "$_ai_now" "$_AI_PREV_C" "$_AI_LAST_A" "$_AI_EMPTY" "$_AI_DEAF" > "$AI_PROBE_STATE"
+        log "AI-probe: пусто, но AI kill-switch активен (blackhole) — глухоту не считаю"
+      else
+        _AI_EMPTY=$((_AI_EMPTY + 1))
+        if [ "$_AI_DEAF" -eq 0 ] 2>/dev/null && [ "$_AI_EMPTY" -ge "$AI_DEAF_THRESHOLD" ] 2>/dev/null; then
+          _AI_DEAF=1
+          if [ "$AI_DEAF_AUTORESTART" = "1" ]; then
+            tg_alert "🕳 <b>AI-канал глух</b>: проба через <code>$AI_TAG</code> не проходит уже ~$((_AI_EMPTY * AI_PROBE_INTERVAL / 60)) мин (сервер по TCP отвечает — похоже, залип туннель). Перезапускаю xray автоматически. Если повторится — смени AI-узел в панели (вкладка «🧠 AI»)."
+            printf '%s|%s|%s|%s|%s\n' "$_ai_now" "$_AI_PREV_C" "$_AI_LAST_A" "$_AI_EMPTY" "$_AI_DEAF" > "$AI_PROBE_STATE"
+            log "AI-probe DEAF: $_AI_EMPTY пустых подряд → xkeen -restart (авто-лечение залипшего туннеля)"
+            /opt/sbin/xkeen -restart >/dev/null 2>&1 &
+            exit 0
+          fi
+          tg_alert "🕳 <b>AI-канал глух</b>: проба через <code>$AI_TAG</code> не проходит уже ~$((_AI_EMPTY * AI_PROBE_INTERVAL / 60)) мин (сервер по TCP отвечает — похоже, залип туннель). Авто-рестарт выключен (AI_DEAF_AUTORESTART=0). Рекомендации: нажми «Сохранить» в панели (это перезапустит xray) или смени AI-узел (вкладка «🧠 AI»)."
+          log "AI-probe DEAF: $_AI_EMPTY пустых подряд (AI_DEAF_AUTORESTART=0 — только алерт)"
+        elif [ "$_AI_DEAF" -eq 1 ] 2>/dev/null && [ "$_AI_EMPTY" -ge $((AI_DEAF_THRESHOLD * 2)) ] 2>/dev/null; then
+          _AI_DEAF=2
+          tg_alert "🚨 <b>AI-канал всё ещё глух</b> после перезапуска xray (суммарно ~$((_AI_EMPTY * AI_PROBE_INTERVAL / 60)) мин). Рестарт не лечит — похоже, проблема на стороне узла. Смени AI-узел в панели (вкладка «🧠 AI»). До восстановления больше не алертю."
+          log "AI-probe DEAF-2: рестарт не помог ($_AI_EMPTY пустых подряд) — рекомендована смена AI-узла"
+        else
+          log "AI-probe: запрос не вернул country (timeout/empty) — подряд: $_AI_EMPTY (порог $AI_DEAF_THRESHOLD, стадия $_AI_DEAF)"
+        fi
+        printf '%s|%s|%s|%s|%s\n' "$_ai_now" "$_AI_PREV_C" "$_AI_LAST_A" "$_AI_EMPTY" "$_AI_DEAF" > "$AI_PROBE_STATE"
+      fi
     fi
   fi
 fi
-# ---------- /v24 ----------
+# ---------- /v24+v25 ----------
 
 # ---------- State ----------
 # Формат state: "<current_state> <counter> <current_default_tag>"
