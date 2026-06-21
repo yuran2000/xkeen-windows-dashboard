@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.86"
+_VERSION_FALLBACK = "1.0.87"
 
 
 def _find_git():
@@ -3099,7 +3099,7 @@ def xkeen_page():
             any_active = any(it.get("is_primary") or it.get("is_failover") or it.get("is_ai") or it.get("in_failover_chain") for it in items)
             sub_m = sub_meta_all.get(canonical_key, {}) if canonical_key else {}
             # Ручное имя группы из subscription_meta.json имеет приоритет над автоопределением.
-            # Пример: автоимя по hostname `sub.provider-d.com` → "Routerwb", но провайдер себя
+            # Пример: автоимя по hostname `sub.provider-d.com` → "Provider D", но провайдер себя
             # называет "Provider C" — юзер вбивает кастом через модалку ✏️ Подписка.
             custom_name = (sub_m.get("name") or "").strip()
             name = custom_name if custom_name else _group_name(items, key)
@@ -11684,7 +11684,7 @@ Use this token to access the HTTP API:
         <li><strong>Egress IPv6</strong> — freedom-outbound на узле должен быть <code>UseIPv4v6</code>, не <code>UseIPv4</code> (иначе xray форсит A-lookup, а у IPv6-only сайта A-записи нет → fail).</li>
         <li><strong><code>sniffing.routeOnly=false</code> на входе узла</strong> — иначе узел набирает мёртвый <code>198.18.0.1</code>, который ему прислал роутер, вместо восстановленного домена. Симптом: TCP проходит, TLS виснет.</li>
       </ul>
-      <p><strong>Что НЕ подойдёт в качестве узла</strong>: «Напрямую без VPN» (роутер с выключенным IPv6 → тупик), сторонние коммерческие VPN-ноды (часто не егрессят IPv6 — пример: BravaVLESS-Амстердам не отдаёт IPv6, ntc.party не открывается). <strong>Самое надёжное</strong> — свой VPS с обоими слоями настройки. У дашборда есть кнопка <strong>«🔎 Проверить, открывает ли узел IPv6»</strong> которая гоняет пробный домен через выбранный канал и показывает <code>tls_ok</code>: <code>✅ узел отдаёт IPv6</code> либо <code>⚠ fake-IP стоит, но узел не тянет</code>.</p>
+      <p><strong>Что НЕ подойдёт в качестве узла</strong>: «Напрямую без VPN» (роутер с выключенным IPv6 → тупик), сторонние коммерческие VPN-ноды (часто не егрессят IPv6 — типичный симптом: ntc.party и другие IPv6-only сайты не открываются). <strong>Самое надёжное</strong> — свой VPS с обоими слоями настройки. У дашборда есть кнопка <strong>«🔎 Проверить, открывает ли узел IPv6»</strong> которая гоняет пробный домен через выбранный канал и показывает <code>tls_ok</code>: <code>✅ узел отдаёт IPv6</code> либо <code>⚠ fake-IP стоит, но узел не тянет</code>.</p>
       <p>Список доменов хранится в <code>IPV6_DOMAINS</code> (watchdog.config), routing-правило генерится из placeholder <code>__IPV6_RULE_BLOCK__</code> (template v12+, watchdog v18+). При добавлении/удалении домена через панель — fake-IP-маппинги (<code>ip host &lt;d&gt; 198.18.0.1</code>) синхронизируются автоматически.</p>
     </div>
   </details>
