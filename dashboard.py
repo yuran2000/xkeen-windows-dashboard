@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.87"
+_VERSION_FALLBACK = "1.0.88"
 
 
 def _find_git():
@@ -999,23 +999,66 @@ def _wg_client_ula(client_ip):
     return f"fd00:{o[1]}:{o[2]}::{o[3]}", f"fd00:{o[1]}:{o[2]}::/64"
 
 
-def build_wg_client_conf(iface, endpoint_host, client_ip, mode, selective_cidrs, dns_ip, home_lan_cidr, v6_antileak=False, client_priv=None):
+def _wg_subtract_cidrs(base_cidrs, exclude_cidrs):
+    """Вычесть exclude-подсети из base-набора (только IPv4). Возвращает список строк CIDR,
+    покрывающих base МИНУС exclude — «дырки» в AllowedIPs: трафик к этим адресам не попадает
+    в маршруты WG → у клиента идёт мимо туннеля напрямую (как route add ... <gw>).
+    Невалидные/непересекающиеся записи игнорируются; остаток схлопывается (collapse)."""
+    import ipaddress
+    nets = []
+    for c in base_cidrs:
+        try:
+            nets.append(ipaddress.ip_network(str(c).strip(), strict=False))
+        except Exception:
+            pass
+    for e in exclude_cidrs:
+        try:
+            ex = ipaddress.ip_network(str(e).strip(), strict=False)
+        except Exception:
+            continue
+        out = []
+        for n in nets:
+            if n.version != ex.version or not n.overlaps(ex):
+                out.append(n)
+            elif ex.subnet_of(n):
+                try:
+                    out.extend(n.address_exclude(ex))   # n содержит ex → режем дырку
+                except ValueError:
+                    out.append(n)
+            elif n.subnet_of(ex):
+                pass                                     # ex покрывает n целиком → n исчезает
+            else:
+                out.append(n)                            # частичное перекрытие без вложенности
+        nets = out
+    return [str(n) for n in ipaddress.collapse_addresses(nets)]
+
+
+def build_wg_client_conf(iface, endpoint_host, client_ip, mode, selective_cidrs, dns_ip, home_lan_cidr, v6_antileak=False, client_priv=None, exclude_cidrs=None):
     """Собрать текст клиентского .conf. PrivateKey НЕ генерируется (плейсхолдер).
     v6_antileak=True добавляет ULA v6-адрес + AllowedIPs `<ula>/64, 2000::/3` (весь global v6 → в туннель,
-    без литерального ::/0 → kill-switch не взводится; fail-closed если у дома нет v6-egress)."""
+    без литерального ::/0 → kill-switch не взводится; fail-closed если у дома нет v6-egress).
+    exclude_cidrs — IPv4-адреса/подсети, вырезаемые из AllowedIPs (идут напрямую мимо туннеля)."""
     port = iface.get("listen_port") or 51820
     pub = iface.get("public_key") or "<SERVER_PUBLIC_KEY>"
     mtu = iface.get("mtu") or 1320
     tunnel_subnet = iface.get("subnet_cidr") or ""
     extras = [x for x in (home_lan_cidr, tunnel_subnet) if x]
+    excl = [c for c in (exclude_cidrs or []) if c]
     if mode == "full":
-        allowed = WG_SPLIT_ALLOWEDIPS + ((", " + ", ".join(extras)) if extras else "")
+        inet = WG_SPLIT_ALLOWEDIPS.split(", ")
+        if excl:
+            inet = _wg_subtract_cidrs(inet, excl)
+            if not inet:
+                raise ValueError("адреса-исключения покрыли весь интернет-набор — full-tunnel остался бы без выхода; убери слишком широкие CIDR (напр. 0.0.0.0/0)")
+        allowed = ", ".join(inet + extras)
     elif mode == "lan":
         # обычный клиент: доступ только к домашней LAN + подсети туннеля (интернет у клиента напрямую, без анти-DPI)
         allowed = ", ".join(extras)
     else:
-        base = ", ".join(c for c in (selective_cidrs or []) if c)
-        allowed = ", ".join(x for x in ([base] + extras) if x)
+        base = [c for c in (selective_cidrs or []) if c]
+        if excl:
+            base = _wg_subtract_cidrs(base, excl)
+        allowed = ", ".join(base + extras)
     address = f"{client_ip}/32"
     if v6_antileak and mode != "lan":
         ula_host, ula_subnet = _wg_client_ula(client_ip)
@@ -1042,6 +1085,61 @@ def build_wg_client_conf(iface, endpoint_host, client_ip, mode, selective_cidrs,
     return "\n".join(lines) + "\n"
 
 
+def build_wg_server_conf(server_priv, address_cidr, listen_port, client_pub, client_ip):
+    """Серверный .conf для импорта в Keenetic («Загрузить из файла» → создаёт WG-интерфейс).
+    Имя интерфейса Keenetic берёт из имени ФАЙЛА. ListenPort/Address/пир — 1-в-1 из файла
+    (проверено на роутере). Endpoint у пира НЕ указываем — это входящий (серверный) пир."""
+    lines = [
+        "[Interface]",
+        f"PrivateKey = {server_priv}",
+        f"Address = {address_cidr}",
+        f"ListenPort = {listen_port}",
+        "",
+        "[Peer]",
+        f"PublicKey = {client_pub}",
+        f"AllowedIPs = {client_ip}/32",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _wg_pick_free_subnet_and_port(interfaces):
+    """По существующим WG-интерфейсам подобрать НЕ пересекающуюся /24-подсеть и свободный
+    listen-port. Сравнение через overlaps() (а не строкой) — ловит вложенность в /16 и т.п.
+    Возвращает (subnet_cidr, server_ip, client_ip, listen_port); subnet_cidr=None если свободной
+    /24 в кандидатных диапазонах не нашлось (вызывающий обязан проверить)."""
+    import ipaddress
+    used_nets, used_ports = [], set()
+    for i in (interfaces or []):
+        sc = i.get("subnet_cidr")
+        if sc:
+            try:
+                used_nets.append(ipaddress.ip_network(sc, strict=False))
+            except Exception:
+                pass
+        lp = i.get("listen_port")
+        try:
+            if lp:
+                used_ports.add(int(lp))
+        except Exception:
+            pass
+    chosen = None
+    for b in ("172.173", "10.10"):
+        for n in range(4, 255):
+            cand = ipaddress.ip_network(f"{b}.{n}.0/24")
+            if not any(cand.overlaps(u) for u in used_nets):
+                chosen = cand
+                break
+        if chosen:
+            break
+    port = 48004
+    while port in used_ports:
+        port += 1
+    if chosen is None:
+        return None, None, None, port
+    hosts = list(chosen.hosts())
+    return str(chosen), str(hosts[0]), str(hosts[1]), port
+
+
 @app.route("/api/xkeen/wg-interfaces", methods=["GET"])
 @requires_auth
 def api_wg_interfaces():
@@ -1060,6 +1158,8 @@ def api_wg_client_conf():
     endpoint_host = (data.get("endpoint_host") or "").strip()
     selective = data.get("selective_cidrs") or ""
     selective_cidrs = [c.strip() for c in re.split(r"[,\s]+", selective) if c.strip()] if isinstance(selective, str) else list(selective)
+    exclude = data.get("exclude_cidrs") or ""
+    exclude_cidrs = [c.strip() for c in re.split(r"[,\s]+", exclude) if c.strip()] if isinstance(exclude, str) else list(exclude)
     info = keenetic_get_wireguard_interfaces()
     if not info.get("ok"):
         return jsonify({"ok": False, "error": info.get("error") or "не удалось прочитать WG с роутера"})
@@ -1080,7 +1180,10 @@ def api_wg_client_conf():
     v6 = data.get("v6_antileak")
     v6 = (v6 is True) or (str(v6).lower() in ("1", "true", "on", "yes"))
     client_priv = (data.get("client_priv") or "").strip() or None
-    conf = build_wg_client_conf(iface, endpoint_host, client_ip, mode, selective_cidrs, dns_ip, home_lan_cidr, v6_antileak=v6, client_priv=client_priv)
+    try:
+        conf = build_wg_client_conf(iface, endpoint_host, client_ip, mode, selective_cidrs, dns_ip, home_lan_cidr, v6_antileak=v6, client_priv=client_priv, exclude_cidrs=exclude_cidrs)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)})
     return jsonify({
         "ok": True, "conf": conf,
         "filename": f"wg-client-{iface_id}-{client_ip}.conf".replace("/", "-"),
@@ -1217,24 +1320,91 @@ def api_wg_disconnect():
 WG_EXE_PATHS = [r"C:\Program Files\WireGuard\wg.exe", r"C:\Program Files (x86)\WireGuard\wg.exe"]
 
 
-@app.route("/api/xkeen/wg-genkey", methods=["POST"])
+@app.route("/api/xkeen/wg-new-client", methods=["POST"])
 @requires_auth
-def api_wg_genkey():
-    """Сгенерировать пару ключей WireGuard через wg.exe (для помощника «Новый клиент»)."""
+def api_wg_new_client():
+    """Создать WG-клиента «с нуля»: генерит ОБЕ пары ключей (сервер+клиент), подбирает свободную
+    подсеть/порт, отдаёт серверный .conf (для «Загрузить из файла» в Keenetic) + клиентский .conf."""
     import subprocess as _sp
+    data = request.get_json(silent=True) or request.form
+    name = (data.get("name") or "").strip() or "client"
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name)[:40].strip("_") or "client"
+    mode = (data.get("mode") or "full").strip()
+    selective = data.get("selective_cidrs") or ""
+    selective_cidrs = [c.strip() for c in re.split(r"[,\s]+", selective) if c.strip()] if isinstance(selective, str) else list(selective)
+    exclude = data.get("exclude_cidrs") or ""
+    exclude_cidrs = [c.strip() for c in re.split(r"[,\s]+", exclude) if c.strip()] if isinstance(exclude, str) else list(exclude)
+    v6 = data.get("v6_antileak")
+    v6 = (v6 is True) or (str(v6).lower() in ("1", "true", "on", "yes"))
     wg = next((p for p in WG_EXE_PATHS if os.path.exists(p)), None)
     if not wg:
-        return jsonify({"ok": False, "error": "wg.exe не найден (поставь WireGuard for Windows) — или сгенерируй ключи в приложении WireGuard вручную"})
+        return jsonify({"ok": False, "error": "wg.exe не найден (поставь WireGuard for Windows)"})
+
+    def _keypair():
+        pr = _sp.run([wg, "genkey"], capture_output=True, timeout=10).stdout.decode("ascii", "ignore").strip()
+        pb = _sp.run([wg, "pubkey"], input=pr.encode(), capture_output=True, timeout=10).stdout.decode("ascii", "ignore").strip()
+        return pr, pb
     try:
-        priv = _sp.run([wg, "genkey"], capture_output=True, timeout=10).stdout.decode("ascii", "ignore").strip()
-        if not priv:
-            return jsonify({"ok": False, "error": "wg.exe genkey не вернул ключ"})
-        pub = _sp.run([wg, "pubkey"], input=priv.encode(), capture_output=True, timeout=10).stdout.decode("ascii", "ignore").strip()
-        if not pub:
-            return jsonify({"ok": False, "error": "wg.exe pubkey не вернул ключ"})
-        return jsonify({"ok": True, "private": priv, "public": pub})
+        s_priv, s_pub = _keypair()
+        c_priv, c_pub = _keypair()
+        if not (s_priv and s_pub and c_priv and c_pub):
+            return jsonify({"ok": False, "error": "wg.exe не вернул ключи"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:200]})
+
+    info = keenetic_get_wireguard_interfaces()
+    if not info.get("ok"):
+        return jsonify({"ok": False, "error": info.get("error") or "не удалось прочитать WG с роутера"})
+    import ipaddress
+    subnet_cidr, server_ip, client_ip, port = _wg_pick_free_subnet_and_port(info.get("interfaces"))
+    prefix = 24
+    ov_subnet = (data.get("subnet") or "").strip()
+    ov_port = str(data.get("listen_port") or "").strip()
+    if ov_subnet:
+        try:
+            net = ipaddress.ip_network(ov_subnet, strict=False)
+        except ValueError:
+            return jsonify({"ok": False, "error": f"неверная подсеть: {ov_subnet}"})
+        hosts = list(net.hosts())
+        if len(hosts) < 2:
+            return jsonify({"ok": False, "error": f"подсеть {ov_subnet} мала — нужно ≥2 адресов (сервер .1 + клиент .2)"})
+        subnet_cidr, server_ip, client_ip, prefix = str(net), str(hosts[0]), str(hosts[1]), net.prefixlen
+    elif subnet_cidr is None:
+        return jsonify({"ok": False, "error": "не нашлось свободной /24-подсети (172.173.x / 10.10.x заняты) — задай подсеть вручную полем"})
+    if ov_port.isdigit():
+        port = int(ov_port)
+    endpoint_host = (data.get("endpoint_host") or "").strip() or info.get("wan_host") or "<endpoint-host>"
+    endpoint_warn = None
+    try:
+        eh = ipaddress.ip_address(endpoint_host)
+        if eh.is_private or eh.is_loopback or eh in ipaddress.ip_network("100.64.0.0/10"):
+            endpoint_warn = f"Endpoint {endpoint_host} — приватный/CGNAT-адрес, снаружи он недостижим. Укажи внешний WAN-IP или DDNS в поле Endpoint, иначе handshake не пройдёт."
+    except ValueError:
+        pass
+    dns_ip = info.get("router_lan_ip") or "<router-lan-ip>"
+    home_lan_cidr = None
+    if dns_ip and re.match(r"\d+\.\d+\.\d+\.\d+$", dns_ip):
+        try:
+            home_lan_cidr = str(ipaddress.ip_network(dns_ip + "/24", strict=False))
+        except Exception:
+            pass
+    server_conf = build_wg_server_conf(s_priv, f"{server_ip}/{prefix}", port, c_pub, client_ip)
+    fake_iface = {"public_key": s_pub, "listen_port": port, "subnet_cidr": subnet_cidr, "mtu": None}
+    try:
+        client_conf = build_wg_client_conf(fake_iface, endpoint_host, client_ip, mode, selective_cidrs,
+                                           dns_ip, home_lan_cidr, v6_antileak=v6, client_priv=c_priv,
+                                           exclude_cidrs=exclude_cidrs)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({
+        "ok": True,
+        "server_conf": server_conf, "client_conf": client_conf,
+        "server_filename": f"WG_{safe}.conf", "client_filename": f"wg-client-{safe}.conf",
+        "subnet": subnet_cidr, "listen_port": port,
+        "server_ip": server_ip, "client_ip": client_ip,
+        "server_pub": s_pub, "client_pub": c_pub, "endpoint_host": endpoint_host,
+        "endpoint_warn": endpoint_warn,
+    })
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -11201,23 +11371,62 @@ Use this token to access the HTTP API:
   <details data-xk-keep-inline style="margin:8px 0; border:1px solid #cdd6df; border-radius:5px; padding:6px 10px; background:#fafcff;">
     <summary style="cursor:pointer; font-weight:600;">➕ Новый клиент — помощник</summary>
     <div style="margin-top:8px;">
-      <p class="muted" style="margin-top:0;">Помощник сгенерит ключи и подскажет, что создать в Keenetic. Приватный ключ автоматически попадёт в итоговый <code>.conf</code> (создавать клиента one-click панель не может — сам WG-интерфейс надёжно заводится только родным мастером Keenetic).</p>
-      <button type="button" class="btn" id="wgGenKeyBtn">🔑 Сгенерировать пару ключей</button>
-      <div id="wgKeyOut" style="display:none; margin-top:8px;">
-        <div style="font-size:0.86em; color:#7a1f1f;">🔒 Приватный (уйдёт в conf, никому не давать):</div>
-        <input type="text" id="wgKeyPriv" readonly onclick="this.select()" style="width:100%; max-width:520px; font-family:monospace; font-size:0.78em;">
-        <div style="font-size:0.86em; margin-top:6px;">🔑 Публичный (его вставить в пир на роутере):</div>
-        <input type="text" id="wgKeyPub" readonly onclick="this.select()" style="width:100%; max-width:520px; font-family:monospace; font-size:0.78em;">
-        <div style="margin-top:8px; padding:8px 10px; background:#fff8e1; border-left:3px solid #f0c200; font-size:0.9em;">
-          <b>Теперь в веб-интерфейсе Keenetic</b> (Интернет → Другие подключения → WireGuard → Добавить соединение):
+      <p class="muted" style="margin-top:0;">Помощник создаёт клиента «с нуля»: генерит обе пары ключей, подбирает свободную подсеть/порт и отдаёт <b>два готовых файла</b> — серверный <code>.conf</code> (его в Keenetic: <b>Интернет → Другие подключения → WireGuard → «Загрузить из файла»</b> — интерфейс создастся сам) и клиентский <code>.conf</code> (на удалённую машину). Заводить интерфейс руками больше не нужно.</p>
+      <div style="margin:6px 0;">
+        <label>Имя клиента (станет именем интерфейса в Keenetic):<br>
+          <input type="text" id="wgNcName" placeholder="напр. office-pc" style="width:280px;"></label>
+      </div>
+      <div style="margin:6px 0;">
+        <label>Режим:<br>
+          <select id="wgNcMode" style="min-width:320px;">
+            <option value="full">Весь трафик (full-tunnel, split-форма) — через анти-DPI</option>
+            <option value="selective">Выборочно (указанные подсети) — через анти-DPI</option>
+            <option value="lan">🏠 Только доступ к дому (LAN) — обычный клиент, без анти-DPI</option>
+          </select></label>
+      </div>
+      <div id="wgNcSelRow" style="display:none; margin:6px 0;">
+        <label>Подсети назначения (через запятую):<br>
+          <input type="text" id="wgNcSel" placeholder="напр. 203.0.113.0/24, 198.51.100.0/24" style="width:100%; max-width:520px;"></label>
+      </div>
+      <div id="wgNcExcRow" style="margin:6px 0;">
+        <label>Адреса-исключения — мимо туннеля (IPv4):<br>
+          <textarea id="wgNcExc" rows="2" placeholder="напр. 198.51.100.5/32" style="width:100%; max-width:520px; font-family:monospace; font-size:0.86em;"></textarea></label>
+        <div class="muted" style="font-size:0.84em;">Пойдут напрямую мимо туннеля (вырезаются из AllowedIPs). Один адрес можно без маски (<code>/32</code> подставится сам).</div>
+      </div>
+      <div id="wgNcV6Row" style="margin:6px 0;">
+        <label><input type="checkbox" id="wgNcV6" checked> 🛡 Закрыть IPv6-утечку (заворачивать v6 в туннель, fail-closed)</label>
+      </div>
+      <div style="margin:6px 0;">
+        <label>Endpoint (внешний WAN-IP / DDNS — если авто-WAN серый/за CGNAT):<br>
+          <input type="text" id="wgNcEndpoint" placeholder="авто: WAN роутера" style="width:300px;"></label>
+      </div>
+      <button type="button" class="btn" id="wgNcBtn">🔑 Создать клиента (ключи + 2 conf)</button>
+      <div class="muted" style="font-size:0.84em; margin-top:4px;">Подсеть и порт подберутся автоматически из свободных на роутере.</div>
+
+      <div id="wgNcOut" style="display:none; margin-top:10px;">
+        <div id="wgNcInfo" class="muted" style="margin-bottom:8px;"></div>
+        <div style="margin:6px 0; padding:8px 10px; background:#fff8e1; border-left:3px solid #f0c200; font-size:0.9em;">
+          <b>Что делать с файлами:</b>
           <ol style="margin:4px 0 0 18px; padding:0;">
-            <li>создай WG-соединение (имя любое), задай адрес интерфейса вида <code>10.10.X.1/24</code> (любая свободная приватная подсеть), запомни <b>listen-port</b>;</li>
-            <li>добавь <b>пир</b>: Public key = публичный ключ выше; Allowed IPs = <code>10.10.X.2/32</code> (или вся подсеть, если клиенту нужен доступ к LAN);</li>
-            <li>сохрани, включи интерфейс;</li>
-            <li>🔥 Сетевые правила → <b>Межсетевой экран</b> → вкладка нового интерфейса: <b>проверь</b>, что есть правила <b>«Разрешить»</b> (если Keenetic не создал их сам) — <b>TCP и UDP обязательно</b> (web+DNS), <b>ICMP желательно</b> (ping/PMTU), источник/назначение «Любой». Нужны для <b>ЛЮБОГО</b> клиента — и для доступа к LAN, и просто для VPN-выхода: без них входящий трафик режется файрволом (handshake есть, связи нет).</li>
+            <li><b>Серверный</b> .conf → в Keenetic <b>Интернет → Другие подключения → WireGuard → «Загрузить из файла»</b>. Интерфейс создастся с этим именем, портом и пиром.</li>
+            <li><b>Включи</b> интерфейс (тумблер) в списке подключений.</li>
+            <li>🔥 <b>Межсетевой экран</b> → вкладка нового интерфейса → <b>добавь правила «Разрешить»</b> (Keenetic их сам НЕ создаёт): <b>TCP и UDP обязательно</b>, <b>ICMP желательно</b>, источник/назначение «Любой». Без них handshake есть, а связи нет.</li>
+            <li><b>Клиентский</b> .conf → на удалённую машину (приватный ключ уже внутри).</li>
+            <li>Для анти-DPI клиента — потом <b>«🔄 Прочитать с роутера»</b> → выбери интерфейс → <b>«🔌 Подключить к анти-DPI»</b>.</li>
           </ol>
         </div>
-        <p class="muted" style="margin-top:8px;">Дальше: <b>«🔄 Прочитать с роутера»</b> → выбери новый интерфейс → режим (анти-DPI / 🏠 доступ к дому) → <b>«Сгенерировать .conf»</b> (приватный ключ подставится сам). Для анти-DPI клиента — ещё <b>«🔌 Подключить к анти-DPI»</b>. 🔑 Ключ из помощника подставляется, пока не сгенеришь новый — генери под каждого клиента отдельно.</p>
+        <div style="font-weight:600; margin-top:8px;">🖥 Серверный .conf (для Keenetic «Загрузить из файла»):</div>
+        <textarea id="wgNcServer" readonly rows="9" style="width:100%; font-family:monospace; font-size:0.8em; white-space:pre; overflow-x:auto;"></textarea>
+        <div style="margin-top:4px; display:flex; gap:8px; flex-wrap:wrap;">
+          <button type="button" class="btn" id="wgNcServerCopy">📋 Копировать</button>
+          <button type="button" class="btn" id="wgNcServerDl">💾 Скачать серверный</button>
+        </div>
+        <div style="font-weight:600; margin-top:10px;">📱 Клиентский .conf (на удалённую машину):</div>
+        <textarea id="wgNcClient" readonly rows="11" style="width:100%; font-family:monospace; font-size:0.8em; white-space:pre; overflow-x:auto;"></textarea>
+        <div style="margin-top:4px; display:flex; gap:8px; flex-wrap:wrap;">
+          <button type="button" class="btn" id="wgNcClientCopy">📋 Копировать</button>
+          <button type="button" class="btn" id="wgNcClientDl">💾 Скачать клиентский</button>
+        </div>
       </div>
     </div>
   </details>
@@ -11251,6 +11460,15 @@ Use this token to access the HTTP API:
       <label>Подсети назначения (через запятую):<br>
         <input type="text" id="wgSelectiveCidrs" placeholder="напр. 160.79.104.0/23, 149.154.160.0/20" style="width:100%; max-width:520px;">
       </label>
+    </div>
+
+    <div id="wgExcludeRow" style="display:none; margin:6px 0;">
+      <label>Адреса-исключения — мимо туннеля (IPv4):<br>
+        <textarea id="wgExcludeCidrs" rows="2" placeholder="напр. 203.0.113.0/24, 198.51.100.5/32" style="width:100%; max-width:520px; font-family:monospace; font-size:0.86em;"></textarea>
+      </label>
+      <div class="muted" style="margin-top:2px; font-size:0.86em;" data-xk-keep-inline>
+        Эти адреса/подсети вырезаются из AllowedIPs (по одному в строке или через запятую) — в готовом .conf их не будет, и трафик к ним у клиента пойдёт <b>напрямую мимо туннеля</b> (через его локальный шлюз). Нужно, когда сервис назначения отвергает заграничный exit-IP туннеля и должен запрашиваться с локального адреса. Один адрес можно писать без маски (<code>/32</code> подставится сам). Только IPv4.
+      </div>
     </div>
 
     <div style="margin:6px 0; display:flex; gap:16px; flex-wrap:wrap;">
@@ -11303,6 +11521,7 @@ Use this token to access the HTTP API:
   function onModeChange(){
     var m=$('wgMode')?$('wgMode').value:'full';
     if($('wgSelectiveRow')) $('wgSelectiveRow').style.display=(m==='selective')?'':'none';
+    if($('wgExcludeRow')) $('wgExcludeRow').style.display=(m==='lan')?'none':'';
     if($('wgV6Row')) $('wgV6Row').style.display=(m==='lan')?'none':'';
     if($('wgLanNote')) $('wgLanNote').style.display=(m==='lan')?'':'none';
   }
@@ -11334,8 +11553,9 @@ Use this token to access the HTTP API:
       client_ip:($('wgClientIp').value||'').trim(),
       endpoint_host:($('wgEndpoint').value||'').trim(),
       selective_cidrs:($('wgSelectiveCidrs').value||'').trim(),
+      exclude_cidrs:(($('wgExcludeCidrs') && $('wgExcludeCidrs').value)||'').trim(),
       v6_antileak: !!($('wgV6') && $('wgV6').checked),
-      client_priv: window.__wgNewPriv || '' };
+      client_priv: '' };  /* основная форма = conf с плейсхолдером ключа; авто-ключ — в помощнике «Новый клиент» */
     var b=$('wgGenBtn'); var ot=b.textContent; b.disabled=true; b.textContent='…';
     fetch('/api/xkeen/wg-client-conf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
       .then(function(r){return r.json();}).then(function(d){
@@ -11353,13 +11573,7 @@ Use this token to access the HTTP API:
       navigator.clipboard.writeText(ta.value).then(done, function(){ try{document.execCommand('copy'); done();}catch(e){} });
     } else { try{document.execCommand('copy'); done();}catch(e){} }
   }
-  function dl(){
-    var ta=$('wgConf'); if(!ta) return;
-    var blob=new Blob([ta.value],{type:'text/plain'});
-    var a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=fname;
-    document.body.appendChild(a); a.click();
-    setTimeout(function(){ URL.revokeObjectURL(a.href); if(a.parentNode) a.parentNode.removeChild(a); },1000);
-  }
+  function dl(){ var ta=$('wgConf'); if(ta) ncDl(ta.value, fname); }
   function connToggle(){
     var i=curIface(); if(!i){ return; }
     var act=($('wgConnBtn').dataset.act)||'connect';
@@ -11375,16 +11589,43 @@ Use this token to access the HTTP API:
         setStatus(d.msg||'готово'); onIfaceChange(); renderConnList();
       }).catch(function(e){ b.disabled=false; b.textContent=ot; alert('Ошибка: '+e); });
   }
-  function genKey(){
-    var b=$('wgGenKeyBtn'); if(!b) return; var ot=b.textContent; b.disabled=true; b.textContent='…';
-    fetch('/api/xkeen/wg-genkey',{method:'POST'}).then(function(r){return r.json();}).then(function(d){
-      b.disabled=false; b.textContent=ot;
-      if(!d.ok){ alert('Ошибка: '+(d.error||'?')); return; }
-      window.__wgNewPriv = d.private;
-      if($('wgKeyPriv')) $('wgKeyPriv').value = d.private;
-      if($('wgKeyPub')) $('wgKeyPub').value = d.public;
-      if($('wgKeyOut')) $('wgKeyOut').style.display='';
-    }).catch(function(e){ b.disabled=false; b.textContent=ot; alert('Ошибка: '+e); });
+  function ncModeChange(){
+    var m=$('wgNcMode')?$('wgNcMode').value:'full';
+    if($('wgNcSelRow')) $('wgNcSelRow').style.display=(m==='selective')?'':'none';
+    if($('wgNcExcRow')) $('wgNcExcRow').style.display=(m==='lan')?'none':'';
+    if($('wgNcV6Row')) $('wgNcV6Row').style.display=(m==='lan')?'none':'';
+  }
+  function ncDl(text, fname){
+    var blob=new Blob([text||''],{type:'text/plain'});
+    var a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=fname||'wg.conf';
+    document.body.appendChild(a); a.click();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); if(a.parentNode) a.parentNode.removeChild(a); },1000);
+  }
+  function ncCopy(text, btn){
+    var done=function(){ if(btn){ var o=btn.textContent; btn.textContent='✅'; setTimeout(function(){btn.textContent=o;},1200);} };
+    if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text||'').then(done, done); }
+    else { try{ var ta=document.createElement('textarea'); ta.value=text||''; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); done(); }catch(e){} }
+  }
+  function newClient(){
+    var b=$('wgNcBtn'); if(!b) return; var ot=b.textContent; b.disabled=true; b.textContent='…';
+    var body={ name:(($('wgNcName') && $('wgNcName').value)||'').trim(), mode:$('wgNcMode').value,
+      endpoint_host:(($('wgNcEndpoint') && $('wgNcEndpoint').value)||'').trim(),
+      selective_cidrs:(($('wgNcSel') && $('wgNcSel').value)||'').trim(),
+      exclude_cidrs:(($('wgNcExc') && $('wgNcExc').value)||'').trim(),
+      v6_antileak: !!($('wgNcV6') && $('wgNcV6').checked) };
+    fetch('/api/xkeen/wg-new-client',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(function(r){return r.json();}).then(function(d){
+        b.disabled=false; b.textContent=ot;
+        if(!d.ok){ alert('Ошибка: '+(d.error||'?')); return; }
+        window.__ncServer=d.server_conf||''; window.__ncClient=d.client_conf||'';
+        window.__ncSF=d.server_filename||'server.conf'; window.__ncCF=d.client_filename||'client.conf';
+        if($('wgNcServer')) $('wgNcServer').value=window.__ncServer;
+        if($('wgNcClient')) $('wgNcClient').value=window.__ncClient;
+        var nci='Подсеть '+d.subnet+' · порт '+d.listen_port+' · сервер '+d.server_ip+' · клиент '+d.client_ip+' · endpoint '+d.endpoint_host;
+        if(d.endpoint_warn) nci+='  ⚠️ '+d.endpoint_warn;
+        if($('wgNcInfo')) $('wgNcInfo').textContent=nci;
+        if($('wgNcOut')) $('wgNcOut').style.display='';
+      }).catch(function(e){ b.disabled=false; b.textContent=ot; alert('Ошибка: '+e); });
   }
   function initWgGen(){
     if(!$('wgLoadBtn')) return;
@@ -11395,7 +11636,13 @@ Use this token to access the HTTP API:
     if($('wgCopyBtn')) $('wgCopyBtn').addEventListener('click', copyConf);
     if($('wgDownloadBtn')) $('wgDownloadBtn').addEventListener('click', dl);
     if($('wgConnBtn')) $('wgConnBtn').addEventListener('click', connToggle);
-    if($('wgGenKeyBtn')) $('wgGenKeyBtn').addEventListener('click', genKey);
+    if($('wgNcMode')) $('wgNcMode').addEventListener('change', ncModeChange);
+    if($('wgNcBtn')) $('wgNcBtn').addEventListener('click', newClient);
+    if($('wgNcServerCopy')) $('wgNcServerCopy').addEventListener('click', function(){ ncCopy(window.__ncServer, $('wgNcServerCopy')); });
+    if($('wgNcServerDl')) $('wgNcServerDl').addEventListener('click', function(){ ncDl(window.__ncServer, window.__ncSF); });
+    if($('wgNcClientCopy')) $('wgNcClientCopy').addEventListener('click', function(){ ncCopy(window.__ncClient, $('wgNcClientCopy')); });
+    if($('wgNcClientDl')) $('wgNcClientDl').addEventListener('click', function(){ ncDl(window.__ncClient, window.__ncCF); });
+    ncModeChange();
   }
   if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded', initWgGen); } else { initWgGen(); }
 })();
