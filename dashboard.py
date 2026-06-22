@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.88"
+_VERSION_FALLBACK = "1.0.89"
 
 
 def _find_git():
@@ -1405,6 +1405,239 @@ def api_wg_new_client():
         "server_pub": s_pub, "client_pub": c_pub, "endpoint_host": endpoint_host,
         "endpoint_warn": endpoint_warn,
     })
+
+
+# ── WG firewall (least-privilege access-list через RCI parse-массив) ──────────
+# RCI POST localhost:79/rci/ принимает массив {"parse":...} в ОДНОЙ сессии (держит config-контекст),
+# чем задаётся многоуровневый access-list (ndmc -c stateless так не умеет). ТЗ рабочей 2026-06-22.
+# ACL интерфейса = _WEBADMIN_Wireguard<N> (тот, что правит веб-UI «Межсетевой экран»).
+
+def _keenetic_rci_post(parse_cmds, timeout=20):
+    """POST массив parse-команд на localhost:79/rci/ (одна сессия, держит config-контекст).
+    parse_cmds: list[str]. Возвращает {ok, errors:[...], raw}."""
+    import json as _json, base64 as _b64
+    body = _json.dumps([{"parse": c} for c in parse_cmds])
+    b64 = _b64.b64encode(body.encode("utf-8")).decode("ascii")
+    cmd = f"echo {b64} | base64 -d | curl -s -X POST 'http://localhost:79/rci/' -H 'Content-Type: application/json' -d @-"
+    r = keenetic_ssh(cmd, timeout=timeout)
+    raw = r.get("stdout") or ""
+    errors = []
+    try:
+        parsed = _json.loads(raw)
+
+        def _walk(o):
+            if isinstance(o, list):
+                for x in o:
+                    _walk(x)
+            elif isinstance(o, dict):
+                st = o.get("status")
+                if isinstance(st, list):
+                    for s in st:
+                        if isinstance(s, dict) and s.get("status") == "error":
+                            errors.append(s.get("message") or "RCI error")
+                for v in o.values():
+                    _walk(v)
+        _walk(parsed)
+    except Exception:
+        # непарсимый ответ: пустое тело при curl-ok = НЕ успех (роутер ничего не выполнил/обрыв)
+        if not raw.strip():
+            errors.append("пустой ответ RCI (роутер не отдал результат — перезапуск/обрыв)")
+        elif not r.get("ok"):
+            errors.append((r.get("stderr") or "RCI POST failed")[:200])
+        else:
+            errors.append("неразборчивый ответ RCI: " + raw.strip()[:120])
+    return {"ok": bool(r.get("ok")) and not errors, "errors": errors, "raw": raw[:1500]}
+
+
+def _wg_dst_and_mask(dst):
+    """'10.0.0.5' → ('10.0.0.5','255.255.255.255'); '10.0.0.0/24' → (net,netmask);
+    'any'/'' → ('0.0.0.0','0.0.0.0'). Бросает ValueError на мусоре."""
+    import ipaddress
+    s = str(dst or "").strip().lower()
+    if s in ("", "any", "0.0.0.0", "*"):
+        return "0.0.0.0", "0.0.0.0"
+    s = str(dst).strip()
+    if "/" in s:
+        net = ipaddress.ip_network(s, strict=False)
+        return str(net.network_address), str(net.netmask)
+    ipaddress.ip_address(s)
+    return s, "255.255.255.255"
+
+
+def _wg_is_permit_all(proto, dst, port, port_to):
+    """Правило = permit-all (tcp/udp на ЛЮБОЙ адрес без порта)? Нормализует dst так же, как
+    генератор (через _wg_dst_and_mask) — чтобы '0.0.0.0/0' и '0.0.0.0' распознавались одинаково."""
+    if str(proto or "").strip().lower() not in ("tcp", "udp"):
+        return False
+    try:
+        d, m = _wg_dst_and_mask(dst)
+    except Exception:
+        return False
+    return d == "0.0.0.0" and m == "0.0.0.0" and port in (None, "", 0) and port_to in (None, "", 0)
+
+
+def wg_acl_permit_lines(rules):
+    """rules: list of {proto:'icmp'|'tcp'|'udp', dst:'any'|ip|cidr, port?, port_to?}
+    → Keenetic-native permit-строки. Бросает ValueError на невалидном вводе."""
+    def _vp(p):
+        p = int(p)
+        if not (1 <= p <= 65535):
+            raise ValueError(f"порт вне диапазона 1..65535: {p}")
+        return p
+    lines = []
+    for r in (rules or []):
+        proto = str(r.get("proto") or "").strip().lower()
+        if proto not in ("icmp", "tcp", "udp"):
+            raise ValueError(f"протокол должен быть icmp/tcp/udp, не '{proto}'")
+        d, m = _wg_dst_and_mask(r.get("dst"))
+        port, port_to = r.get("port"), r.get("port_to")
+        has_port = port not in (None, "", 0)
+        has_to = port_to not in (None, "", 0)
+        if proto == "icmp":
+            if has_port or has_to:
+                raise ValueError("у протокола icmp нет портов — убери порт из icmp-правила")
+            lines.append(f"permit icmp 0.0.0.0 0.0.0.0 {d} {m}")
+            continue
+        if has_to and not has_port:
+            raise ValueError("для диапазона портов нужны ОБА конца (нижний порт пуст)")
+        line = f"permit {proto} 0.0.0.0 0.0.0.0 {d} {m}"
+        if has_port and has_to:
+            line += f" port range {_vp(port)} {_vp(port_to)}"
+        elif has_port:
+            line += f" port eq {_vp(port)}"
+        lines.append(line)
+    return lines
+
+
+def _wg_acl_block(acl_name):
+    """permit/deny-строки блока access-list <acl_name> из running-config.
+    Возвращает list (может быть пустым = ACL без правил) ЛИБО None = СБОЙ чтения (≠ пустой ACL).
+    Различие критично для fail-open guard: сбой чтения нельзя принять за «ACL чист»."""
+    r = keenetic_ssh("ndmc -c 'show running-config' 2>/dev/null", timeout=15)
+    if not r.get("ok"):
+        return None
+    txt = r.get("stdout") or ""
+    out, grab = [], False
+    for ln in txt.splitlines():
+        s = ln.strip()
+        if s == f"access-list {acl_name}":
+            grab = True
+            continue
+        if grab:
+            if s.startswith("permit ") or s.startswith("deny ") or s == "auto-delete":
+                out.append(s)
+            else:
+                break
+    return out
+
+
+def _wg_block_has_permit_all(block):
+    """fail-open детект по уже прочитанному блоку: permit tcp/udp на dst any (0.0.0.0 0.0.0.0) БЕЗ порта."""
+    for s in (block or []):
+        p = s.split()
+        if len(p) >= 6 and p[0] == "permit" and p[1] in ("tcp", "udp"):
+            if p[4] == "0.0.0.0" and p[5] == "0.0.0.0" and "port" not in p:
+                return True
+    return False
+
+
+def _wg_parse_permit(s):
+    """permit-строка → {proto,dst,port?,port_to?} для UI-редактора."""
+    import ipaddress
+    p = s.split()
+    if len(p) < 6 or p[0] != "permit":
+        return None
+    if p[4] == "0.0.0.0":
+        dst = "any"
+    elif p[5] == "255.255.255.255":
+        dst = p[4]
+    else:
+        try:
+            dst = str(ipaddress.ip_network(f"{p[4]}/{p[5]}", strict=False))
+        except Exception:
+            dst = p[4]
+    out = {"proto": p[1], "dst": dst}
+    if "port" in p:
+        i = p.index("port")
+        op = p[i + 1] if i + 1 < len(p) else ""
+        if op == "eq" and i + 2 < len(p):
+            out["port"] = p[i + 2]
+        elif op == "range" and i + 3 < len(p):
+            out["port"], out["port_to"] = p[i + 2], p[i + 3]
+    return out
+
+
+def wg_apply_acl(iface_index, rules):
+    """Применение least-privilege ACL к Wireguard<index> через RCI (ТЗ рабочей 2026-06-22):
+    отвязать(tolerant) → удалить(tolerant) → создать+permits(strict) → привязать(strict)
+    → fail-open guard (перечитать ACL: сбой чтения / лишние правила / непрошеный permit-all → стоп)
+    → save(strict). Сбой посередине = fail-CLOSED (поправимо повтором), не дыра."""
+    acl = f"_WEBADMIN_Wireguard{iface_index}"
+    iface = f"Wireguard{iface_index}"
+    try:
+        permits = wg_acl_permit_lines(rules)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if not permits:
+        return {"ok": False, "error": "нужно хотя бы одно правило permit"}
+    _keenetic_rci_post([f"interface {iface}", f"no ip access-group {acl} in"])    # 1 отвязать (tolerant)
+    _keenetic_rci_post([f"no access-list {acl}"])                                  # 2 удалить (tolerant)
+    r3 = _keenetic_rci_post([f"access-list {acl}"] + permits)                      # 3 создать (strict). auto-delete НЕ ставим: на непривязанном ACL даёт "cannot enable auto-deletion for unreferenced lists" (проверено на боевом 2026-06-22), и не нужен — фаза 2 (no access-list) сама чистит старый при пересоздании.
+    if not r3["ok"]:
+        return {"ok": False, "error": "создание ACL: " + "; ".join(r3["errors"] or ["?"])}
+    r4 = _keenetic_rci_post([f"interface {iface}", f"ip access-group {acl} in"])   # 4 привязать (strict)
+    if not r4["ok"]:
+        return {"ok": False, "error": "привязка ACL: " + "; ".join(r4["errors"] or ["?"])}
+    block = _wg_acl_block(acl)                                                     # 5 fail-open guard — перечитать ACL
+    if block is None:                                                              # сбой чтения ≠ «чисто» → fail-CLOSED
+        return {"ok": False, "error": "не удалось перечитать ACL для проверки безопасности — НЕ сохраняю (fail-closed); повтори"}
+    actual_permits = [s for s in block if s.startswith("permit ")]
+    if len(actual_permits) > len(permits):                                         # правил больше задано → старый ACL не удалился (ловит и при намеренном permit-all)
+        return {"ok": False, "error": f"в ACL правил больше ({len(actual_permits)}), чем задано ({len(permits)}) — старый ACL не удалился; НЕ сохраняю, повтори"}
+    expect_all = any(_wg_is_permit_all(r.get("proto"), r.get("dst"), r.get("port"), r.get("port_to"))
+                     for r in (rules or []))                                       # намеренный permit-all (VPN-выход), нормализованный
+    if not expect_all and _wg_block_has_permit_all(block):
+        return {"ok": False, "error": "в ACL виден permit-all (tcp/udp на любой адрес без порта), хотя в правилах его нет — НЕ сохраняю, повтори"}
+    r6 = _keenetic_rci_post(["system configuration save"])                         # 6 save (strict)
+    if not r6["ok"]:
+        return {"ok": False, "error": "сохранение: " + "; ".join(r6["errors"] or ["?"])}
+    return {"ok": True, "acl": acl, "rules": permits}
+
+
+@app.route("/api/xkeen/wg-acl", methods=["GET"])
+@requires_auth
+def api_wg_acl_get():
+    """Текущие firewall-правила (permit) WG-интерфейса для редактора."""
+    iface_id = (request.args.get("iface_id") or "").strip()
+    m = re.search(r"(\d+)$", iface_id)
+    if not m:
+        return jsonify({"ok": False, "error": "не задан iface_id (напр. Wireguard5)"})
+    acl = f"_WEBADMIN_Wireguard{m.group(1)}"
+    block = _wg_acl_block(acl)
+    if block is None:
+        return jsonify({"ok": False, "error": "не удалось прочитать конфиг роутера"})
+    rules = [x for x in (_wg_parse_permit(s) for s in block) if x]
+    has_deny = any(s.startswith("deny ") for s in block)
+    return jsonify({"ok": True, "acl": acl, "rules": rules, "has_deny": has_deny})
+
+
+@app.route("/api/xkeen/wg-acl-apply", methods=["POST"])
+@requires_auth
+def api_wg_acl_apply():
+    """Применить least-privilege ACL к WG-интерфейсу (5-фазный RCI + fail-open guard + save)."""
+    data = request.get_json(silent=True) or request.form
+    iface_id = (data.get("iface_id") or "").strip()
+    m = re.search(r"(\d+)$", iface_id)
+    if not m:
+        return jsonify({"ok": False, "error": "не задан iface_id"})
+    rules = data.get("rules") or []
+    if isinstance(rules, str):
+        import json as _j
+        try:
+            rules = _j.loads(rules)
+        except Exception:
+            rules = []
+    return jsonify(wg_apply_acl(m.group(1), rules))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -11443,7 +11676,24 @@ Use this token to access the HTTP API:
     <div id="wgConnRow" style="display:none; margin:6px 0; padding:8px 10px; background:#f3f6fa; border-radius:4px;">
       <span id="wgConnStatus" class="muted"></span>
       <button type="button" class="btn" id="wgConnBtn" style="margin-left:10px;"></button>
-      <div class="muted" style="margin-top:4px; font-size:0.86em;">«Подключить» ставит на роутер хук (заворот этого интерфейса в xray) + cron self-heal — это нужно, чтобы трафик клиента реально шёл через анти-DPI.</div>
+      <button type="button" class="btn" id="wgAclBtn" style="margin-left:6px;">🔥 Правила</button>
+      <div class="muted" style="margin-top:4px; font-size:0.86em;">«Подключить» ставит на роутер хук (заворот этого интерфейса в xray) + cron self-heal — это нужно, чтобы трафик клиента реально шёл через анти-DPI. «Правила» — firewall-доступ интерфейса (нужен новому: при импорте «Загрузить из файла» Keenetic правил не создаёт).</div>
+      <div id="wgAclBox" style="display:none; margin-top:8px; padding:8px 10px; background:#fff; border:1px solid #cdd6df; border-radius:4px;">
+        <div style="font-weight:600; margin-bottom:4px;">🔥 Firewall-правила интерфейса (least-privilege)</div>
+        <div class="muted" style="font-size:0.84em; margin-bottom:6px;">Одна строка = одно правило: <code>протокол назначение [порт | порт-порт]</code>. Протокол — <code>icmp</code>/<code>tcp</code>/<code>udp</code>; назначение — <code>any</code>, IP (<code>192.168.1.10</code>) или подсеть (<code>192.168.1.0/24</code>); порт необязателен. Пустой список = весь вход закрыт (security-level public). Применяется на роутере: пересоздаёт <code>_WEBADMIN_WireguardN</code> и сохраняет конфиг.</div>
+        <div style="margin-bottom:6px; display:flex; gap:6px; flex-wrap:wrap;">
+          <button type="button" class="btn" id="wgAclPreVpn">VPN-выход (любой)</button>
+          <button type="button" class="btn" id="wgAclPreRdp">+ RDP</button>
+          <button type="button" class="btn" id="wgAclPreWeb">+ Web</button>
+          <button type="button" class="btn" id="wgAclPreDns">+ DNS</button>
+          <button type="button" class="btn" id="wgAclClear">Очистить</button>
+        </div>
+        <textarea id="wgAclText" rows="6" placeholder="icmp any&#10;tcp any 80&#10;tcp 192.168.1.10 3389&#10;udp 192.168.1.1 53" style="width:100%; font-family:monospace; font-size:0.85em;"></textarea>
+        <div style="margin-top:6px;">
+          <button type="button" class="btn" id="wgAclApplyBtn">💾 Применить правила к роутеру</button>
+          <span id="wgAclStatus" class="muted" style="margin-left:8px;"></span>
+        </div>
+      </div>
     </div>
 
     <div style="margin:6px 0;">
@@ -11627,6 +11877,60 @@ Use this token to access the HTTP API:
         if($('wgNcOut')) $('wgNcOut').style.display='';
       }).catch(function(e){ b.disabled=false; b.textContent=ot; alert('Ошибка: '+e); });
   }
+  function aclRuleToLine(r){
+    var s=(r.proto||'')+' '+(r.dst||'any');
+    if(r.port && r.port_to) s+=' '+r.port+'-'+r.port_to;
+    else if(r.port) s+=' '+r.port;
+    return s;
+  }
+  function aclParse(text){
+    var rules=[];
+    (text||'').split('\n').forEach(function(ln){
+      var t=ln.trim(); if(!t || t.charAt(0)==='#') return;
+      var p=t.split(/\s+/);
+      var r={proto:(p[0]||'').toLowerCase(), dst:p[1]||'any'};
+      if(p[2]){ var pr=p[2].split('-'); if(pr.length===2){ r.port=pr[0]; r.port_to=pr[1]; } else { r.port=p[2]; } }
+      rules.push(r);
+    });
+    return rules;
+  }
+  function aclAppend(txt){
+    var ta=$('wgAclText'); if(!ta) return;
+    var cur=ta.value.replace(/\s+$/,'');
+    ta.value=(cur?cur+'\n':'')+txt;
+  }
+  function aclToggle(){
+    var i=curIface(); if(!i){ alert('Сначала выбери интерфейс'); return; }
+    var box=$('wgAclBox'); if(!box) return;
+    var open=(box.style.display==='none'||box.style.display==='');
+    box.style.display=open?'block':'none';
+    if(!open) return;
+    var ta=$('wgAclText');
+    if(ta && ta.value.trim() && window.__aclIface===i.id){ if($('wgAclStatus')) $('wgAclStatus').textContent='(несохранённые правки на месте; «Очистить» — перечитать с роутера)'; return; }
+    window.__aclIface=i.id;
+    if($('wgAclStatus')) $('wgAclStatus').textContent='читаю текущие правила…';
+    fetch('/api/xkeen/wg-acl?iface_id='+encodeURIComponent(i.id)).then(function(r){return r.json();}).then(function(d){
+      if(!d.ok){ if($('wgAclStatus')) $('wgAclStatus').textContent='⚠ '+(d.error||'?'); return; }
+      var st='ACL '+d.acl+' · правил: '+(d.rules?d.rules.length:0);
+      if(d.has_deny) st+=' · ⚠️ есть deny-правила — НЕ показаны, будут УДАЛЕНЫ при «Применить»';
+      if($('wgAclStatus')) $('wgAclStatus').textContent=st;
+      if(ta) ta.value=(d.rules||[]).map(aclRuleToLine).join('\n');
+    }).catch(function(e){ if($('wgAclStatus')) $('wgAclStatus').textContent='⚠ '+e; });
+  }
+  function aclApply(){
+    var i=curIface(); if(!i) return;
+    var rules=aclParse($('wgAclText')?$('wgAclText').value:'');
+    if(!rules.length){ if(!confirm('Правил нет — это ЗАКРОЕТ весь вход на интерфейс. Продолжить?')) return; }
+    else if(!confirm('Применить '+rules.length+' правил к '+i.id+'? Перезапишет _WEBADMIN_'+i.id+' на роутере и сохранит конфиг.')) return;
+    var b=$('wgAclApplyBtn'); var ot=b.textContent; b.disabled=true; b.textContent='…';
+    if($('wgAclStatus')) $('wgAclStatus').textContent='применяю…';
+    fetch('/api/xkeen/wg-acl-apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({iface_id:i.id, rules:rules})})
+      .then(function(r){return r.json();}).then(function(d){
+        b.disabled=false; b.textContent=ot;
+        if($('wgAclStatus')) $('wgAclStatus').textContent=d.ok?('✅ применено: '+((d.rules&&d.rules.length)||0)+' правил, сохранено'):('⚠ '+(d.error||'?'));
+        if(!d.ok) alert('Ошибка: '+(d.error||'?'));
+      }).catch(function(e){ b.disabled=false; b.textContent=ot; if($('wgAclStatus')) $('wgAclStatus').textContent='⚠ '+e; });
+  }
   function initWgGen(){
     if(!$('wgLoadBtn')) return;
     $('wgLoadBtn').addEventListener('click', loadIfaces);
@@ -11636,6 +11940,13 @@ Use this token to access the HTTP API:
     if($('wgCopyBtn')) $('wgCopyBtn').addEventListener('click', copyConf);
     if($('wgDownloadBtn')) $('wgDownloadBtn').addEventListener('click', dl);
     if($('wgConnBtn')) $('wgConnBtn').addEventListener('click', connToggle);
+    if($('wgAclBtn')) $('wgAclBtn').addEventListener('click', aclToggle);
+    if($('wgAclApplyBtn')) $('wgAclApplyBtn').addEventListener('click', aclApply);
+    if($('wgAclPreVpn')) $('wgAclPreVpn').addEventListener('click', function(){ aclAppend('icmp any\ntcp any\nudp any'); });
+    if($('wgAclPreRdp')) $('wgAclPreRdp').addEventListener('click', function(){ aclAppend('tcp any 3389'); });
+    if($('wgAclPreWeb')) $('wgAclPreWeb').addEventListener('click', function(){ aclAppend('tcp any 80\ntcp any 443'); });
+    if($('wgAclPreDns')) $('wgAclPreDns').addEventListener('click', function(){ aclAppend('udp any 53\ntcp any 53'); });
+    if($('wgAclClear')) $('wgAclClear').addEventListener('click', function(){ if($('wgAclText')) $('wgAclText').value=''; window.__aclIface=null; });
     if($('wgNcMode')) $('wgNcMode').addEventListener('change', ncModeChange);
     if($('wgNcBtn')) $('wgNcBtn').addEventListener('click', newClient);
     if($('wgNcServerCopy')) $('wgNcServerCopy').addEventListener('click', function(){ ncCopy(window.__ncServer, $('wgNcServerCopy')); });
