@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.89"
+_VERSION_FALLBACK = "1.0.90"
 
 
 def _find_git():
@@ -980,6 +980,7 @@ def keenetic_get_wireguard_interfaces():
             "mtu": v.get("mtu"),
             "peers_count": len(peers) if isinstance(peers, list) else 0,
             "suggested_client_ip": suggested,
+            "iface_up": (v.get("state") == "up" or v.get("link") == "up" or v.get("connected") == "yes"),
         })
     return {
         "ok": True,
@@ -11759,7 +11760,13 @@ Use this token to access the HTTP API:
   function onIfaceChange(){
     var i=curIface(); if(!i) return;
     if($('wgClientIp')) $('wgClientIp').placeholder = 'авто: ' + (i.suggested_client_ip || '?');
-    if($('wgIfaceInfo')) $('wgIfaceInfo').textContent = 'Порт ' + (i.listen_port||'?') + ' · MTU ' + (i.mtu||'?') + ' · подсеть ' + (i.subnet_cidr||'?') + ' · пиров: ' + (i.peers_count!=null?i.peers_count:'?');
+    if($('wgIfaceInfo')){
+      var info = 'Порт ' + (i.listen_port||'?') + ' · MTU ' + (i.mtu||'?') + ' · подсеть ' + (i.subnet_cidr||'?') + ' · пиров: ' + (i.peers_count!=null?i.peers_count:'?');
+      info += i.iface_up ? ' · 🟢 включён' : ' · 🔴 ВЫКЛЮЧЕН — включи тумблер интерфейса в Keenetic (Другие подключения), иначе клиент и правила не работают';
+      $('wgIfaceInfo').textContent = info;
+      $('wgIfaceInfo').style.color = i.iface_up ? '' : '#c33';
+      $('wgIfaceInfo').style.fontWeight = i.iface_up ? '' : '600';
+    }
     var cr=$('wgConnRow'), cs=$('wgConnStatus'), cb=$('wgConnBtn');
     if(cr && cs && cb){
       cr.style.display='';
@@ -11927,7 +11934,11 @@ Use this token to access the HTTP API:
     fetch('/api/xkeen/wg-acl-apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({iface_id:i.id, rules:rules})})
       .then(function(r){return r.json();}).then(function(d){
         b.disabled=false; b.textContent=ot;
-        if($('wgAclStatus')) $('wgAclStatus').textContent=d.ok?('✅ применено: '+((d.rules&&d.rules.length)||0)+' правил, сохранено'):('⚠ '+(d.error||'?'));
+        if($('wgAclStatus')){
+          var msg=d.ok?('✅ применено: '+((d.rules&&d.rules.length)||0)+' правил, сохранено'):('⚠ '+(d.error||'?'));
+          if(d.ok && i && !i.iface_up) msg+=' · ⚠️ но интерфейс ВЫКЛЮЧЕН — включи тумблер в Keenetic, иначе не заработает!';
+          $('wgAclStatus').textContent=msg;
+        }
         if(!d.ok) alert('Ошибка: '+(d.error||'?'));
       }).catch(function(e){ b.disabled=false; b.textContent=ot; if($('wgAclStatus')) $('wgAclStatus').textContent='⚠ '+e; });
   }
