@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.90"
+_VERSION_FALLBACK = "1.0.91"
 
 
 def _find_git():
@@ -982,11 +982,17 @@ def keenetic_get_wireguard_interfaces():
             "suggested_client_ip": suggested,
             "iface_up": (v.get("state") == "up" or v.get("link") == "up" or v.get("connected") == "yes"),
         })
+    # Осиротевшие анти-DPI хуки: файл zz_wg_xray_nwgX.sh есть, а интерфейса nwgX уже нет
+    # (удалили в Keenetic, не нажав «Отключить»). Их надо подчистить — иначе cron держит их
+    # правила, и новый интерфейс с тем же nwgX подхватит старый хук → «подключается, но не работает».
+    live_kernels = {i["kernel_name"] for i in out if i.get("kernel_name")}
+    orphan_hooks = sorted(panel_managed - live_kernels)
     return {
         "ok": True,
         "interfaces": out,
         "wan_host": wan_host,
         "router_lan_ip": getattr(cfg, "KEENETIC_HOST", None),
+        "orphan_hooks": orphan_hooks,
     }
 
 
@@ -1038,14 +1044,27 @@ def build_wg_client_conf(iface, endpoint_host, client_ip, mode, selective_cidrs,
     """Собрать текст клиентского .conf. PrivateKey НЕ генерируется (плейсхолдер).
     v6_antileak=True добавляет ULA v6-адрес + AllowedIPs `<ula>/64, 2000::/3` (весь global v6 → в туннель,
     без литерального ::/0 → kill-switch не взводится; fail-closed если у дома нет v6-egress).
-    exclude_cidrs — IPv4-адреса/подсети, вырезаемые из AllowedIPs (идут напрямую мимо туннеля)."""
+    exclude_cidrs — IPv4-адреса/подсети, вырезаемые из AllowedIPs (идут напрямую мимо туннеля).
+    Endpoint сервера (WAN-IP) вырезается из AllowedIPs автоматически — иначе routing loop (пакеты
+    к серверу уходят в сам туннель), и клиенты без авто-исключения endpoint (macOS) не поднимут WG."""
     port = iface.get("listen_port") or 51820
     pub = iface.get("public_key") or "<SERVER_PUBLIC_KEY>"
     mtu = iface.get("mtu") or 1320
     tunnel_subnet = iface.get("subnet_cidr") or ""
-    extras = [x for x in (home_lan_cidr, tunnel_subnet) if x]
+    # Домашняя LAN попадает в маршруты клиента ТОЛЬКО для режимов с доступом к локалке
+    # (full_lan / lan). Чистый full = весь интернет, но БЕЗ доступа к домашним хостам.
+    lan_access = mode in ("full_lan", "lan")
+    extras = [x for x in ((home_lan_cidr if lan_access else None), tunnel_subnet) if x]
     excl = [c for c in (exclude_cidrs or []) if c]
-    if mode == "full":
+    # Авто-исключение endpoint сервера (WAN-IP) из AllowedIPs. Иначе пакеты К серверу
+    # маршрутизируются в САМ туннель (routing loop) → handshake не уходит: WG-клиенты,
+    # которые не исключают endpoint сами (macOS этого не делает, в отличие от Windows),
+    # вообще не поднимут туннель. Только для IPv4-endpoint и режимов, где он попал бы
+    # в маршруты туннеля (full/full_lan/selective); для lan endpoint в AllowedIPs не входит.
+    ep = (endpoint_host or "").strip()
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ep) and mode in ("full", "full_lan", "selective") and f"{ep}/32" not in excl:
+        excl = excl + [f"{ep}/32"]
+    if mode in ("full", "full_lan"):
         inet = WG_SPLIT_ALLOWEDIPS.split(", ")
         if excl:
             inet = _wg_subtract_cidrs(inet, excl)
@@ -1086,10 +1105,19 @@ def build_wg_client_conf(iface, endpoint_host, client_ip, mode, selective_cidrs,
     return "\n".join(lines) + "\n"
 
 
-def build_wg_server_conf(server_priv, address_cidr, listen_port, client_pub, client_ip):
+def build_wg_server_conf(server_priv, address_cidr, listen_port, client_pub, client_ip, lan_cidrs=None):
     """Серверный .conf для импорта в Keenetic («Загрузить из файла» → создаёт WG-интерфейс).
     Имя интерфейса Keenetic берёт из имени ФАЙЛА. ListenPort/Address/пир — 1-в-1 из файла
-    (проверено на роутере). Endpoint у пира НЕ указываем — это входящий (серверный) пир."""
+    (проверено на роутере). Endpoint у пира НЕ указываем — это входящий (серверный) пир.
+
+    lan_cidrs — список LAN-подсетей роутера, добавляемых в AllowedIPs пира. Нужно для
+    доступа клиента к домашним хостам: на Keenetic это авторизует forward WG→LAN (без него
+    FORWARD policy DROP режет трафик к локалке). Проверено на роутере: LAN-маршрут при этом
+    остаётся на br0 (ip route не уводит локалку в туннель). Пусто = point-to-point /32."""
+    allowed = f"{client_ip}/32"
+    for c in (lan_cidrs or []):
+        if c:
+            allowed += f", {c}"
     lines = [
         "[Interface]",
         f"PrivateKey = {server_priv}",
@@ -1098,7 +1126,7 @@ def build_wg_server_conf(server_priv, address_cidr, listen_port, client_pub, cli
         "",
         "[Peer]",
         f"PublicKey = {client_pub}",
-        f"AllowedIPs = {client_ip}/32",
+        f"AllowedIPs = {allowed}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -1201,17 +1229,25 @@ def _keenetic_detect_dns_port():
     return m.group(1) if m else "41102"
 
 
-def _build_wg_xray_hook(kernel, subnet, lan_ip, dns_port, mss):
+def _build_wg_xray_hook(kernel, subnet, lan_ip, dns_port, mss, lan_net=None, lan_if=None):
     """netfilter.d-хук: завернуть весь трафик WG-интерфейса <kernel> в цепочку xkeen (xray) +
     DNS-redirect/SNAT на ndnproxy + MSS-clamp. Идемпотентен (-C || -I/-A), scoped по -i <kernel>.
-    1-в-1 с проверенным zz_wg_home_xkeen.sh, параметризован."""
-    return "\n".join([
+    1-в-1 с проверенным zz_wg_home_xkeen.sh, параметризован.
+
+    lan_net/lan_if — LAN-подсеть роутера и её интерфейс (напр. br0). Если заданы, добавляется
+    masquerade трафика клиента к LAN (SNAT под адрес роутера) — без него крупные пакеты к
+    LAN-хостам (RDP/SMB) застревают: домашний хост видит «чужой» src туннеля, обратный путь
+    асимметричен + FASTNAT обходит MSS-clamp. Правило «спит» пока в серверном peer нет
+    LAN-подсети (FORWARD режет трафик до POSTROUTING), поэтому ставится безопасно всегда."""
+    lines = [
         "#!/bin/sh",
         f"# claude-panel: route WG client {kernel} through XKeen (xray) anti-DPI. Managed by xray-dashboard.",
         '[ "$type" = "ip6tables" ] && exit 0',
         f"WGIF={kernel}",
         f"SUBNET={subnet}",
         f"LANIP={lan_ip}",
+        f"LANNET={lan_net or ''}",
+        f"LANIF={lan_if or 'br0'}",
         f"DNSP={dns_port}",
         f"MSS={mss}",
         'iptables -w -t mangle -C PREROUTING -i $WGIF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS 2>/dev/null || iptables -w -t mangle -I PREROUTING -i $WGIF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS',
@@ -1219,11 +1255,13 @@ def _build_wg_xray_hook(kernel, subnet, lan_ip, dns_port, mss):
         'iptables -w -t nat -C PREROUTING -i $WGIF -p udp --dport 53 -j REDIRECT --to-ports $DNSP 2>/dev/null || iptables -w -t nat -I PREROUTING -i $WGIF -p udp --dport 53 -j REDIRECT --to-ports $DNSP',
         'iptables -w -t nat -C PREROUTING -i $WGIF -p tcp --dport 53 -j REDIRECT --to-ports $DNSP 2>/dev/null || iptables -w -t nat -I PREROUTING -i $WGIF -p tcp --dport 53 -j REDIRECT --to-ports $DNSP',
         'for proto in udp tcp; do iptables -w -t nat -C INPUT -i $WGIF -s $SUBNET -p $proto --dport $DNSP -j SNAT --to-source $LANIP 2>/dev/null || iptables -w -t nat -A INPUT -i $WGIF -s $SUBNET -p $proto --dport $DNSP -j SNAT --to-source $LANIP; done',
+        '[ -n "$LANNET" ] && { iptables -w -t nat -C POSTROUTING -s $SUBNET -d $LANNET -o $LANIF -j MASQUERADE 2>/dev/null || iptables -w -t nat -I POSTROUTING -s $SUBNET -d $LANNET -o $LANIF -j MASQUERADE; }',
         'iptables -w -t nat    -C PREROUTING -i $WGIF -p tcp -j xkeen 2>/dev/null || iptables -w -t nat    -A PREROUTING -i $WGIF -p tcp -j xkeen',
         'iptables -w -t mangle -C PREROUTING -i $WGIF -p udp -j xkeen 2>/dev/null || iptables -w -t mangle -I PREROUTING -i $WGIF -p udp -j xkeen',
         "exit 0",
         "",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def _wg_resolve_params(iface_id):
@@ -1249,13 +1287,27 @@ def _wg_resolve_params(iface_id):
     if not subnet:
         return None, f"у {kernel} нет адреса/подсети — подними интерфейс на роутере"
     lan_ip = info.get("router_lan_ip") or getattr(cfg, "KEENETIC_HOST", "")
+    # LAN-подсеть и её интерфейс для masquerade WG→LAN. Определяем ДИНАМИЧЕСКИ по адресу
+    # роутера в LAN (а не хардкодим подсеть/br0 — на чужих роутерах и LAN, и bridge другие).
+    lan_net, lan_if = None, "br0"
+    if lan_ip and re.match(r"\d+\.\d+\.\d+\.\d+$", lan_ip):
+        r2 = keenetic_ssh(f"ip -o -4 addr show 2>/dev/null | awk -v ip={lan_ip} '{{split($4,a,\"/\"); if(a[1]==ip){{print $2, $4; exit}}}}'", timeout=8)
+        parts = (r2.get("stdout") or "").strip().split()
+        try:
+            if len(parts) >= 2:
+                lan_if = parts[0]
+                lan_net = str(ipaddress.ip_network(parts[1], strict=False))
+            else:
+                lan_net = str(ipaddress.ip_network(lan_ip + "/24", strict=False))
+        except Exception:
+            lan_net = None
     dns_port = _keenetic_detect_dns_port()
     try:
         mss = max(1200, int(iface.get("mtu") or 1320) - 84)
     except Exception:
         mss = 1240
     return {"iface": iface, "kernel": kernel, "subnet": subnet, "lan_ip": lan_ip,
-            "dns_port": dns_port, "mss": mss}, None
+            "lan_net": lan_net, "lan_if": lan_if, "dns_port": dns_port, "mss": mss}, None
 
 
 @app.route("/api/xkeen/wg-connect", methods=["POST"])
@@ -1269,7 +1321,8 @@ def api_wg_connect():
         return jsonify({"ok": False, "error": err})
     kernel = p["kernel"]
     path = f"/opt/etc/ndm/netfilter.d/zz_wg_xray_{kernel}.sh"
-    hook = _build_wg_xray_hook(kernel, p["subnet"], p["lan_ip"], p["dns_port"], p["mss"])
+    hook = _build_wg_xray_hook(kernel, p["subnet"], p["lan_ip"], p["dns_port"], p["mss"],
+                               lan_net=p.get("lan_net"), lan_if=p.get("lan_if"))
     b64 = base64.b64encode(hook.encode("utf-8")).decode("ascii")
     cron_line = f"*/1 * * * * {path} >/dev/null 2>&1"
     cmd = (
@@ -1311,11 +1364,49 @@ def api_wg_disconnect():
         f"rm -f {path}",
         f"crontab -l 2>/dev/null | grep -vF '{path}' | crontab -",
     ]
+    # masquerade снимаем устойчиво — по ФАКТУ стоящих правил с этим -s {subnet} (значения
+    # lan_net/lan_if могли дрейфовать с момента connect или не зарезолвиться при disconnect),
+    # а не по пересчитанным значениям: иначе -D промахнётся и SNAT повиснет осиротевшим.
+    dels.insert(0, f"iptables -w -t nat -S POSTROUTING 2>/dev/null | grep -- '-s {subnet} ' | grep -- '-j MASQUERADE' | sed 's/^-A /-D /' | while read _r; do iptables -w -t nat $_r 2>/dev/null; done")
     cmd = "; ".join(dels) + f"; iptables -t nat -S PREROUTING | grep -q -- '-i {kernel} -p tcp -j xkeen' && echo WG_STILL || echo WG_GONE"
     r = keenetic_ssh(cmd, timeout=30)
     if "WG_GONE" in (r.get("stdout") or ""):
         return jsonify({"ok": True, "connected": False, "kernel": kernel, "msg": f"{kernel} отключён от анти-DPI"})
     return jsonify({"ok": False, "error": "catch-all всё ещё на месте — возможно интерфейс ведёт сторонний хук (напр. zz_wg_home_xkeen.sh). Проверь вручную."})
+
+
+@app.route("/api/xkeen/wg-cleanup-orphan", methods=["POST"])
+@requires_auth
+def api_wg_cleanup_orphan():
+    """Убрать ОСИРОТЕВШИЙ анти-DPI хук (zz_wg_xray_nwgX.sh, для которого интерфейса nwgX уже нет —
+    удалили в Keenetic, не нажав «Отключить»): rm файл + cron-строка + flush всех правил nwgX +
+    snять masquerade его подсети (SUBNET берём из самого файла хука перед удалением).
+    🔒 Защита: если nwgX — ЖИВОЙ интерфейс, очистку отклоняем (для живого = «Отключить от анти-DPI»)."""
+    data = request.get_json(silent=True) or request.form
+    kernel = (data.get("kernel") or "").strip()
+    if not re.match(r"^nwg\d+$", kernel):
+        return jsonify({"ok": False, "error": "неверное имя интерфейса (ожидается nwgN)"})
+    info = keenetic_get_wireguard_interfaces()
+    if not info.get("ok"):
+        return jsonify({"ok": False, "error": info.get("error") or "не удалось прочитать WG с роутера"})
+    if kernel in {i.get("kernel_name") for i in (info.get("interfaces") or [])}:
+        return jsonify({"ok": False, "error": f"{kernel} — ЖИВОЙ интерфейс. Для него используй «Отключить от анти-DPI», а не очистку осиротевших."})
+    if kernel not in (info.get("orphan_hooks") or []):
+        return jsonify({"ok": False, "error": f"хук {kernel} не найден среди осиротевших (возможно уже убран)"})
+    path = f"/opt/etc/ndm/netfilter.d/zz_wg_xray_{kernel}.sh"
+    cmd = (
+        f"SUBNET=$(grep -oE 'SUBNET=[0-9./]+' {path} 2>/dev/null | head -1 | cut -d= -f2); "
+        f"rm -f {path}; "
+        f"crontab -l 2>/dev/null | grep -vF '{path}' | crontab -; "
+        f"for T in nat mangle; do iptables -t $T -S PREROUTING 2>/dev/null | grep -- '-i {kernel} ' | sed 's|^-A |-D |' | while read r; do iptables -w -t $T $r 2>/dev/null; done; done; "
+        f"iptables -t nat -S INPUT 2>/dev/null | grep -- '-i {kernel} ' | sed 's|^-A |-D |' | while read r; do iptables -w -t nat $r 2>/dev/null; done; "
+        f"[ -n \"$SUBNET\" ] && iptables -t nat -S POSTROUTING 2>/dev/null | grep -F -- \"-s $SUBNET \" | grep MASQUERADE | sed 's|^-A |-D |' | while read r; do iptables -w -t nat $r 2>/dev/null; done; "
+        f"[ -f {path} ] && echo WG_ORPHAN_STILL || echo WG_ORPHAN_GONE"
+    )
+    r = keenetic_ssh(cmd, timeout=25)
+    if "WG_ORPHAN_GONE" in (r.get("stdout") or ""):
+        return jsonify({"ok": True, "kernel": kernel, "msg": f"осиротевший хук {kernel} убран (файл + cron + правила + masquerade)"})
+    return jsonify({"ok": False, "error": (r.get("stderr") or r.get("stdout") or "не удалось убрать хук")[:200]})
 
 
 WG_EXE_PATHS = [r"C:\Program Files\WireGuard\wg.exe", r"C:\Program Files (x86)\WireGuard\wg.exe"]
@@ -1382,6 +1473,14 @@ def api_wg_new_client():
             endpoint_warn = f"Endpoint {endpoint_host} — приватный/CGNAT-адрес, снаружи он недостижим. Укажи внешний WAN-IP или DDNS в поле Endpoint, иначе handshake не пройдёт."
     except ValueError:
         pass
+    # Проверка осиротевших хуков ПЕРЕД созданием: новый интерфейс может занять тот же nwgX и
+    # подхватить старый хук → «зеленеет, но не работает». Предупреждаем (не блокируем — хук может
+    # быть для другого номера; пользователь решает, убрать ли его сначала).
+    orphan_warn = None
+    if info.get("orphan_hooks"):
+        orphan_warn = ("На роутере есть осиротевшие анти-DPI хуки: " + ", ".join(info["orphan_hooks"]) +
+                       ". Новый интерфейс может получить тот же номер и подхватить старый хук → «зеленеет, но не работает». "
+                       "Лучше сначала убери их: «🔄 Прочитать с роутера» → кнопка «🧹 Убрать».")
     dns_ip = info.get("router_lan_ip") or "<router-lan-ip>"
     home_lan_cidr = None
     if dns_ip and re.match(r"\d+\.\d+\.\d+\.\d+$", dns_ip):
@@ -1389,7 +1488,10 @@ def api_wg_new_client():
             home_lan_cidr = str(ipaddress.ip_network(dns_ip + "/24", strict=False))
         except Exception:
             pass
-    server_conf = build_wg_server_conf(s_priv, f"{server_ip}/{prefix}", port, c_pub, client_ip)
+    # Режимы с доступом к домашней LAN: добавить LAN-подсеть в AllowedIPs серверного пира
+    # (авторизует forward WG→LAN на роутере). Masquerade ставит анти-DPI хук при «Подключить».
+    lan_cidrs = [home_lan_cidr] if (mode in ("full_lan", "lan") and home_lan_cidr) else None
+    server_conf = build_wg_server_conf(s_priv, f"{server_ip}/{prefix}", port, c_pub, client_ip, lan_cidrs=lan_cidrs)
     fake_iface = {"public_key": s_pub, "listen_port": port, "subnet_cidr": subnet_cidr, "mtu": None}
     try:
         client_conf = build_wg_client_conf(fake_iface, endpoint_host, client_ip, mode, selective_cidrs,
@@ -1405,6 +1507,7 @@ def api_wg_new_client():
         "server_ip": server_ip, "client_ip": client_ip,
         "server_pub": s_pub, "client_pub": c_pub, "endpoint_host": endpoint_host,
         "endpoint_warn": endpoint_warn,
+        "orphan_warn": orphan_warn,
     })
 
 
@@ -11613,7 +11716,8 @@ Use this token to access the HTTP API:
       <div style="margin:6px 0;">
         <label>Режим:<br>
           <select id="wgNcMode" style="min-width:320px;">
-            <option value="full">Весь трафик (full-tunnel, split-форма) — через анти-DPI</option>
+            <option value="full">Весь трафик через анти-DPI — БЕЗ доступа к домашней LAN</option>
+            <option value="full_lan">Весь трафик через анти-DPI + 🏠 доступ к домашней LAN (RDP/файлы дома)</option>
             <option value="selective">Выборочно (указанные подсети) — через анти-DPI</option>
             <option value="lan">🏠 Только доступ к дому (LAN) — обычный клиент, без анти-DPI</option>
           </select></label>
@@ -11646,7 +11750,7 @@ Use this token to access the HTTP API:
             <li><b>Включи</b> интерфейс (тумблер) в списке подключений.</li>
             <li>🔥 <b>Межсетевой экран</b> → вкладка нового интерфейса → <b>добавь правила «Разрешить»</b> (Keenetic их сам НЕ создаёт): <b>TCP и UDP обязательно</b>, <b>ICMP желательно</b>, источник/назначение «Любой». Без них handshake есть, а связи нет.</li>
             <li><b>Клиентский</b> .conf → на удалённую машину (приватный ключ уже внутри).</li>
-            <li>Для анти-DPI клиента — потом <b>«🔄 Прочитать с роутера»</b> → выбери интерфейс → <b>«🔌 Подключить к анти-DPI»</b>.</li>
+            <li>Для анти-DPI клиента — потом <b>«🔄 Прочитать с роутера»</b> → выбери интерфейс → <b>«🔌 Подключить к анти-DPI»</b>. Для режима <b>«+ доступ к домашней LAN»</b> эта же кнопка ставит masquerade к домашним хостам — без неё крупные пакеты (RDP/файлы) к LAN не пойдут.</li>
           </ol>
         </div>
         <div style="font-weight:600; margin-top:8px;">🖥 Серверный .conf (для Keenetic «Загрузить из файла»):</div>
@@ -11670,6 +11774,7 @@ Use this token to access the HTTP API:
 
   <div id="wgForm" style="display:none; margin-top:12px;">
     <div id="wgConnList" style="margin:6px 0; padding:8px 10px; background:#eef6ee; border-radius:4px; font-size:0.92em;"></div>
+    <div id="wgOrphanBox" style="display:none; margin:6px 0; padding:10px 12px; background:#fff3cd; border:2px solid #e0a800; border-radius:6px; font-size:0.92em;"></div>
     <div style="margin:6px 0;">
       <label>WG-интерфейс роутера:<br><select id="wgIface" style="min-width:300px;"></select></label>
     </div>
@@ -11679,6 +11784,11 @@ Use this token to access the HTTP API:
       <button type="button" class="btn" id="wgConnBtn" style="margin-left:10px;"></button>
       <button type="button" class="btn" id="wgAclBtn" style="margin-left:6px;">🔥 Правила</button>
       <div class="muted" style="margin-top:4px; font-size:0.86em;">«Подключить» ставит на роутер хук (заворот этого интерфейса в xray) + cron self-heal — это нужно, чтобы трафик клиента реально шёл через анти-DPI. «Правила» — firewall-доступ интерфейса (нужен новому: при импорте «Загрузить из файла» Keenetic правил не создаёт).</div>
+      <div style="margin-top:8px; padding:10px 12px; background:#ffe5e5; border:2px solid #d33; border-radius:6px; color:#a00; font-weight:700; font-size:0.92em;">
+        🔴 ВАЖНО: если интерфейс подключён к анти-DPI — <u>СНАЧАЛА нажми «🔌 Отключить от анти-DPI», и только ПОТОМ удаляй интерфейс в Keenetic!</u>
+        <div style="font-weight:400; font-size:0.92em; margin-top:4px;">Хук анти-DPI живёт отдельным файлом на роутере + строкой в cron, а не в самом интерфейсе. Если удалить интерфейс не отключив — хук осиротеет, cron продолжит держать его правила, и новый WG-интерфейс с тем же номером <code>nwgX</code> подхватит старый хук → «подключается, но не работает».</div>
+        <div style="font-weight:400; font-size:0.92em; margin-top:4px;">✅ <b>Если уже забыли отключить перед удалением</b> — ничего страшного: нажми <b>«🔄 Прочитать с роутера»</b>, панель сама найдёт осиротевший хук и покажет кнопку <b>«🧹 Убрать»</b>. Сделай это <b>ПЕРЕД созданием нового клиента</b>.</div>
+      </div>
       <div id="wgAclBox" style="display:none; margin-top:8px; padding:8px 10px; background:#fff; border:1px solid #cdd6df; border-radius:4px;">
         <div style="font-weight:600; margin-bottom:4px;">🔥 Firewall-правила интерфейса (least-privilege)</div>
         <div class="muted" style="font-size:0.84em; margin-bottom:6px;">Одна строка = одно правило: <code>протокол назначение [порт | порт-порт]</code>. Протокол — <code>icmp</code>/<code>tcp</code>/<code>udp</code>; назначение — <code>any</code>, IP (<code>192.168.1.10</code>) или подсеть (<code>192.168.1.0/24</code>); порт необязателен. Пустой список = весь вход закрыт (security-level public). Применяется на роутере: пересоздаёт <code>_WEBADMIN_WireguardN</code> и сохраняет конфиг.</div>
@@ -11700,7 +11810,8 @@ Use this token to access the HTTP API:
     <div style="margin:6px 0;">
       <label>Режим:<br>
         <select id="wgMode" style="min-width:300px;">
-          <option value="full">Весь трафик (full-tunnel, безопасная split-форма) — через анти-DPI</option>
+          <option value="full">Весь трафик через анти-DPI — БЕЗ доступа к домашней LAN</option>
+          <option value="full_lan">Весь трафик через анти-DPI + 🏠 доступ к домашней LAN</option>
           <option value="selective">Выборочно (только указанные подсети) — через анти-DPI</option>
           <option value="lan">🏠 Только доступ к дому (LAN) — обычный клиент, без анти-DPI</option>
         </select>
@@ -11732,7 +11843,7 @@ Use this token to access the HTTP API:
       <div class="muted" style="margin-top:2px; font-size:0.88em;">Рекомендуется для full-tunnel. Для выборочного режима обычно выключают. При включённом v6-only сайты с клиента недоступны.</div>
     </div>
     <div id="wgLanNote" style="display:none; margin:8px 0; padding:8px 10px; background:#eef6ee; border-radius:4px; font-size:0.9em;">
-      🏠 Обычный клиент: видит домашнюю сеть (LAN + подсеть туннеля), интернет у него идёт <b>напрямую</b>. Анти-DPI не нужен — кнопку «Подключить к анти-DPI» для этого интерфейса <b>не нажимай</b>. Сам WG-интерфейс создай родным мастером Keenetic, потом «🔄 Прочитать с роутера».
+      🏠 Обычный клиент: видит домашнюю сеть (LAN + подсеть туннеля), интернет у него идёт <b>напрямую</b>. Анти-DPI не нужен — кнопку «Подключить к анти-DPI» для этого интерфейса <b>не нажимай</b>. Сам WG-интерфейс создай родным мастером Keenetic, потом «🔄 Прочитать с роутера». <b>⚠ Крупные пакеты к LAN-хостам (RDP, файлы)</b> в этом режиме могут застревать: masquerade к локалке ставит только анти-DPI хук — для надёжного доступа к дому используй режим «<b>Весь трафик через анти-DPI + доступ к домашней LAN</b>».
     </div>
 
     <button type="button" class="btn" id="wgGenBtn" style="margin-top:8px;">🧩 Сгенерировать .conf</button>
@@ -11789,6 +11900,28 @@ Use this token to access the HTTP API:
     var parts = conn.map(function(x){ return (x.kernel_name||'?') + (x.name?(' · '+x.name):'') + (x.panel_managed?'':' <span style="color:#888">(внешний хук)</span>'); });
     el.innerHTML='<b>В анти-DPI заведено ('+conn.length+'):</b> ' + parts.join(', ');
   }
+  function renderOrphans(list){
+    var el=$('wgOrphanBox'); if(!el) return;
+    list = list || [];
+    if(!list.length){ el.style.display='none'; el.innerHTML=''; return; }
+    var rows = list.map(function(k){
+      return '🔴 Осиротевший хук <code>'+k+'</code> — интерфейса уже нет, но его правила держит cron. '
+        + '<button type="button" class="btn" data-orphan="'+k+'" style="margin-left:6px;">🧹 Убрать '+k+'</button>';
+    });
+    el.innerHTML = '<b>⚠️ Найдены осиротевшие анти-DPI хуки</b> (интерфейс удалён без «🔌 Отключить» — их правила держит cron; новый клиент с тем же номером подхватит старый хук и не заработает). Убери их:<br>' + rows.join('<br>');
+    el.style.display='';
+    var btns = el.querySelectorAll('button[data-orphan]');
+    for(var i=0;i<btns.length;i++){ btns[i].addEventListener('click', function(){ cleanupOrphan(this.getAttribute('data-orphan'), this); }); }
+  }
+  function cleanupOrphan(kernel, btn){
+    if(!confirm('Убрать осиротевший хук '+kernel+'? (удалит файл хука + cron-строку + его правила на роутере)')) return;
+    if(btn){ btn.disabled=true; btn.textContent='…'; }
+    fetch('/api/xkeen/wg-cleanup-orphan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kernel:kernel})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(!d.ok){ alert('Ошибка: '+(d.error||'?')); if(btn){btn.disabled=false; btn.textContent='🧹 Убрать '+kernel;} return; }
+        setStatus(d.msg||'осиротевший хук убран'); loadIfaces();
+      }).catch(function(e){ alert('Ошибка: '+e); if(btn){btn.disabled=false; btn.textContent='🧹 Убрать '+kernel;} });
+  }
   function loadIfaces(){
     setStatus('Читаю WG-интерфейсы роутера…');
     fetch('/api/xkeen/wg-interfaces').then(function(r){return r.json();}).then(function(d){
@@ -11800,7 +11933,7 @@ Use this token to access the HTTP API:
           o.textContent = i.id + (i.name?(' ('+i.name+')'):'') + (i.subnet_cidr?(' — '+i.subnet_cidr):''); sel.appendChild(o); }); }
       if($('wgEndpoint')) $('wgEndpoint').placeholder = 'авто: ' + (wan||'—');
       if($('wgForm')) $('wgForm').style.display='';
-      onIfaceChange(); onModeChange(); renderConnList();
+      onIfaceChange(); onModeChange(); renderConnList(); renderOrphans(d.orphan_hooks);
       setStatus('✅ Прочитано. WAN: ' + (wan||'—') + ' · DNS: ' + (dns||'—') + '. Выбери интерфейс и нажми «Сгенерировать».');
     }).catch(function(e){ setStatus('⚠ ошибка: ' + e); });
   }
@@ -11880,8 +12013,10 @@ Use this token to access the HTTP API:
         if($('wgNcClient')) $('wgNcClient').value=window.__ncClient;
         var nci='Подсеть '+d.subnet+' · порт '+d.listen_port+' · сервер '+d.server_ip+' · клиент '+d.client_ip+' · endpoint '+d.endpoint_host;
         if(d.endpoint_warn) nci+='  ⚠️ '+d.endpoint_warn;
+        if(d.orphan_warn) nci+='  🔴 '+d.orphan_warn;
         if($('wgNcInfo')) $('wgNcInfo').textContent=nci;
         if($('wgNcOut')) $('wgNcOut').style.display='';
+        if(d.orphan_warn) alert('🔴 ВНИМАНИЕ — осиротевшие анти-DPI хуки на роутере:\n\n'+d.orphan_warn);
       }).catch(function(e){ b.disabled=false; b.textContent=ot; alert('Ошибка: '+e); });
   }
   function aclRuleToLine(r){
