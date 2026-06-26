@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.91"
+_VERSION_FALLBACK = "1.0.92"
 
 
 def _find_git():
@@ -1232,7 +1232,8 @@ def _keenetic_detect_dns_port():
 def _build_wg_xray_hook(kernel, subnet, lan_ip, dns_port, mss, lan_net=None, lan_if=None):
     """netfilter.d-хук: завернуть весь трафик WG-интерфейса <kernel> в цепочку xkeen (xray) +
     DNS-redirect/SNAT на ndnproxy + MSS-clamp. Идемпотентен (-C || -I/-A), scoped по -i <kernel>.
-    1-в-1 с проверенным zz_wg_home_xkeen.sh, параметризован.
+    Произошёл от ручного zz_wg_home_xkeen.sh (параметризован), но НЕ идентичен: UDP catch-all через -A
+    (в НИЗ mangle PREROUTING), чтобы DNS-RETURN сработал раньше. Источник истины — этот генератор.
 
     lan_net/lan_if — LAN-подсеть роутера и её интерфейс (напр. br0). Если заданы, добавляется
     masquerade трафика клиента к LAN (SNAT под адрес роутера) — без него крупные пакеты к
@@ -1257,7 +1258,11 @@ def _build_wg_xray_hook(kernel, subnet, lan_ip, dns_port, mss, lan_net=None, lan
         'for proto in udp tcp; do iptables -w -t nat -C INPUT -i $WGIF -s $SUBNET -p $proto --dport $DNSP -j SNAT --to-source $LANIP 2>/dev/null || iptables -w -t nat -A INPUT -i $WGIF -s $SUBNET -p $proto --dport $DNSP -j SNAT --to-source $LANIP; done',
         '[ -n "$LANNET" ] && { iptables -w -t nat -C POSTROUTING -s $SUBNET -d $LANNET -o $LANIF -j MASQUERADE 2>/dev/null || iptables -w -t nat -I POSTROUTING -s $SUBNET -d $LANNET -o $LANIF -j MASQUERADE; }',
         'iptables -w -t nat    -C PREROUTING -i $WGIF -p tcp -j xkeen 2>/dev/null || iptables -w -t nat    -A PREROUTING -i $WGIF -p tcp -j xkeen',
-        'iptables -w -t mangle -C PREROUTING -i $WGIF -p udp -j xkeen 2>/dev/null || iptables -w -t mangle -I PREROUTING -i $WGIF -p udp -j xkeen',
+        # -A (НЕ -I): catch-all UDP ставим в НИЗ mangle PREROUTING, чтобы DNS-RETURN выше (он через -I)
+        # сработал ПЕРВЫМ. Иначе DNS клиента (dport 53) утягивается в tproxy xray вместо ndnproxy → xray
+        # не отвечает на DNS → клиент долбит повторами → Recv-Q UDP-сокета пухнет → watchdog рубит рестарт.
+        # (Тот же приём в nat-таблице: REDIRECT для dport 53 через -I выше, TCP catch-all через -A ниже.)
+        'iptables -w -t mangle -C PREROUTING -i $WGIF -p udp -j xkeen 2>/dev/null || iptables -w -t mangle -A PREROUTING -i $WGIF -p udp -j xkeen',
         "exit 0",
         "",
     ]
