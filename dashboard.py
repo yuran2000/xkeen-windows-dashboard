@@ -23,7 +23,7 @@ import qrcode
 import socket
 import sys
 import time as _time_mod
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 # ── Вендоренный rkn_checker (папка rkn_checker/, см. rkn_checker/VENDOR.md) ──
 # Послойная диагностика блокировок (DNS/TCP/TLS/HTTP) для секции «Почему не
@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.92"
+_VERSION_FALLBACK = "1.0.93"
 
 
 def _find_git():
@@ -2111,6 +2111,12 @@ def keenetic_set_sub_meta(pbk, **fields):
 # нужно было бы ходить через ssh, что медленнее и шумнее.
 _OUTBOUND_STATUS_CACHE = {}
 _OUTBOUND_STATUS_TTL = 60  # секунд — за этот период не probим повторно
+# Жёсткий потолок одновременных SSH-сессий к dropbear в пробе + глобальный лок:
+# у dropbear низкий лимит параллельных сессий с одного IP — перебор → он рвёт лишние
+# ("closed by remote host") → ложно-мёртвые серверы. Лок сериализует параллельные
+# запросы пробы (две вкладки / авто-проба при загрузке), чтобы сессии не складывались.
+_PROBE_MAX_CONCURRENCY = 3
+_PROBE_SSH_LOCK = _threading.Lock()
 
 
 def _probe_via_router(targets, connect_timeout=4, max_time=7):
@@ -2213,6 +2219,35 @@ def _probe_via_router(targets, connect_timeout=4, max_time=7):
     return parsed
 
 
+def _probe_targets_batched(targets, max_workers):
+    """Пробит targets ПАЧКАМИ (по CHUNK) параллельно, но с жёстким капом конкурентности к dropbear
+    (_PROBE_MAX_CONCURRENCY) + глобальным локом (_PROBE_SSH_LOCK): одной длинной командой со всеми
+    серверами dropbear рвал сессию (→ ложно-мёртвые), много одновременных сессий — тот же эффект.
+    Возвращает {tag: val}: val = (ok, ms) | ("nc", None) от curl, либо ("__sshfail__", err) если
+    SSH этой пачки упал. Сбой одной пачки не роняет остальные."""
+    out = {}
+    if not targets:
+        return out
+    CHUNK = 8
+    chunks = [targets[i:i + CHUNK] for i in range(0, len(targets), CHUNK)]
+    workers = max(1, min(max_workers, len(chunks), _PROBE_MAX_CONCURRENCY))
+    with _PROBE_SSH_LOCK:
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as _ex:
+                chunk_results = list(_ex.map(_probe_via_router, chunks))
+        except Exception as _probe_exc:
+            chunk_results = [{"__ssh_failed__": (False, None, str(_probe_exc)[:200])} for _ in chunks]
+    for chunk, batched in zip(chunks, chunk_results):
+        if "__ssh_failed__" in batched:
+            err = batched["__ssh_failed__"][2] if len(batched["__ssh_failed__"]) >= 3 else ""
+            for tag, host, port in chunk:
+                out[tag] = ("__sshfail__", err)
+        else:
+            for tag, host, port in chunk:
+                out[tag] = batched.get(tag, (False, None))
+    return out
+
+
 def probe_outbounds(outbounds, force=False, max_workers=8):
     """Для каждого vless-outbound делает TCP-connect параллельно. Возвращает
     dict {tag: {ok, ms, ts}}. Использует in-memory кэш с TTL — если запись свежая,
@@ -2245,33 +2280,43 @@ def probe_outbounds(outbounds, force=False, max_workers=8):
         to_probe.append((tag, host, port))
 
     if to_probe:
-        # Один batched SSH-вызов на роутер — все probes параллельно через bash &/wait
-        batched = _probe_via_router(to_probe)
-        # SSH сам упал — не трогаем кэш, возвращаем что было (с маркером stale если совсем нет)
-        if "__ssh_failed__" in batched:
-            err_msg = batched["__ssh_failed__"][2] if len(batched["__ssh_failed__"]) >= 3 else ""
-            for tag, host, port in to_probe:
+        hp = {tag: (host, port) for (tag, host, port) in to_probe}
+        probed = _probe_targets_batched(to_probe, max_workers)
+        # Anti-flap (retry упавших): за 1 проход реально-мёртвая нода и ТРАНЗИЕНТНЫЙ false-down
+        # (Reality моргает, +шум параллельной нагрузки / 7с-таймаута) неотличимы → на каждом
+        # «Пинге» в «не отвечает» попадают РАЗНЫЕ ноды. Перепробуем ТОЛЬКО упавших (ok is False)
+        # вторым заходом: кто ожил — был транзиент; кто упал дважды — действительно мёртв.
+        # ssh_fail НЕ ретраим (это не «мёртв», а сбой канала — держим stale).
+        retry = [(t, hp[t][0], hp[t][1]) for t in hp if probed.get(t) == (False, None)]
+        if retry:
+            for tag, val in _probe_targets_batched(retry, max_workers).items():
+                if isinstance(val, tuple) and (val[0] is True or val[0] == "nc"):
+                    probed[tag] = val  # ожил на 2-м заходе → больше не «мёртв»
+
+        for tag, (host, port) in hp.items():
+            val = probed.get(tag, (False, None))
+            if isinstance(val, tuple) and len(val) >= 1 and val[0] == "__sshfail__":
+                # SSH этой пачки упал — не трогаем кэш, держим что было (stale), иначе ssh_fail.
+                err_msg = val[1] if len(val) > 1 else ""
                 stale = _OUTBOUND_STATUS_CACHE.get(tag)
                 if stale:
-                    # Помечаем что данные stale, но не перетираем как dead
                     entry = dict(stale)
                     entry["stale"] = True
                     entry["ssh_error"] = err_msg
-                    result[tag] = entry
                 else:
-                    result[tag] = {"ok": None, "ms": None, "ts": now, "kind": "ssh_fail",
-                                   "host": host, "port": port, "ssh_error": err_msg}
-        else:
-            for tag, host, port in to_probe:
-                ok, ms = batched.get(tag, (False, None))
-                if ok == "nc":
-                    kind = "tcp_nc"
-                    ok = True
-                else:
-                    kind = "probe"
-                entry = {"ok": ok, "ms": ms, "ts": now, "kind": kind, "host": host, "port": port}
-                _OUTBOUND_STATUS_CACHE[tag] = entry
+                    entry = {"ok": None, "ms": None, "ts": now, "kind": "ssh_fail",
+                             "host": host, "port": port, "ssh_error": err_msg}
                 result[tag] = entry
+                continue
+            ok, ms = val if isinstance(val, tuple) else (False, None)
+            if ok == "nc":
+                kind = "tcp_nc"
+                ok = True
+            else:
+                kind = "probe"
+            entry = {"ok": ok, "ms": ms, "ts": now, "kind": kind, "host": host, "port": port}
+            _OUTBOUND_STATUS_CACHE[tag] = entry
+            result[tag] = entry
 
     return result
 
@@ -10613,6 +10658,11 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     #failover-chain tr.grp-5 td.group-cell { border-left-color: #c99;  background: #faf3f3; }
     .group-name-badge { font-size: 0.78em; color: #555; padding: 1px 5px; border-radius: 3px; background: rgba(255,255,255,0.7); display: inline-block; }
   </style>
+  <div style="margin: 6px 0 8px 0;">
+    <button class="btn" onclick="saveFailoverChain()">💾 Сохранить цепочку</button>
+    <button class="btn" onclick="pingFailoverChain(this)" title="TCP+TLS-проба всех серверов цепочки с дашборда (force). Бейджи появятся в колонке «Сейчас / роль»; мёртвые подсветятся.">🏓 Пинг цепочки</button>
+    <button class="btn" id="fc-remove-dead" onclick="removeDeadFromChain()" style="display:none; background:#c33; color:#fff;" title="Снять из цепочки серверы, не ответившие на последний «🏓 Пинг цепочки», и сохранить.">🗑 Убрать мёртвые (<span id="fc-dead-count">0</span>)</button>
+  </div>
   <table id="failover-chain" style="margin-top: 6px; max-width: 850px;">
     <tr><th style="width:30px"></th><th style="width: 80px;">№</th><th style="width: 80px;">В цепочке</th><th>Tag</th><th style="width: 140px;">Подписка</th><th>Host:Port</th><th>Сейчас / роль</th></tr>
     {% for o in chain_outbounds %}
@@ -10626,7 +10676,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         <td class="mono"><strong>{{ o.tag }}</strong>{% if o.note %}<br><span style="font-style:italic; font-size:0.8em; color:#3a6;">📝 {{ o.note }}</span>{% endif %}</td>
         <td class="group-cell"><span class="group-name-badge" title="pbk={{ o.group_pbk_short }}">{{ o.group_name or '?' }}</span></td>
         <td class="mono">{{ o.host }}:{{ o.port }}</td>
-        <td><span class="badge badge-ok">🟢 PRIMARY</span>{% if o.tag == watchdog.current_default %} <span class="badge badge-active">⚡ активен</span>{% endif %}</td>
+        <td><span class="badge badge-ok">🟢 PRIMARY</span>{% if o.tag == watchdog.current_default %} <span class="badge badge-active">⚡ активен</span>{% endif %} <span class="status-cell"></span></td>
       </tr>
     {% else %}
       <tr class="draggable grp-{{ o.group_color_idx or 0 }}" draggable="true" data-tag="{{ o.tag }}">
@@ -10636,7 +10686,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         <td class="mono"><strong>{{ o.tag }}</strong>{% if o.note %}<br><span style="font-style:italic; font-size:0.8em; color:#3a6;">📝 {{ o.note }}</span>{% endif %}</td>
         <td class="group-cell"><span class="group-name-badge" title="pbk={{ o.group_pbk_short }}">{{ o.group_name or '?' }}</span></td>
         <td class="mono">{{ o.host }}:{{ o.port }}</td>
-        <td>{% if o.tag == watchdog.current_default %}<span class="badge badge-active">⚡ активен</span>{% endif %}{% if o.is_ai %} <span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}{% if o.is_yt %} <span class="badge" style="background:#fbdada; color:#c33">📺 YT</span>{% endif %}{% if o.is_foreign %} <span class="badge" style="background:#efe2f7; color:#8e44ad">📱 РФ-блок</span>{% endif %}</td>
+        <td>{% if o.tag == watchdog.current_default %}<span class="badge badge-active">⚡ активен</span>{% endif %}{% if o.is_ai %} <span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}{% if o.is_yt %} <span class="badge" style="background:#fbdada; color:#c33">📺 YT</span>{% endif %}{% if o.is_foreign %} <span class="badge" style="background:#efe2f7; color:#8e44ad">📱 РФ-блок</span>{% endif %} <span class="status-cell"></span></td>
       </tr>
     {% endif %}
     {% endfor %}
@@ -15733,6 +15783,93 @@ async function saveFailoverChain() {
   const fd = new FormData();
   fd.append('tags', tags);
   flash(true, 'Сохраняю цепочку...');
+  const res = await apiCall('/api/xkeen/set-failover-chain', fd);
+  if (res.ok) {
+    flash(true, res.stdout || 'Цепочка обновлена');
+    setTimeout(() => location.reload(), 1500);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+
+// === Пинг цепочки FAILOVER + убрать мёртвые (probe-status force + переиспользует saveFailoverChain) ===
+let _fcDeadTags = [];
+async function pingFailoverChain(btn) {
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ пингую…';
+  _fcDeadTags = [];
+  try {
+    const res = await fetch('/api/xkeen/probe-status?force=1', { method: 'POST' });
+    const j = await res.json();
+    if (!j.ok || !j.statuses) {
+      btn.textContent = '❌ ошибка';
+      setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
+      return;
+    }
+    const st = j.statuses;
+    document.querySelectorAll('#failover-chain tr[data-tag]').forEach(tr => {
+      const cell = tr.querySelector('.status-cell');
+      if (!cell) return;
+      const s = st[tr.dataset.tag];
+      tr.style.background = '';
+      if (!s || s.kind === 'local') {
+        cell.innerHTML = '<span class="badge badge-dim">—</span>';
+      } else if (s.kind === 'ssh_fail') {
+        cell.innerHTML = '<span class="badge" style="background:#eee; color:#888;" title="не удалось проверить (SSH)">⚪ ?</span>';
+      } else if (s.kind === 'tcp_nc') {
+        cell.innerHTML = '<span class="badge" style="background:#dfe8ff; color:#1a55cc;" title="TCP открыт, TLS молчит (Reality без фолбэка — норма)">🔌 TCP</span>';
+      } else if (s.ok) {
+        cell.innerHTML = '<span class="badge badge-ok">🟢' + (s.ms != null ? ' ' + s.ms + 'ms' : '') + '</span>';
+      } else {
+        cell.innerHTML = '<span class="badge" style="background:#c33; color:#fff;">⛔ не отвечает</span>';
+        const chk = tr.querySelector('.fc-check');
+        // Считаем «к удалению» ТОЛЬКО отмеченных (в цепочке) — запасные мёртвые видны бейджем,
+        // но в счётчик «Убрать мёртвые» и подсветку-к-удалению не попадают (PRIMARY тоже вне).
+        if (!tr.dataset.primary && chk && chk.checked) {
+          _fcDeadTags.push(tr.dataset.tag);
+          tr.style.background = '#fbeaea';
+        }
+      }
+    });
+    const rm = document.getElementById('fc-remove-dead');
+    const cnt = document.getElementById('fc-dead-count');
+    if (cnt) cnt.textContent = _fcDeadTags.length;
+    if (rm) rm.style.display = _fcDeadTags.length ? '' : 'none';
+    btn.textContent = orig;
+    btn.disabled = false;
+  } catch (e) {
+    btn.textContent = '❌';
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
+  }
+}
+async function removeDeadFromChain() {
+  if (!_fcDeadTags.length) {
+    flash(false, 'Сначала нажми «🏓 Пинг цепочки» — мёртвых пока не помечено');
+    return;
+  }
+  // НЕ трогаем DOM до подтверждения и успешного сохранения (иначе при отмене / пустом
+  // результате экран врёт «обнулено», а сервер держит старую цепочку). Считаем ЖИВЫХ
+  // отмеченных (order>0), исключив мёртвых, и сохраняем только их — напрямую.
+  const deadSet = new Set(_fcDeadTags);
+  const items = [];
+  document.querySelectorAll('#failover-chain tr').forEach(tr => {
+    const chk = tr.querySelector('.fc-check');
+    const ord = tr.querySelector('.fc-order');
+    if (chk && ord && chk.checked && !deadSet.has(chk.dataset.tag)) {
+      const order = parseInt(ord.value) || 0;
+      if (order > 0) items.push({ tag: chk.dataset.tag, order: order });
+    }
+  });
+  if (items.length === 0) {
+    flash(false, 'В цепочке не останется ни одного живого сервера — убирать нельзя. Добавь рабочий резерв или проверь подписки.');
+    return;
+  }
+  items.sort((a, b) => a.order - b.order);
+  if (!confirm('Убрать из цепочки FAILOVER мёртвые (' + _fcDeadTags.length + '): ' + _fcDeadTags.join(', ') + '\n\nОстанется живых: ' + items.length + '. Сохранить?')) return;
+  const fd = new FormData();
+  fd.append('tags', items.map(i => i.tag).join(','));
+  flash(true, 'Убираю мёртвые из цепочки...');
   const res = await apiCall('/api/xkeen/set-failover-chain', fd);
   if (res.ok) {
     flash(true, res.stdout || 'Цепочка обновлена');
