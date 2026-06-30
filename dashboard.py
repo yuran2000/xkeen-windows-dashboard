@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.93"
+_VERSION_FALLBACK = "1.0.94"
 
 
 def _find_git():
@@ -2879,6 +2879,7 @@ def keenetic_remove_outbounds_bulk(tags):
     ai = targets.get("ai_tag")
     yt = targets.get("yt_tag")
     foreign = targets.get("foreign_tag")
+    ipv6 = targets.get("ipv6_tag")
     failover_set = set(targets.get("failover_tags") or [])
     skipped = {}
     to_remove = []
@@ -2893,6 +2894,8 @@ def keenetic_remove_outbounds_bulk(tags):
             skipped[t] = "сейчас YouTube-sticky"
         elif t == foreign:
             skipped[t] = "сейчас «Зарубежные сервисы»"
+        elif t == ipv6:
+            skipped[t] = "сейчас «Через IPv6»"
         elif t in failover_set:
             skipped[t] = "в списке FAILOVER"
         else:
@@ -2936,6 +2939,189 @@ def keenetic_remove_outbounds_bulk(tags):
         "removed": removed_actual,
         "skipped": skipped,
     }
+
+
+# ── Удаление подписки целиком + чистка осиротевших записей subscription_meta ──
+# Закрывают класс «хвостов»: при смене адреса подписки у провайдера старые серверы
+# и/или их метаданные остаются осиротевшими и копятся. Эти helper'ы позволяют
+# убрать подписку одним действием (карточка группы) и подчистить записи
+# subscription_meta, для которых не осталось ни одного живого outbound'а.
+
+def _subscription_removal_plan(key, outbounds, targets, subs):
+    """Чистый планировщик (без записи) — что будет удалено при сносе подписки `key`.
+    key = canonical-ключ группы: sub_url (http(s)://...) ИЛИ pbk (Reality publicKey).
+    Возвращает {member_tags, protected: {tag: roles}, meta_keys: [keys]}.
+    Вынесен отдельно, чтобы тестироваться офлайн-прогоном на живых данных без мутаций."""
+    key = (key or "").strip()
+    is_url = key.startswith(("http://", "https://"))
+    member_tags = []
+    for o in (outbounds or []):
+        if o.get("protocol") != "vless":
+            continue
+        if is_url:
+            if (o.get("sub_url") or "").strip() == key:
+                member_tags.append(o.get("tag"))
+        elif key and (o.get("pbk") or "") == key:
+            member_tags.append(o.get("tag"))
+    # Роли. БЛОКИРУЮТ удаление только реально активные УНИКАЛЬНЫЕ роли: PRIMARY/AI/YT/
+    # FOREIGN/IPV6 + ГОЛОВА резервной цепочки (failover_tag = FAILOVER_TAGS[0]). Членство в
+    # ХВОСТЕ резервной цепочки (#2..#N) НЕ блокирует — такие серверы авто-убираются из
+    # FAILOVER_TAGS при удалении (как делает синк подписок при «Удалить отсутствующие»).
+    t = targets or {}
+    critical_roles = [
+        (t.get("primary_tag"), "PRIMARY"),
+        (t.get("ai_tag"), "AI"),
+        (t.get("yt_tag"), "YouTube"),
+        (t.get("foreign_tag"), "Зарубежные сервисы"),
+        (t.get("ipv6_tag"), "Через IPv6"),
+        (t.get("failover_tag"), "голова резервной цепочки"),
+    ]
+    fchain = set(t.get("failover_tags") or [])
+    critical = {}
+    failover_tail = []
+    for tag in member_tags:
+        roles = [label for (rt, label) in critical_roles if rt and rt == tag]
+        if roles:
+            critical[tag] = ", ".join(roles)
+        elif tag in fchain:
+            failover_tail.append(tag)
+    # Записи subscription_meta на удаление: сам ключ + pbk-тени с тем же sub_url.
+    meta_keys = []
+    for k, v in (subs or {}).items():
+        if k == key:
+            meta_keys.append(k)
+        elif is_url and isinstance(v, dict) and (v.get("sub_url") or "").strip() == key:
+            meta_keys.append(k)
+    return {"member_tags": member_tags, "critical": critical,
+            "failover_tail": failover_tail, "meta_keys": meta_keys}
+
+
+def keenetic_remove_subscription(key, dry_run=False):
+    """Удалить подписку целиком: все её vless-outbound'ы + записи subscription_meta
+    (групповая + pbk-тени) + (через bulk) их outbound_meta. Серверы-ХВОСТ резервной
+    цепочки авто-убираются из FAILOVER_TAGS перед сносом. Fail-closed: если хотя бы один
+    сервер подписки в активной УНИКАЛЬНОЙ роли (PRIMARY/AI/YT/FOREIGN/IPV6/голова резерва)
+    — отказ целиком. dry_run=True — только вернуть план (для офлайн-проверки, без записи)."""
+    key = (key or "").strip()
+    if not key:
+        return {"ok": False, "stderr": "пустой ключ подписки"}
+    outbounds = keenetic_get_outbounds()
+    if outbounds is None:
+        return {"ok": False, "stderr": "не удалось прочитать outbound'ы с роутера"}
+    targets = keenetic_get_watchdog_targets() or {}
+    subs = keenetic_read_sub_meta() or {}
+    plan = _subscription_removal_plan(key, outbounds, targets, subs)
+    if plan["critical"]:
+        return {"ok": False, "blocked": True, "protected": plan["critical"],
+                "member_count": len(plan["member_tags"]),
+                "stderr": "В подписке есть узел в активной роли (PRIMARY/AI/YouTube/Зарубежные/IPv6/голова резерва) — сначала переназначьте роль на другой канал, затем повторите."}
+    if dry_run:
+        return {"ok": True, "dry_run": True, **plan}
+    member_tags = plan["member_tags"]
+    # 1. Убрать серверы-хвост из резервной цепочки ДО сноса (иначе bulk пропустит их как «в FAILOVER»).
+    removed_from_failover = []
+    if plan["failover_tail"]:
+        drop = set(plan["failover_tail"])
+        chain_after = [t for t in (targets.get("failover_tags") or []) if t not in drop]
+        wd = keenetic_write_watchdog_config({"FAILOVER_TAGS": " ".join(chain_after)})
+        if not (isinstance(wd, dict) and wd.get("ok")):
+            return {"ok": False, "phase": "failover",
+                    "stderr": "Не удалось убрать серверы из резервной цепочки (watchdog.config) — удаление отменено, ничего не тронуто."}
+        removed_from_failover = list(plan["failover_tail"])
+    # 2. Снести серверы (bulk: бэкап 04_outbounds + рестарт + откат + чистка outbound_meta).
+    removed_outbounds = []
+    if member_tags:
+        r = keenetic_remove_outbounds_bulk(member_tags)
+        if not r.get("ok"):
+            return {"ok": False, "phase": "outbounds", "removed_from_failover": removed_from_failover,
+                    "stderr": "Не удалил серверы подписки: " + (r.get("stderr") or "")}
+        removed_outbounds = r.get("removed", []) or []
+        # Если bulk пропустил что-то НЕ по причине «не найден» (гонка: узел стал активен) —
+        # подписка ещё жива, метаданные НЕ удаляем.
+        survived = {tg: why for tg, why in (r.get("skipped") or {}).items() if why != "не найден"}
+        if survived:
+            return {"ok": True, "removed": removed_outbounds, "removed_meta": [], "skipped": survived,
+                    "removed_from_failover": removed_from_failover,
+                    "stdout": f"Удалено серверов: {len(removed_outbounds)}. Метаданные не тронуты — часть узлов стала активной во время операции."}
+    # 3. Почистить subscription_meta (с проверяемым бэкапом).
+    removed_meta = []
+    if plan["meta_keys"]:
+        new_subs = {k: v for k, v in subs.items() if k not in set(plan["meta_keys"])}
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        bak = keenetic_ssh(f"if [ -f {KEENETIC_SUB_META_FILE} ]; then cp {KEENETIC_SUB_META_FILE} {KEENETIC_SUB_META_FILE}.bak-{ts} && echo BAKOK || echo BAKFAIL; else echo NOFILE; fi")
+        if (not bak.get("ok")) or "BAKFAIL" in (bak.get("stdout") or ""):
+            return {"ok": True, "removed": removed_outbounds, "removed_meta": [], "meta_write_failed": True,
+                    "removed_from_failover": removed_from_failover,
+                    "stdout": f"Серверы удалены ({len(removed_outbounds)}), но бэкап метаданных не создался — записи НЕ тронуты (безвредны)."}
+        if keenetic_write_sub_meta(new_subs):
+            removed_meta = plan["meta_keys"]
+        else:
+            return {"ok": True, "removed": removed_outbounds, "removed_meta": [], "meta_write_failed": True,
+                    "removed_from_failover": removed_from_failover,
+                    "stdout": f"Серверы удалены ({len(removed_outbounds)}), но запись метаданных не удалась — записи остались (они безвредны)."}
+    msg = f"Подписка удалена: серверов — {len(removed_outbounds)}, записей метаданных — {len(removed_meta)}."
+    if removed_from_failover:
+        msg += f" Из резервной цепочки убрано: {len(removed_from_failover)}."
+    return {"ok": True, "removed": removed_outbounds, "removed_meta": removed_meta,
+            "removed_from_failover": removed_from_failover, "stdout": msg}
+
+
+def keenetic_find_orphan_sub_meta(outbounds=None, subs=None):
+    """Найти осиротевшие записи subscription_meta — те, для которых не осталось ни
+    одного живого vless-outbound'а (накапливаются при смене адреса подписки).
+    Возвращает list[{key, name, expires_at, note, kind}]."""
+    if outbounds is None:
+        outbounds = keenetic_get_outbounds() or []
+    if subs is None:
+        subs = keenetic_read_sub_meta() or {}
+    live_sub_urls = {(o.get("sub_url") or "").strip() for o in outbounds
+                     if o.get("protocol") == "vless" and (o.get("sub_url") or "").strip()}
+    live_pbks = {o.get("pbk") for o in outbounds
+                 if o.get("protocol") == "vless" and o.get("pbk")}
+    orphans = []
+    for k, v in subs.items():
+        if not isinstance(v, dict):
+            continue
+        is_url = k.startswith(("http://", "https://"))
+        sub_url = (v.get("sub_url") or "").strip()
+        if is_url:
+            alive = k in live_sub_urls
+        elif sub_url:
+            alive = sub_url in live_sub_urls   # pbk-тень живой подписки
+        else:
+            # Запись pbk-группы: жива, если есть outbound с этим pbk. NB: если две
+            # подписки делят один Reality pbk (общий шаблон), осиротевшую запись одной
+            # из них не вычистим, пока жива другая — fail-safe (лишнего НЕ удалим).
+            alive = k in live_pbks
+        if not alive:
+            orphans.append({"key": k, "name": v.get("name", ""),
+                            "expires_at": v.get("expires_at", ""), "note": v.get("note", ""),
+                            "kind": "url" if is_url else ("shadow" if sub_url else "pbk")})
+    return orphans
+
+
+def keenetic_purge_orphan_sub_meta(dry_run=False):
+    """Удалить ВСЕ осиротевшие записи subscription_meta одной перезаписью (с бэкапом).
+    Outbound'ы не трогает (у орфанов их нет). dry_run=True — только вернуть список."""
+    outbounds = keenetic_get_outbounds()
+    if outbounds is None:
+        return {"ok": False, "stderr": "не удалось прочитать outbound'ы с роутера"}
+    subs = keenetic_read_sub_meta() or {}
+    orphans = keenetic_find_orphan_sub_meta(outbounds, subs)
+    keys = [o["key"] for o in orphans]
+    if dry_run:
+        return {"ok": True, "dry_run": True, "orphans": orphans}
+    if not keys:
+        return {"ok": True, "removed_meta": [], "stdout": "Осиротевших записей подписок нет."}
+    new_subs = {k: v for k, v in subs.items() if k not in set(keys)}
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    bak = keenetic_ssh(f"if [ -f {KEENETIC_SUB_META_FILE} ]; then cp {KEENETIC_SUB_META_FILE} {KEENETIC_SUB_META_FILE}.bak-{ts} && echo BAKOK || echo BAKFAIL; else echo NOFILE; fi")
+    if (not bak.get("ok")) or "BAKFAIL" in (bak.get("stdout") or ""):
+        return {"ok": False, "stderr": "не удалось создать бэкап subscription_meta.json — чистка отменена"}
+    if keenetic_write_sub_meta(new_subs):
+        return {"ok": True, "removed_meta": keys, "orphans": orphans,
+                "stdout": f"Удалено осиротевших записей подписок: {len(keys)}."}
+    return {"ok": False, "stderr": "не удалось записать subscription_meta.json"}
 
 
 def keenetic_add_outbound(payload, tag_override=None, overwrite=False):
@@ -3996,6 +4182,42 @@ def api_xkeen_sub_meta():
         "stderr": "" if ok else "write failed",
         "synced_pbks_count": len(synced),
     })
+
+
+@app.route("/api/xkeen/remove-subscription", methods=["POST"])
+@requires_auth
+def api_xkeen_remove_subscription():
+    """Удалить подписку целиком по canonical-ключу группы (sub_url или pbk):
+    серверы + записи subscription_meta. Защита активных ролей — в helper'е."""
+    key = request.form.get("key", "").strip()
+    if not key:
+        return jsonify({"ok": False, "stderr": "ключ подписки не передан"})
+    result = keenetic_remove_subscription(key)
+    for tg in result.get("removed", []) or []:
+        _OUTBOUND_STATUS_CACHE.pop(tg, None)
+    if result.get("removed"):
+        sync = _auto_sync_template_ips_silent()
+        if sync.get("changed"):
+            result["auto_sync"] = f"🔁 Template auto-sync: +{len(sync.get('added', []))} / −{len(sync.get('removed', []))} IP (watchdog подхватит ≤1 мин)"
+    return jsonify(result)
+
+
+@app.route("/api/xkeen/orphan-sub-meta")
+@requires_auth
+def api_xkeen_orphan_sub_meta():
+    """Список осиротевших записей subscription_meta (нет живых outbound'ов)."""
+    try:
+        orphans = keenetic_find_orphan_sub_meta()
+    except Exception as ex:
+        return jsonify({"ok": False, "stderr": str(ex), "orphans": [], "count": 0})
+    return jsonify({"ok": True, "orphans": orphans, "count": len(orphans)})
+
+
+@app.route("/api/xkeen/remove-orphan-sub-meta", methods=["POST"])
+@requires_auth
+def api_xkeen_remove_orphan_sub_meta():
+    """Подчистить ВСЕ осиротевшие записи subscription_meta одной перезаписью."""
+    return jsonify(keenetic_purge_orphan_sub_meta())
 
 
 @app.route("/api/xkeen/watchdog/<mode>", methods=["POST"])
@@ -10710,6 +10932,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     Outbound'ы сгруппированы по <strong>publicKey + SNI</strong> (Reality identity) — это значит «одна подписка от одного провайдера». Имя группы берётся из meta-поля «Провайдер» (если задано) или из общего префикса tag (например, provider-a-de1, provider-a-nl → группа «Provider A»). Сворачивай неинтересные группы ▶ чтобы не загромождать.<br>
     <strong>Проверить связь</strong> — кнопка «🏓 Пинг» внутри каждой группы: TCP+TLS-probe до каждого сервера группы с дашборда, бейджи появляются в колонке «статус». Один probe покрывает все группы (кэш 60&nbsp;сек).
   </p>
+  <div id="orphan-sub-meta-box" style="display:none;"></div>
   {% for group in outbound_groups %}
   <details data-group-key="{{ group.key }}" data-group-name="{{ group.name }}" style="margin-bottom: 14px; border: 1px solid #e0e0e0; border-radius: 6px; padding: 8px 12px; {% if group.any_active %}background: #f7fbf3;{% endif %}">
     <summary style="cursor: pointer; font-weight: 600; padding: 4px 0;">
@@ -10764,6 +10987,12 @@ XKEEN_TEMPLATE = r"""<!doctype html>
               data-custom-name="{{ group.custom_name or '' }}"
               onclick="editSubMetaFromBtn(this)"
               title="Редактировать название, примечание, дату истечения и Subscription URL">✏️ Подписка</button>
+      <button class="btn btn-sm" style="padding:1px 8px; font-size:0.8em; background:#fbeaea; color:#b33; border:1px solid #e2b3b3;"
+              data-key="{{ group.pbk }}"
+              data-name="{{ group.name }}"
+              data-count="{{ group.count }}"
+              onclick="removeSubscriptionFromBtn(this)"
+              title="Удалить эту подписку целиком: все её серверы + сохранённые название/дату/URL и связанные записи. Активные узлы (PRIMARY/резерв/AI/YouTube/Зарубежные/IPv6) защищены — операция откажет, пока роль не снята.">🗑 Удалить подписку</button>
     </div>
     {% endif %}
     {% if group.key != 'service' %}
@@ -15400,6 +15629,81 @@ async function bulkRemoveSelected(btn) {
     flash(false, 'Ошибка bulk-удаления', res.stderr || JSON.stringify(res));
   }
 }
+
+// Удалить подписку целиком (серверы + записи subscription_meta). Кнопка «🗑 Удалить подписку»
+// в шапке группы. Fail-closed на сервере: активные узлы защищены, операция вернёт blocked.
+function removeSubscriptionFromBtn(btn) {
+  removeSubscription(btn.dataset.key, btn.dataset.name, parseInt(btn.dataset.count) || 0);
+}
+
+async function removeSubscription(key, name, count) {
+  if (!key) return;
+  if (!confirm(
+    `Удалить подписку «${name}» целиком?\n\n` +
+    `Будут удалены все её серверы (${count}) и сохранённые данные подписки ` +
+    `(название, дата истечения, URL). Её серверы из резервной цепочки FAILOVER ` +
+    `будут авто-убраны из неё.\n\n` +
+    `Защита: если сервер подписки сейчас в активной роли ` +
+    `(PRIMARY / AI / YouTube / Зарубежные / IPv6 / голова резерва) — операция откажет.\n\n` +
+    `Бэкапы 04_outbounds.json и subscription_meta.json сохранятся на роутере.`
+  )) return;
+  flash(true, `🗑 Удаляю подписку «${name}»...`);
+  const fd = new FormData();
+  fd.append('key', key);
+  const res = await apiCall('/api/xkeen/remove-subscription', fd);
+  if (res.ok) {
+    const ro = (res.removed || []).length, rm = (res.removed_meta || []).length;
+    flash(true, `Подписка «${name}» удалена`, res.stdout || `серверов: ${ro}, записей: ${rm}`);
+    setTimeout(() => location.reload(), 1800);
+  } else if (res.blocked) {
+    const lst = Object.entries(res.protected || {}).map(([t, r]) => `  • ${t} — ${r}`).join('\n');
+    flash(false, 'Подписка не удалена — есть активные узлы',
+      `Снимите роль / уберите из цепочки резерва, затем повторите:\n\n${lst}`);
+  } else {
+    flash(false, 'Ошибка удаления подписки', res.stderr || JSON.stringify(res));
+  }
+}
+
+// Авто-детект и чистка осиротевших записей subscription_meta (без живых серверов).
+async function loadOrphanSubMeta() {
+  const box = document.getElementById('orphan-sub-meta-box');
+  if (!box) return;
+  let res;
+  try { res = await (await fetch('/api/xkeen/orphan-sub-meta')).json(); } catch (e) { return; }
+  if (!res || !res.ok || !res.count) { box.style.display = 'none'; return; }
+  const esc = s => (s || '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  const rows = res.orphans.map(o => {
+    const nm = esc(o.name) || '(без имени)';
+    const exp = o.expires_at ? ` · ⏰ ${esc(o.expires_at)}` : '';
+    const kind = o.kind === 'url' ? 'URL' : (o.kind === 'shadow' ? 'тень pbk' : 'pbk');
+    return `  • ${nm} <span style="color:#888;">[${kind}]${exp}</span>`;
+  }).join('<br>');
+  box.innerHTML =
+    `<div style="margin:0 0 12px; padding:8px 12px; background:#fff8e6; border:1px solid #e6cf8a; border-radius:6px; font-size:0.88em;">` +
+      `<strong style="color:#8a6d1a;">🧹 Осиротевшие записи подписок: ${res.count}</strong>` +
+      `<div style="color:#666; margin:4px 0 8px;">Метаданные подписок, у которых не осталось ни одного сервера (остаются при смене адреса подписки у провайдера). Безвредны, но засоряют список и могут давать ложный алерт об истечении.</div>` +
+      `<div style="margin:6px 0; line-height:1.6;">${rows}</div>` +
+      `<button class="btn btn-sm" style="background:#8a6d1a; color:#fff; padding:3px 12px;" onclick="purgeOrphanSubMeta(this)">🧹 Убрать осиротевшие (${res.count})</button>` +
+    `</div>`;
+  box.style.display = 'block';
+}
+
+async function purgeOrphanSubMeta(btn) {
+  if (!confirm('Убрать все осиротевшие записи подписок?\n\nУдаляются только метаданные (серверов у них нет). Бэкап subscription_meta.json сохранится на роутере.')) return;
+  btn.disabled = true;
+  flash(true, '🧹 Чищу осиротевшие записи...');
+  const res = await apiCall('/api/xkeen/remove-orphan-sub-meta', new FormData());
+  if (res.ok) {
+    flash(true, `Убрано записей: ${(res.removed_meta || []).length}`, res.stdout || '');
+    setTimeout(() => location.reload(), 1500);
+  } else {
+    btn.disabled = false;
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', loadOrphanSubMeta);
+else loadOrphanSubMeta();
 
 // Массово добавить выделенные outbound'ы в цепочку резерва (FAILOVER).
 // Берём текущую цепочку (отмеченные строки таблицы цепочки, в порядке) + выделенные (дедуп) → set-failover-chain.
