@@ -23,6 +23,10 @@ backups/
 .DS_Store
 Thumbs.db
 desktop.ini
+# Windows reserved-name артефакт: git-bash ssh c "UserKnownHostsFile=NUL" создаёт
+# реальный файл ./NUL в рабочей папке (на Windows-ssh.exe NUL — это null-устройство).
+# Игнорируем, чтобы он не попал в коммит при git add -A.
+NUL
 
 # Сертификаты, ключи (на случай если кто-то положит)
 *.pem
