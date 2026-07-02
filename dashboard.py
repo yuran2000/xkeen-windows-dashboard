@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.94"
+_VERSION_FALLBACK = "1.0.95"
 
 
 def _find_git():
@@ -1355,24 +1355,20 @@ def api_wg_disconnect():
     p, err = _wg_resolve_params((data.get("iface_id") or "").strip())
     if err:
         return jsonify({"ok": False, "error": err})
-    kernel = p["kernel"]; subnet = p["subnet"]; lan_ip = p["lan_ip"]; dnsp = p["dns_port"]; mss = p["mss"]
+    kernel = p["kernel"]; subnet = p["subnet"]
     path = f"/opt/etc/ndm/netfilter.d/zz_wg_xray_{kernel}.sh"
+    # ВСЕ правила интерфейса снимаем по ФАКТУ (grep '-i {kernel} ' → -D), а не по
+    # пересчитанным значениям dns-порта / MSS / lan_ip: они могли дрейфовать с момента
+    # connect (сменился MTU/DNS-порт роутера) → value-specific -D промахнулся бы и оставил
+    # осиротевшие правила. Тот же by-fact подход, что и в очистке осиротевших хуков.
     dels = [
-        f"iptables -w -t nat -D PREROUTING -i {kernel} -p tcp -j xkeen 2>/dev/null",
-        f"iptables -w -t mangle -D PREROUTING -i {kernel} -p udp -j xkeen 2>/dev/null",
-        f"iptables -w -t mangle -D PREROUTING -i {kernel} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss} 2>/dev/null",
-        f"iptables -w -t mangle -D PREROUTING -i {kernel} -p udp --dport 53 -j RETURN 2>/dev/null",
-        f"iptables -w -t nat -D PREROUTING -i {kernel} -p udp --dport 53 -j REDIRECT --to-ports {dnsp} 2>/dev/null",
-        f"iptables -w -t nat -D PREROUTING -i {kernel} -p tcp --dport 53 -j REDIRECT --to-ports {dnsp} 2>/dev/null",
-        f"iptables -w -t nat -D INPUT -i {kernel} -s {subnet} -p udp --dport {dnsp} -j SNAT --to-source {lan_ip} 2>/dev/null",
-        f"iptables -w -t nat -D INPUT -i {kernel} -s {subnet} -p tcp --dport {dnsp} -j SNAT --to-source {lan_ip} 2>/dev/null",
         f"rm -f {path}",
         f"crontab -l 2>/dev/null | grep -vF '{path}' | crontab -",
+        f"for T in nat mangle; do iptables -w -t $T -S PREROUTING 2>/dev/null | grep -- '-i {kernel} ' | sed 's|^-A |-D |' | while read _r; do iptables -w -t $T $_r 2>/dev/null; done; done",
+        f"iptables -w -t nat -S INPUT 2>/dev/null | grep -- '-i {kernel} ' | sed 's|^-A |-D |' | while read _r; do iptables -w -t nat $_r 2>/dev/null; done",
+        # masquerade подсети — тоже по факту (lan_net/lan_if могли дрейфовать или не зарезолвиться).
+        f"iptables -w -t nat -S POSTROUTING 2>/dev/null | grep -- '-s {subnet} ' | grep -- '-j MASQUERADE' | sed 's|^-A |-D |' | while read _r; do iptables -w -t nat $_r 2>/dev/null; done",
     ]
-    # masquerade снимаем устойчиво — по ФАКТУ стоящих правил с этим -s {subnet} (значения
-    # lan_net/lan_if могли дрейфовать с момента connect или не зарезолвиться при disconnect),
-    # а не по пересчитанным значениям: иначе -D промахнётся и SNAT повиснет осиротевшим.
-    dels.insert(0, f"iptables -w -t nat -S POSTROUTING 2>/dev/null | grep -- '-s {subnet} ' | grep -- '-j MASQUERADE' | sed 's/^-A /-D /' | while read _r; do iptables -w -t nat $_r 2>/dev/null; done")
     cmd = "; ".join(dels) + f"; iptables -t nat -S PREROUTING | grep -q -- '-i {kernel} -p tcp -j xkeen' && echo WG_STILL || echo WG_GONE"
     r = keenetic_ssh(cmd, timeout=30)
     if "WG_GONE" in (r.get("stdout") or ""):
@@ -1453,8 +1449,26 @@ def api_wg_new_client():
     if not info.get("ok"):
         return jsonify({"ok": False, "error": info.get("error") or "не удалось прочитать WG с роутера"})
     import ipaddress
-    subnet_cidr, server_ip, client_ip, port = _wg_pick_free_subnet_and_port(info.get("interfaces"))
+    ifaces = info.get("interfaces") or []
+    subnet_cidr, server_ip, client_ip, port = _wg_pick_free_subnet_and_port(ifaces)
     prefix = 24
+    # Существующие WG-подсети и порты — чтобы ручной override не пересёкся с ними
+    # (иначе новый интерфейс конфликтует по адресации/порту и молча не поднимается).
+    _existing_nets = []
+    _used_ports = set()
+    for _i in ifaces:
+        _sc = _i.get("subnet_cidr")
+        if _sc:
+            try:
+                _existing_nets.append(ipaddress.ip_network(_sc, strict=False))
+            except Exception:
+                pass
+        try:
+            _lp = int(_i.get("listen_port") or 0)
+            if _lp:
+                _used_ports.add(_lp)
+        except Exception:
+            pass
     ov_subnet = (data.get("subnet") or "").strip()
     ov_port = str(data.get("listen_port") or "").strip()
     if ov_subnet:
@@ -1465,10 +1479,17 @@ def api_wg_new_client():
         hosts = list(net.hosts())
         if len(hosts) < 2:
             return jsonify({"ok": False, "error": f"подсеть {ov_subnet} мала — нужно ≥2 адресов (сервер .1 + клиент .2)"})
+        _clash = next((str(e) for e in _existing_nets if net.overlaps(e)), None)
+        if _clash:
+            return jsonify({"ok": False, "error": f"подсеть {ov_subnet} пересекается с уже существующей WG-подсетью {_clash} — выбери другую."})
         subnet_cidr, server_ip, client_ip, prefix = str(net), str(hosts[0]), str(hosts[1]), net.prefixlen
     elif subnet_cidr is None:
         return jsonify({"ok": False, "error": "не нашлось свободной /24-подсети (172.173.x / 10.10.x заняты) — задай подсеть вручную полем"})
-    if ov_port.isdigit():
+    if ov_port:
+        if not ov_port.isdigit() or not (1 <= int(ov_port) <= 65535):
+            return jsonify({"ok": False, "error": f"неверный порт: {ov_port} (нужно число 1–65535)"})
+        if int(ov_port) in _used_ports:
+            return jsonify({"ok": False, "error": f"порт {ov_port} уже занят другим WG-интерфейсом — выбери другой."})
         port = int(ov_port)
     endpoint_host = (data.get("endpoint_host") or "").strip() or info.get("wan_host") or "<endpoint-host>"
     endpoint_warn = None
@@ -2506,21 +2527,47 @@ def _parse_watchdog_config(raw):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        m = re.match(r'^(\w+)\s*=\s*"?([^"]*)"?\s*$', line)
+        # Значения пишутся как KEY="..." с _esc-экранированием (\ " $ `). Читаем
+        # весь квотированный кусок и разэкранируем — старый регекс [^"]* обрывал
+        # значение на первой же экранированной кавычке (потеря/искажение при обратном чтении).
+        m = re.match(r'^(\w+)\s*=\s*"(.*)"\s*$', line)
         if m:
-            out[m.group(1)] = m.group(2)
+            out[m.group(1)] = re.sub(r'\\([\\"$`])', r'\1', m.group(2))
+            continue
+        # Fallback: значение без кавычек (legacy / ручная правка).
+        m2 = re.match(r'^(\w+)\s*=\s*(.*?)\s*$', line)
+        if m2:
+            out[m2.group(1)] = m2.group(2)
     return out
 
 
 def keenetic_read_watchdog_config():
-    """Читает /opt/etc/xray/watchdog.config с роутера."""
-    raw = keenetic_read_file("/opt/etc/xray/watchdog.config")
-    return _parse_watchdog_config(raw)
+    """Читает /opt/etc/xray/watchdog.config с роутера.
+
+    Возвращает: dict — файл прочитан (пустой dict = файла ещё нет, легитимно на
+    чистом роутере до первого «Сохранить»); None — чтение НЕ УДАЛОСЬ (SSH-сбой/
+    таймаут). Спутать None с {} = fail-open: удаление «защищённого» активного
+    outbound'а или перезапись конфига дефолтами с потерей доменов/TG-токена."""
+    r = keenetic_ssh("if [ -f /opt/etc/xray/watchdog.config ]; then cat /opt/etc/xray/watchdog.config; else echo __WDCFG_ABSENT__; fi")
+    if not r["ok"]:
+        return None
+    if "__WDCFG_ABSENT__" in (r["stdout"] or ""):
+        return {}
+    return _parse_watchdog_config(r["stdout"])
 
 
-def keenetic_get_watchdog_targets():
-    """Возвращает все поля из watchdog.config для UI: PRIMARY/FAILOVER/AI/DIRECT."""
+def keenetic_get_watchdog_targets(strict=False):
+    """Возвращает все поля из watchdog.config для UI: PRIMARY/FAILOVER/AI/DIRECT.
+
+    strict=True — вернуть None, если конфиг не прочитался (SSH-сбой): обязателен
+    в точках УДАЛЕНИЯ (fail-closed), где сбой чтения нельзя путать с «ролей нет».
+    strict=False (default) — сбой чтения даёт все роли None: годится только для
+    отображения, НЕ для решений об удалении."""
     cfg_d = keenetic_read_watchdog_config()
+    if cfg_d is None:
+        if strict:
+            return None
+        cfg_d = {}
     failover_str = cfg_d.get("FAILOVER_TAGS", "")
     failover_list = [t.strip() for t in re.split(r"[,\s]+", failover_str) if t.strip()]
     ai_domains_str = cfg_d.get("AI_DOMAINS", "")
@@ -2702,6 +2749,10 @@ def keenetic_write_watchdog_config(updates):
     with _WATCHDOG_CFG_LOCK:
         _wd_sync = keenetic_ensure_watchdog_current()
         cur = keenetic_read_watchdog_config()
+        if cur is None:
+            # Fail-closed: сбой чтения ≠ пустой конфиг. Продолжить = записать
+            # дефолты+updates и потерять домены каналов / TG-токен / пороги.
+            return {"ok": False, "stderr": "watchdog.config не прочитался с роутера (SSH-сбой/таймаут) — запись отменена, чтобы не затереть текущие настройки. Повтори позже."}
         # Defaults если первый раз
         if "PRIMARY_TAG" not in cur: cur["PRIMARY_TAG"] = "vless-reality"
         if "FAILOVER_TAGS" not in cur: cur["FAILOVER_TAGS"] = "provider-a-nl"
@@ -2768,7 +2819,24 @@ def keenetic_set_watchdog_target(role, new_tag):
     """
     if role not in ("primary", "failover", "ai", "yt", "foreign", "ipv6"):
         return {"ok": False, "stderr": "invalid role"}
+    # Валидируем целевой tag: назначение роли на несуществующий/опечатанный outbound
+    # заставит watchdog регенерить routing на отсутствующий outboundTag → xray не стартует.
+    # Пустой tag допустим только для «отключаемых» каналов (ai/yt/foreign/ipv6).
+    _CLEARABLE = {"ai": "AI_TAG", "yt": "YT_TAG", "foreign": "FOREIGN_TAG", "ipv6": "IPV6_TAG"}
+    new_tag = (new_tag or "").strip()
+    if not new_tag:
+        if role in _CLEARABLE:
+            return keenetic_write_watchdog_config({_CLEARABLE[role]: ""})
+        return {"ok": False, "stderr": "не передан целевой outbound"}
+    _obs = keenetic_get_outbounds()
+    if _obs is None:
+        return {"ok": False, "stderr": "не удалось прочитать outbound'ы с роутера — смена роли отменена. Повтори позже."}
+    _valid = {o.get("tag") for o in _obs}
+    if new_tag not in _valid:
+        return {"ok": False, "stderr": f"outbound '{new_tag}' не найден среди серверов на роутере — обнови страницу (возможно список устарел) и выбери существующий."}
     cur = keenetic_read_watchdog_config()
+    if cur is None:
+        return {"ok": False, "stderr": "watchdog.config не прочитался с роутера — смена роли отменена (иначе можно потерять текущую резервную цепочку). Повтори позже."}
     failover_str = cur.get("FAILOVER_TAGS", "")
     failover_list = [t.strip() for t in re.split(r"[,\s]+", failover_str) if t.strip()]
 
@@ -2823,8 +2891,11 @@ def keenetic_remove_outbound(tag):
     Удаление активного outbound сломало бы routing — xray не стартанул бы."""
     if tag in ("direct", "block"):
         return {"ok": False, "stderr": f"tag '{tag}' — служебный, не удаляется"}
-    # Проверяем активные роли
-    targets = keenetic_get_watchdog_targets()
+    # Проверяем активные роли. strict: сбой чтения watchdog.config НЕ считается
+    # «ролей нет» — иначе удаление активного PRIMARY прошло бы без блокировки (fail-open).
+    targets = keenetic_get_watchdog_targets(strict=True)
+    if targets is None:
+        return {"ok": False, "stderr": "не удалось прочитать watchdog.config — удаление отменено (защита активных ролей, fail-closed). Повтори позже."}
     if tag == targets.get("primary_tag"):
         return {"ok": False, "stderr": f"tag '{tag}' сейчас PRIMARY. Сначала смени PRIMARY на другой outbound."}
     if tag == targets.get("ai_tag"):
@@ -2833,6 +2904,8 @@ def keenetic_remove_outbound(tag):
         return {"ok": False, "stderr": f"tag '{tag}' сейчас YouTube-sticky. Сначала смени YouTube на другой outbound."}
     if tag == targets.get("foreign_tag"):
         return {"ok": False, "stderr": f"tag '{tag}' сейчас канал «Зарубежные сервисы». Сначала смени его на другой outbound."}
+    if tag == targets.get("ipv6_tag"):
+        return {"ok": False, "stderr": f"tag '{tag}' сейчас канал «Через IPv6». Сначала смени его на другой outbound."}
     if tag in (targets.get("failover_tags") or []):
         return {"ok": False, "stderr": f"tag '{tag}' в списке FAILOVER. Сначала убери его оттуда (смени FAILOVER на другой)."}
     raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
@@ -2874,7 +2947,9 @@ def keenetic_remove_outbounds_bulk(tags):
     tags = [t for t in (tags or []) if t]
     if not tags:
         return {"ok": False, "stderr": "пустой список tags"}
-    targets = keenetic_get_watchdog_targets()
+    targets = keenetic_get_watchdog_targets(strict=True)
+    if targets is None:
+        return {"ok": False, "stderr": "не удалось прочитать watchdog.config — удаление отменено (защита активных ролей, fail-closed). Повтори позже."}
     primary = targets.get("primary_tag")
     ai = targets.get("ai_tag")
     yt = targets.get("yt_tag")
@@ -3008,7 +3083,9 @@ def keenetic_remove_subscription(key, dry_run=False):
     outbounds = keenetic_get_outbounds()
     if outbounds is None:
         return {"ok": False, "stderr": "не удалось прочитать outbound'ы с роутера"}
-    targets = keenetic_get_watchdog_targets() or {}
+    targets = keenetic_get_watchdog_targets(strict=True)
+    if targets is None:
+        return {"ok": False, "stderr": "не удалось прочитать watchdog.config — удаление подписки отменено (защита активных ролей, fail-closed). Повтори позже."}
     subs = keenetic_read_sub_meta() or {}
     plan = _subscription_removal_plan(key, outbounds, targets, subs)
     if plan["critical"]:
@@ -3540,8 +3617,14 @@ def xkeen_page():
             "current_default": None,
             "effective_ai": None,
             "effective_yt": None,
+            "effective_foreign": None,
             "last_bad_md5": None,
         }
+        # ВАЖНО: набор ключей ДОЛЖЕН 1:1 совпадать с keenetic_get_watchdog_targets() —
+        # шаблон итерирует targets.foreign_domains / targets.ipv6_domains ({% for %}),
+        # а обход Undefined в Jinja бросает UndefinedError → 500 (страница «роутер
+        # недоступен» вместо приветственного баннера). При добавлении новой роли в
+        # get_watchdog_targets — добавь ключ и сюда.
         targets = {
             "primary_tag": None,
             "failover_tag": None,
@@ -3555,6 +3638,13 @@ def xkeen_page():
             "yt_domains": [],
             "yt_ext_categories": "",
             "yt_geoip_categories": "",
+            "foreign_tag": None,
+            "foreign_domains": [],
+            "foreign_ext_categories": "",
+            "foreign_geoip_categories": "",
+            "foreign_fail_block": None,
+            "ipv6_tag": None,
+            "ipv6_domains": [],
             "direct_domains": [],
             "block_domains": [],
             "force_mode": "auto",
@@ -3587,10 +3677,13 @@ def xkeen_page():
         if cached and (now_epoch - cached["ts"]) < _OUTBOUND_STATUS_TTL:
             statuses[tag] = cached
     # Ключевые слова для эвристики «anti-DPI / DPI-обход маскировкой».
-    # ВАЖНО: чисто-RU keyword'ы (🇷🇺, россия, ростелеком/мтс/билайн/мегафон/теле2) НЕ относятся
-    # к anti-DPI — это просто RU-exit, помечается отдельным is_ru. Обход = либо SNI≠host
-    # (реальная маскировка), либо явные «обход / антиглушилк / whitelist / тспу / ркн».
-    # Синхронизировано с api_xkeen_subscription_preview() — при добавлении правь оба места.
+    # ВАЖНО: на ЭТОЙ странице anti-DPI и RU-exit РАЗДЕЛЕНЫ намеренно: чисто-RU маркеры
+    # (🇷🇺, россия, ростелеком/мтс/билайн/мегафон/теле2, lte) идут в отдельный is_ru (_RU_KW
+    # ниже), а не сюда. Обход = либо SNI≠host (реальная маскировка), либо явные слова ниже.
+    # AI-риск в шаблоне = is_anti_dpi OR is_ru — оба ветвятся к предупреждению.
+    # NB: api_xkeen_subscription_preview использует ОДИН объединённый список (_ANTI_DPI_KEYWORDS,
+    # там RU-маркеры тоже помечены как anti-DPI) — это осознанно разные представления, НЕ
+    # копия друг друга; при правке одного второе править НЕ обязательно.
     _ANTI_DPI_KW = (
         "обход", "антиглушилк", "анти-глушилк", "antidpi", "anti-dpi",
         "белые списки", "белый список", "whitelist",
@@ -3660,11 +3753,17 @@ def xkeen_page():
         except OSError:
             pass
         if host in _ip_cache: return _ip_cache[host]
+        # setdefaulttimeout мутирует ГЛОБАЛЬНЫЙ default для всех сокетов процесса.
+        # Раньше он выставлялся в 1.5 и НЕ восстанавливался → навсегда ломал таймауты
+        # других операций (probe/requests). Ставим на время lookup и возвращаем прежний.
+        _prev_to = _socket.getdefaulttimeout()
         try:
             _socket.setdefaulttimeout(1.5)
             ip = _socket.gethostbyname(host)
         except Exception:
             ip = ""
+        finally:
+            _socket.setdefaulttimeout(_prev_to)
         _ip_cache[host] = ip
         return ip
     vless_meta = {
@@ -3911,6 +4010,7 @@ def xkeen_page():
         "россия", "russia",
         "ростелеком", "rostelecom",
         "мтс", "билайн", "beeline", "мегафон", "megafon", "теле2", "tele2",
+        "lte",  # RU-мобильный exit (Provider C «LTE») — RU-IP: ок для YT, опасно для AI. Паритет с preview.
     )
     vless_options = []
     # Виртуальная опция «🌐 Напрямую без VPN» — выбирает встроенный freedom-outbound
@@ -4744,6 +4844,30 @@ def _normalize_outbound_tag(t):
     return n.strip("_-")
 
 
+def _uniquify_parsed_tags(parsed):
+    """Разводит коллизии тегов внутри одной подписки. Два РАЗНЫХ сервера с одинаковым
+    именем (особенно после _normalize_outbound_tag: «Токио ⚡» и «Токио (2)» → «Токио»)
+    молча схлопывались «последний перезатирает первого» — сервер терялся. Полный дубль
+    (тот же host:port+pbk+uuid) отбрасываем; разным серверам — суффикс _2, _3...
+    Используется И в preview, И в sync — теги обязаны совпадать между ними."""
+    seen = {}
+    out = []
+    for p in parsed:
+        tag = p["tag"]
+        ident = (p.get("host"), p.get("port"), p.get("pbk") or "", p.get("uuid") or "")
+        if tag in seen:
+            if seen[tag] == ident:
+                continue
+            n = 2
+            while f"{tag}_{n}" in seen:
+                n += 1
+            tag = f"{tag}_{n}"
+            p = {**p, "tag": tag}
+        seen[tag] = ident
+        out.append(p)
+    return out
+
+
 def _parse_vless_url_dict(url):
     """vless URL → dict с полями. None если не парсится."""
     from urllib.parse import urlparse, parse_qs, unquote
@@ -4751,12 +4875,13 @@ def _parse_vless_url_dict(url):
         u = urlparse(url.strip())
         if "@" not in u.netloc:
             return None
-        uuid_part, host_part = u.netloc.split("@", 1)
-        if ":" in host_part:
-            host, port_str = host_part.rsplit(":", 1)
-            port = int(port_str)
-        else:
-            host, port = host_part, 443
+        uuid_part = u.netloc.split("@", 1)[0]
+        # hostname/port вместо ручного rsplit(':'): IPv6-литерал ([2001:db8::1]:443)
+        # rsplit резал по последнему двоеточию АДРЕСА — парсинг падал в None.
+        host = u.hostname or ""
+        port = u.port or 443
+        if not host:
+            return None
         q = parse_qs(u.query)
         def g(k, d=None):
             v = q.get(k, [d])
@@ -4797,6 +4922,7 @@ def api_xkeen_subscription_preview():
         p = _parse_vless_url_dict(url)
         if p and p.get("tag"):
             parsed.append(p)
+    parsed = _uniquify_parsed_tags(parsed)
 
     # Текущие outbound'ы на роутере (strip //-комментариев — XKeen в свежем файле их кладёт)
     raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
@@ -4949,8 +5075,13 @@ def api_xkeen_subscription_preview():
     # из подписки) ИЛИ pbk (для legacy не-sync импортов).
     expire_conflicts = []
     new_expire = sub_info.get("expire_at", "")
-    if new_expire:
+    # Читаем sub_meta ОДИН раз на запрос (ниже используется ещё для existing_name) —
+    # раньше было два отдельных SSH-чтения одного файла в одном preview.
+    try:
         existing_sub_meta = keenetic_read_sub_meta()
+    except Exception:
+        existing_sub_meta = {}
+    if new_expire:
         # Этот sync будет писать в sub_meta по ключу sub_url, поэтому проверяем
         # сначала его, а потом fallback по pbk (если у старых записей он ключ).
         candidate_keys = {sub_url}
@@ -4976,10 +5107,9 @@ def api_xkeen_subscription_preview():
     # Имя подписки из Profile-Title header (Provider D шлёт "Provider C" в base64).
     # Покажем юзеру в preview какое имя автоматически подтянется при sync.
     profile_title = _parse_profile_title(headers)
-    # Старое имя для сравнения — лежит в sub_meta под ключом sub_url
+    # Старое имя для сравнения — лежит в sub_meta под ключом sub_url (уже прочитан выше)
     existing_name = ""
     try:
-        existing_sub_meta = keenetic_read_sub_meta()
         existing_name = (existing_sub_meta.get(sub_url, {}).get("name") or "").strip()
     except Exception:
         pass
@@ -5077,11 +5207,14 @@ def api_xkeen_subscription_sync():
     # Заполняем поле `name` в sub_meta только если у группы его ещё нет — не затираем юзерский custom.
     profile_title = _parse_profile_title(headers)
 
-    parsed_by_tag = {}
+    _parsed_list = []
     for url in vless_lines:
         p = _parse_vless_url_dict(url)
         if p and p.get("tag"):
-            parsed_by_tag[p["tag"]] = p
+            _parsed_list.append(p)
+    # Коллизии тегов разводим тем же helper'ом что и preview — иначе два разных
+    # сервера с одним именем молча схлопывались (последний перезатирал первого).
+    parsed_by_tag = {p["tag"]: p for p in _uniquify_parsed_tags(_parsed_list)}
 
     if not parsed_by_tag:
         return jsonify({"ok": False, "stderr": "Не удалось распарсить ни один vless URL"})
@@ -5693,6 +5826,29 @@ def api_xkeen_restore():
     # SECURITY: разрешаем писать только в whitelist путей
     allowed = set(XKEEN_BACKUP_FILES)
     ts = _time.strftime('%Y%m%d-%H%M%S')
+
+    # ВАЛИДАЦИЯ ДО ЛЮБОЙ ЗАПИСИ: обрезанный/битый snapshot не должен попасть на роутер и
+    # уронить xray (для watchdog.sh обычный апгрейд делает sh -n — restore обязан тоже).
+    # JSON-конфиги проверяем локально; watchdog.sh — через `sh -n` на роутере. Любая ошибка
+    # → ничего не пишем (атомарность «всё или ничего»).
+    val_errors = []
+    for path, content in items:
+        if path not in allowed:
+            continue
+        base = os.path.basename(path)
+        if path.endswith(".json"):
+            try:
+                json.loads(_strip_json_comments(content or ""))
+            except Exception as ex:
+                val_errors.append(f"{base}: невалидный JSON ({str(ex)[:100]})")
+        elif path.endswith(".sh"):
+            chk = keenetic_ssh("sh -n", stdin_data=(content or ""), timeout=12)
+            if not chk["ok"]:
+                val_errors.append(f"{base}: не проходит проверку синтаксиса sh -n ({(chk.get('stderr') or '').strip()[:120]})")
+    if val_errors:
+        return jsonify({"ok": False, "stage": "validate",
+                        "stderr": "Snapshot НЕ применён — содержимое не прошло проверку (на роутере ничего не тронуто):\n• " + "\n• ".join(val_errors)})
+
     restored = []
     errors = []
     skipped = []
@@ -6021,9 +6177,12 @@ def api_xkeen_set_ipv6_domains():
     дошёл до xray; иначе IPv6-only сайт (нет A-записи) вообще не резолвится у клиента.
     Возвращаем текущий IPV6_TAG — фронт предупредит, если узел канала ещё не выбран."""
     cur = keenetic_read_watchdog_config()
+    if cur is None:
+        return jsonify({"ok": False, "stderr": "watchdog.config не прочитался с роутера — изменения канала «Через IPv6» отменены. Повтори позже."})
     old_domains = [d.strip() for d in re.split(r"[\s,]+", cur.get("IPV6_DOMAINS", "")) if d.strip()]
     action = (request.form.get("action") or "").strip()
     force_remove = set()
+    invalid = []
     if action == "add":
         one = (request.form.get("domain", "") or "").strip().lower().rstrip(".")
         if not _IPHOST_DOMAIN_RE.match(one):
@@ -6035,26 +6194,35 @@ def api_xkeen_set_ipv6_domains():
         force_remove = {one}  # снять fake-IP даже если домена уже не было в списке (осиротевший)
     else:
         raw = request.form.get("domains", "").strip()
-        domains = [d.strip() for d in re.split(r"[\s,]+", raw) if d.strip()]
+        parsed_all = [d.strip().lower().rstrip(".") for d in re.split(r"[\s,]+", raw) if d.strip()]
+        # Тот же фильтр что и в action=add: невалидный домен не попадает ни в config,
+        # ни в fake-IP (раньше писался в IPV6_DOMAINS, но fake-IP не получал — рассинхрон).
+        domains = [d for d in parsed_all if _IPHOST_DOMAIN_RE.match(d)]
+        invalid = [d for d in parsed_all if not _IPHOST_DOMAIN_RE.match(d)]
     res = keenetic_write_watchdog_config({"IPV6_DOMAINS": " ".join(domains)})
-    # fake-IP синхронизируется с членством в канале: ставим для текущих, снимаем для выбывших.
-    new_set = {d.lower().rstrip(".") for d in domains}
-    old_set = {d.lower().rstrip(".") for d in old_domains}
     set_hosts, removed_hosts, changed = [], [], False
-    for dd in new_set:
-        if _IPHOST_DOMAIN_RE.match(dd):
-            keenetic_ssh(f'ndmc -c "ip host {dd} {_FAKE_IP_FOR_V6ONLY}"', timeout=15)
-            set_hosts.append(dd); changed = True
-    for dd in ((old_set - new_set) | force_remove):
-        if dd and _IPHOST_DOMAIN_RE.match(dd):
-            keenetic_ssh(f'ndmc -c "no ip host {dd} {_FAKE_IP_FOR_V6ONLY}"', timeout=15)
-            removed_hosts.append(dd); changed = True
-    if changed:
-        keenetic_ssh('ndmc -c "system configuration save"', timeout=15)
+    if isinstance(res, dict) and res.get("ok"):
+        # fake-IP синхронизируется с членством в канале: ставим для текущих, снимаем для
+        # выбывших — но ТОЛЬКО после успешной записи config (иначе fake-IP стоит, а канала нет).
+        new_set = {d.lower().rstrip(".") for d in domains}
+        old_set = {d.lower().rstrip(".") for d in old_domains}
+        for dd in new_set:
+            if _IPHOST_DOMAIN_RE.match(dd):
+                keenetic_ssh(f'ndmc -c "ip host {dd} {_FAKE_IP_FOR_V6ONLY}"', timeout=15)
+                set_hosts.append(dd); changed = True
+        for dd in ((old_set - new_set) | force_remove):
+            if dd and _IPHOST_DOMAIN_RE.match(dd):
+                keenetic_ssh(f'ndmc -c "no ip host {dd} {_FAKE_IP_FOR_V6ONLY}"', timeout=15)
+                removed_hosts.append(dd); changed = True
+        if changed:
+            keenetic_ssh('ndmc -c "system configuration save"', timeout=15)
     if isinstance(res, dict):
         res["fake_ip_set"] = set_hosts
         res["fake_ip_removed"] = removed_hosts
         res["ipv6_tag"] = (cur.get("IPV6_TAG") or "").strip()
+        if invalid:
+            res["invalid_domains"] = invalid
+            res["stdout"] = (res.get("stdout") or "") + f" ⚠ Пропущены невалидные домены: {', '.join(invalid)}."
     return jsonify(res)
 
 
@@ -8899,12 +9067,8 @@ def api_xkeen_dat_categories():
     # Map категорий → описание из known-списка
     desc_by_name = {c["name"]: c["desc"] for c in V2FLY_KNOWN_CATEGORIES}
 
-    # Парсер JSON с комментариями — XKeen 05_routing.json начинается с // комментариями.
-    # Удаляем строки начинающиеся с //, потом стандартный json.loads.
-    import re as _re_local
-    def _strip_json_comments(text_):
-        return _re_local.sub(r'^\s*//.*$', '', text_, flags=_re_local.MULTILINE)
-
+    # JSON с //-комментариями (XKeen кладёт их в 05_routing.json) чистит глобальный
+    # _strip_json_comments — локальная копия была идентична, убрана.
     def _scan_rules_file(remote_path, source_label):
         """Читает routing-файл с роутера, находит rules с ext:... ссылками.
         Возвращает list of dicts: {full, dat, category, outbound_tag, source, rule_index}."""
@@ -14125,23 +14289,21 @@ function parseDomainsTextarea(value) {
   value.split(/\r?\n/).forEach(line => {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) return;
-    if (trimmed.includes('#')) {
-      // Строка с inline-комментарием: parse "domain  # note"
-      const m = trimmed.match(_DOMAIN_LINE_RE);
-      if (m && m[1] && !seen.has(m[1])) {
-        seen.add(m[1]);
-        result.push({ domain: m[1], note: (m[2] || '').trim() });
-      }
-    } else {
-      // Строка без `#`: может быть один домен или несколько через пробел/запятую (старый формат)
-      trimmed.split(/[\s,]+/).forEach(d => {
-        const dom = d.trim();
-        if (dom && !seen.has(dom)) {
-          seen.add(dom);
-          result.push({ domain: dom, note: '' });
-        }
-      });
-    }
+    // Отделяем inline-комментарий по ПЕРВОМУ '#'. Часть до '#' может быть одним доменом
+    // ИЛИ несколькими через пробел/запятую (старый формат) — разбиваем ВСЕГДА. Иначе:
+    //  • "a.com b.com # note" — старый regex не матчил всю строку → оба домена терялись;
+    //  • "a.com,b.com # note" — давал мусорный «домен» с запятой внутри.
+    const hashPos = trimmed.indexOf('#');
+    const domPart = (hashPos >= 0 ? trimmed.slice(0, hashPos) : trimmed).trim();
+    const note = hashPos >= 0 ? trimmed.slice(hashPos + 1).trim() : '';
+    const toks = domPart.split(/[\s,]+/).map(d => d.trim()).filter(Boolean);
+    toks.forEach((dom, i) => {
+      if (seen.has(dom)) return;
+      seen.add(dom);
+      // Комментарий в старом мультидоменном формате был на всю строку — относим его
+      // к первому домену; остальным пустой note, чтобы не дублировать.
+      result.push({ domain: dom, note: i === 0 ? note : '' });
+    });
   });
   return result;
 }
@@ -14543,7 +14705,7 @@ function renderOutboundInfo(divId, tag, opts) {
   const el = document.getElementById(divId);
   if (!el) return;
   const m = VLESS_META[tag];
-  if (!m) { el.innerHTML = '<span class="oi-missing">⚠️ нет данных для tag=' + tag + '</span>'; return; }
+  if (!m) { el.innerHTML = '<span class="oi-missing">⚠️ нет данных для tag=' + escapeHtml(tag) + '</span>'; return; }
   // Заголовок: бейджи подписки/обхода/даты на фоне цвета группы.
   // Опционально (showTagInTitle=true) — крупно имя канала в Matrix-стиле.
   const groupName = m.group_name || '';
@@ -14574,12 +14736,12 @@ function renderOutboundInfo(divId, tag, opts) {
     }
     expiresHtml = ' <span class="oi-expires" style="' + style + '">' + label + '</span>';
   }
-  const titleHtml = opts.showTagInTitle ? ('<span class="oi-title">' + tag + '</span>') : '';
-  const noteHtml = opts.activeNote ? (' <span class="oi-active-note">' + opts.activeNote + '</span>') : '';
+  const titleHtml = opts.showTagInTitle ? ('<span class="oi-title">' + escapeHtml(tag) + '</span>') : '';
+  const noteHtml = opts.activeNote ? (' <span class="oi-active-note">' + escapeHtml(opts.activeNote) + '</span>') : '';
   const headerHtml =
     '<div class="oi-header" style="background: ' + groupBg + ';">' +
       titleHtml +
-      (groupName ? ' <span class="oi-sub">📦 ' + groupName + '</span>' : '') +
+      (groupName ? ' <span class="oi-sub">📦 ' + escapeHtml(groupName) + '</span>' : '') +
       badge +
       expiresHtml +
       noteHtml +
@@ -14590,12 +14752,12 @@ function renderOutboundInfo(divId, tag, opts) {
   // 2 строки у каналов где host=домен → информации больше не отображаемой, а info-блоки
   // у AI и YT начинали разъезжаться по высоте. Сейчас target_ip уехал в tooltip над host.
   const hostTitle = (m.target_ip && m.target_ip !== m.host)
-    ? ' title="DNS-резолв ' + m.host + ' → ' + m.target_ip + '"'
+    ? ' title="DNS-резолв ' + escapeHtml(m.host) + ' → ' + escapeHtml(m.target_ip) + '"'
     : '';
-  let row1 = '<span class="oi-proto">' + (m.protocol || '—') + '</span>' +
-             ' · <span class="oi-host"' + hostTitle + '>' + m.host + ':' + m.port + '</span>' +
-             ' · <span class="oi-net">' + (m.network || '—') + '</span>' +
-             ' / <span class="oi-sec">' + (m.security || '—') + '</span>';
+  let row1 = '<span class="oi-proto">' + escapeHtml(m.protocol || '—') + '</span>' +
+             ' · <span class="oi-host"' + hostTitle + '>' + escapeHtml(m.host) + ':' + escapeHtml(String(m.port)) + '</span>' +
+             ' · <span class="oi-net">' + escapeHtml(m.network || '—') + '</span>' +
+             ' / <span class="oi-sec">' + escapeHtml(m.security || '—') + '</span>';
   if (m.sni) {
     row1 += ' · <span class="oi-k">sni:</span> <span class="oi-v">' + m.sni + '</span>';
   }
@@ -15283,8 +15445,8 @@ async function previewSubscription() {
       } else {
         mask = `<span style="color:#888;">—</span>`;
       }
-      const sniDisplay = o.sni || '—';
-      html += `<tr><td style="padding:3px 8px;text-align:center;">${cb}</td><td class="mono" style="padding:3px 8px;">${o.tag}</td><td class="mono" style="padding:3px 8px;">${o.host}</td><td class="mono" style="padding:3px 8px;color:#555;">${sniDisplay}</td><td style="padding:3px 8px;text-align:center;font-size:0.85em;">${mask}</td></tr>`;
+      const sniDisplay = o.sni ? escapeHtml(o.sni) : '—';
+      html += `<tr><td style="padding:3px 8px;text-align:center;">${cb}</td><td class="mono" style="padding:3px 8px;">${escapeHtml(o.tag)}</td><td class="mono" style="padding:3px 8px;">${escapeHtml(o.host)}</td><td class="mono" style="padding:3px 8px;color:#555;">${sniDisplay}</td><td style="padding:3px 8px;text-align:center;font-size:0.85em;">${mask}</td></tr>`;
     });
     html += `</tbody></table>`;
   }
@@ -15306,7 +15468,7 @@ async function previewSubscription() {
       } else if (o.in_failover_only) {
         badge = ` <span title="Только в хвосте FAILOVER-цепочки (позиция #${o.failover_position}). При удалении панель автоматически уберёт tag из FAILOVER_TAGS в watchdog.config — цепочка просто сократится на 1." style="background:#fff4d4;color:#a8801c;border:1px solid #e8c878;border-radius:3px;padding:1px 6px;font-size:0.82em;font-weight:600;margin-left:6px;">🔗 FAILOVER #${o.failover_position}</span>`;
       }
-      html += `<li class="mono">${o.tag} — ${o.host}${badge}</li>`;
+      html += `<li class="mono">${escapeHtml(o.tag)} — ${escapeHtml(o.host)}${badge}</li>`;
     });
     html += `</ul>`;
   }
@@ -15856,14 +16018,6 @@ async function restoreSnapshot() {
   } catch (e) {
     flash(false, 'Сетевая ошибка', String(e));
   }
-}
-
-async function restartDashboard() {
-  if (!confirm('Перезапустить xray-dashboard?\n\nПанель отключится на 5-7 сек. Обнови страницу когда снова откроется.')) return;
-  flash(true, '🔄 Перезапускаю панель... обнови страницу через 5-7 секунд (Ctrl+F5).');
-  try {
-    await fetch('/api/xkeen/restart-dashboard', { method: 'POST' });
-  } catch (e) {}
 }
 
 // Активный рестарт панели — кнопка «🔄 рестарт панели» в шапке.
@@ -17049,6 +17203,9 @@ async function toggleAIFailBlock(enabled) {
     flash(true, res.stdout || (enabled ? '🛡️ Kill-switch включён' : '⚠️ Kill-switch выключен'));
     setTimeout(() => location.reload(), 1500);
   } else {
+    // Сервер не применил — вернуть галку в прежнее положение, иначе UI врёт про роутер.
+    const cb = document.getElementById('ai-fail-block-toggle');
+    if (cb) cb.checked = !enabled;
     flash(false, 'Ошибка', res.stderr);
   }
 }
@@ -17158,6 +17315,8 @@ async function toggleYTFailBlock(enabled) {
     flash(true, res.stdout || (enabled ? '🛡️ YT Kill-switch включён' : '⚠️ YT Kill-switch выключен'));
     setTimeout(() => location.reload(), 1500);
   } else {
+    const cb = document.getElementById('yt-fail-block-toggle');
+    if (cb) cb.checked = !enabled;
     flash(false, 'Ошибка', res.stderr);
   }
 }
@@ -17445,6 +17604,8 @@ async function toggleForeignFailBlock(enabled) {
     flash(true, res.stdout || (enabled ? '🛡️ Kill-switch включён' : '⚠️ Kill-switch выключен'));
     setTimeout(() => location.reload(), 1500);
   } else {
+    const cb = document.getElementById('foreign-fail-block-toggle');
+    if (cb) cb.checked = !enabled;
     flash(false, 'Ошибка', res.stderr);
   }
 }
@@ -18399,6 +18560,10 @@ function renderDiagnose(j) {
     return;
   }
   const s = j.summary || {};
+  // fix-объекты храним в массиве, в onclick идёт только числовой индекс — так никакие
+  // апострофы/кавычки в fix_label/fix_explain не ломают атрибут (прежний .replace(/'/,'&#39;')
+  // не спасал: браузер декодирует &#39; обратно в ' ДО парсинга JS → SyntaxError на апострофе).
+  window._diagFixes = [];
   const overall = j.ok ? 'green' : 'red';
   const overallText = j.ok
     ? `✅ Всё в норме (${s.passed}/${s.total} проверок прошли)`
@@ -18412,8 +18577,11 @@ function renderDiagnose(j) {
   for (const c of j.checks) {
     const icon = c.ok ? '✅' : (c.severity === 'critical' ? '❌' : '⚠️');
     const rowBg = c.ok ? '#f0f8f0' : (c.severity === 'critical' ? '#fde8e8' : '#fff8e1');
+    const _fixIdx = c.fix_id
+      ? (window._diagFixes.push({ id: c.fix_id, label: c.fix_label || '🔧 Применить fix', explain: (c.fix_explain || '').replace(/\n/g, ' ') }) - 1)
+      : -1;
     const fixBtn = c.fix_id
-      ? `<button class="btn btn-sm" type="button" style="background:#c33; color:#fff; padding: 4px 10px;" onclick="applyFix('${c.fix_id}', '${(c.fix_label || '').replace(/'/g, '&#39;')}', '${(c.fix_explain || '').replace(/'/g, '&#39;').replace(/\n/g, ' ')}')">${escapeHtml(c.fix_label || '🔧 Применить fix')}</button>`
+      ? `<button class="btn btn-sm" type="button" style="background:#c33; color:#fff; padding: 4px 10px;" onclick="applyFixByIdx(${_fixIdx})">${escapeHtml(c.fix_label || '🔧 Применить fix')}</button>`
       : (c.fix_explain ? `<span style="font-size:0.85em; color:#888; font-style: italic;">⚠ Auto-fix недоступен</span>` : '');
     html += `<tr style="background: ${rowBg}; border-bottom: 1px solid #eee;">`;
     html += `<td style="padding: 6px 10px; text-align: center; font-size: 1.2em;">${icon}</td>`;
@@ -18436,6 +18604,12 @@ function renderDiagnose(j) {
   html += `<p style="margin-top: 12px; font-size: 0.85em; color: #888;">Совет: после применения fix'а — нажми «🔬 Диагностика XKeen» снова чтобы проверить что проблема решена.</p>`;
 
   out.innerHTML = html;
+}
+
+function applyFixByIdx(i) {
+  const f = (window._diagFixes || [])[i];
+  if (!f) return;
+  applyFix(f.id, f.label, f.explain);
 }
 
 async function applyFix(fixId, label, explain) {
