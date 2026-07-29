@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.95"
+_VERSION_FALLBACK = "1.0.96"
 
 
 def _find_git():
@@ -2589,6 +2589,7 @@ def keenetic_get_watchdog_targets(strict=False):
         "ai_tag":       cfg_d.get("AI_TAG"),
         "ai_domains":   ai_domains_list,
         "ai_ext_categories": cfg_d.get("AI_EXT_CATEGORIES", "").strip(),
+        "ai_ip_ranges": cfg_d.get("AI_IP_RANGES", "").strip(),
         "ai_fail_block": cfg_d.get("AI_FAIL_BLOCK", "1") == "1",
         "yt_tag":       cfg_d.get("YT_TAG"),
         "yt_domains":   yt_domains_list,
@@ -2619,7 +2620,7 @@ def _build_watchdog_config(d):
         return re.sub(r'([\\"$`])', r'\\\1', str(v))
     keys_order = [
         "PRIMARY_TAG", "FAILOVER_TAGS",
-        "AI_TAG", "AI_DOMAINS", "AI_EXT_CATEGORIES", "AI_FAIL_BLOCK",
+        "AI_TAG", "AI_DOMAINS", "AI_EXT_CATEGORIES", "AI_IP_RANGES", "AI_FAIL_BLOCK",
         "YT_TAG", "YT_DOMAINS", "YT_EXT_CATEGORIES", "YT_GEOIP_CATEGORIES", "YT_FAIL_BLOCK",
         "FOREIGN_TAG", "FOREIGN_DOMAINS", "FOREIGN_EXT_CATEGORIES", "FOREIGN_GEOIP_CATEGORIES", "FOREIGN_FAIL_BLOCK",
         "IPV6_TAG", "IPV6_DOMAINS",
@@ -2764,6 +2765,10 @@ def keenetic_write_watchdog_config(updates):
         # Когда юзер добавляет напр. "openai anthropic" — watchdog подставит ext:geosite_v2fly.dat:openai
         # в AI-правило 05_routing.json (вместе с ручными доменами из AI_DOMAINS).
         if "AI_EXT_CATEGORIES" not in cur: cur["AI_EXT_CATEGORIES"] = ""
+        # v1.0.96: AI_IP_RANGES — CIDR-диапазоны AI-провайдеров. Ловит соединения ПО ЧИСТОМУ IP
+        # (без SNI), которые доменные правила не видят. Watchdog v26 генерит отдельное правило
+        # {"ip": [...]} -> AI_TAG (kill-switch наследуется).
+        if "AI_IP_RANGES" not in cur: cur["AI_IP_RANGES"] = ""
         if "YT_EXT_CATEGORIES" not in cur: cur["YT_EXT_CATEGORIES"] = ""
         # v1.6.0 (2026-05-18): YT_GEOIP_CATEGORIES — для IP-only приложений (Telegram Desktop, Discord).
         # Когда юзер добавляет "telegram" — watchdog v10 сгенерит отдельное правило
@@ -3635,6 +3640,7 @@ def xkeen_page():
             "yt_fail_block": None,
             "ai_domains": [],
             "ai_ext_categories": "",
+            "ai_ip_ranges": "",
             "yt_domains": [],
             "yt_ext_categories": "",
             "yt_geoip_categories": "",
@@ -5998,6 +6004,38 @@ def api_xkeen_set_ai_ext_categories():
     if not ok:
         return jsonify({"ok": False, "stderr": _cat_missing_msg(missing, "geosite")})
     return jsonify(keenetic_write_watchdog_config({"AI_EXT_CATEGORIES": " ".join(categories)}))
+
+
+@app.route("/api/xkeen/set-ai-ip-ranges", methods=["POST"])
+@requires_auth
+def api_xkeen_set_ai_ip_ranges():
+    """Обновить список IP-диапазонов (CIDR) для AI-правила.
+    Часть клиентов AI-сервисов ходит к провайдеру ПО ЧИСТОМУ IP без SNI/домена
+    (например, приложения Anthropic бьют в 160.79.104.0/23 напрямую) — доменные
+    правила такие соединения не видят, и они уходят в default-маршрут (PRIMARY).
+    Watchdog v26 генерит отдельное правило {"ip": [...]} -> AI_TAG.
+    Пустой список разрешён — IP-правило выключено.
+    Body: ranges=<CIDR/IP через пробел/запятую>, например "160.79.104.0/23 2607:6bc0::/48"."""
+    import ipaddress
+    raw = request.form.get("ranges", "").strip()
+    ranges, bad = [], []
+    for token in re.split(r"[\s,]+", raw):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            # Сохраняем КАНОНИЗИРОВАННУЮ сеть, не сырой токен: ipaddress принимает
+            # netmask-нотацию (160.79.104.0/255.255.254.0) и host-биты (160.79.104.5/23),
+            # которые xray НЕ парсит — сырой токен заклинил бы регенерацию routing
+            # (гейт xray -test отбрасывал бы КАЖДЫЙ новый конфиг, включая failover).
+            ranges.append(str(ipaddress.ip_network(token, strict=False)))
+        except ValueError:
+            bad.append(token)
+    if bad:
+        return jsonify({"ok": False, "stderr": "Не IP/CIDR: " + ", ".join(bad) +
+                        ". Формат: 160.79.104.0/23 (IPv4) или 2607:6bc0::/48 (IPv6)."})
+    ranges = list(dict.fromkeys(ranges))
+    return jsonify(keenetic_write_watchdog_config({"AI_IP_RANGES": " ".join(ranges)}))
 
 
 @app.route("/api/xkeen/set-yt-ext-categories", methods=["POST"])
@@ -10557,6 +10595,21 @@ XKEEN_TEMPLATE = r"""<!doctype html>
               <input id="ai-ext-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.ai_ext_categories or '' }}" placeholder="через пробел: openai anthropic deepseek" />
               <button class="btn" style="margin-top: 6px; background: #6a3;" onclick="saveAIExtCategories()" title="Записать список v2fly-категорий в watchdog.config. Watchdog подхватит при следующем тике (≤1 мин).">💾 Сохранить категории</button>
               <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Без префиксов — только имя категории. Полный список: <a href="https://github.com/v2fly/domain-list-community/tree/master/data" target="_blank">v2fly community</a> (есть кнопка «🩻 Просканировать» в секции «🛠 Управление XKeen»).</p>
+            </div>
+          </details>
+
+          <!-- v1.0.96: IP-диапазоны (CIDR) AI-провайдеров — соединения по чистому IP мимо доменных правил -->
+          <details style="margin-top: 14px; border-top: 1px dashed #ccc; padding-top: 10px;" {% if targets.ai_ip_ranges %}open{% endif %}>
+            <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">📡 IP-диапазоны (CIDR) <span style="color: #888; font-weight: 400; font-size: 0.88em;">— для приложений, которые ходят по IP без домена</span></summary>
+            <div style="margin-top: 8px;">
+              <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">Часть клиентов AI-сервисов подключается к своему провайдеру <strong>по чистому IP</strong>, без SNI/домена в запросе — доменные правила выше такие соединения не видят, и они уходят через основной канал (PRIMARY). Впиши сюда IP-диапазоны провайдера — и они пойдут через AI-канал вместе с доменами. Kill-switch AI действует и на них.</p>
+              <div style="margin-bottom: 6px;">
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIIpRange('160.79.104.0/23'); addAIIpRange('2607:6bc0::/48')" title="Добавить IP-диапазоны Anthropic (Claude): 160.79.104.0/23 (IPv4, весь inbound-блок AS399358) + 2607:6bc0::/48 (IPv6). Приложения Claude часто бьют в эти адреса напрямую, без домена в SNI.">🟣 Anthropic (Claude)</button>
+                <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearAIIpRanges()" title="Очистить IP-диапазоны. Домены и категории выше не трогаются.">🗑 Очистить</button>
+              </div>
+              <input id="ai-ip-ranges" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.ai_ip_ranges or '' }}" placeholder="через пробел: 160.79.104.0/23 2607:6bc0::/48" />
+              <button class="btn" style="margin-top: 6px; background: #6a3;" onclick="saveAIIpRanges()" title="Записать IP-диапазоны в watchdog.config. Watchdog подхватит при следующем тике (≤1 мин).">💾 Сохранить IP-диапазоны</button>
+              <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Формат: CIDR (<code>160.79.104.0/23</code>) или одиночный IP. IPv6 тоже можно. Чей диапазон — смотри в whois или в выводе «🔎 Проверить» ниже.</p>
             </div>
           </details>
         </div>
@@ -17402,6 +17455,40 @@ async function _saveExtCategories(endpoint, inputId, label) {
   }
 }
 async function saveAIExtCategories() { await _saveExtCategories('/api/xkeen/set-ai-ext-categories', 'ai-ext-categories', 'AI'); }
+
+// ============== v1.0.96: AI IP-диапазоны (CIDR) ==============
+// Соединения к AI-провайдерам по чистому IP (без SNI) — доменные правила их не видят.
+// Отдельное правило {"ip": [...]} с outboundTag = AI_TAG (kill-switch наследуется).
+function addAIIpRange(cidr) { _extCatAdd('ai-ip-ranges', cidr); }
+function clearAIIpRanges() {
+  if (!confirm(`Очистить IP-диапазоны AI-канала? Соединения по чистому IP снова пойдут через PRIMARY.`)) return;
+  document.getElementById('ai-ip-ranges').value = '';
+  flash(true, `IP-диапазоны очищены. Нажми «Сохранить IP-диапазоны».`, null, {noScroll: true});
+}
+async function saveAIIpRanges() {
+  const el = document.getElementById('ai-ip-ranges');
+  const ranges = el.value.split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+  // Черновая проверка формата — строгая валидация CIDR на сервере (ipaddress.ip_network)
+  const bad = ranges.filter(r => !/^[0-9a-fA-F:.]+(\/[0-9]{1,3})?$/.test(r));
+  if (bad.length > 0) {
+    flash(false, `Не похоже на IP/CIDR: ${bad.join(', ')}. Формат: 160.79.104.0/23`);
+    return;
+  }
+  const msg = ranges.length === 0
+    ? `Очистить IP-диапазоны AI-канала? Соединения по чистому IP снова пойдут через PRIMARY.`
+    : `Сохранить ${ranges.length} IP-диапазонов для AI-канала?\n\n  • ${ranges.join('\n  • ')}\n\nWatchdog перегенерит routing на следующем тике (≤1 мин).`;
+  if (!confirm(msg)) return;
+  const fd = new FormData();
+  fd.append('ranges', ranges.join(' '));
+  flash(true, `Сохраняю IP-диапазоны...`);
+  const res = await apiCall('/api/xkeen/set-ai-ip-ranges', fd);
+  if (res.ok) {
+    flash(true, res.stdout || `AI IP-диапазоны сохранены. Watchdog подхватит при следующем тике.`);
+    setTimeout(() => location.reload(), 1800);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
 async function saveYTExtCategories() { await _saveExtCategories('/api/xkeen/set-yt-ext-categories', 'yt-ext-categories', 'YT'); }
 
 // ============== v1.6.0: YT GeoIP-категории ==============

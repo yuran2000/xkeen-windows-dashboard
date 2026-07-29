@@ -1,4 +1,14 @@
 #!/bin/sh
+# XKeen failover watchdog v26 (2026-07-29, AI_IP_RANGES — IP-диапазоны AI-провайдеров в AI-канал):
+#   Часть клиентов AI-сервисов ходит ПО ЧИСТОМУ IP без SNI/домена (например, приложения
+#   Anthropic бьют в 160.79.104.0/23 напрямую) — доменное AI-правило такие соединения не
+#   видит, и они уходили в default-маршрут (PRIMARY). Если PRIMARY когда-нибудь станет
+#   direct/RU-выходом — AI-провайдер увидит «неправильный» IP со всеми вытекающими.
+#   v26 читает AI_IP_RANGES из watchdog.config (CIDR через пробел/запятую, IPv4 и IPv6)
+#   и генерит ОТДЕЛЬНОЕ правило { "ip": [...] } → EFFECTIVE_AI_TAG в том же
+#   __AI_RULE_BLOCK__ (поля domain+ip в одном rule = AND, объединять нельзя — как YT GeoIP).
+#   Kill-switch AI наследуется автоматически (правило строится от EFFECTIVE_AI_TAG);
+#   заодно kill-switch теперь активен и когда заданы только категории/IP без ручных доменов.
 # XKeen failover watchdog v25 (2026-06-12, детект «глухого» AI-канала + авто-лечение рестартом):
 #   TCP-health видит сервер живым, а туннель к нему может залипнуть (стейл-сессии) — v24-проба
 #   в этом случае возвращала пусто, и тик просто пропускался: канал глух часами, алертов нет
@@ -367,6 +377,29 @@ generate_routing() {
   elif [ -n "$clean_ai_combined" ] && [ -z "$ai_tag" ]; then
     log "WARN: AI_DOMAINS/AI_EXT_CATEGORIES заданы, но AI_TAG пустой — AI правило не генерируем (вместо генерации с битым outboundTag='')"
   fi
+
+  # ---- AI IP rule block (v26) ----
+  # AI_IP_RANGES — CIDR-диапазоны AI-провайдеров (например 160.79.104.0/23 = Anthropic).
+  # Ловит соединения ПО ЧИСТОМУ IP без SNI (приложения бьют в IP напрямую) — доменное
+  # правило выше их не видит. ОТДЕЛЬНОЕ правило с "ip" (в одном rule поля domain+ip = AND,
+  # объединение не сработало бы — та же механика, что YT_GEOIP_CATEGORIES). outboundTag тот же
+  # ($ai_tag = EFFECTIVE_AI_TAG) → kill-switch наследуется. Приклеивается в тот же
+  # __AI_RULE_BLOCK__ одной строкой — template менять не нужно.
+  local clean_ai_ip
+  clean_ai_ip=$(echo "$AI_IP_RANGES" | tr -d ' ,\t\n\r')
+  local ai_ip_rule_block=""
+  if [ -n "$clean_ai_ip" ] && [ -n "$ai_tag" ]; then
+    local ai_ip_json
+    ai_ip_json=$(echo "$AI_IP_RANGES" | tr ' ,' '\n' | grep -v '^$' | \
+      jq -R -s -c 'split("\n") | map(select(length>0))' 2>/dev/null)
+    if [ -n "$ai_ip_json" ] && [ "$ai_ip_json" != "[]" ]; then
+      ai_ip_rule_block=' { "inboundTag": ["redirect","tproxy"], "outboundTag": "'"$ai_tag"'", "type": "field", "ip": '"$ai_ip_json"' },'
+    fi
+  elif [ -n "$clean_ai_ip" ] && [ -z "$ai_tag" ]; then
+    log "WARN: AI_IP_RANGES задан, но AI_TAG пуст — IP-правило не генерируем"
+  fi
+  # Комбинируем: domain-правило + IP-правило в одном placeholder (любое из них может быть пустым)
+  ai_rule_block="${ai_rule_block}${ai_ip_rule_block}"
 
   # ---- DIRECT rule block ----
   # DIRECT_DOMAINS — список сайтов которые НЕ идут через VPN (mail.ru, okko, etc).
@@ -1179,7 +1212,7 @@ AI_BLOCKED=$(grep -o 'AI_BLOCKED=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2
 AI_KCTR=$(grep -o 'AI_KCTR=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$AI_KCTR" ] && AI_KCTR=0
 EFFECTIVE_AI_TAG="$AI_TAG"
 AI_PROBE_CODE=""
-if [ -n "$AI_DOMAINS" ] && [ -n "$AI_TAG" ] && [ "$AI_TAG" != "block" ] && [ "${AI_FAIL_BLOCK:-1}" = "1" ]; then
+if [ -n "$AI_DOMAINS$AI_EXT_CATEGORIES$AI_IP_RANGES" ] && [ -n "$AI_TAG" ] && [ "$AI_TAG" != "block" ] && [ "${AI_FAIL_BLOCK:-1}" = "1" ]; then
   # Пингуем AI_TAG (TCP-probe, без HTTPS — у некоторых провайдеров нет HTTP endpoint)
   if probe_tag "$AI_TAG" ""; then AI_PROBE_CODE="up"; else AI_PROBE_CODE="down"; fi
   # v16: блок/снятие — только после порога подряд (не по одной пробе) → нет «дребезга».
