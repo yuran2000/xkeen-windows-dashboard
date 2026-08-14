@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.96"
+_VERSION_FALLBACK = "1.0.97"
 
 
 def _find_git():
@@ -4373,7 +4373,7 @@ def api_xkeen_header_status():
       label: текст для бейджа («xray TPROXY · vless-reality»)
       tooltip: подробности при hover
       active_tag: текущий PRIMARY-tag (из watchdog.state)
-      mode: TPROXY|Mixed|Redirect|unknown
+      mode: TPROXY|Mixed|Hybrid|Redirect|unknown
       running: bool
       has_error: bool — есть свежие ошибки в error.log
     """
@@ -4417,9 +4417,12 @@ def api_xkeen_header_status():
     state_text = parts["state"].strip()
 
     running = "запущен" in status_text and "не запущен" not in status_text
-    # Mode из status (в порядке приоритета)
+    # Mode из status (в порядке приоритета). Hybrid — XKeen 2.0 (новое имя прежнего
+    # Mixed: TCP через redirect + UDP через tproxy), проверяем первым.
     mode = "unknown"
-    if "TPROXY" in status_text and "Mixed" not in status_text:
+    if "Hybrid" in status_text:
+        mode = "Hybrid"
+    elif "TPROXY" in status_text and "Mixed" not in status_text:
         mode = "TPROXY"
     elif "Mixed" in status_text:
         mode = "Mixed"
@@ -4449,14 +4452,17 @@ def api_xkeen_header_status():
             "label": f"xray {mode} · ошибка",
             "tooltip": error_text[:400],
         }
-    elif mode in ("TPROXY", "Mixed", "Redirect"):
-        # Все три — ВАЛИДНЫЕ рабочие режимы XKeen. Mixed = TCP через redirect + UDP через
-        # tproxy (штатный/частый дефолт на MT7621). Раньше Mixed/Redirect метились «warn»
-        # (жёлтый) и пугали зря — VPN полностью работает. Теперь любой рабочий режим = ok.
+    elif mode in ("TPROXY", "Mixed", "Hybrid", "Redirect"):
+        # Все — ВАЛИДНЫЕ рабочие режимы XKeen. Mixed = TCP через redirect + UDP через
+        # tproxy (штатный/частый дефолт на MT7621); в XKeen 2.0 этот же режим называется
+        # Hybrid. Раньше Mixed/Redirect метились «warn» (жёлтый) и пугали зря — VPN
+        # полностью работает. Теперь любой рабочий режим = ok.
         if mode == "TPROXY":
             _modenote = "Режим TPROXY (TCP+UDP через tproxy) — оптимальный."
         elif mode == "Mixed":
             _modenote = "Режим Mixed (TCP через redirect + UDP через tproxy) — штатный режим XKeen, всё нормально."
+        elif mode == "Hybrid":
+            _modenote = "Режим Hybrid (TCP через redirect + UDP через tproxy; так в XKeen 2.0 называется прежний Mixed) — штатный режим XKeen, всё нормально."
         else:
             _modenote = "Режим Redirect (TCP через redirect) — рабочий режим."
         result = {
@@ -9030,7 +9036,9 @@ def api_xkeen_auto_fix():
             if is_running and not load_errors:
                 ok = True
                 # Информационное сообщение про режим (без флага ошибки)
-                if "Mixed" in status:
+                if "Hybrid" in status:
+                    log_lines.append("ℹ️ xkeen в режиме Hybrid — штатный режим XKeen 2.0 (прежнее имя — Mixed). VPN работает. Проверить можно через https://checkip.amazonaws.com — должен показать IP VPN-сервера, не твоего провайдера.")
+                elif "Mixed" in status:
                     log_lines.append("ℹ️ xkeen в режиме Mixed — это валидный режим работы (один из трёх: TPROXY/Mixed/Redirect). VPN работает. Проверить можно через https://checkip.amazonaws.com — должен показать IP VPN-сервера, не твоего провайдера.")
                 elif "TPROXY" in status:
                     log_lines.append("ℹ️ xkeen в режиме TPROXY — оптимальный режим.")
@@ -11855,7 +11863,7 @@ echo OK</pre>
 
       <h4 style="margin: 14px 0 6px;">Команды xkeen-CLI</h4>
       <ul style="margin: 6px 0 6px 22px;">
-        <li><strong>📊 Статус XKeen</strong> — <code>xkeen -status</code>. Показывает что запущено (xray, mihomo если есть), в каком режиме (Mixed/TPROXY).</li>
+        <li><strong>📊 Статус XKeen</strong> — <code>xkeen -status</code>. Показывает что запущено (xray, mihomo если есть), в каком режиме (TPROXY/Hybrid/Mixed).</li>
         <li><strong>▶️ Restart XKeen</strong> — <code>xkeen -restart</code>. Перезапускает xray-процесс на роутере (~2 сек, разрыв соединений). Watchdog не трогает — он отдельный cron-job.</li>
         <li><strong>🔧 Restart XKeen с паузой</strong> — <code>xkeen -stop</code> → пауза 15с → <code>xkeen -start</code>. Когда xray завис (у XKeen-устройств пропал интернет/DNS, хотя xray «запущен»): пауза сбрасывает залипшие сокеты/conntrack и лечит затык DNS на <code>:53</code>, который обычный Restart не берёт. На ~25 сек VPN прервётся, потом восстановится.</li>
         <li><strong>⏹️ Остановить XKeen</strong> — <code>xkeen -stop</code>. Аварийная остановка: снимает tproxy → трафик идёт НАПРЯМУЮ, без VPN. Возвращает интернет, если VPN сломался намертво. ⚠ Удалённый доступ через сам VPN тоже прервётся. Включить обратно — Restart.</li>
@@ -11943,7 +11951,7 @@ echo OK</pre>
       <th style="border:1px solid #ccc; padding: 6px 10px; text-align: left;">Значение</th>
     </tr></thead>
     <tbody>
-      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟢 зелёный</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>ok</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray запущен в рабочем режиме (<strong>TPROXY / Mixed / Redirect</strong> — все три валидны), error.log чистый. <em>Mixed</em> = TCP через redirect + UDP через tproxy — штатный режим XKeen, не хуже остальных.</td></tr>
+      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟢 зелёный</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>ok</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray запущен в рабочем режиме (<strong>TPROXY / Hybrid / Mixed / Redirect</strong> — все валидны), error.log чистый. <em>Hybrid</em> (XKeen 2.0; в 1.x назывался <em>Mixed</em>) = TCP через redirect + UDP через tproxy — штатный режим XKeen, не хуже остальных.</td></tr>
       <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟡 жёлтый</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>warn</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray запущен, но режим не распознан / статус прочитать не удалось. VPN скорее всего работает — глянь «📊 Статус».</td></tr>
       <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟠 оранжевый (мигает)</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>error</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray запущен, но в error.log есть <code>failed to load</code> / <code>cannot find</code> / <code>panic</code> / <code>fatal</code> — что-то поломалось в конфиге.</td></tr>
       <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🔴 красный (мигает)</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>stopped</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray НЕ запущен — VPN не работает совсем.</td></tr>
@@ -12947,7 +12955,7 @@ Use this token to access the HTTP API:
       <h4>🩻 v2fly категории — когда ломается</h4>
       <ol>
         <li><strong>Категория несовместима с каналом</strong>. Если YT-канал = российский (для DPI-обхода YouTube без рекламы) — <code>facebook</code> / <code>instagram</code> / <code>twitter</code> через него <strong>не пробьют блокировку Meta/X для RU-IP</strong>. Instagram сломается, xray зависнет в retries. <strong>Через RU-канал безопасно</strong>: только <code>youtube</code>, <code>tiktok</code>, <code>discord</code>.</li>
-        <li><strong>Опечатка в имени</strong> (<code>youtub</code> вместо <code>youtube</code>) → xray не найдёт в <code>geosite_v2fly.dat</code> → упадёт с <code>code not found</code> → xkeen уйдёт в Mixed mode. Точные имена — в репо v2fly community (ссылка выше).</li>
+        <li><strong>Опечатка в имени</strong> (<code>youtub</code> вместо <code>youtube</code>) → xray не найдёт в <code>geosite_v2fly.dat</code> → упадёт с <code>code not found</code> → xkeen уйдёт в Mixed/Hybrid mode. Точные имена — в репо v2fly community (ссылка выше).</li>
         <li><strong>Слишком жирная категория</strong> (например <code>google</code>) — перехватит дофига сайтов, что-то неожиданное сломается. Лучше использовать узкие категории.</li>
       </ol>
 
@@ -12957,7 +12965,7 @@ Use this token to access the HTTP API:
       <p><strong>Когда использовать</strong>: если приложение «зависает на Connecting», а тот же сервис через браузер работает — это IP-only-проблема. Добавь категорию (<code>telegram</code>, <code>discord</code>) → трафик пойдёт через YT-канал по IP.</p>
 
       <h4>🌍 GeoIP-категории — обязательный шаг</h4>
-      <div class="warn">⚠️ XKeen-installer ставит GeoIP-базы только <strong>со странами</strong> (geoip_refilter, geoip_zkeen) — категорий <em>сервисов</em> (telegram, discord) в них <strong>нет</strong>. Если после сохранения GeoIP-категории xkeen уходит в режим <strong>Mixed</strong> — нужно установить <strong>расширенный <code>geoip.dat</code></strong> от Loyalsoldier.</div>
+      <div class="warn">⚠️ XKeen-installer ставит GeoIP-базы только <strong>со странами</strong> (geoip_refilter, geoip_zkeen) — категорий <em>сервисов</em> (telegram, discord) в них <strong>нет</strong>. Если после сохранения GeoIP-категории xkeen уходит в режим <strong>Mixed/Hybrid</strong> — нужно установить <strong>расширенный <code>geoip.dat</code></strong> от Loyalsoldier.</div>
       <p>В UI GeoIP-секции есть зелёная кнопка <strong>📥 Установить расширенный geoip.dat (Loyalsoldier)</strong> — один клик, без SSH:</p>
       <ol>
         <li>Бэкап текущего geoip.dat → <code>.bak-&lt;timestamp&gt;</code></li>
@@ -13094,7 +13102,7 @@ Use this token to access the HTTP API:
           </table>
 
           <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin: 4px 0; font-size: 0.9em;">
-            ⚠ Если после сохранения GeoIP <code>xkeen -status</code> покажет «в режиме <strong>Mixed</strong>» — <strong>проверь <code>error.log</code></strong>: если там <code>code not found</code>/<code>failed to load</code>, то категория действительно не найдена в geoip.dat → в жёлтом блоке там же нажми зелёную кнопку <strong>«📥 Установить расширенный geoip.dat (Loyalsoldier)»</strong>. <em>Если error.log чистый — Mixed это валидный режим работы XKeen, VPN работает (проверка через <code>https://checkip.amazonaws.com</code> покажет VPN-IP).</em>
+            ⚠ Если после сохранения GeoIP <code>xkeen -status</code> покажет «в режиме <strong>Mixed/Hybrid</strong>» — <strong>проверь <code>error.log</code></strong>: если там <code>code not found</code>/<code>failed to load</code>, то категория действительно не найдена в geoip.dat → в жёлтом блоке там же нажми зелёную кнопку <strong>«📥 Установить расширенный geoip.dat (Loyalsoldier)»</strong>. <em>Если error.log чистый — Mixed/Hybrid это валидный режим работы XKeen, VPN работает (проверка через <code>https://checkip.amazonaws.com</code> покажет VPN-IP).</em>
           </div>
 
           <h4 style="margin: 12px 0 6px;">Шаг 6. Проверка</h4>
@@ -13996,7 +14004,7 @@ ls -la /opt/etc/xray/configs/
             <li>Через ≤1 мин watchdog подхватит и:
               <ul>
                 <li>В шапке исчезнет «⚠ работаем через резерв»</li>
-                <li><code>xkeen -status</code> покажет «Прокси-клиент xray запущен в режиме Mixed»</li>
+                <li><code>xkeen -status</code> покажет «Прокси-клиент xray запущен в режиме Hybrid» (в XKeen 1.x — «Mixed»)</li>
               </ul>
             </li>
           </ol>
@@ -14129,7 +14137,7 @@ xkeen -restart</pre>
             <li><strong>Залипшая пустая политика, нельзя удалить через Web UI</strong> — через Keenetic CLI (см. опциональный шаг «Удаление политики через Keenetic CLI»).</li>
             <li><strong>«unzip: replace?» / прерывание prompt'ом</strong> — всегда используй <code>unzip -o</code> (force overwrite, без интерактивности).</li>
             <li><strong>Telegram Desktop / Discord native виснет на «Connecting»</strong> — это IP-only-проблема. Доменные правила их не ловят, нужны GeoIP-категории. См. подраздел «🩻 v2fly категории и 🌍 GeoIP-категории» выше.</li>
-            <li><strong>geoip:telegram не работает (xkeen в Mixed + в error.log <code>code not found</code>)</strong> — стандартный <code>geoip.dat</code> от XKeen-installer содержит только страны. Нужен расширенный от Loyalsoldier — кнопка в самой панели в секции «🌍 GeoIP-категории». ⚠ Если в Mixed но в error.log пусто — это просто другой режим работы XKeen, VPN при этом работает. Проверь через <code>curl https://checkip.amazonaws.com</code> с устройства в политике XKeen — должен показать VPN-IP.</li>
+            <li><strong>geoip:telegram не работает (xkeen в Mixed/Hybrid + в error.log <code>code not found</code>)</strong> — стандартный <code>geoip.dat</code> от XKeen-installer содержит только страны. Нужен расширенный от Loyalsoldier — кнопка в самой панели в секции «🌍 GeoIP-категории». ⚠ Если в Mixed/Hybrid но в error.log пусто — это просто другой режим работы XKeen, VPN при этом работает. Проверь через <code>curl https://checkip.amazonaws.com</code> с устройства в политике XKeen — должен показать VPN-IP.</li>
             <li><strong>Полная переустановка</strong> — <code>xkeen -remove</code> снесёт всё подчистую (xray + конфиги + cron). Можно начать заново с Шага 5.</li>
           </ul>
           <p class="muted">💡 Актуальная официальная документация и обсуждение проблем — в Telegram-канале XKeen
