@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.97"
+_VERSION_FALLBACK = "1.0.98"
 
 
 def _find_git():
@@ -14798,7 +14798,11 @@ function renderOutboundInfo(divId, tag, opts) {
     expiresHtml = ' <span class="oi-expires" style="' + style + '">' + label + '</span>';
   }
   const titleHtml = opts.showTagInTitle ? ('<span class="oi-title">' + escapeHtml(tag) + '</span>') : '';
-  const noteHtml = opts.activeNote ? (' <span class="oi-active-note">' + escapeHtml(opts.activeNote) + '</span>') : '';
+  // opts.activeNote — уже готовый ДОВЕРЕННЫЙ HTML (бейдж статуса из getChannelStatusNote +
+  // кнопка 🔄 из makeProbeBtn, либо статик-заметки failover/active). НЕ прогонять через
+  // escapeHtml: иначе теги span/button экранируются и показываются как сырой текст
+  // (регрессия v1.0.95 — сырой HTML в описаниях YouTube/AI outbound).
+  const noteHtml = opts.activeNote ? (' <span class="oi-active-note">' + opts.activeNote + '</span>') : '';
   const headerHtml =
     '<div class="oi-header" style="background: ' + groupBg + ';">' +
       titleHtml +
