@@ -217,7 +217,7 @@ import threading as _threading
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.98"
+_VERSION_FALLBACK = "1.0.99"
 
 
 def _find_git():
@@ -2570,6 +2570,15 @@ def keenetic_get_watchdog_targets(strict=False):
         cfg_d = {}
     failover_str = cfg_d.get("FAILOVER_TAGS", "")
     failover_list = [t.strip() for t in re.split(r"[,\s]+", failover_str) if t.strip()]
+    # v1.0.99 (watchdog v27): СВОИ цепочки резерва у каналов AI и YouTube. Формат тот же,
+    # что у FAILOVER_TAGS — теги через пробел, порядок = приоритет перебора.
+    ai_chain_list = [t.strip() for t in re.split(r"[,\s]+", cfg_d.get("AI_FAILOVER_TAGS", "")) if t.strip()]
+    yt_chain_list = [t.strip() for t in re.split(r"[,\s]+", cfg_d.get("YT_FAILOVER_TAGS", "")) if t.strip()]
+    # Пускать ли RU-узлы в цепочку. ОТСУТСТВУЮЩЕЕ/ПУСТОЕ значение = дефолт watchdog.sh
+    # (AI=0 — RU-exit ⇒ бан Anthropic; YT=1 — RU-узел для YouTube штатный), а НЕ «выключено»:
+    # иначе UI показывал бы «выкл» там, где watchdog применяет «вкл» (рассинхрон настройки).
+    _ai_ru_raw = (cfg_d.get("AI_CHAIN_ALLOW_RU", "") or "").strip()
+    _yt_ru_raw = (cfg_d.get("YT_CHAIN_ALLOW_RU", "") or "").strip()
     ai_domains_str = cfg_d.get("AI_DOMAINS", "")
     ai_domains_list = [d.strip() for d in re.split(r"[\s,]+", ai_domains_str) if d.strip()]
     yt_domains_str = cfg_d.get("YT_DOMAINS", "")
@@ -2591,11 +2600,15 @@ def keenetic_get_watchdog_targets(strict=False):
         "ai_ext_categories": cfg_d.get("AI_EXT_CATEGORIES", "").strip(),
         "ai_ip_ranges": cfg_d.get("AI_IP_RANGES", "").strip(),
         "ai_fail_block": cfg_d.get("AI_FAIL_BLOCK", "1") == "1",
+        "ai_failover_tags": ai_chain_list,
+        "ai_chain_allow_ru": (_ai_ru_raw == "1") if _ai_ru_raw else False,
         "yt_tag":       cfg_d.get("YT_TAG"),
         "yt_domains":   yt_domains_list,
         "yt_ext_categories": cfg_d.get("YT_EXT_CATEGORIES", "").strip(),
         "yt_geoip_categories": cfg_d.get("YT_GEOIP_CATEGORIES", "").strip(),
         "yt_fail_block": cfg_d.get("YT_FAIL_BLOCK", "1") == "1",
+        "yt_failover_tags": yt_chain_list,
+        "yt_chain_allow_ru": (_yt_ru_raw == "1") if _yt_ru_raw else True,
         "foreign_tag":       cfg_d.get("FOREIGN_TAG"),
         "foreign_domains":   foreign_domains_list,
         "foreign_ext_categories": cfg_d.get("FOREIGN_EXT_CATEGORIES", "").strip(),
@@ -2621,7 +2634,9 @@ def _build_watchdog_config(d):
     keys_order = [
         "PRIMARY_TAG", "FAILOVER_TAGS",
         "AI_TAG", "AI_DOMAINS", "AI_EXT_CATEGORIES", "AI_IP_RANGES", "AI_FAIL_BLOCK",
+        "AI_FAILOVER_TAGS", "AI_CHAIN_ALLOW_RU",
         "YT_TAG", "YT_DOMAINS", "YT_EXT_CATEGORIES", "YT_GEOIP_CATEGORIES", "YT_FAIL_BLOCK",
+        "YT_FAILOVER_TAGS", "YT_CHAIN_ALLOW_RU",
         "FOREIGN_TAG", "FOREIGN_DOMAINS", "FOREIGN_EXT_CATEGORIES", "FOREIGN_GEOIP_CATEGORIES", "FOREIGN_FAIL_BLOCK",
         "IPV6_TAG", "IPV6_DOMAINS",
         "DIRECT_DOMAINS",
@@ -2769,6 +2784,13 @@ def keenetic_write_watchdog_config(updates):
         # (без SNI), которые доменные правила не видят. Watchdog v26 генерит отдельное правило
         # {"ip": [...]} -> AI_TAG (kill-switch наследуется).
         if "AI_IP_RANGES" not in cur: cur["AI_IP_RANGES"] = ""
+        # v1.0.99: цепочки резерва AI/YouTube (watchdog v27). Пустая цепочка = поведение как
+        # раньше (упал основной → сразу kill-switch). ALLOW_RU пишем ЯВНО числом: пустое
+        # значение watchdog трактует как свой дефолт, и UI-галочка разъехалась бы с реальностью.
+        if "AI_FAILOVER_TAGS" not in cur: cur["AI_FAILOVER_TAGS"] = ""
+        if not (cur.get("AI_CHAIN_ALLOW_RU") or "").strip(): cur["AI_CHAIN_ALLOW_RU"] = "0"
+        if "YT_FAILOVER_TAGS" not in cur: cur["YT_FAILOVER_TAGS"] = ""
+        if not (cur.get("YT_CHAIN_ALLOW_RU") or "").strip(): cur["YT_CHAIN_ALLOW_RU"] = "1"
         if "YT_EXT_CATEGORIES" not in cur: cur["YT_EXT_CATEGORIES"] = ""
         # v1.6.0 (2026-05-18): YT_GEOIP_CATEGORIES — для IP-only приложений (Telegram Desktop, Discord).
         # Когда юзер добавляет "telegram" — watchdog v10 сгенерит отдельное правило
@@ -2913,6 +2935,13 @@ def keenetic_remove_outbound(tag):
         return {"ok": False, "stderr": f"tag '{tag}' сейчас канал «Через IPv6». Сначала смени его на другой outbound."}
     if tag in (targets.get("failover_tags") or []):
         return {"ok": False, "stderr": f"tag '{tag}' в списке FAILOVER. Сначала убери его оттуда (смени FAILOVER на другой)."}
+    # v1.0.99: цепочки резерва AI/YouTube — та же защита, что и у FAILOVER-цепочки.
+    # Удалить outbound, на который watchdog переключится при падении AI/YT-канала, значит
+    # тихо оставить в watchdog.config тег-зомби (в аварии цепочка молча укоротится).
+    if tag in (targets.get("ai_failover_tags") or []):
+        return {"ok": False, "stderr": f"tag '{tag}' в цепочке резерва AI-канала. Сначала убери его из цепочки (карточка «🤖 AI» → «⛓️ Цепочка резерва»)."}
+    if tag in (targets.get("yt_failover_tags") or []):
+        return {"ok": False, "stderr": f"tag '{tag}' в цепочке резерва YouTube-канала. Сначала убери его из цепочки (карточка «📺 YouTube» → «⛓️ Цепочка резерва»)."}
     raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
     if not raw:
         return {"ok": False, "stderr": "не смог прочитать 04_outbounds.json"}
@@ -2961,6 +2990,8 @@ def keenetic_remove_outbounds_bulk(tags):
     foreign = targets.get("foreign_tag")
     ipv6 = targets.get("ipv6_tag")
     failover_set = set(targets.get("failover_tags") or [])
+    ai_chain_set = set(targets.get("ai_failover_tags") or [])
+    yt_chain_set = set(targets.get("yt_failover_tags") or [])
     skipped = {}
     to_remove = []
     for t in tags:
@@ -2978,6 +3009,10 @@ def keenetic_remove_outbounds_bulk(tags):
             skipped[t] = "сейчас «Через IPv6»"
         elif t in failover_set:
             skipped[t] = "в списке FAILOVER"
+        elif t in ai_chain_set:
+            skipped[t] = "в цепочке резерва AI"
+        elif t in yt_chain_set:
+            skipped[t] = "в цепочке резерва YouTube"
         else:
             to_remove.append(t)
     if not to_remove:
@@ -3057,14 +3092,27 @@ def _subscription_removal_plan(key, outbounds, targets, subs):
         (t.get("failover_tag"), "голова резервной цепочки"),
     ]
     fchain = set(t.get("failover_tags") or [])
+    # v1.0.99: цепочки резерва AI/YouTube — тот же класс, что хвост FAILOVER: удаление не
+    # блокируем, но тег обязан уйти из watchdog.config, иначе в аварии цепочка молча
+    # укоротится (watchdog посчитает несуществующий узел мёртвым и пойдёт дальше).
+    ai_chain = set(t.get("ai_failover_tags") or [])
+    yt_chain = set(t.get("yt_failover_tags") or [])
     critical = {}
     failover_tail = []
+    ai_chain_tail = []
+    yt_chain_tail = []
     for tag in member_tags:
         roles = [label for (rt, label) in critical_roles if rt and rt == tag]
         if roles:
             critical[tag] = ", ".join(roles)
-        elif tag in fchain:
+            continue
+        # Один и тот же узел может стоять сразу в нескольких цепочках — проверяем все.
+        if tag in fchain:
             failover_tail.append(tag)
+        if tag in ai_chain:
+            ai_chain_tail.append(tag)
+        if tag in yt_chain:
+            yt_chain_tail.append(tag)
     # Записи subscription_meta на удаление: сам ключ + pbk-тени с тем же sub_url.
     meta_keys = []
     for k, v in (subs or {}).items():
@@ -3073,7 +3121,8 @@ def _subscription_removal_plan(key, outbounds, targets, subs):
         elif is_url and isinstance(v, dict) and (v.get("sub_url") or "").strip() == key:
             meta_keys.append(k)
     return {"member_tags": member_tags, "critical": critical,
-            "failover_tail": failover_tail, "meta_keys": meta_keys}
+            "failover_tail": failover_tail, "ai_chain_tail": ai_chain_tail,
+            "yt_chain_tail": yt_chain_tail, "meta_keys": meta_keys}
 
 
 def keenetic_remove_subscription(key, dry_run=False):
@@ -3100,16 +3149,29 @@ def keenetic_remove_subscription(key, dry_run=False):
     if dry_run:
         return {"ok": True, "dry_run": True, **plan}
     member_tags = plan["member_tags"]
-    # 1. Убрать серверы-хвост из резервной цепочки ДО сноса (иначе bulk пропустит их как «в FAILOVER»).
+    # 1. Убрать серверы-хвост из ВСЕХ цепочек резерва ДО сноса (иначе bulk пропустит их как
+    #    «в FAILOVER» / «в цепочке резерва AI»). Одна запись config = один прогон watchdog.
     removed_from_failover = []
+    removed_from_ai_chain = []
+    removed_from_yt_chain = []
+    _chain_updates = {}
     if plan["failover_tail"]:
         drop = set(plan["failover_tail"])
-        chain_after = [t for t in (targets.get("failover_tags") or []) if t not in drop]
-        wd = keenetic_write_watchdog_config({"FAILOVER_TAGS": " ".join(chain_after)})
+        _chain_updates["FAILOVER_TAGS"] = " ".join(t for t in (targets.get("failover_tags") or []) if t not in drop)
+    if plan.get("ai_chain_tail"):
+        drop = set(plan["ai_chain_tail"])
+        _chain_updates["AI_FAILOVER_TAGS"] = " ".join(t for t in (targets.get("ai_failover_tags") or []) if t not in drop)
+    if plan.get("yt_chain_tail"):
+        drop = set(plan["yt_chain_tail"])
+        _chain_updates["YT_FAILOVER_TAGS"] = " ".join(t for t in (targets.get("yt_failover_tags") or []) if t not in drop)
+    if _chain_updates:
+        wd = keenetic_write_watchdog_config(_chain_updates)
         if not (isinstance(wd, dict) and wd.get("ok")):
             return {"ok": False, "phase": "failover",
-                    "stderr": "Не удалось убрать серверы из резервной цепочки (watchdog.config) — удаление отменено, ничего не тронуто."}
+                    "stderr": "Не удалось убрать серверы из цепочек резерва (watchdog.config) — удаление отменено, ничего не тронуто."}
         removed_from_failover = list(plan["failover_tail"])
+        removed_from_ai_chain = list(plan.get("ai_chain_tail") or [])
+        removed_from_yt_chain = list(plan.get("yt_chain_tail") or [])
     # 2. Снести серверы (bulk: бэкап 04_outbounds + рестарт + откат + чистка outbound_meta).
     removed_outbounds = []
     if member_tags:
@@ -3144,8 +3206,14 @@ def keenetic_remove_subscription(key, dry_run=False):
     msg = f"Подписка удалена: серверов — {len(removed_outbounds)}, записей метаданных — {len(removed_meta)}."
     if removed_from_failover:
         msg += f" Из резервной цепочки убрано: {len(removed_from_failover)}."
+    if removed_from_ai_chain:
+        msg += f" Из цепочки резерва AI убрано: {len(removed_from_ai_chain)}."
+    if removed_from_yt_chain:
+        msg += f" Из цепочки резерва YouTube убрано: {len(removed_from_yt_chain)}."
     return {"ok": True, "removed": removed_outbounds, "removed_meta": removed_meta,
-            "removed_from_failover": removed_from_failover, "stdout": msg}
+            "removed_from_failover": removed_from_failover,
+            "removed_from_ai_chain": removed_from_ai_chain,
+            "removed_from_yt_chain": removed_from_yt_chain, "stdout": msg}
 
 
 def keenetic_find_orphan_sub_meta(outbounds=None, subs=None):
@@ -3638,6 +3706,10 @@ def xkeen_page():
             "failover_tags": [],
             "ai_fail_block": None,
             "yt_fail_block": None,
+            "ai_failover_tags": [],
+            "yt_failover_tags": [],
+            "ai_chain_allow_ru": False,
+            "yt_chain_allow_ru": True,
             "ai_domains": [],
             "ai_ext_categories": "",
             "ai_ip_ranges": "",
@@ -3667,6 +3739,8 @@ def xkeen_page():
     yt_tag = targets.get("yt_tag")
     foreign_tag = targets.get("foreign_tag")
     failover_tags = targets.get("failover_tags") or []
+    ai_chain_tags = targets.get("ai_failover_tags") or []
+    yt_chain_tags = targets.get("yt_failover_tags") or []
     # Статусы outbound'ов — НЕ probим автоматически (это шум на серверах
     # провайдеров + лаг рендера ~3 сек). Берём только из кэша. Если кэш пуст
     # (свежий рестарт дашборда или 60s TTL истёк) — UI покажет «⚪ нажми кнопку».
@@ -3703,6 +3777,12 @@ def xkeen_page():
         o["is_yt"]       = (o["tag"] == yt_tag)
         o["is_foreign"]  = (o["tag"] == foreign_tag)
         o["in_failover_chain"] = (o["tag"] in failover_tags)
+        # v1.0.99: членство в цепочках резерва AI/YouTube (watchdog v27) — для бейджей
+        # в таблице и чтобы такой outbound не считался «не задействован».
+        o["in_ai_chain"] = (o["tag"] in ai_chain_tags)
+        o["in_yt_chain"] = (o["tag"] in yt_chain_tags)
+        o["ai_chain_position"] = (ai_chain_tags.index(o["tag"]) + 1) if o["tag"] in ai_chain_tags else 0
+        o["yt_chain_position"] = (yt_chain_tags.index(o["tag"]) + 1) if o["tag"] in yt_chain_tags else 0
         st = statuses.get(o["tag"], {})
         o["status_ok"]   = st.get("ok")
         o["status_ms"]   = st.get("ms")
@@ -3734,6 +3814,8 @@ def xkeen_page():
             and not o["is_ai"]
             and not o["is_yt"]
             and not o["in_failover_chain"]
+            and not o["in_ai_chain"]
+            and not o["in_yt_chain"]
         )
     # Только vless-outbounds можно выбрать как primary/failover
     vless_tags = [o["tag"] for o in outbounds if o["protocol"] == "vless"]
@@ -4092,6 +4174,21 @@ def xkeen_page():
                 "options": opts,
             })
 
+    # v1.0.99: справка по каналам для редактора цепочек резерва AI/YouTube.
+    #   ru_wd   — распознаёт ли тег как российский ТОТ ЖЕ фильтр, что стоит в watchdog;
+    #   ru_look — панельная эвристика «выглядит российским» (шире: LTE, имена операторов).
+    # Расхождение между ними и есть ловушка: узел выглядит российским, а фильтр цепочки
+    # его пропустит внутрь (для AI это чужой RU-выход вместо блокировки).
+    chain_tag_info = {
+        o["tag"]: {
+            "ru_wd": wd_is_ru_tag(o["tag"]),
+            "ru_look": bool(o.get("is_ru")),
+            "anti_dpi": bool(o.get("is_anti_dpi")),
+            "group": o.get("group_name") or "",
+        }
+        for o in vless_options if not o.get("is_direct")
+    }
+
     # Уникальные subscription URLs из sub_meta (group-level) для dropdown «Сохранённый URL»
     # Берём из subscription_meta — там URL хранится один на подписку (по pbk), без дублей
     sub_urls_to_groups = {}  # url → список (group_name, count)
@@ -4154,6 +4251,7 @@ def xkeen_page():
         domain_notes_json=json.dumps(domain_notes, ensure_ascii=False),  # v1.7.0
         cfg=cfg,  # доступ к EXTERNAL_DOMAIN/HOME_DOMAIN/LAN_HOST из config_local в шаблонах
         structure=structure,  # дрейф версий watchdog/template — для баннера
+        chain_tag_info=chain_tag_info,  # v1.0.99 — справка по каналам для редактора цепочек
     )
 
 
@@ -5377,20 +5475,38 @@ def api_xkeen_subscription_sync():
     # outbound уже удалён из 04_outbounds.json, теперь убираем его из списка резерва
     # в watchdog.config, чтобы watchdog не пытался регенерить routing-rule на
     # несуществующий tag. Head цепочки (#1) сюда не попадает — он защищён pre-check'ом.
+    # v1.0.99: заодно чистим цепочки резерва AI/YouTube (watchdog v27) — тот же класс
+    # «хвост цепочки», тот же риск tag-зомби. Все цепочки пишем ОДНИМ вызовом: каждая
+    # запись config = ещё один прогон watchdog.sh (~30 c с health-check).
     removed_from_failover = []
+    removed_from_ai_chain = []
+    removed_from_yt_chain = []
     failover_cleanup_error = ""
     if remove_orphans and removed_tags:
-        failover_list_current = list(targets.get("failover_tags") or [])
         removed_set = set(removed_tags)
+        _chain_updates = {}
+        failover_list_current = list(targets.get("failover_tags") or [])
         failover_after = [t for t in failover_list_current if t not in removed_set]
         if failover_after != failover_list_current:
             removed_from_failover = [t for t in failover_list_current if t in removed_set]
+            _chain_updates["FAILOVER_TAGS"] = " ".join(failover_after)
+        ai_chain_current = list(targets.get("ai_failover_tags") or [])
+        ai_chain_after = [t for t in ai_chain_current if t not in removed_set]
+        if ai_chain_after != ai_chain_current:
+            removed_from_ai_chain = [t for t in ai_chain_current if t in removed_set]
+            _chain_updates["AI_FAILOVER_TAGS"] = " ".join(ai_chain_after)
+        yt_chain_current = list(targets.get("yt_failover_tags") or [])
+        yt_chain_after = [t for t in yt_chain_current if t not in removed_set]
+        if yt_chain_after != yt_chain_current:
+            removed_from_yt_chain = [t for t in yt_chain_current if t in removed_set]
+            _chain_updates["YT_FAILOVER_TAGS"] = " ".join(yt_chain_after)
+        if _chain_updates:
             # write_watchdog_config возвращает {"ok": bool, ...}. Если SSH-запись или запуск
             # watchdog.sh провалится — outbound уже удалён из 04_outbounds.json, но tag-зомби
-            # остаётся в FAILOVER_TAGS. Watchdog в следующий тик попытается регенерить
+            # остаётся в цепочке. Watchdog в следующий тик попытается регенерить
             # routing-rule на несуществующий tag → xray error. Поэтому ловим failure и сообщаем.
             try:
-                _wd_result = keenetic_write_watchdog_config({"FAILOVER_TAGS": " ".join(failover_after)})
+                _wd_result = keenetic_write_watchdog_config(_chain_updates)
                 if not (isinstance(_wd_result, dict) and _wd_result.get("ok")):
                     failover_cleanup_error = (_wd_result or {}).get("stderr", "write watchdog.config failed")[:200] if isinstance(_wd_result, dict) else "watchdog.config write returned no status"
             except Exception as _ex:
@@ -6282,6 +6398,122 @@ def api_xkeen_set_failover_chain():
     if not tags:
         return jsonify({"ok": False, "stderr": "после фильтрации пусто"})
     result = keenetic_write_watchdog_config({"FAILOVER_TAGS": " ".join(tags)})
+    return jsonify(result)
+
+
+# ---- v1.0.99: цепочки резерва каналов AI / YouTube (watchdog v27) ----
+# Watchdog при падении основного канала перебирает цепочку СВЕРХУ ВНИЗ и переключается на
+# первый живой; block (kill-switch) — только когда вся цепочка молчит *_CHAIN_ROUNDS кругов.
+
+CHANNEL_CHAIN_MAX = 8   # длиннее смысла нет: каждый тег = отдельная проба внутри минутного тика
+
+# Маркеры «российского» тега — 1:1 порт is_ru_tag() из watchdog.sh v27 (case-варианты
+# оттуда же, включая асимметрию: подстрока «Ru_» есть, а «Ru-» нет).
+# 🔴 Держать синхронно с bootstrap/watchdog.sh.cur. Если разъедется — панель пообещает
+# «RU-узлы пропустим», а watchdog пустит AI через RU-IP (это бан аккаунта Anthropic).
+_WD_RU_SUBSTR = ("RU_", "Ru_", "ru_", "RU-", "ru-")
+_WD_RU_SUFFIX = ("_RU", "_Ru", "_ru", "-RU", "-ru")
+_WD_RU_WORDS  = ("Росси", "росси", "РОССИ",
+                 "Russia", "russia", "RUSSIA", "🇷🇺")
+
+
+def wd_is_ru_tag(tag):
+    """Считает ли watchdog этот тег российским узлом (для фильтра цепочки *_CHAIN_ALLOW_RU)."""
+    t = tag or ""
+    if any(s in t for s in _WD_RU_SUBSTR):
+        return True
+    if any(t.endswith(s) for s in _WD_RU_SUFFIX):
+        return True
+    return any(w in t for w in _WD_RU_WORDS)
+
+
+@app.route("/api/xkeen/set-channel-chain", methods=["POST"])
+@requires_auth
+def api_xkeen_set_channel_chain():
+    """Цепочка резерва канала AI или YouTube + флаг «пускать RU-узлы».
+    Body: kind=ai|yt, tags=<теги через запятую, порядок = приоритет>, allow_ru=1|0 (необязателен).
+    Пустой tags разрешён — это «цепочки нет», поведение как до watchdog v27
+    (основной упал → сразу kill-switch/default)."""
+    kind = (request.form.get("kind") or "").strip().lower()
+    if kind not in ("ai", "yt"):
+        return jsonify({"ok": False, "stderr": "kind должен быть ai или yt"})
+    label     = "AI" if kind == "ai" else "YouTube"
+    key_chain = "AI_FAILOVER_TAGS" if kind == "ai" else "YT_FAILOVER_TAGS"
+    key_ru    = "AI_CHAIN_ALLOW_RU" if kind == "ai" else "YT_CHAIN_ALLOW_RU"
+    key_main  = "ai_tag" if kind == "ai" else "yt_tag"
+
+    raw = (request.form.get("tags") or "").strip()
+    parsed = [t.strip() for t in re.split(r"[,\s]+", raw) if t.strip()]
+    # Дедуп с сохранением порядка: повтор тега = лишняя проба того же узла каждый круг.
+    seen, tags = set(), []
+    for t in parsed:
+        if t not in seen:
+            seen.add(t)
+            tags.append(t)
+    dropped_dup = len(parsed) - len(tags)
+
+    notes = []
+    # direct/block в цепочке НЕДОПУСТИМЫ: probe_tag отдаёт для них «жив» безусловно, и
+    # AI ушёл бы напрямую с РФ-IP роутера (watchdog их и сам фильтрует, но молча).
+    service = [t for t in tags if t in ("direct", "block")]
+    if service:
+        return jsonify({"ok": False, "stderr":
+                        "В цепочку нельзя ставить служебные каналы (" + ", ".join(service) +
+                        "): watchdog считает их всегда живыми, и трафик ушёл бы напрямую "
+                        "с IP роутера. Для «пусть идёт как обычно, если всё упало» — сними "
+                        "галочку блокировки ниже."})
+
+    # Роли из watchdog.config: strict — сбой чтения не должен молча превратиться в «ролей нет».
+    targets = keenetic_get_watchdog_targets(strict=True)
+    if targets is None:
+        return jsonify({"ok": False, "stderr": "watchdog.config не прочитался с роутера (SSH-сбой) — цепочка не сохранена. Повтори позже."})
+    main_tag = targets.get(key_main)
+    if main_tag and main_tag in tags:
+        tags = [t for t in tags if t != main_tag]
+        notes.append("основной канал " + main_tag + " убран из цепочки — он и так проверяется первым")
+
+    # Тег должен существовать в 04_outbounds.json, иначе цепочка тихо укоротится в аварии.
+    outbounds = keenetic_get_outbounds()
+    if outbounds is None:
+        return jsonify({"ok": False, "stderr": "не удалось прочитать 04_outbounds.json с роутера — цепочка не сохранена (нечем проверить теги). Повтори позже."})
+    known = {o.get("tag") for o in outbounds}
+    unknown = [t for t in tags if t not in known]
+    if unknown:
+        return jsonify({"ok": False, "stderr":
+                        "Нет таких outbound'ов: " + ", ".join(unknown) +
+                        ". Обнови страницу — список каналов мог измениться."})
+
+    if len(tags) > CHANNEL_CHAIN_MAX:
+        return jsonify({"ok": False, "stderr":
+                        "В цепочке " + str(len(tags)) + " каналов, максимум " + str(CHANNEL_CHAIN_MAX) +
+                        ": watchdog пробует их по очереди внутри минутного тика, длинная цепочка не успеет пройтись."})
+
+    updates = {key_chain: " ".join(tags)}
+    allow_ru_raw = request.form.get("allow_ru")
+    allow_ru = (targets.get("ai_chain_allow_ru") if kind == "ai" else targets.get("yt_chain_allow_ru"))
+    if allow_ru_raw is not None:
+        allow_ru = (allow_ru_raw == "1")
+        updates[key_ru] = "1" if allow_ru else "0"
+
+    # Предупреждения (не блокируют): что именно watchdog сделает с этой цепочкой.
+    ru_in_chain = [t for t in tags if wd_is_ru_tag(t)]
+    if ru_in_chain and not allow_ru:
+        notes.append("watchdog ПРОПУСТИТ как российские: " + ", ".join(ru_in_chain) +
+                     " (галочка «пускать RU-узлы» выключена)")
+    if ru_in_chain and allow_ru and kind == "ai":
+        notes.append("⚠️ в цепочке AI есть российские узлы (" + ", ".join(ru_in_chain) +
+                     ") — Anthropic/OpenAI могут заблокировать аккаунт за RU-IP")
+
+    if dropped_dup:
+        notes.append("повторов убрано: " + str(dropped_dup))
+
+    result = keenetic_write_watchdog_config(updates)
+    if isinstance(result, dict) and result.get("ok"):
+        chain_txt = " → ".join(tags) if tags else "пусто (цепочки нет)"
+        result["stdout"] = ("Цепочка резерва " + label + ": " + chain_txt +
+                            (". " + "; ".join(notes) if notes else "")) + " " + (result.get("stdout") or "")
+        result["chain"] = tags
+        result["notes"] = notes
     return jsonify(result)
 
 
@@ -7277,14 +7509,26 @@ FAILOVER_TAGS=""
 AI_TAG=""
 AI_DOMAINS="anthropic.com chatgpt.com claude.ai claudeusercontent.com featureassets.org featuregates.org oaistatic.com oaiusercontent.com openai.com sora.com statsig.com"
 AI_FAIL_BLOCK="1"
+# цепочка резерва AI: теги через пробел, порядок = приоритет перебора (пусто = цепочки нет)
+AI_FAILOVER_TAGS=""
+# пускать ли российские узлы в цепочку AI (0 — RU-выход блокируют Anthropic/OpenAI)
+AI_CHAIN_ALLOW_RU="0"
 YT_TAG=""
 YT_DOMAINS="ggpht.com googlevideo.com youtu.be youtube-nocookie.com youtube.com youtubei.googleapis.com yt3.ggpht.com yt4.ggpht.com ytimg.com"
 YT_FAIL_BLOCK="0"
+# цепочка резерва YouTube: теги через пробел, порядок = приоритет перебора
+YT_FAILOVER_TAGS=""
+# для YouTube российский узел штатен (меньше рекламы, нет троттлинга) — по умолчанию разрешён
+YT_CHAIN_ALLOW_RU="1"
 DIRECT_DOMAINS=""
 BLOCK_DOMAINS=""
 PRIMARY_PROBE_URL="https://www.cloudflare.com/cdn-cgi/trace"
-FAIL_THRESHOLD="2   # сколько раз primary должен упасть подряд → switch to failover"
-PASS_THRESHOLD="3   # сколько раз primary должен ожить подряд → switch back to primary"
+# сколько раз primary должен упасть подряд → switch to failover
+# 🔴 значение — ТОЛЬКО число: комментарий внутри кавычек ломает сравнение в ash
+# ([ "$CTR" -ge "$FAIL_THRESHOLD" ] → "bad number") и ветка failover становится недостижимой.
+FAIL_THRESHOLD="2"
+# сколько раз primary должен ожить подряд → switch back to primary
+PASS_THRESHOLD="3"
 TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 FORCE_MODE="auto"
@@ -10201,6 +10445,27 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     border-radius: 4px;
     min-height: 160px;  /* вмещает оба варианта текста (ВКЛ/ВЫКЛ) у AI и YT — чтобы блоки доменов начинались на одной высоте */
   }
+  /* v1.0.99: редактор цепочки резерва канала (AI / YouTube) */
+  .chain-list { margin: 6px 0; }
+  .chain-row {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 6px; margin-bottom: 4px;
+    background: #fafaf5; border: 1px solid #e2e2d8; border-radius: 4px;
+    font-size: 0.85em;
+  }
+  .chain-row .chain-pos { color: #888; font-weight: 600; min-width: 20px; }
+  .chain-row .chain-tag { flex: 1 1 auto; font-family: Consolas, monospace; word-break: break-all; }
+  .chain-row .chain-note { font-family: -apple-system, Segoe UI, Roboto, sans-serif; word-break: normal; }
+  .chain-row .chain-btn {
+    border: 1px solid #ccc; background: #fff; border-radius: 3px;
+    cursor: pointer; padding: 1px 6px; font-size: 0.95em; line-height: 1.4;
+  }
+  .chain-row .chain-btn:hover { background: #eee; }
+  .chain-row .chain-btn:disabled { opacity: 0.35; cursor: default; }
+  .chain-row.chain-skip { background: #fdf3f3; border-color: #e8c8c8; }
+  .chain-row.chain-main { background: #eef7e6; border-color: #cfe3bf; }
+  .chain-empty { color: #888; font-size: 0.85em; font-style: italic; padding: 4px 0; }
+  .chain-warn { color: #a55a18; font-size: 0.82em; margin: 4px 0 0; }
   /* Outbound-info блок (вывод параметров выбранного канала) — фиксированная min-height,
      чтобы пустой блок (когда канал ещё не выбран / без extra полей) занимал то же место. */
   .outbound-info { min-height: 78px; }  /* вмещает header (2 строки бейджей) + params (2 строки при переносе длинного vless) — чтобы AI/YT info-блоки были одинаковой высоты независимо от длины параметров */
@@ -10520,6 +10785,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
                 <span style="color: #c33;">🚨 АКТИВЕН — AI заблокирован</span>
               {% elif watchdog.effective_ai == targets.ai_tag %}
                 <span style="color: #2a7;">✓ канал {{ watchdog.effective_ai }} жив</span>
+              {% elif watchdog.effective_ai in (targets.ai_failover_tags or []) %}
+                <span style="color: #e80;">🔀 работает резерв из цепочки — {{ watchdog.effective_ai }} (#{{ (targets.ai_failover_tags or []).index(watchdog.effective_ai) + 1 }})</span>
               {% elif watchdog.effective_ai %}
                 <span style="color: #e80;">⚠️ FALLBACK — AI идёт через {{ watchdog.effective_ai }}</span>
               {% else %}
@@ -10528,16 +10795,47 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             </div>
             <label style="font-size: 0.85em; margin-top: 6px; display: block; cursor: pointer;">
               <input type="checkbox" id="ai-fail-block-toggle" {% if targets.ai_fail_block %}checked{% endif %} onchange="toggleAIFailBlock(this.checked)">
-              Блокировать AI-трафик если канал упал (рекомендую)
+              {% if targets.ai_failover_tags %}Блокировать AI-трафик, если вся цепочка упала (рекомендуется){% else %}Блокировать AI-трафик, если канал упал (рекомендуется){% endif %}
             </label>
             <p class="subtitle" style="margin: 4px 0 0;">
               {% if targets.ai_fail_block %}
-                ВКЛ: если <code>{{ targets.ai_tag }}</code> не отвечает — AI-домены идут в <code>block</code> (drop). Защита от засветки RU IP в Anthropic/OpenAI.
+                ВКЛ: когда <code>{{ targets.ai_tag }}</code>{% if targets.ai_failover_tags %} и все каналы цепочки резерва ниже{% endif %} не отвечают — AI-домены идут в <code>block</code> (drop). Защита от засветки RU IP в Anthropic/OpenAI.
               {% else %}
-                ВЫКЛ: при падении <code>{{ targets.ai_tag }}</code> AI идёт через текущий default-канал (PRIMARY/FAILOVER). ⚠️ Если default = RU IP, Anthropic может забанить аккаунт.
+                ВЫКЛ: когда <code>{{ targets.ai_tag }}</code>{% if targets.ai_failover_tags %} и вся цепочка резерва{% endif %} не отвечают, AI идёт через текущий default-канал (PRIMARY/FAILOVER). ⚠️ Если default = RU IP, Anthropic может забанить аккаунт.
               {% endif %}
             </p>
           </div>
+
+          <!-- v1.0.99: цепочка резерва AI-канала (watchdog v27) -->
+          <details class="chain-box" data-xk-keep-inline {% if targets.ai_failover_tags %}open{% endif %} style="margin-top: 12px; border-top: 1px dashed #ccc; padding-top: 10px;">
+            <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">⛓️ Цепочка резерва <span style="color: #888; font-weight: 400; font-size: 0.88em;">— куда переводить AI-трафик, если канал выше упал{% if targets.ai_failover_tags %} (каналов: {{ targets.ai_failover_tags|length }}){% else %} (сейчас пусто){% endif %}</span></summary>
+            <div style="margin-top: 8px;">
+              <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">
+                Watchdog перебирает каналы <strong>сверху вниз</strong> и переводит AI-трафик на первый живой. Как только оживёт более приоритетный — вернёт наверх. <strong>Основной канал сюда добавлять не нужно</strong> — он проверяется раньше цепочки, при каждой проверке (раз в минуту), и трафик вернётся на него автоматически. Блокировка (kill-switch выше) срабатывает только когда молчит <strong>вся</strong> цепочка. Пустая цепочка = прежнее поведение: канал упал → сразу блокировка.
+              </p>
+              <div id="ai-chain-list" class="chain-list"></div>
+              <div style="margin: 8px 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
+                <select id="ai-chain-add" style="flex: 1 1 240px; padding: 6px; font-size: 0.9em; border: 1px solid #ccc; border-radius: 4px;">
+                  <option value="">— выбрать канал —</option>
+                  {% for grp in vless_option_groups %}
+                  <optgroup label="📦 {{ grp.name }}">
+                    {% for opt in grp.options %}{% if not opt.is_direct %}
+                    <option value="{{ opt.tag }}">{{ grp.name }} · {{ opt.tag }}{% if opt.is_anti_dpi %} · 🛡️ Обход{% elif opt.is_ru %} · 📺 Ютуб{% endif %}</option>
+                    {% endif %}{% endfor %}
+                  </optgroup>
+                  {% endfor %}
+                </select>
+                <button type="button" class="btn btn-sm" onclick="chainAdd('ai')" title="Добавить выбранный канал в конец цепочки. Порядок потом меняется стрелками.">➕ Добавить</button>
+              </div>
+              <label style="font-size: 0.85em; display: block; cursor: pointer; margin-top: 6px;">
+                <input type="checkbox" id="ai-chain-allow-ru" {% if targets.ai_chain_allow_ru %}checked{% endif %} onchange="chainRender('ai')">
+                Пускать российские узлы в цепочку
+                <span class="subtitle" style="font-weight: normal;">— по умолчанию выключено: с российского IP Anthropic и OpenAI блокируют аккаунт</span>
+              </label>
+              <button class="btn" style="margin-top: 8px; background: #6a3;" onclick="saveChannelChain('ai')" title="Записать цепочку в watchdog.config. Watchdog применит её при следующей проверке.">💾 Сохранить цепочку</button>
+              <p class="subtitle" style="margin: 6px 0 0; font-size: 0.82em;">Служебные каналы (<code>direct</code>, <code>block</code>) в цепочку не ставятся: watchdog считает их всегда живыми, и AI-трафик ушёл бы напрямую с IP роутера.</p>
+            </div>
+          </details>
         </div>
       </div>
 
@@ -10655,6 +10953,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
                 <span style="color: #c33;">🚨 АКТИВЕН — YouTube заблокирован</span>
               {% elif watchdog.effective_yt == targets.yt_tag %}
                 <span style="color: #2a7;">✓ канал {{ watchdog.effective_yt }} жив</span>
+              {% elif watchdog.effective_yt in (targets.yt_failover_tags or []) %}
+                <span style="color: #e80;">🔀 работает резерв из цепочки — {{ watchdog.effective_yt }} (#{{ (targets.yt_failover_tags or []).index(watchdog.effective_yt) + 1 }})</span>
               {% elif watchdog.effective_yt %}
                 <span style="color: #e80;">⚠️ FALLBACK — YT идёт через {{ watchdog.effective_yt }}</span>
               {% else %}
@@ -10663,17 +10963,48 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             </div>
             <label style="font-size: 0.85em; margin-top: 6px; display: block; cursor: pointer;">
               <input type="checkbox" id="yt-fail-block-toggle" {% if targets.yt_fail_block %}checked{% endif %} onchange="toggleYTFailBlock(this.checked)">
-              Блокировать трафик если канал упал
+              {% if targets.yt_failover_tags %}Блокировать трафик, если вся цепочка упала{% else %}Блокировать трафик если канал упал{% endif %}
               <span class="subtitle" style="font-weight: normal;">— на выбор: ВКЛ = чисто без рекламы (видео не работает); ВЫКЛ = реклама вернётся, видео работает</span>
             </label>
             <p class="subtitle" style="margin: 4px 0 0;">
               {% if targets.yt_fail_block %}
-                ВКЛ: если <code>{{ targets.yt_tag }}</code> не отвечает — YouTube/IG/Discord идут в <code>block</code> (drop). Видео не запустится.
+                ВКЛ: когда <code>{{ targets.yt_tag }}</code>{% if targets.yt_failover_tags %} и вся цепочка резерва{% endif %} не отвечают — YouTube/IG/Discord идут в <code>block</code> (drop). Видео не запустится.
               {% else %}
-                ВЫКЛ: при падении <code>{{ targets.yt_tag }}</code> YouTube пойдёт через текущий default-канал (PRIMARY/FAILOVER) — реклама вернётся, но видео работает.
+                ВЫКЛ: когда <code>{{ targets.yt_tag }}</code>{% if targets.yt_failover_tags %} и вся цепочка резерва{% endif %} не отвечают, YouTube пойдёт через текущий default-канал (PRIMARY/FAILOVER) — реклама вернётся, но видео работает.
               {% endif %}
             </p>
           </div>
+
+          <!-- v1.0.99: цепочка резерва YouTube-канала (watchdog v27) -->
+          <details class="chain-box" data-xk-keep-inline {% if targets.yt_failover_tags %}open{% endif %} style="margin-top: 12px; border-top: 1px dashed #ccc; padding-top: 10px;">
+            <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">⛓️ Цепочка резерва <span style="color: #888; font-weight: 400; font-size: 0.88em;">— куда переводить YouTube, если канал выше упал{% if targets.yt_failover_tags %} (каналов: {{ targets.yt_failover_tags|length }}){% else %} (сейчас пусто){% endif %}</span></summary>
+            <div style="margin-top: 8px;">
+              <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">
+                Watchdog перебирает каналы <strong>сверху вниз</strong> и переводит YouTube на первый живой. Как только оживёт более приоритетный — вернёт наверх. <strong>Основной канал сюда добавлять не нужно</strong> — он проверяется раньше цепочки, при каждой проверке (раз в минуту), и трафик вернётся на него автоматически. Блокировка (kill-switch выше) срабатывает только когда молчит <strong>вся</strong> цепочка. Пустая цепочка = прежнее поведение.
+              </p>
+              <div id="yt-chain-list" class="chain-list"></div>
+              <div style="margin: 8px 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
+                <select id="yt-chain-add" style="flex: 1 1 240px; padding: 6px; font-size: 0.9em; border: 1px solid #ccc; border-radius: 4px;">
+                  <option value="">— выбрать канал —</option>
+                  {% for grp in vless_option_groups %}
+                  <optgroup label="📦 {{ grp.name }}">
+                    {% for opt in grp.options %}{% if not opt.is_direct %}
+                    <option value="{{ opt.tag }}">{{ grp.name }} · {{ opt.tag }}{% if opt.is_anti_dpi %} · 🛡️ Обход{% elif opt.is_ru %} · 📺 Ютуб{% endif %}</option>
+                    {% endif %}{% endfor %}
+                  </optgroup>
+                  {% endfor %}
+                </select>
+                <button type="button" class="btn btn-sm" style="background: #c33;" onclick="chainAdd('yt')" title="Добавить выбранный канал в конец цепочки. Порядок потом меняется стрелками.">➕ Добавить</button>
+              </div>
+              <label style="font-size: 0.85em; display: block; cursor: pointer; margin-top: 6px;">
+                <input type="checkbox" id="yt-chain-allow-ru" {% if targets.yt_chain_allow_ru %}checked{% endif %} onchange="chainRender('yt')">
+                Пускать российские узлы в цепочку
+                <span class="subtitle" style="font-weight: normal;">— для YouTube российский выход штатен: меньше рекламы и нет замедления Google-CDN</span>
+              </label>
+              <button class="btn" style="margin-top: 8px; background: #c33;" onclick="saveChannelChain('yt')" title="Записать цепочку в watchdog.config. Watchdog применит её при следующей проверке.">💾 Сохранить цепочку</button>
+              <p class="subtitle" style="margin: 6px 0 0; font-size: 0.82em;">Служебные каналы (<code>direct</code>, <code>block</code>) в цепочку не ставятся: watchdog считает их всегда живыми.</p>
+            </div>
+          </details>
         </div>
       </div>
 
@@ -11133,7 +11464,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         <td class="mono"><strong>{{ o.tag }}</strong>{% if o.note %}<br><span style="font-style:italic; font-size:0.8em; color:#3a6;">📝 {{ o.note }}</span>{% endif %}</td>
         <td class="group-cell"><span class="group-name-badge" title="pbk={{ o.group_pbk_short }}">{{ o.group_name or '?' }}</span></td>
         <td class="mono">{{ o.host }}:{{ o.port }}</td>
-        <td>{% if o.tag == watchdog.current_default %}<span class="badge badge-active">⚡ активен</span>{% endif %}{% if o.is_ai %} <span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}{% if o.is_yt %} <span class="badge" style="background:#fbdada; color:#c33">📺 YT</span>{% endif %}{% if o.is_foreign %} <span class="badge" style="background:#efe2f7; color:#8e44ad">📱 РФ-блок</span>{% endif %} <span class="status-cell"></span></td>
+        <td>{% if o.tag == watchdog.current_default %}<span class="badge badge-active">⚡ активен</span>{% endif %}{% if o.is_ai %} <span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}{% if o.is_yt %} <span class="badge" style="background:#fbdada; color:#c33">📺 YT</span>{% endif %}{% if o.in_ai_chain %} <span class="badge" style="background:#e6f3dc; color:#4a7a2a; border:1px solid #b9d9a0;" title="Резерв цепочки AI-канала, позиция {{ o.ai_chain_position }}">🤖 резерв AI №{{ o.ai_chain_position }}</span>{% endif %}{% if o.in_yt_chain %} <span class="badge" style="background:#fdeaea; color:#a33; border:1px solid #eec4c4;" title="Резерв цепочки YouTube-канала, позиция {{ o.yt_chain_position }}">📺 резерв YT №{{ o.yt_chain_position }}</span>{% endif %}{% if o.is_foreign %} <span class="badge" style="background:#efe2f7; color:#8e44ad">📱 РФ-блок</span>{% endif %} <span class="status-cell"></span></td>
       </tr>
     {% endif %}
     {% endfor %}
@@ -11297,7 +11628,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         {% endif %}
       </td>
       <td style="vertical-align: top;">
-        {% set has_current = o.is_default or o.is_primary or o.is_failover or o.in_failover_chain or o.is_ai or o.is_yt or o.is_foreign or o.tag in ('direct','block') %}
+        {% set has_current = o.is_default or o.is_primary or o.is_failover or o.in_failover_chain or o.in_ai_chain or o.in_yt_chain or o.is_ai or o.is_yt or o.is_foreign or o.tag in ('direct','block') %}
         <div style="background: #f0f5f0; border-left: 3px solid #6a9; padding: 2px 8px; border-radius: 3px; margin-bottom: 4px;">
           <span style="color:#3a6; font-size:0.72em; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px; margin-right:5px;">▼ сейчас:</span>
           {% if has_current %}
@@ -11311,6 +11642,10 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             {% endif %}
             {% if o.is_ai %}<span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}
             {% if o.is_yt %}<span class="badge" style="background:#fbdada; color:#c33">📺 YT</span>{% endif %}
+            {% if o.in_ai_chain %}<span class="badge" style="background:#e6f3dc; color:#4a7a2a; border:1px solid #b9d9a0;" title="Резерв цепочки AI-канала (позиция {{ o.ai_chain_position }}). Watchdog переведёт сюда AI-трафик, если каналы выше по цепочке мертвы. Менять порядок — в карточке «🤖 AI» → «⛓️ Цепочка резерва».">🤖 резерв AI №{{ o.ai_chain_position }}</span>
+              <button class="btn btn-sm" style="background:#eef7e6; color:#4a7a2a; border:1px solid #b9d9a0; padding:1px 7px; font-size:0.72em; margin-left:3px;" onclick="removeFromChannelChain('ai', '{{ o.tag }}')" title="Убрать этот канал из цепочки резерва AI">✖ из цепочки AI</button>{% endif %}
+            {% if o.in_yt_chain %}<span class="badge" style="background:#fdeaea; color:#a33; border:1px solid #eec4c4;" title="Резерв цепочки YouTube-канала (позиция {{ o.yt_chain_position }}). Watchdog переведёт сюда YouTube, если каналы выше по цепочке мертвы. Менять порядок — в карточке «📺 YouTube» → «⛓️ Цепочка резерва».">📺 резерв YT №{{ o.yt_chain_position }}</span>
+              <button class="btn btn-sm" style="background:#fdeaea; color:#a33; border:1px solid #eec4c4; padding:1px 7px; font-size:0.72em; margin-left:3px;" onclick="removeFromChannelChain('yt', '{{ o.tag }}')" title="Убрать этот канал из цепочки резерва YouTube">✖ из цепочки YT</button>{% endif %}
             {% if o.is_foreign %}<span class="badge" style="background:#efe2f7; color:#8e44ad">📱 РФ-блок</span>{% endif %}
             {% if o.tag in ('direct','block') %}<span class="badge badge-dim">служ.</span>{% endif %}
           {% else %}
@@ -12876,12 +13211,21 @@ Use this token to access the HTTP API:
       <h4>🤖 AI-sticky outbound</h4>
       <p>Sticky-канал именно для AI-сайтов из списка <code>📦 Список AI-доменов</code>. <strong>Независим</strong> от PRIMARY/FAILOVER — даже если default переключился, AI всё равно идёт через выбранный канал.</p>
       <p>Зачем: AI-сервисы (Anthropic, OpenAI, Gemini) <strong>геоблокируют российские IP</strong> — получишь 403/region-denied. Поэтому выбирай EU-канал (Германия, Нидерланды, Финляндия). НЕ выбирай канал с бейджем <strong>🛡️ Обход</strong> или <strong>📺 Ютуб</strong> — это RU-exit, AI заблокирует. В dropdown'е такие подсвечены коричневым с предупреждением.</p>
-      <p><strong>Kill-switch (рекомендую включён)</strong>: если AI-канал упал — AI-домены идут в <code>block</code> (drop), а не через PRIMARY. Защита от засветки твоего RU-IP в Anthropic/OpenAI (после такого аккаунт могут заблокировать).</p>
+      <p><strong>Kill-switch (рекомендуется включённым)</strong>: когда AI-канал упал и цепочка резерва (см. ниже) пуста или тоже молчит — AI-домены идут в <code>block</code> (drop), а не через PRIMARY. Это защита от засветки российского IP в Anthropic/OpenAI: после такого аккаунт могут заблокировать.</p>
 
       <h4>📺 YouTube-sticky outbound</h4>
       <p>Sticky-канал для YouTube/Google-видео из списка <code>📺 Список YouTube-доменов</code>. Аналог AI-sticky. <em>(Instagram/Telegram/Twitter/Discord сюда НЕ кладём — они в отдельном канале «Зарубежные сервисы» ниже.)</em></p>
       <p>Зачем: при просмотре YouTube через EU/US-VPN — <strong>лезет реклама</strong> (Google показывает по geo-IP) и видео могут тротлить. Если же канал — <strong>RU-exit</strong> (через российский IP), рекламы меньше и троттлинга нет (специфика политики Google для RU-аудитории). Поэтому выбирай канал с бейджем <strong>📺 Ютуб</strong> в dropdown'е (это RU-exit без anti-DPI маскировки).</p>
-      <p><strong>Kill-switch выключен по умолчанию</strong> — если YT-канал упал, YouTube идёт через PRIMARY (с рекламой, но работает).</p>
+      <p><strong>Kill-switch выключен по умолчанию</strong> — если YT-канал и его цепочка резерва (см. ниже) молчат, YouTube идёт через PRIMARY (с рекламой, но работает).</p>
+
+
+      <h4>⛓️ Цепочка резерва у каналов AI и YouTube</h4>
+      <p>У AI-канала и YouTube-канала есть <strong>собственная цепочка резерва</strong> — отдельная от цепочки PRIMARY/FAILOVER. Настраивается в карточке канала: <strong>⛓️ Цепочка резерва</strong>.</p>
+      <p><strong>Как это работает.</strong> Основной канал упал → watchdog перебирает цепочку <strong>сверху вниз</strong> и переводит трафик на первый живой канал. Как только оживает более приоритетный (или сам основной) — трафик возвращается наверх, залипания на дальнем резерве не происходит. Блокировка (kill-switch) включается <strong>последней мерой</strong>, когда молчит вся цепочка: не после первого промаха, а после двух пустых кругов подряд — чтобы короткая просадка связи не роняла канал в блок.</p>
+      <p><strong>Порядок = приоритет.</strong> Первым ставится самый желанный резерв. Для AI-канала полезно ставить в начало узлы с постоянным адресом (например, собственный VPS): AI-сервисы спокойнее относятся к стабильному IP, чем к смене страны. Разумно, чтобы дальше в цепочке шли узлы <strong>других</strong> провайдеров или хостов — иначе падение одного сервера уносит всю цепочку разом.</p>
+      <p><strong>Галочка «Пускать российские узлы в цепочку».</strong> Для AI по умолчанию выключена: российский выход = блокировка аккаунта у Anthropic и OpenAI. Для YouTube по умолчанию включена: там российский выход штатен — меньше рекламы и нет замедления Google-CDN. Российским узел считается по имени тега: <code>RU</code>, <code>Россия</code>, <code>Russia</code> или флаг в названии. Если узел российский, но в имени этого нет, фильтр его не распознает — панель показывает такое предупреждение прямо в списке цепочки.</p>
+      <p><strong>Что в цепочку не ставится.</strong> Служебные каналы <code>direct</code> (напрямую без VPN) и <code>block</code>: watchdog считает их всегда живыми, и трафик ушёл бы напрямую с IP роутера — для AI это ровно то, от чего защищает kill-switch.</p>
+      <p><strong>Проверка состояния.</strong> В карточке канала строка Kill-switch показывает, что работает прямо сейчас: сам канал, резерв из цепочки (с его номером) или блокировка. Переключения приходят и в Telegram-алерты, если бот настроен.</p>
 
       <h4>📱 «Зарубежные сервисы»-sticky outbound</h4>
       <p>Sticky-канал для <strong>зарубежных сервисов</strong>: Meta/Instagram, WhatsApp, Telegram, Twitter/X, Discord (список <code>📱 Список доменов</code> в этом канале).</p>
@@ -14935,6 +15279,20 @@ async function probeChannelFromInfo(role) {
   // refreshAIInfo/refreshYTInfo внутри applyStatusesToMeta перерисуют info-блок,
   // включая саму кнопку — состояние btn сбросится автоматически.
 }
+// v1.0.99: позиция канала в цепочке резерва своей роли (1..N) или 0, если он не оттуда.
+// Один helper на все индикаторы — чтобы разные места UI не расходились в формулировках.
+function chainPositionOf(roleLabel, tag) {
+  const kind = roleLabel === 'AI' ? 'ai' : (roleLabel === 'YouTube' ? 'yt' : null);
+  if (!kind || !tag) return 0;
+  // CHAIN_STATE объявлен ниже по файлу через const: до его инициализации даже typeof
+  // бросает ReferenceError (temporal dead zone), поэтому именно try/catch, не проверка.
+  try {
+    return CHAIN_STATE[kind] ? CHAIN_STATE[kind].tags.indexOf(tag) + 1 : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
 function getChannelStatusNote(tag, effective, failBlock, roleLabel) {
   if (effective === 'block') {
     return '<span style="background:#c33; color:#fff; padding:1px 6px; border-radius:3px;" title="Канал упал и kill-switch заблокировал ' + roleLabel + '-трафик (защита от засветки RU IP). Восстановится автоматически когда канал оживёт.">🚫 канал упал → kill-switch</span>';
@@ -14948,6 +15306,13 @@ function getChannelStatusNote(tag, effective, failBlock, roleLabel) {
   // подменил EFFECTIVE_*_TAG на DEFAULT_TAG. Это значит трафик AI/YT временно идёт
   // через PRIMARY/FAILOVER. Показываем явное оранжевое предупреждение.
   if (effective && effective !== tag && effective !== 'block') {
+    // v1.0.99: сперва смотрим, не резерв ли это из СВОЕЙ цепочки канала — это штатное
+    // переключение, а не «трафик утёк в default». Разные подписи в разных местах UI
+    // раньше уже путали (см. историю с меткой FAILOVER-карточки), поэтому источник один.
+    const chainPos = chainPositionOf(roleLabel, effective);
+    if (chainPos) {
+      return '<span style="background:#fff0d0; color:#a55a18; padding:1px 6px; border-radius:3px;" title="Канал ' + tag + ' не отвечает, watchdog перевёл ' + roleLabel + '-трафик на резерв №' + chainPos + ' из цепочки (' + effective + '). Вернётся сам, как только оживёт более приоритетный канал.">🔀 резерв цепочки №' + chainPos + ' → ' + effective + '</span>';
+    }
     const aiWarn = roleLabel === 'AI' ? ' ⚠️ Anthropic может увидеть текущий IP (если default = RU — риск бана).' : '';
     return '<span style="background:#fff0d0; color:#a55a18; padding:1px 6px; border-radius:3px;" title="Канал ' + tag + ' упал, kill-switch ВЫКЛ → watchdog временно отправил ' + roleLabel + '-трафик через default-канал ' + effective + '.' + aiWarn + ' Восстановится автоматически когда ' + tag + ' оживёт.">⚠️ fallback → ' + effective + '</span>';
   }
@@ -15008,7 +15373,10 @@ function refreshActiveInfo(role, divId, effective, selectedTag, roleLabel) {
     note = '<span style="background:#c33; color:#fff; padding:1px 6px; border-radius:3px;">🚫 ' + roleLabel + '-трафик заблокирован kill-switch\'ем (канал упал)</span>';
   } else {
     activeTag = effective;
-    note = '<span style="background:#ffe28a; color:#7a4d00; padding:1px 6px; border-radius:3px;">⚠️ FALLBACK из ' + selectedTag + '</span>';
+    const chainPos = chainPositionOf(roleLabel, effective);
+    note = chainPos
+      ? '<span style="background:#ffe28a; color:#7a4d00; padding:1px 6px; border-radius:3px;">🔀 резерв цепочки №' + chainPos + ' (основной ' + selectedTag + ' не отвечает)</span>'
+      : '<span style="background:#ffe28a; color:#7a4d00; padding:1px 6px; border-radius:3px;">⚠️ FALLBACK из ' + selectedTag + '</span>';
   }
   renderOutboundInfo(divId, activeTag, { showTagInTitle: true, activeNote: note });
 }
@@ -15022,6 +15390,145 @@ function refreshYTActiveInfo() {
   if (!sel) return;
   refreshActiveInfo('yt', 'info-yt-active', WATCHDOG_EFFECTIVE_YT, sel.value, 'YouTube');
 }
+
+// ===== v1.0.99: редактор цепочек резерва каналов AI / YouTube (watchdog v27) =====
+// Цепочка = порядок перебора: watchdog берёт первый ЖИВОЙ канал сверху вниз, а kill-switch
+// (блокировка) включается только когда молчит вся цепочка. Правки живут в браузере до
+// нажатия «Сохранить цепочку» — тогда весь список уходит одним запросом.
+const CHAIN_TAG_INFO = {{ chain_tag_info|tojson }};
+const CHAIN_MAX = 8;
+const CHAIN_STATE = {
+  ai: { tags: {{ (targets.ai_failover_tags or [])|tojson }}, label: 'AI',
+        effective: WATCHDOG_EFFECTIVE_AI, mainSel: 'select-ai',
+        mainTag: {{ targets.ai_tag|tojson }} },
+  yt: { tags: {{ (targets.yt_failover_tags or [])|tojson }}, label: 'YouTube',
+        effective: WATCHDOG_EFFECTIVE_YT, mainSel: 'select-yt',
+        mainTag: {{ targets.yt_tag|tojson }} }
+};
+
+function chainAllowRu(kind) {
+  const cb = document.getElementById(kind + '-chain-allow-ru');
+  return !!(cb && cb.checked);
+}
+
+// Перерисовка списка. Заодно показывает, что именно сделает watchdog с каждым каналом:
+// пропустит (российский при выключенной галочке / нет такого outbound), рискует баном
+// (RU в AI-цепочке), либо пройдёт фильтр вопреки «российскому» виду имени.
+function chainRender(kind) {
+  const st = CHAIN_STATE[kind];
+  const box = document.getElementById(kind + '-chain-list');
+  if (!st || !box) return;
+  // Основной канал показан ПЕРВОЙ строкой, но не как часть цепочки: watchdog проверяет его
+  // раньше всех на каждом тике и сам возвращает на него трафик. Тот же приём, что в таблице
+  // «Цепочка резерва (FAILOVER)», где PRIMARY стоит отдельной строкой только для наглядности.
+  // Без этой подсказки первый вопрос к форме — «а основной канал сюда добавлять?».
+  let html = '';
+  if (st.mainTag) {
+    html += '<div class="chain-row chain-main" title="Основной канал выбран в списке выше. '
+          + 'Watchdog проверяет его раз в минуту и вернёт трафик сюда автоматически, как только канал оживёт.">'
+          + '<span class="chain-pos">✔</span>'
+          + '<span class="chain-tag">' + escapeHtml(st.mainTag)
+          + '<br><span class="chain-note" style="color:#5a7a45; font-weight:400;">основной канал — проверяется первым, '
+          + 'каждую минуту. Добавлять его в цепочку не нужно</span></span>'
+          + '</div>';
+  }
+  if (!st.tags.length) {
+    box.innerHTML = html + '<div class="chain-empty">Цепочка резерва пуста — при падении канала сразу сработает настройка блокировки выше.</div>';
+    return;
+  }
+  const allowRu = chainAllowRu(kind);
+  st.tags.forEach(function (tag, i) {
+    const info = CHAIN_TAG_INFO[tag];
+    const notes = [];
+    let skip = false;
+    if (!info) {
+      notes.push('⚠️ такого канала нет среди outbound-ов — watchdog его пропустит');
+      skip = true;
+    } else if (info.ru_wd && !allowRu) {
+      notes.push('⏭ будет пропущен: распознан как российский узел, галочка ниже выключена');
+      skip = true;
+    } else if (info.ru_wd && kind === 'ai') {
+      notes.push('⚠️ российский узел в AI-цепочке: Anthropic и OpenAI блокируют аккаунты за RU-адрес');
+    } else if (info.ru_look && kind === 'ai') {
+      notes.push('⚠️ название выглядит российским, но фильтр ищет RU / Россия / Russia / RU-флаг в теге — этот канал в цепочку пройдёт');
+    }
+    if (st.effective && st.effective === tag) notes.push('⚡ сейчас трафик идёт через него');
+    const grp = info && info.group ? escapeHtml(info.group) : '';
+    const grpHtml = grp ? ' <span style="color:#888; font-weight:400;">· ' + grp + '</span>' : '';
+    const noteHtml = notes.length ? '<br><span class="chain-warn chain-note">' + notes.map(escapeHtml).join(' · ') + '</span>' : '';
+    html += '<div class="chain-row' + (skip ? ' chain-skip' : '') + '">'
+          + '<span class="chain-pos">#' + (i + 1) + '</span>'
+          + '<span class="chain-tag">' + escapeHtml(tag) + grpHtml + noteHtml + '</span>'
+          + '<button type="button" class="chain-btn" onclick="chainMove(&quot;' + kind + '&quot;, ' + i + ', -1)" ' + (i === 0 ? 'disabled' : '') + ' title="Поднять выше по приоритету">↑</button>'
+          + '<button type="button" class="chain-btn" onclick="chainMove(&quot;' + kind + '&quot;, ' + i + ', 1)" ' + (i === st.tags.length - 1 ? 'disabled' : '') + ' title="Опустить ниже по приоритету">↓</button>'
+          + '<button type="button" class="chain-btn" onclick="chainRemove(&quot;' + kind + '&quot;, ' + i + ')" title="Убрать из цепочки">✖</button>'
+          + '</div>';
+  });
+  box.innerHTML = html;
+}
+
+function chainMove(kind, idx, dir) {
+  const st = CHAIN_STATE[kind];
+  if (!st) return;
+  const j = idx + dir;
+  if (j < 0 || j >= st.tags.length) return;
+  const tmp = st.tags[idx];
+  st.tags[idx] = st.tags[j];
+  st.tags[j] = tmp;
+  chainRender(kind);
+}
+
+function chainRemove(kind, idx) {
+  const st = CHAIN_STATE[kind];
+  if (!st) return;
+  st.tags.splice(idx, 1);
+  chainRender(kind);
+}
+
+function chainAdd(kind) {
+  const st = CHAIN_STATE[kind];
+  const sel = document.getElementById(kind + '-chain-add');
+  if (!st || !sel) return;
+  const tag = sel.value;
+  if (!tag) { flash(false, 'Сначала выберите канал в списке', null, { noScroll: true }); return; }
+  if (st.tags.indexOf(tag) >= 0) { flash(false, 'Канал ' + tag + ' уже в цепочке', null, { noScroll: true }); return; }
+  const mainSel = document.getElementById(st.mainSel);
+  if (mainSel && mainSel.value === tag) {
+    flash(false, 'Это основной канал ' + st.label + ' — он проверяется первым, добавлять его в резерв не нужно', null, { noScroll: true });
+    return;
+  }
+  if (st.tags.length >= CHAIN_MAX) {
+    flash(false, 'В цепочке максимум ' + CHAIN_MAX + ' каналов — watchdog перебирает их внутри одной минутной проверки', null, { noScroll: true });
+    return;
+  }
+  st.tags.push(tag);
+  sel.value = '';
+  chainRender(kind);
+}
+
+async function saveChannelChain(kind) {
+  const st = CHAIN_STATE[kind];
+  if (!st) return;
+  const allowRu = chainAllowRu(kind);
+  const preview = st.tags.length
+    ? st.tags.map(function (t, i) { return '  ' + (i + 1) + '. ' + t; }).join('\n')
+    : '  (пусто — цепочки не будет)';
+  if (!confirm('Сохранить цепочку резерва ' + st.label + ':\n\n' + preview
+      + '\n\nРоссийские узлы: ' + (allowRu ? 'разрешены' : 'пропускаются'))) return;
+  const fd = new FormData();
+  fd.append('kind', kind);
+  fd.append('tags', st.tags.join(','));
+  fd.append('allow_ru', allowRu ? '1' : '0');
+  flash(true, 'Сохраняю цепочку ' + st.label + '...');
+  const res = await apiCall('/api/xkeen/set-channel-chain', fd);
+  if (res.ok) {
+    flash(true, res.stdout || 'Цепочка обновлена');
+    setTimeout(function () { location.reload(); }, 2000);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   bindOutboundInfo('select-primary',  'info-primary');
   refreshFailoverInfo();
@@ -15037,6 +15544,10 @@ document.addEventListener('DOMContentLoaded', () => {
   refreshYTActiveInfo();
   const ytSel = document.getElementById('select-yt');
   if (ytSel) ytSel.addEventListener('change', refreshYTInfo);
+  // v1.0.99: списки цепочек резерва AI/YouTube рисуются на клиенте (порядок правится
+  // стрелками без перезагрузки, запись — по кнопке «Сохранить цепочку»).
+  chainRender('ai');
+  chainRender('yt');
   // Старт самодиагностики панели
   refreshDashboardHealth();
   setInterval(refreshDashboardHealth, 15000);
@@ -16405,6 +16916,29 @@ async function removeDeadFromChain() {
 // Убрать один канал из цепочки резерва (FAILOVER) прямо из строки таблицы outbound'ов.
 // Берём текущую цепочку (отмеченные строки таблицы цепочки, в порядке) МИНУС этот tag и
 // сохраняем через тот же set-failover-chain. Удобно для мёртвых серверов из подписки.
+// Быстрое «убрать из цепочки» из таблицы outbound-ов: правит список и сразу пишет его
+// в watchdog.config (в отличие от редактора в карточке, где правки копятся до кнопки).
+async function removeFromChannelChain(kind, tag) {
+  const st = CHAIN_STATE[kind];
+  if (!st) return;
+  const rest = st.tags.filter(function (t) { return t !== tag; });
+  if (rest.length === st.tags.length) { flash(false, 'Канал ' + tag + ' и так не в цепочке ' + st.label); return; }
+  if (!confirm('Убрать «' + tag + '» из цепочки резерва ' + st.label + '?\n\nОстанется каналов: ' + rest.length
+      + (rest.length ? '' : ' — цепочки не будет, при падении канала сработает настройка блокировки'))) return;
+  const fd = new FormData();
+  fd.append('kind', kind);
+  fd.append('tags', rest.join(','));
+  flash(true, 'Убираю из цепочки ' + st.label + '...');
+  const res = await apiCall('/api/xkeen/set-channel-chain', fd);
+  if (res.ok) {
+    st.tags = rest;
+    flash(true, res.stdout || ('«' + tag + '» убран из цепочки ' + st.label));
+    setTimeout(function () { location.reload(); }, 1500);
+  } else {
+    flash(false, 'Ошибка', res.stderr || JSON.stringify(res));
+  }
+}
+
 async function removeFromFailoverChain(tag) {
   const rows = document.querySelectorAll('#failover-chain tr');
   const items = [];
