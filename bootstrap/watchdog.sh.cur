@@ -1,4 +1,39 @@
 #!/bin/sh
+# XKeen failover watchdog v27 (2026-08-25, сквозная проба default + своя цепочка резерва AI):
+#   ПРОБЛЕМА, которую чинит v27 (инцидент 2026-08-25): probe_tag меряет TCP-коннект ДО узла,
+#   МИМО туннеля. Узел, который принимает соединения, но перестал выпускать трафик наружу
+#   (деградация его аплинка), выглядит «живым» → FAIL-счётчик не растёт → failover НЕ
+#   срабатывает. В тот вечер PRIMARY/FOREIGN несколько часов сидели на глухом узле, а
+#   задетектила аварию только AI-проба — единственная, что ходит СКВОЗЬ туннель.
+#   1) DEEP-PROBE: сквозная проба default через socks-local (DEEP_PROBE_PORT, по умолчанию
+#      10808 — этот inbound маршрутизируется через default). N пустых подряд
+#      (DEEP_PROBE_THRESHOLD) при живой TCP-пробе → форсируем PROBE_CODE=down → штатный
+#      failover по цепочке. Только при state=primary (в failover перевыбор делают ветки ниже —
+#      форсировать там «down» рискованно, можно словить петлю переключений).
+#   2) AI_FAILOVER_TAGS / YT_FAILOVER_TAGS: свои цепочки резерва для AI и YouTube.
+#      Список = ПРИОРИТЕТ: 1-й главный, 2-й чуть менее главный и т.д. Перебор всегда с начала,
+#      поэтому как только более приоритетный оживает — возвращаемся вверх (узел из конца
+#      цепочки не «залипает» навсегда). Порядок: основной *_TAG → цепочка → block.
+#      • Блок теперь ПОСЛЕДНЯЯ мера: не после одного пустого прохода, а после *_CHAIN_ROUNDS
+#        пустых кругов подряд (по умолчанию 2, тик = 1 мин) — узлы могли моргнуть. В промежутке
+#        маршрут НЕ меняем, чтобы не дёргать xkeen лишним рестартом.
+#      • AI_FAIL_BLOCK / YT_FAIL_BLOCK больше не решают, входить ли в логику — только «что
+#        делать, когда цепочка кончилась» (block или оставить основной как раньше).
+#      • Смена резерва на более приоритетный — не чаще *_CHAIN_SWITCH_COOLDOWN (300 c):
+#        каждое переключение = xkeen restart = обрыв соединений. Если текущий УМЕР —
+#        переключение немедленное (cooldown не мешает аварийному уходу).
+#      • Глухота: канал может отвечать по TCP и не пропускать трафик — тогда killswitch_decide
+#        его не поймает. Для AI берём стадию глухоты из AI-probe (v25, поле 5 в watchdog.aiprobe):
+#        стадия 2 = «рестарт не помог» → считаем канал мёртвым, уходим по цепочке и НЕ выбираем
+#        его снова. После такого ухода — карантин AI_RETURN_HOLD (1800 c) на возврат, иначе
+#        TCP-проба вернула бы нас на всё ещё глухой канал.
+#      • RU-узлы в цепочке — НАСТРОЙКА, а не хардкод: AI_CHAIN_ALLOW_RU (по умолчанию 0 —
+#        RU-exit = бан Anthropic) и YT_CHAIN_ALLOW_RU (по умолчанию 1 — для YouTube RU-узел
+#        штатный: меньше рекламы, нет троттлинга googlevideo). Распознавание — is_ru_tag().
+#        Имя тега ≠ гарантия страны, поэтому реальный exit для AI всё равно проверяет AI-probe.
+#   Новые поля state: AI_EFF/YT_EFF (что применено), DEEP_CTR/DEEP_TS (глубокая проба),
+#   AI_CMISS/YT_CMISS (пустые круги цепочки), AI_SW_TS/YT_SW_TS (когда переключились),
+#   AI_LEFT_TS (когда ушли по глухоте — для карантина возврата).
 # XKeen failover watchdog v26 (2026-07-29, AI_IP_RANGES — IP-диапазоны AI-провайдеров в AI-канал):
 #   Часть клиентов AI-сервисов ходит ПО ЧИСТОМУ IP без SNI/домена (например, приложения
 #   Anthropic бьют в 160.79.104.0/23 напрямую) — доменное AI-правило такие соединения не
@@ -235,14 +270,42 @@ probe_tag() {
   esac
 }
 
+# v27: числовые параметры из watchdog.config могут прийти с «хвостом»: bootstrap-шаблон панели
+# пишет FAIL_THRESHOLD="2   # сколько раз ...", то есть комментарий ВНУТРИ значения. В ash
+# сравнение [ "$CTR" -ge "$FAIL_THRESHOLD" ] тогда падает с «bad number» (rc=2) и считается
+# ЛОЖНЫМ — ветка failover была недостижима в принципе (поймано ревью 2026-08-25; объясняет,
+# почему watchdog «ни разу не переключался по цепочке»). Берём первое целое, иначе дефолт.
+_num() {
+  _nv=$(printf '%s' "$1" | awk '{print $1}' | tr -cd '0-9')
+  [ -z "$_nv" ] && _nv="$2"
+  printf '%s' "$_nv"
+}
+# Санитизируем пороги ДО любых сравнений (значения приходят из watchdog.config).
+FAIL_THRESHOLD=$(_num "$FAIL_THRESHOLD" 2)
+PASS_THRESHOLD=$(_num "$PASS_THRESHOLD" 3)
+
+# v27: похож ли тег на РОССИЙСКИЙ узел. Нужен для цепочек резерва: для AI такой узел = бан
+# (Anthropic/OpenAI режут RU-IP), для YouTube наоборот желателен. Пускать или нет — решает
+# настройка AI_CHAIN_ALLOW_RU / YT_CHAIN_ALLOW_RU, эта функция только распознаёт.
+# 🔴 Имя тега — не гарантия страны (entry может быть NL, а exit DE). Это дешёвый фильтр
+# первого уровня; реальный exit для AI проверяет AI-probe через socks-ai-check и алертит
+# при RU/BY/CN/IR/KP/SY. Возврат: 0 = похоже на RU, 1 = не похоже.
+is_ru_tag() {
+  case "$1" in
+    *RU_*|*_RU|*RU-*|*-RU|*Ru_*|*_Ru|*ru_*|*_ru|*ru-*|*-ru) return 0 ;;
+    *Росси*|*росси*|*РОССИ*|*Russia*|*russia*|*RUSSIA*|*🇷🇺*) return 0 ;;
+  esac
+  return 1
+}
+
 # ---------- Kill-switch гистерезис (v16) ----------
 # Сглаживает «дребезг» AI/YT/FOREIGN kill-switch'ей: одиночная неудачная проба больше НЕ роняет
 # канал в block (а одиночная удачная — не снимает блок). Нужно KILL_FAIL_THRESHOLD подряд неудач,
 # чтобы включить блок, и KILL_PASS_THRESHOLD подряд успехов, чтобы снять. Симметрично PRIMARY.
 # Состояние (latch 0/1 + счётчик подряд-противоположных проб) живёт в watchdog.state между тиками.
 # Вызов: killswitch_decide <up|down> <prev_latch 0/1> <prev_ctr>; результат в KS_BLOCKED / KS_CTR.
-KILL_FAIL_THRESHOLD=${KILL_FAIL_THRESHOLD:-3}
-KILL_PASS_THRESHOLD=${KILL_PASS_THRESHOLD:-2}
+KILL_FAIL_THRESHOLD=$(_num "${KILL_FAIL_THRESHOLD:-3}" 3)
+KILL_PASS_THRESHOLD=$(_num "${KILL_PASS_THRESHOLD:-2}" 2)
 killswitch_decide() {
   local probe="$1" blocked="${2:-0}" ctr="${3:-0}"
   if [ "$probe" = "down" ]; then
@@ -790,13 +853,48 @@ fi
 # один раз. Это даёт watchdog'у канал для curl-проверки exit-IP именно через AI-outbound.
 # Сам routing-rule добавляется в generate_routing() (post-template hook).
 AI_PROBE_PORT=${AI_PROBE_PORT:-10818}
-AI_PROBE_INTERVAL=${AI_PROBE_INTERVAL:-600}
+AI_PROBE_INTERVAL=$(_num "${AI_PROBE_INTERVAL:-600}" 600)
 AI_PROBE_ALERT_COOLDOWN=${AI_PROBE_ALERT_COOLDOWN:-3600}
 AI_PROBE_BAD_COUNTRIES="${AI_PROBE_BAD_COUNTRIES:-RU BY CN IR KP SY}"
 AI_PROBE_STATE=/opt/etc/xray/watchdog.aiprobe
 # v25: детект глухого AI-канала (N подряд пустых проб) + авто-лечение рестартом
-AI_DEAF_THRESHOLD=${AI_DEAF_THRESHOLD:-3}
+AI_DEAF_THRESHOLD=$(_num "${AI_DEAF_THRESHOLD:-3}" 3)
 AI_DEAF_AUTORESTART=${AI_DEAF_AUTORESTART:-1}
+# ---------- v27 (2026-08-25) ----------
+# 1) Сквозная («глубокая») проба default-канала. Зачем: probe_tag меряет TCP-коннект ДО узла,
+#    МИМО туннеля — «глухой» узел (принимает соединения, но не выпускает трафик наружу)
+#    выглядит живым, поэтому failover не срабатывал (инцидент 2026-08-25: PRIMARY/FOREIGN весь
+#    вечер сидели на больном узле, TCP-проба возвращала «жив»). Глубокая проба идёт СКВОЗЬ
+#    туннель через socks-local (этот inbound маршрутизируется через default) — как AI-проба
+#    через socks-ai-check, которая единственная и задетектила ту аварию.
+# 🔴 ВЫКЛЮЧЕНО по умолчанию до этапа 2: сейчас проба ходит через socks-local, а этот inbound
+# generate_routing привязывает по приоритету FOREIGN_TAG → YT_TAG → default → AI_TAG, то есть
+# при заданном FOREIGN_TAG она меряет ЧУЖОЙ канал (ревью 2026-08-25). Чтобы мерить именно
+# default, нужен отдельный inbound socks-deep с правилом на default — это отдельная правка
+# с рестартом xray. Включать только после неё.
+DEEP_PROBE_ENABLE=$(_num "${DEEP_PROBE_ENABLE:-0}" 0)
+DEEP_PROBE_PORT=${DEEP_PROBE_PORT:-10808}        # socks-local → идёт через default-канал
+DEEP_PROBE_INTERVAL=$(_num "${DEEP_PROBE_INTERVAL:-180}" 180)  # не чаще раза в 3 мин (проба = внешний запрос)
+DEEP_PROBE_THRESHOLD=$(_num "${DEEP_PROBE_THRESHOLD:-3}" 3)  # N пустых подряд → считаем default глухим
+# 2) Своя цепочка резерва для AI-канала (список тегов через пробел/запятую).
+#    Пусто = прежнее поведение (kill-switch сразу). Порядок: основной AI_TAG → цепочка → block.
+#    🔴 Kill-switch остаётся ПОСЛЕДНЕЙ мерой (вся цепочка мертва) — блок нужен, чтобы не светить
+#    RU-IP в Anthropic/OpenAI. В цепочку класть ТОЛЬКО заграничные (EU) узлы: RU-exit = бан.
+AI_FAILOVER_TAGS="${AI_FAILOVER_TAGS:-}"
+#    Сколько ПОЛНЫХ кругов по цепочке должно оказаться пустыми подряд, прежде чем включать
+#    kill-switch. Один круг — это мгновенный снимок TCP-проб: узлы (или сам роутер/провайдер)
+#    могли моргнуть, и рубить AI-трафик сразу неправильно. Тик watchdog = 1 мин, значит
+#    2 круга ≈ 2 минуты терпения. В промежутке маршрут НЕ меняем (нет лишнего xkeen-restart).
+AI_CHAIN_ROUNDS=$(_num "${AI_CHAIN_ROUNDS:-2}" 2)
+# 3) Цепочка резерва для YouTube — то же самое, отдельным списком.
+YT_FAILOVER_TAGS="${YT_FAILOVER_TAGS:-}"
+YT_CHAIN_ROUNDS=$(_num "${YT_CHAIN_ROUNDS:-2}" 2)
+# 4) Пускать ли РОССИЙСКИЕ узлы в цепочку — настройка, а не хардкод (решает владелец):
+#    AI  — по умолчанию 0 (RU-exit = бан Anthropic/OpenAI, это защита);
+#    YT  — по умолчанию 1 (для YouTube RU-узел штатный и желательный: меньше рекламы,
+#          нет троттлинга googlevideo).
+AI_CHAIN_ALLOW_RU=${AI_CHAIN_ALLOW_RU:-0}
+YT_CHAIN_ALLOW_RU=${YT_CHAIN_ALLOW_RU:-1}
 _INB_FILE=/opt/etc/xray/configs/03_inbounds.json
 if [ -n "$AI_TAG" ] && [ -f "$_INB_FILE" ] && command -v jq >/dev/null 2>&1; then
   if ! grep -q '"socks-ai-check"' "$_INB_FILE" 2>/dev/null; then
@@ -1037,7 +1135,14 @@ elif [ -n "$AI_TAG" ]; then
       # Probe не сработал (curl timeout / socks-ai-check ещё не слушает / AI kill-switch заблокировал).
       # v25: считаем ПОДРЯД идущие пустые пробы — серия = глухой туннель при живом TCP-сервере.
       _ai_ks=$(grep -o 'AI_BLOCKED=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2)
-      if [ "$_ai_ks" = "1" ]; then
+      # v27: «ожидаемая пустота» — только реальный blackhole (EFFECTIVE_AI=block). При работе
+      # на резерве цепочки AI_BLOCKED=1 (основной мёртв), НО трафик идёт через резерв —
+      # там глухоту считать НАДО. AI_EFF пуст (state от версии <v27) → старая логика.
+      _ai_eff_now=$(grep -o 'AI_EFF=[^ ]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2-)
+      _ai_skip=0
+      [ "$_ai_eff_now" = "block" ] && _ai_skip=1
+      [ -z "$_ai_eff_now" ] && [ "$_ai_ks" = "1" ] && _ai_skip=1
+      if [ "$_ai_skip" = "1" ]; then
         # AI kill-switch активен → AI-трафик в blackhole, пустая проба ОЖИДАЕМА. Не считаем.
         printf '%s|%s|%s|%s|%s\n' "$_ai_now" "$_AI_PREV_C" "$_AI_LAST_A" "$_AI_EMPTY" "$_AI_DEAF" > "$AI_PROBE_STATE"
         log "AI-probe: пусто, но AI kill-switch активен (blackhole) — глухоту не считаю"
@@ -1121,6 +1226,42 @@ case "$FORCE_MODE" in
     else
       PRIMARY_ALIVE=0
       PROBE_CODE="down"
+    fi
+
+    # v27: TCP-проба сказала «жив» — проверяем, идёт ли трафик СКВОЗЬ канал. Узел может
+    # принимать соединения, но не выпускать их наружу (деградация его аплинка) — тогда
+    # TCP-проба врёт «up», и без этой проверки failover не сработает (инцидент 25.08).
+    # Только при CUR=primary: в failover-состоянии перевыбор резерва делают ветки ниже,
+    # форсировать там «down» — риск петли переключений.
+    if [ "$PROBE_CODE" = "up" ] && [ "$CUR" = "primary" ] && [ "$DEEP_PROBE_ENABLE" = "1" ]; then
+      _dp_now=$(date +%s)
+      _dp_ts=$(grep -o 'DEEP_TS=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$_dp_ts" ] && _dp_ts=0
+      _dp_ctr=$(grep -o 'DEEP_CTR=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$_dp_ctr" ] && _dp_ctr=0
+      if [ $((_dp_now - _dp_ts)) -ge "$DEEP_PROBE_INTERVAL" ] 2>/dev/null; then
+        DEEP_TS="$_dp_now"
+        # ipinfo.io/country — тот же лёгкий endpoint, что у AI-пробы (2-буквенный ISO).
+        _dp_c=$(curl -s --max-time 8 --socks5-hostname "127.0.0.1:$DEEP_PROBE_PORT" https://ipinfo.io/country 2>/dev/null | head -1 | tr -d '\r\n\t ')
+        if [ -z "$_dp_c" ] || [ "${#_dp_c}" -gt 4 ]; then
+          _dp_c=$(curl -s --max-time 8 --socks5-hostname "127.0.0.1:$DEEP_PROBE_PORT" https://ifconfig.me/country_code 2>/dev/null | head -1 | tr -d '\r\n\t ')
+        fi
+        if [ -n "$_dp_c" ] && [ "${#_dp_c}" -le 4 ]; then
+          [ "$_dp_ctr" -ge 1 ] 2>/dev/null && log "DEEP-PROBE RECOVER: default ($CUR_DEFAULT) снова пропускает трафик (exit=$_dp_c)"
+          DEEP_CTR=0
+        else
+          DEEP_CTR=$((_dp_ctr + 1))
+          if [ "$DEEP_CTR" -ge "$DEEP_PROBE_THRESHOLD" ] 2>/dev/null; then
+            log "DEEP-PROBE DEAF: default ($CUR_DEFAULT) глух — TCP отвечает, но трафик сквозь не идёт ($DEEP_CTR подряд) → форсирую failover"
+            tg_alert "🕳 <b>Основной канал глух</b>: <code>$CUR_DEFAULT</code> отвечает по TCP, но трафик СКВОЗЬ него не проходит (~$((DEEP_CTR * DEEP_PROBE_INTERVAL / 60)) мин). Переключаюсь на резерв."
+            PROBE_CODE="down"
+            PRIMARY_ALIVE=0
+            DEEP_CTR=0
+          else
+            log "DEEP-PROBE: сквозная проба через default пуста — подряд: $DEEP_CTR (порог $DEEP_PROBE_THRESHOLD)"
+          fi
+        fi
+      else
+        DEEP_CTR="$_dp_ctr"; DEEP_TS="$_dp_ts"
+      fi
     fi
 
     case "$CUR/$PROBE_CODE" in
@@ -1212,15 +1353,157 @@ AI_BLOCKED=$(grep -o 'AI_BLOCKED=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2
 AI_KCTR=$(grep -o 'AI_KCTR=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$AI_KCTR" ] && AI_KCTR=0
 EFFECTIVE_AI_TAG="$AI_TAG"
 AI_PROBE_CODE=""
-if [ -n "$AI_DOMAINS$AI_EXT_CATEGORIES$AI_IP_RANGES" ] && [ -n "$AI_TAG" ] && [ "$AI_TAG" != "block" ] && [ "${AI_FAIL_BLOCK:-1}" = "1" ]; then
+# v27: вход в блок больше НЕ зависит от AI_FAIL_BLOCK. Разделены две вещи:
+#   • цепочка резерва AI (AI_FAILOVER_TAGS) — работает всегда, когда основной AI_TAG упал;
+#   • AI_FAIL_BLOCK — решает только ЧТО делать, когда живых в цепочке не осталось:
+#     1 = block (не светить RU-IP, рекомендуется), 0 = оставить AI_TAG как раньше.
+if [ -n "$AI_DOMAINS$AI_EXT_CATEGORIES$AI_IP_RANGES" ] && [ -n "$AI_TAG" ] && [ "$AI_TAG" != "block" ]; then
   # Пингуем AI_TAG (TCP-probe, без HTTPS — у некоторых провайдеров нет HTTP endpoint)
   if probe_tag "$AI_TAG" ""; then AI_PROBE_CODE="up"; else AI_PROBE_CODE="down"; fi
   # v16: блок/снятие — только после порога подряд (не по одной пробе) → нет «дребезга».
+  # AI_BLOCKED здесь = «основной AI_TAG признан мёртвым» (с гистерезисом).
   killswitch_decide "$AI_PROBE_CODE" "$AI_BLOCKED" "$AI_KCTR"
   AI_BLOCKED="$KS_BLOCKED"; AI_KCTR="$KS_CTR"
-  [ "$AI_BLOCKED" = "1" ] && EFFECTIVE_AI_TAG="block"
+  _ai_eff_prev=$(grep -o 'AI_EFF=[^ ]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2-)
+  # v27: основной (или текущий резерв) может быть ГЛУХИМ — TCP отвечает, а трафик сквозь не
+  # идёт. killswitch_decide этого не видит (он меряет TCP), поэтому берём стадию глухоты из
+  # AI-probe v25 (поле 5 в watchdog.aiprobe): стадия 2 = «рестарт не помог, канал не пропускает»
+  # → для цепочки считаем канал мёртвым. Без этого цепочка не сработала бы в самом частом
+  # сценарии аварии (инцидент 2026-08-25) — узел жив на приём, но глух на выход.
+  _ai_deaf_stage=$(cut -d'|' -f5 "$AI_PROBE_STATE" 2>/dev/null | tr -d '\r\n\t ')
+  [ -z "$_ai_deaf_stage" ] && _ai_deaf_stage=0
+  # 🔴 Стадия описывает канал, который работал НА МОМЕНТ ЗАМЕРА, а замер идёт раз в
+  # AI_PROBE_INTERVAL (600 c) при тике в 60 c. Если мы переключились недавно, стадия ещё
+  # относится к ПРЕДЫДУЩЕМУ каналу — применять её нельзя: иначе каждый тик выкидывался бы
+  # текущий резерв «как глухой» и шла ротация по цепочке с xkeen-restart раз в минуту
+  # (ревью 2026-08-25). Ждём хотя бы один свежий замер на новом канале.
+  _ai_sw_prev=$(grep -o 'AI_SW_TS=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$_ai_sw_prev" ] && _ai_sw_prev=0
+  _ai_nowchk=$(date +%s)
+  if [ "$_ai_sw_prev" -gt 0 ] 2>/dev/null && [ $((_ai_nowchk - _ai_sw_prev)) -lt "$AI_PROBE_INTERVAL" ] 2>/dev/null; then
+    [ "$_ai_deaf_stage" -ge 2 ] 2>/dev/null && log "AI: стадия глухоты ($_ai_deaf_stage) относится к предыдущему каналу — переключились $((_ai_nowchk - _ai_sw_prev))с назад, свежего замера ещё нет, игнорирую"
+    _ai_deaf_stage=0
+  fi
+  _ai_primary_dead=0
+  [ "$AI_BLOCKED" = "1" ] && _ai_primary_dead=1
+  [ "$_ai_deaf_stage" -ge 2 ] 2>/dev/null && _ai_primary_dead=1
+  # Анти-флап: после ухода ПО ГЛУХОТЕ не возвращаемся на канал сразу (TCP-проба скажет «жив»
+  # мгновенно, а он всё ещё может не пропускать) — выдерживаем карантин AI_RETURN_HOLD.
+  AI_RETURN_HOLD=${AI_RETURN_HOLD:-1800}
+  _ai_left=$(grep -o 'AI_LEFT_TS=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$_ai_left" ] && _ai_left=0
+  AI_LEFT_TS="$_ai_left"
+  _ai_now2=$(date +%s)
+  if [ "$_ai_primary_dead" = "1" ]; then
+    # Основной упал → ищем первый живой в СВОЕЙ цепочке AI (не в общей FAILOVER_TAGS:
+    # там могут быть RU-узлы, а для AI это бан Anthropic).
+    # Цепочка — СПИСОК ПО ПРИОРИТЕТУ: 1-й важнее 2-го и т.д. Перебор всегда с начала, поэтому
+    # как только более приоритетный оживает, он и выбирается (стремимся вверх по списку).
+    # Позицию текущего канала находим отдельным дешёвым проходом (без проб) — нужна, чтобы
+    # отличить «текущий умер, берём следующий» (переключаться сразу) от «ожил более
+    # приоритетный» (переключаться не чаще cooldown: каждая смена = xkeen restart = обрыв).
+    _ai_prev_idx=0; _ai_i=0
+    for _at in $(echo "$AI_FAILOVER_TAGS" | tr ',' ' '); do
+      _ai_i=$((_ai_i + 1))
+      [ "$_at" = "$_ai_eff_prev" ] && _ai_prev_idx="$_ai_i"
+    done
+    _ai_pick=""; _ai_pick_idx=0; _ai_i=0
+    for _at in $(echo "$AI_FAILOVER_TAGS" | tr ',' ' '); do
+      _ai_i=$((_ai_i + 1))
+      [ "$_at" = "$AI_TAG" ] && continue
+      # 🔴 direct/block — не туннели: probe_tag отдаёт для них «жив» безусловно, и AI-трафик
+      # ушёл бы прямо с РФ-IP роутера (мгновенный флаг у Anthropic). В цепочку не берём.
+      case "$_at" in ""|direct|block) log "AI-FAILOVER: пропускаю $_at — это не туннель (direct/block)"; continue ;; esac
+      # Текущий эффективный признан глухим — не выбираем его снова, идём дальше по цепочке,
+      # иначе застрянем: TCP-проба у глухого узла успешна, и он побеждал бы каждый круг.
+      if [ "$_ai_deaf_stage" -ge 2 ] 2>/dev/null && [ "$_at" = "$_ai_eff_prev" ]; then
+        log "AI-FAILOVER: пропускаю $_at — он признан глухим (стадия $_ai_deaf_stage)"
+        continue
+      fi
+      # RU-узел в AI = бан Anthropic. Пускать или нет — решает настройка AI_CHAIN_ALLOW_RU.
+      if [ "$AI_CHAIN_ALLOW_RU" != "1" ] && is_ru_tag "$_at"; then
+        log "AI-FAILOVER: пропускаю $_at (похоже на RU-узел, AI_CHAIN_ALLOW_RU=0)"
+        continue
+      fi
+      if probe_tag "$_at" ""; then _ai_pick="$_at"; _ai_pick_idx="$_ai_i"; break; fi
+    done
+    _ai_cmiss=$(grep -o 'AI_CMISS=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$_ai_cmiss" ] && _ai_cmiss=0
+    AI_CHAIN_SWITCH_COOLDOWN=${AI_CHAIN_SWITCH_COOLDOWN:-300}
+    _ai_sw=$(grep -o 'AI_SW_TS=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$_ai_sw" ] && _ai_sw=0
+    AI_SW_TS="$_ai_sw"
+    if [ -n "$_ai_pick" ]; then
+      AI_CMISS=0
+      # Ожил более приоритетный (его индекс МЕНЬШЕ текущего), а текущий, судя по всему, ещё
+      # жив — иначе он бы и не дожил до этой ветки. Тогда соблюдаем cooldown, чтобы мерцающий
+      # канал не дёргал xray каждую минуту. Если текущий умер (pick ниже по списку) — сразу.
+      if [ "$_ai_prev_idx" -gt 0 ] 2>/dev/null && [ "$_ai_pick_idx" -lt "$_ai_prev_idx" ] 2>/dev/null \
+         && [ $((_ai_now2 - AI_SW_TS)) -lt "$AI_CHAIN_SWITCH_COOLDOWN" ] 2>/dev/null; then
+        # Остаёмся на текущем ТОЛЬКО если он реально жив — иначе cooldown пригвоздил бы нас
+        # к мёртвому каналу (ревью 2026-08-25).
+        if probe_tag "$_ai_eff_prev" ""; then
+          log "AI-FAILOVER: ожил более приоритетный $_ai_pick, но с последнего переключения прошло $((_ai_now2 - AI_SW_TS))с (< $AI_CHAIN_SWITCH_COOLDOWN) — остаюсь на живом $_ai_eff_prev"
+          _ai_pick="$_ai_eff_prev"
+        else
+          log "AI-FAILOVER: cooldown не истёк, но текущий $_ai_eff_prev мёртв → перехожу на $_ai_pick немедленно"
+        fi
+      fi
+      EFFECTIVE_AI_TAG="$_ai_pick"
+      if [ "$_ai_eff_prev" != "$_ai_pick" ]; then
+        AI_SW_TS="$_ai_now2"
+        # Ушли по глухоте — заводим карантин на возврат (TCP скажет «жив» мгновенно, а канал
+        # может всё ещё не пропускать трафик).
+        [ "$_ai_deaf_stage" -ge 2 ] 2>/dev/null && AI_LEFT_TS="$_ai_now2"
+        log "AI-FAILOVER: основной $AI_TAG недоступен (blocked=$AI_BLOCKED, глухота=$_ai_deaf_stage) → AI переключён на резерв $_ai_pick"
+        tg_alert "🔀 <b>AI переключён на резерв</b>: основной <code>$AI_TAG</code> не работает → AI-трафик идёт через <code>$_ai_pick</code>. Вернусь на основной автоматически, когда он заработает."
+      fi
+    else
+      # Никто в цепочке не ответил. НЕ рубим сразу: один круг — мгновенный снимок TCP-проб,
+      # узлы (или сам роутер/провайдер) могли моргнуть. Ждём AI_CHAIN_ROUNDS пустых кругов подряд.
+      AI_CMISS=$((_ai_cmiss + 1))
+      if [ "$AI_CMISS" -lt "$AI_CHAIN_ROUNDS" ] 2>/dev/null; then
+        # Промежуточный круг: маршрут НЕ меняем (иначе лишний xkeen-restart на пустом месте).
+        if [ -n "$_ai_eff_prev" ] && [ "$_ai_eff_prev" != "block" ]; then
+          EFFECTIVE_AI_TAG="$_ai_eff_prev"
+        else
+          EFFECTIVE_AI_TAG="$AI_TAG"
+        fi
+        log "AI-FAILOVER: основной $AI_TAG и вся цепочка не ответили (круг $AI_CMISS из $AI_CHAIN_ROUNDS) — жду ещё тик перед блокировкой, маршрут не меняю"
+      elif [ "${AI_FAIL_BLOCK:-1}" = "1" ]; then
+        EFFECTIVE_AI_TAG="block"
+        if [ "$_ai_eff_prev" != "block" ]; then
+          # Сбрасываем счётчики глухоты: в block проба уходит в blackhole и «пустая» проба
+          # ожидаема, стадия заморозилась бы на 2 и после выхода из блока мгновенно снова
+          # объявляла канал глухим (вечный блэкхол — ревью 2026-08-25).
+          _b1=$(cut -d'|' -f1 "$AI_PROBE_STATE" 2>/dev/null); _b2=$(cut -d'|' -f2 "$AI_PROBE_STATE" 2>/dev/null); _b3=$(cut -d'|' -f3 "$AI_PROBE_STATE" 2>/dev/null)
+          printf '%s|%s|%s|0|0
+' "${_b1:-0}" "$_b2" "${_b3:-0}" > "$AI_PROBE_STATE" 2>/dev/null
+          log "AI-KILL-SWITCH: основной $AI_TAG и вся цепочка AI недоступны $AI_CMISS круга подряд → AI-трафик в block"
+          tg_alert "🚫 <b>AI-трафик заблокирован</b>: основной <code>$AI_TAG</code> и вся цепочка резерва не отвечают уже $AI_CMISS круга подряд. Блокирую, чтобы не светить RU-IP в Anthropic/OpenAI."
+        fi
+      else
+        # Галочка выключена: как раньше — оставляем AI_TAG (трафик пойдёт через него как есть).
+        EFFECTIVE_AI_TAG="$AI_TAG"
+        [ "$_ai_eff_prev" != "$AI_TAG" ] && log "AI: основной $AI_TAG мёртв, цепочка мертва ($AI_CMISS круга), AI_FAIL_BLOCK=0 → оставляю $AI_TAG"
+      fi
+    fi
+    [ "$AI_CMISS" -gt 99 ] 2>/dev/null && AI_CMISS=99
+  elif [ -n "$_ai_eff_prev" ] && [ "$_ai_eff_prev" != "$AI_TAG" ] && [ "$_ai_eff_prev" != "block" ]; then
+    AI_CMISS=0
+    # Основной ожил (killswitch_decide снял latch после серии успехов) → возврат на него:
+    # 1-й в списке всегда приоритетнее, плюс постоянство IP важнее «просто рабочего»
+    # (гео-прыжки повышают риск флага у Anthropic).
+    if [ "$AI_LEFT_TS" -gt 0 ] 2>/dev/null && [ $((_ai_now2 - AI_LEFT_TS)) -lt "$AI_RETURN_HOLD" ] 2>/dev/null; then
+      # Уходили по ГЛУХОТЕ: TCP-проба скажет «жив» мгновенно, но канал может всё ещё не
+      # пропускать трафик — держим карантин, чтобы не прыгать туда-обратно.
+      EFFECTIVE_AI_TAG="$_ai_eff_prev"
+      log "AI: основной $AI_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((AI_RETURN_HOLD - (_ai_now2 - AI_LEFT_TS)))с, остаюсь на $_ai_eff_prev"
+    else
+      AI_LEFT_TS=0
+      AI_SW_TS="$_ai_now2"
+      log "AI-FAILOVER-RETURN: основной $AI_TAG ожил → AI вернулся на него (был $_ai_eff_prev)"
+      tg_alert "✅ <b>AI вернулся на основной канал</b> <code>$AI_TAG</code> (резерв больше не нужен)."
+    fi
+  fi
 else
-  AI_BLOCKED=0; AI_KCTR=0   # kill-switch неактивен — сбрасываем latch
+  AI_BLOCKED=0; AI_KCTR=0; AI_CMISS=0   # AI не сконфигурирован — сбрасываем latch
 fi
 
 # ---------- YT kill-switch (по умолчанию ВЫКЛЮЧЕН — YT_FAIL_BLOCK=0) ----------
@@ -1233,13 +1516,93 @@ YT_BLOCKED=$(grep -o 'YT_BLOCKED=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2
 YT_KCTR=$(grep -o 'YT_KCTR=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$YT_KCTR" ] && YT_KCTR=0
 EFFECTIVE_YT_TAG="$YT_TAG"
 YT_PROBE_CODE=""
-if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "${YT_FAIL_BLOCK:-0}" = "1" ]; then
+# v27: блок активен, если включён kill-switch ИЛИ задана своя цепочка резерва для YouTube.
+# (Раньше вход зависел только от YT_FAIL_BLOCK.) Для YT, в отличие от AI, RU-узлы РАЗРЕШЕНЫ —
+# «Россия без рекламы» это штатный и желательный выход для YouTube.
+_yt_active=0
+[ "${YT_FAIL_BLOCK:-0}" = "1" ] && _yt_active=1
+[ -n "$YT_FAILOVER_TAGS" ] && _yt_active=1
+if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_yt_active" = "1" ]; then
   if probe_tag "$YT_TAG" ""; then YT_PROBE_CODE="up"; else YT_PROBE_CODE="down"; fi
   killswitch_decide "$YT_PROBE_CODE" "$YT_BLOCKED" "$YT_KCTR"
   YT_BLOCKED="$KS_BLOCKED"; YT_KCTR="$KS_CTR"
-  [ "$YT_BLOCKED" = "1" ] && EFFECTIVE_YT_TAG="block"
+  _yt_eff_prev=$(grep -o 'YT_EFF=[^ ]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2-)
+  if [ "$YT_BLOCKED" = "1" ]; then
+    # Цепочка YT — тоже список по приоритету (1-й важнее 2-го): перебор с начала, поэтому
+    # при оживании более приоритетного возвращаемся вверх. Позиция текущего — дешёвым проходом.
+    _yt_prev_idx=0; _yt_i=0
+    for _yt in $(echo "$YT_FAILOVER_TAGS" | tr ',' ' '); do
+      _yt_i=$((_yt_i + 1))
+      [ "$_yt" = "$_yt_eff_prev" ] && _yt_prev_idx="$_yt_i"
+    done
+    _yt_pick=""; _yt_pick_idx=0; _yt_i=0
+    for _yt in $(echo "$YT_FAILOVER_TAGS" | tr ',' ' '); do
+      _yt_i=$((_yt_i + 1))
+      [ "$_yt" = "$YT_TAG" ] && continue
+      case "$_yt" in ""|direct|block) log "YT-FAILOVER: пропускаю $_yt — это не туннель (direct/block)"; continue ;; esac
+      # RU-узлы для YouTube по умолчанию РАЗРЕШЕНЫ (YT_CHAIN_ALLOW_RU=1) — «Россия без рекламы»
+      # штатный выход. Запретить можно настройкой.
+      if [ "$YT_CHAIN_ALLOW_RU" != "1" ] && is_ru_tag "$_yt"; then
+        log "YT-FAILOVER: пропускаю $_yt (RU-узел, YT_CHAIN_ALLOW_RU=0)"
+        continue
+      fi
+      if probe_tag "$_yt" ""; then _yt_pick="$_yt"; _yt_pick_idx="$_yt_i"; break; fi
+    done
+    _yt_cmiss=$(grep -o 'YT_CMISS=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$_yt_cmiss" ] && _yt_cmiss=0
+    YT_CHAIN_SWITCH_COOLDOWN=${YT_CHAIN_SWITCH_COOLDOWN:-300}
+    _yt_sw=$(grep -o 'YT_SW_TS=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$_yt_sw" ] && _yt_sw=0
+    YT_SW_TS="$_yt_sw"
+    _yt_now=$(date +%s)
+    if [ -n "$_yt_pick" ]; then
+      YT_CMISS=0
+      # Ожил более приоритетный, а текущий ещё жив → соблюдаем cooldown (смена = xkeen restart).
+      if [ "$_yt_prev_idx" -gt 0 ] 2>/dev/null && [ "$_yt_pick_idx" -lt "$_yt_prev_idx" ] 2>/dev/null \
+         && [ $((_yt_now - YT_SW_TS)) -lt "$YT_CHAIN_SWITCH_COOLDOWN" ] 2>/dev/null; then
+        if probe_tag "$_yt_eff_prev" ""; then
+          log "YT-FAILOVER: ожил более приоритетный $_yt_pick, но с последнего переключения прошло $((_yt_now - YT_SW_TS))с (< $YT_CHAIN_SWITCH_COOLDOWN) — остаюсь на живом $_yt_eff_prev"
+          _yt_pick="$_yt_eff_prev"
+        else
+          log "YT-FAILOVER: cooldown не истёк, но текущий $_yt_eff_prev мёртв → перехожу на $_yt_pick немедленно"
+        fi
+      fi
+      EFFECTIVE_YT_TAG="$_yt_pick"
+      if [ "$_yt_eff_prev" != "$_yt_pick" ]; then
+        YT_SW_TS="$_yt_now"
+        log "YT-FAILOVER: основной $YT_TAG недоступен → YouTube переключён на резерв $_yt_pick"
+        tg_alert "🔀 <b>YouTube переключён на резерв</b>: основной <code>$YT_TAG</code> не отвечает → трафик идёт через <code>$_yt_pick</code>. Вернусь на основной, когда он оживёт."
+      fi
+    else
+      # Вся цепочка молчит — даём YT_CHAIN_ROUNDS кругов, прежде чем что-то менять.
+      YT_CMISS=$((_yt_cmiss + 1))
+      if [ "$YT_CMISS" -lt "$YT_CHAIN_ROUNDS" ] 2>/dev/null; then
+        if [ -n "$_yt_eff_prev" ] && [ "$_yt_eff_prev" != "block" ]; then
+          EFFECTIVE_YT_TAG="$_yt_eff_prev"
+        else
+          EFFECTIVE_YT_TAG="$YT_TAG"
+        fi
+        log "YT-FAILOVER: основной $YT_TAG и вся цепочка не ответили (круг $YT_CMISS из $YT_CHAIN_ROUNDS) — жду ещё тик, маршрут не меняю"
+      elif [ "${YT_FAIL_BLOCK:-0}" = "1" ]; then
+        EFFECTIVE_YT_TAG="block"
+        if [ "$_yt_eff_prev" != "block" ]; then
+          log "YT-KILL-SWITCH: основной $YT_TAG и вся цепочка недоступны $YT_CMISS круга подряд → YouTube в block"
+          tg_alert "🚫 <b>YouTube-трафик заблокирован</b>: основной <code>$YT_TAG</code> и вся цепочка резерва не отвечают уже $YT_CMISS круга подряд."
+        fi
+      else
+        # Галочка выключена (дефолт для YT) — оставляем YT_TAG, как было раньше.
+        EFFECTIVE_YT_TAG="$YT_TAG"
+        [ "$_yt_eff_prev" != "$YT_TAG" ] && log "YT: основной $YT_TAG мёртв, цепочка мертва ($YT_CMISS круга), YT_FAIL_BLOCK=0 → оставляю $YT_TAG"
+      fi
+    fi
+  else
+    YT_CMISS=0
+    if [ -n "$_yt_eff_prev" ] && [ "$_yt_eff_prev" != "$YT_TAG" ] && [ "$_yt_eff_prev" != "block" ]; then
+      YT_SW_TS=$(date +%s)
+      log "YT-FAILOVER-RETURN: основной $YT_TAG ожил → YouTube вернулся на него (был $_yt_eff_prev)"
+      tg_alert "✅ <b>YouTube вернулся на основной канал</b> <code>$YT_TAG</code>."
+    fi
+  fi
 else
-  YT_BLOCKED=0; YT_KCTR=0
+  YT_BLOCKED=0; YT_KCTR=0; YT_CMISS=0
 fi
 
 # ---------- FOREIGN kill-switch (канал «Заблокированные в РФ», default ВЫКЛ) ----------
@@ -1395,4 +1758,25 @@ fi
 
 # ---------- Save state ----------
 # Формат: "<state> <counter> <default_tag> EFFECTIVE_AI=<tag> EFFECTIVE_YT=<tag> LAST_FULL_PROBE=<epoch> PREV_ALIVE=<n>"
-echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR" > "$STATE_FILE"
+# v27: DEEP_CTR/DEEP_TS могли не выставиться в этом тике (глубокая проба выключена, не auto-mode
+# или не наступил интервал) — переносим прежние значения, иначе счётчик глухоты сбрасывался бы
+# каждый тик и порог никогда бы не набрался.
+if [ -z "$DEEP_CTR" ]; then
+  DEEP_CTR=$(grep -o 'DEEP_CTR=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$DEEP_CTR" ] && DEEP_CTR=0
+fi
+if [ -z "$DEEP_TS" ]; then
+  DEEP_TS=$(grep -o 'DEEP_TS=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$DEEP_TS" ] && DEEP_TS=0
+fi
+# То же для счётчиков/таймстампов цепочек AI и YT: ветка могла не выполниться (канал жив,
+# цепочка не задана, блок неактивен) — переносим прежние значения из state, иначе счётчик
+# кругов и cooldown обнулялись бы каждый тик.
+for _v in AI_CMISS AI_SW_TS AI_LEFT_TS YT_CMISS YT_SW_TS; do
+  eval "_cur=\$$_v"
+  if [ -z "$_cur" ]; then
+    _old=$(grep -o "$_v=[0-9]*" "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$_old" ] && _old=0
+    eval "$_v=\$_old"
+  fi
+done
+# AI_EFF — что РЕАЛЬНО применено для AI в этом тике (основной / резерв цепочки / block).
+# Нужен, чтобы (а) не спамить алертами о переключении, (б) AI-probe отличал blackhole от резерва.
+echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR AI_EFF=$EFFECTIVE_AI_TAG DEEP_CTR=$DEEP_CTR DEEP_TS=$DEEP_TS AI_CMISS=$AI_CMISS AI_SW_TS=$AI_SW_TS AI_LEFT_TS=$AI_LEFT_TS YT_EFF=$EFFECTIVE_YT_TAG YT_CMISS=$YT_CMISS YT_SW_TS=$YT_SW_TS" > "$STATE_FILE"
