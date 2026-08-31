@@ -2478,7 +2478,14 @@ def keenetic_get_routing_active():
 def keenetic_get_watchdog():
     """Читает watchdog.state (формат: 'primary|failover counter default_tag EFFECTIVE_AI=<tag> EFFECTIVE_YT=<tag>')
     + последние строки watchdog.log."""
-    state_raw = keenetic_read_file(cfg.KEENETIC_WATCHDOG_STATE)
+    # Один SSH-вызов на оба файла: state + aiprobe. Отдельное чтение aiprobe вторым
+    # соединением на тяжёлой странице стабильно не успевало (таймаут) → ai_probe=null
+    # и бейдж «насквозь» молча пропадал. Маркер =AIPROBE= (только ASCII: ssh от SYSTEM перекодирует argv в cp1251, и не-ASCII разделитель приезжает битым) разделяет вывод.
+    _combo = keenetic_read_file(
+        cfg.KEENETIC_WATCHDOG_STATE + "; echo '=AIPROBE='; cat " +
+        cfg.KEENETIC_WATCHDOG_STATE.rsplit("/", 1)[0] + "/watchdog.aiprobe 2>/dev/null")
+    state_raw, _aiprobe_raw = ((_combo.split("=AIPROBE=", 1) + [""])[:2]
+                               if _combo else (None, ""))
     state = "unknown"
     counter = 0
     current_default = None
@@ -2514,7 +2521,7 @@ def keenetic_get_watchdog():
     # запроса СКВОЗЬ туннель, который watchdog делает раз в AI_PROBE_INTERVAL (10 мин).
     ai_probe = None
     try:
-        raw = keenetic_read_file(cfg.KEENETIC_WATCHDOG_STATE.rsplit("/", 1)[0] + "/watchdog.aiprobe")
+        raw = _aiprobe_raw
         if raw and "|" in raw:
             f = (raw.strip().splitlines()[0].split("|") + ["", "", "", "", ""])[:5]
             ai_probe = {
@@ -2522,7 +2529,7 @@ def keenetic_get_watchdog():
                 "country": (f[1] or "").strip() or None,
                 "empty": int(f[3]) if f[3].isdigit() else 0,
                 "stage": int(f[4]) if f[4].isdigit() else 0,
-                "age_min": max(0, int((time.time() - int(f[0])) // 60)) if f[0].isdigit() else None,
+                "age_min": max(0, int((_time_mod.time() - int(f[0])) // 60)) if f[0].isdigit() else None,
             }
     except Exception:
         ai_probe = None
@@ -3712,6 +3719,8 @@ def xkeen_page():
             "effective_yt": None,
             "effective_foreign": None,
             "last_bad_md5": None,
+            "log": [],
+            "ai_probe": None,   # без него {{ watchdog.ai_probe|tojson }} падает на Undefined
         }
         # ВАЖНО: набор ключей ДОЛЖЕН 1:1 совпадать с keenetic_get_watchdog_targets() —
         # шаблон итерирует targets.foreign_domains / targets.ipv6_domains ({% for %}),
