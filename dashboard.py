@@ -2507,6 +2507,25 @@ def keenetic_get_watchdog():
                 elif p.startswith("LAST_BAD_MD5="):
                     last_bad_md5 = p.split("=", 1)[1] or None
     log_lines = keenetic_tail_log(cfg.KEENETIC_WATCHDOG_LOG, n=30)
+    # Сквозная AI-проба watchdog (файл watchdog.aiprobe: ts|country|last_alert|empty|stage).
+    # Зачем: handshake-проба панели («жив · N мс») меряет достижимость СЕРВЕРА, а не туннеля.
+    # Если xray на роутере залип (типовое после отключения питания: стартовал раньше WAN),
+    # сервер отвечает и проба зелёная, а сквозной путь мёртв. Здесь же — результат реального
+    # запроса СКВОЗЬ туннель, который watchdog делает раз в AI_PROBE_INTERVAL (10 мин).
+    ai_probe = None
+    try:
+        raw = keenetic_read_file(cfg.KEENETIC_WATCHDOG_STATE.rsplit("/", 1)[0] + "/watchdog.aiprobe")
+        if raw and "|" in raw:
+            f = (raw.strip().splitlines()[0].split("|") + ["", "", "", "", ""])[:5]
+            ai_probe = {
+                "ts": int(f[0]) if f[0].isdigit() else 0,
+                "country": (f[1] or "").strip() or None,
+                "empty": int(f[3]) if f[3].isdigit() else 0,
+                "stage": int(f[4]) if f[4].isdigit() else 0,
+                "age_min": max(0, int((time.time() - int(f[0])) // 60)) if f[0].isdigit() else None,
+            }
+    except Exception:
+        ai_probe = None
     return {
         "state": state, "counter": counter,
         "current_default": current_default,
@@ -2515,6 +2534,7 @@ def keenetic_get_watchdog():
         "effective_foreign": effective_foreign,
         "last_bad_md5": last_bad_md5,
         "log": log_lines,
+        "ai_probe": ai_probe,
     }
 
 
@@ -15097,6 +15117,9 @@ const WATCHDOG_PRIMARY_TAG = {{ targets.primary_tag|tojson }};
 const WATCHDOG_STATE = {{ watchdog.state|tojson }};
 const WATCHDOG_LAST_BAD_MD5 = {{ watchdog.last_bad_md5|tojson }};
 const WATCHDOG_EFFECTIVE_AI = {{ watchdog.effective_ai|tojson }};
+// Сквозная AI-проба watchdog (запрос СКВОЗЬ туннель, раз в 10 мин): country/empty/stage/age_min.
+// Отличие от «жив · N мс»: то — handshake до сервера, это — реально прошедший через туннель запрос.
+const WATCHDOG_AI_PROBE = {{ watchdog.ai_probe|tojson }};
 const WATCHDOG_EFFECTIVE_YT = {{ watchdog.effective_yt|tojson }};
 const AI_FAIL_BLOCK = {{ targets.ai_fail_block|tojson }};
 const YT_FAIL_BLOCK = {{ targets.yt_fail_block|tojson }};
@@ -15336,6 +15359,31 @@ function getChannelStatusNote(tag, effective, failBlock, roleLabel) {
   }
   return '<span style="background:#eee; color:#777; padding:1px 6px; border-radius:3px;" title="Watchdog ещё не отработал тик после рестарта (≤1 мин) либо канал/домены не сконфигурированы. Нажми 🔄 для probe.">⚪ статус ждём</span>';
 }
+// Сквозная проверка AI-туннеля (данные watchdog.aiprobe). Ловит «залипший xray»:
+// сервер отвечает (handshake зелёный), а СКВОЗЬ туннель запросы не ходят — так было
+// после отключения питания, панель показывала «жив» при неработающем Claude.
+function aiThroughProbeNote() {
+  const p = WATCHDOG_AI_PROBE;
+  if (!p || p.age_min == null) return '';
+  const age = p.age_min < 60 ? p.age_min + ' мин назад' : Math.floor(p.age_min / 60) + ' ч назад';
+  if (p.empty > 0 || p.stage > 0) {
+    const fix = p.stage >= 1
+      ? 'Авто-рестарт уже был и не помог — канал не пропускает, смени AI-узел.'
+      : 'После 3 пустых проб watchdog сам перезапустит xray (~полчаса). Быстрее: xkeen -restart на роутере.';
+    return ' <span style="background:#fdd; color:#b00; padding:1px 6px; border-radius:3px;"' +
+           ' title="Запрос СКВОЗЬ туннель не прошёл (пустых проб подряд: ' + p.empty + ', замер ' + age + '). ' +
+           'Handshake-проба слева при этом может быть зелёной — она меряет достижимость сервера, а не туннель. ' + fix + '">' +
+           '🕳 туннель не отвечает насквозь (' + p.empty + ')</span>';
+  }
+  if (p.country) {
+    return ' <span style="background:#e2f0d9; color:#2a6b2a; padding:1px 6px; border-radius:3px;"' +
+           ' title="Реальный запрос СКВОЗЬ туннель прошёл (замер ' + age + '), страна выхода — ' + p.country + '. ' +
+           'Это честнее handshake-пробы: подтверждён весь путь, а не только достижимость сервера.">' +
+           '✅ насквозь: ' + p.country + '</span>';
+  }
+  return '';
+}
+
 // Мини-кнопка 🔄 рядом со статус-бейджем — probe канала прямо из info-блока,
 // чтобы не лазить в раздел «Все outbounds».
 function makeProbeBtn(role) {
@@ -15344,7 +15392,7 @@ function makeProbeBtn(role) {
 function refreshAIInfo() {
   const sel = document.getElementById('select-ai');
   if (!sel) return;
-  const note = getChannelStatusNote(sel.value, WATCHDOG_EFFECTIVE_AI, AI_FAIL_BLOCK, 'AI') + makeProbeBtn('ai');
+  const note = getChannelStatusNote(sel.value, WATCHDOG_EFFECTIVE_AI, AI_FAIL_BLOCK, 'AI') + aiThroughProbeNote() + makeProbeBtn('ai');
   renderOutboundInfo('info-ai', sel.value, { activeNote: note });
   syncSelectColor(sel);
 }
