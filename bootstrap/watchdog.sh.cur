@@ -1,4 +1,14 @@
 #!/bin/sh
+# XKeen failover watchdog v28 (2026-09-04, фикс ложного «канал восстановился»):
+#   ПРОБЛЕМА (поймана 2026-09-04): блок TG-уведомлений о kill-switch остался двоичным со
+#   времён до цепочек резерва — «EFFECTIVE стал block» ? заблокирован : восстановился.
+#   В v27 появился третий случай: EFFECTIVE меняется при уходе на резерв цепочки (и при
+#   смене канала в панели), block при этом не участвует. Такая смена падала в else →
+#   вдогонку честному «🔀 переключён на резерв» прилетало ложное «✅ канал восстановился»
+#   (тот же тик, разница в секунды), а на возврате шли два сообщения об одном событии.
+#   ФИКС: ветка CLEAR теперь под условием «предыдущий EFFECTIVE был block». Смены внутри
+#   цепочки не комментируем — про них уже сообщают блоки AI-FAILOVER / YT-FAILOVER.
+#   Логики маршрутизации не касается: меняются только уведомления.
 # XKeen failover watchdog v27 (2026-08-25, сквозная проба default + своя цепочка резерва AI):
 #   ПРОБЛЕМА, которую чинит v27 (инцидент 2026-08-25): probe_tag меряет TCP-коннект ДО узла,
 #   МИМО туннеля. Узел, который принимает соединения, но перестал выпускать трафик наружу
@@ -1660,12 +1670,19 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
         else
           log "UPDATE routing config changed (AI_DOMAINS / AI_TAG / kill-switch state) — default остаётся $NEW_DEFAULT"
         fi
+        # Уведомления о kill-switch. Сообщаем ТОЛЬКО про вход в block и выход из него:
+        # EFFECTIVE_*_TAG меняется и без всякого block — при уходе на резерв цепочки (v27)
+        # и при смене канала в панели. До v28 такая смена падала в else и слала ложное
+        # «канал восстановился» ровно в тот момент, когда основной как раз и не отвечал.
+        # Про смены внутри цепочки сообщают блоки *-FAILOVER выше — здесь молчим.
+        # Выход из block тоже бывает не на основной, а на резерв — тогда «восстановился»
+        # снова было бы неправдой, поэтому второе условие: вернулись именно на *_TAG.
         # AI kill-switch event log
         if [ "$EFFECTIVE_AI_TAG" != "$PREV_AI" ]; then
           if [ "$EFFECTIVE_AI_TAG" = "block" ]; then
             log "AI-KILL-SWITCH: AI_TAG=$AI_TAG мёртв — AI-трафик заблокирован"
             tg_alert "🛡️ <b>XKeen AI kill-switch</b>: канал <code>$AI_TAG</code> недоступен → AI-сайты ВРЕМЕННО заблокированы (чтобы не светить RU IP). Восстановится автоматически когда $AI_TAG оживёт."
-          else
+          elif [ "$PREV_AI" = "block" ] && [ "$EFFECTIVE_AI_TAG" = "$AI_TAG" ]; then
             log "AI-KILL-SWITCH-CLEAR: $AI_TAG восстановился — AI-трафик пошёл через него"
             tg_alert "✅ <b>XKeen AI kill-switch</b>: канал <code>$AI_TAG</code> восстановился, AI-сайты снова работают через него."
           fi
@@ -1675,7 +1692,7 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
           if [ "$EFFECTIVE_YT_TAG" = "block" ]; then
             log "YT-KILL-SWITCH: YT_TAG=$YT_TAG мёртв — YouTube-трафик заблокирован (YT_FAIL_BLOCK=1)"
             tg_alert "📺 <b>XKeen YT kill-switch</b>: канал <code>$YT_TAG</code> недоступен → YouTube/IG/Discord ВРЕМЕННО заблокированы. Восстановится автоматически когда $YT_TAG оживёт."
-          else
+          elif [ "$PREV_YT" = "block" ] && [ "$EFFECTIVE_YT_TAG" = "$YT_TAG" ]; then
             log "YT-KILL-SWITCH-CLEAR: $YT_TAG восстановился — YouTube-трафик пошёл через него"
             tg_alert "✅ <b>XKeen YT kill-switch</b>: канал <code>$YT_TAG</code> восстановился, YouTube/IG/Discord снова работают через него."
           fi
@@ -1685,7 +1702,7 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
           if [ "$EFFECTIVE_FOREIGN_TAG" = "block" ]; then
             log "FOREIGN-KILL-SWITCH: FOREIGN_TAG=$FOREIGN_TAG мёртв — трафик «Заблокированные в РФ» заблокирован (FOREIGN_FAIL_BLOCK=1)"
             tg_alert "🛡️ <b>XKeen FOREIGN kill-switch</b>: канал <code>$FOREIGN_TAG</code> недоступен → Meta/Telegram/Twitter ВРЕМЕННО заблокированы (чтобы не светить реальный IP). Восстановится когда $FOREIGN_TAG оживёт."
-          else
+          elif [ "$PREV_FOREIGN" = "block" ] && [ "$EFFECTIVE_FOREIGN_TAG" = "$FOREIGN_TAG" ]; then
             log "FOREIGN-KILL-SWITCH-CLEAR: $FOREIGN_TAG восстановился — трафик пошёл через него"
             tg_alert "✅ <b>XKeen FOREIGN kill-switch</b>: канал <code>$FOREIGN_TAG</code> восстановился, Meta/Telegram/Twitter снова работают через него."
           fi
