@@ -212,12 +212,17 @@ if _ext_ini and os.path.isfile(_ext_ini):
 
 import threading as _threading
 
+# v1.1.0: общий список путей snapshot (с xkeen_snapshot_daily.py) и генератор kill-switch —
+# отдельные модули без Flask, чтобы их можно было проверять офлайн.
+import xkeen_backup_paths
+import xkeen_killswitch
+
 # ============== ВЕРСИЯ ПАНЕЛИ ==============
 # Hardcoded fallback. Обновляется руками при каждом release (см. CONTRIBUTING.md).
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.0.101"
+_VERSION_FALLBACK = "1.1.0"
 
 
 def _find_git():
@@ -1408,6 +1413,215 @@ def api_wg_cleanup_orphan():
     if "WG_ORPHAN_GONE" in (r.get("stdout") or ""):
         return jsonify({"ok": True, "kernel": kernel, "msg": f"осиротевший хук {kernel} убран (файл + cron + правила + masquerade)"})
     return jsonify({"ok": False, "error": (r.get("stderr") or r.get("stdout") or "не удалось убрать хук")[:200]})
+
+
+# ============== KILL-SWITCH ПОЛИТИКИ XKEEN (v1.1.0) ==============
+# Логика хука — в xkeen_killswitch.py (без Flask). Здесь: чтение параметров с роутера,
+# статус, идемпотентная установка и маршруты. Хук ставится по образцу WG-хуков выше
+# (base64 → sh -n → mv → chmod → первый прогон → cron self-heal).
+_KS_LOCK = _threading.Lock()
+
+
+def _ks_read_params():
+    """Актуальные параметры хука с роутера: метка политики XKeen (RCI show/ip/policy —
+    ищется по description без учёта регистра, как делает сам XKeen), перехватываемые порты
+    (port_proxying.lst + обязательные 80,443), WAN (default-маршрут), наличие ip6tables.
+    → (params, None) | (None, текст ошибки)."""
+    pol = _keenetic_rci("show/ip/policy", timeout=10)
+    policy = xkeen_killswitch.parse_policy(pol, "xkeen") if isinstance(pol, dict) else None
+    if not policy:
+        return None, ("политика XKeen не найдена в Keenetic (RCI show/ip/policy). Kill-switch привязан "
+                      "к её метке — нужна политика с именем XKeen и привязанные к ней устройства "
+                      "(см. «Помощь → Клиенты политики»).")
+    r = keenetic_ssh(
+        "cat /opt/etc/xkeen/port_proxying.lst 2>/dev/null; echo '###WAN###'; "
+        "ip route show default 2>/dev/null | head -1; echo '###V6###'; "
+        "command -v ip6tables >/dev/null 2>&1 && echo yes || echo no; echo '###WANIP###'; "
+        "W=$(ip route show default 2>/dev/null | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p' | head -1); "
+        "[ -n \"$W\" ] && ip -4 addr show dev \"$W\" 2>/dev/null | sed -n 's/.*inet \\([0-9.]*\\).*/\\1/p' | head -1",
+        timeout=8)
+    out = r.get("stdout") or ""
+    lst, _, rest = out.partition("###WAN###")
+    wan_part, _, rest2 = rest.partition("###V6###")
+    v6_part, _, wanip_part = rest2.partition("###WANIP###")
+    m = re.search(r"\sdev\s+(\S+)", wan_part)
+    wan = m.group(1) if m else None
+    if not wan:
+        return None, "не удалось определить WAN-интерфейс роутера (ip route show default пуст)"
+    wan_ip = (wanip_part or "").strip().splitlines()[0].strip() if (wanip_part or "").strip() else None
+    return {
+        "mark": policy["mark"], "policy_id": policy["id"], "policy_desc": policy["description"],
+        "table4": policy.get("table4"),
+        "ports": xkeen_killswitch.parse_ports_lst(lst),
+        "wan": wan, "wan_ip": wan_ip, "ipv6": "yes" in v6_part,
+    }, None
+
+
+def keenetic_killswitch_status(with_leaks=True):
+    """Состояние kill-switch: установлен ли хук, cron, правила v4/v6 на месте, режим, дрейф
+    запечённых параметров относительно актуальных, число прямых соединений политики (утечек).
+    state: absent | broken | observe | protect."""
+    st_raw = keenetic_ssh("sh", stdin_data=xkeen_killswitch.status_script(), timeout=15)
+    if not (st_raw.get("stdout") or "").strip():
+        return {"ok": False, "error": "роутер недоступен: " + (st_raw.get("stderr") or "")[:200]}
+    st = xkeen_killswitch.parse_status(st_raw.get("stdout") or "")
+    params, perr = _ks_read_params()
+    hp = st.get("hook_params") or {}
+    installed = bool(st.get("hook_exists"))
+    mode = hp.get("KS_MODE") if installed else None
+    drift = []
+    if installed and params:
+        want = xkeen_killswitch.params_signature(params["mark"], params["ports"], params["wan"],
+                                                mode or "protect", params["ipv6"])
+        for k in ("KS_VERSION", "KS_MARK", "KS_PORTS", "KS_V6"):
+            if hp.get(k) != want[k]:
+                drift.append(f"{k}: в хуке {hp.get(k)!r}, нужно {want[k]!r}")
+        if hp.get("KS_WAN") != want["KS_WAN"]:
+            # WAN хук уточняет сам при каждом запуске; расхождение запечённого — повод обновить
+            drift.append(f"KS_WAN: в хуке {hp.get('KS_WAN')!r}, сейчас {want['KS_WAN']!r}")
+    v4 = {
+        "present": st.get("iptables_present") == 1,
+        "jumps": st.get("iptables_jumps", 0), "first": st.get("iptables_first") == 1,
+        "chain_rules": st.get("iptables_chain_rules", 0), "act": st.get("iptables_act") or "",
+    }
+    v6 = {
+        "present": st.get("ip6tables_present") == 1,
+        "jumps": st.get("ip6tables_jumps", 0), "first": st.get("ip6tables_first") == 1,
+        "chain_rules": st.get("ip6tables_chain_rules", 0), "act": st.get("ip6tables_act") or "",
+    }
+    v4_ok = installed and v4["present"] and v4["jumps"] >= 1 and v4["first"] and v4["chain_rules"] >= 8
+    v6_needed = installed and hp.get("KS_V6") == "1" and v6["present"]
+    v6_ok = (not v6_needed) or (v6["jumps"] >= 1 and v6["first"] and v6["chain_rules"] >= 8)
+    if installed and mode == "protect" and v4["act"] and v4["act"] != "DROP":
+        drift.append(f"в цепочке стоит {v4['act']}, для режима protect ожидается DROP")
+    active = installed and bool(st.get("hook_exec")) and st.get("cron", 0) >= 1 and v4_ok and v6_ok
+    if not installed:
+        state = "absent"
+    elif not active or drift:
+        state = "broken"
+    elif mode == "observe":
+        state = "observe"
+    else:
+        state = "protect"
+    res = {
+        "ok": True, "state": state, "installed": installed, "active": active, "mode": mode,
+        "hook_exec": bool(st.get("hook_exec")), "cron": st.get("cron", 0) >= 1,
+        "v4": v4, "v6": v6, "v6_needed": v6_needed, "drift": drift, "hook_params": hp,
+        "wan": st.get("wan"), "wg_ifaces": st.get("wgs", []),
+        "params": params, "params_error": perr,
+        "hook_path": xkeen_killswitch.HOOK_PATH, "cron_line": xkeen_killswitch.CRON_LINE,
+    }
+    if with_leaks and params:
+        lr = keenetic_ssh("sh", stdin_data=xkeen_killswitch.leaks_script(params["mark"], params["ports"],
+                                                                          wan_ip=params.get("wan_ip")),
+                          timeout=12)
+        res["leaks"] = xkeen_killswitch.parse_leaks(lr.get("stdout") or "")
+    return res
+
+
+def keenetic_ensure_killswitch(mode=None, force=False):
+    """Идемпотентно привести kill-switch на роутере к актуальным параметрам.
+    mode=None — сохранить режим уже стоящего хука (нет хука → protect). force — переустановить
+    даже без дрейфа (смена режима, «починить»).
+    → {"action": "installed"|"updated"|"current"|"skip"|"failed", "detail", "status"}."""
+    with _KS_LOCK:
+        params, perr = _ks_read_params()
+        if not params:
+            return {"action": "skip", "detail": perr}
+        st = keenetic_killswitch_status(with_leaks=False)
+        if not st.get("ok"):
+            return {"action": "skip", "detail": st.get("error")}
+        cur_mode = st.get("mode") if st.get("installed") else None
+        new_mode = mode or cur_mode or "protect"
+        if new_mode not in xkeen_killswitch.MODES:
+            return {"action": "failed", "detail": f"неизвестный режим {new_mode!r}"}
+        need = (force or not st["installed"] or not st["active"] or bool(st["drift"])
+                or (st.get("hook_params") or {}).get("KS_MODE") != new_mode)
+        if not need:
+            return {"action": "current", "detail": "kill-switch актуален", "status": st}
+        try:
+            hook = xkeen_killswitch.build_hook(params["mark"], params["ports"], params["wan"],
+                                               mode=new_mode, ipv6=params["ipv6"])
+        except ValueError as ex:
+            return {"action": "failed", "detail": f"параметры хука: {ex}"}
+        b64 = base64.b64encode(hook.encode("utf-8")).decode("ascii")
+        r = keenetic_ssh(xkeen_killswitch.install_command(), stdin_data=b64, timeout=40)
+        out = r.get("stdout") or ""
+        if "KS_INSTALL_OK" not in out:
+            return {"action": "failed",
+                    "detail": "установка не подтверждена: " + ((r.get("stderr") or out)[-300:]).strip()}
+        st2 = keenetic_killswitch_status(with_leaks=False)
+        if not st2.get("active"):
+            return {"action": "failed", "status": st2,
+                    "detail": "хук записан, но правила не встали: " + ("; ".join(st2.get("drift") or [])
+                                                                         or "переход не первый в FORWARD / нет cron")}
+        action = "updated" if st["installed"] else "installed"
+        return {"action": action, "status": st2,
+                "detail": (f"режим {new_mode}, метка {params['mark']}, порты {' '.join(params['ports'])}, "
+                           f"WAN {params['wan']}" + (", IPv6" if params["ipv6"] else ""))}
+
+
+@app.route("/api/xkeen/killswitch-status")
+@requires_auth
+def api_xkeen_killswitch_status():
+    """Состояние kill-switch + утечки. ?heal=1 — если хук стоит, но правила/параметры разъехались,
+    привести в порядок прямо сейчас (самообслуживание установленного kill-switch; неустановленный
+    без явного действия не ставится)."""
+    try:
+        st = keenetic_killswitch_status(with_leaks=True)
+        if request.args.get("heal") == "1" and st.get("ok") and st.get("installed") and st.get("state") == "broken":
+            fix = keenetic_ensure_killswitch()
+            st = keenetic_killswitch_status(with_leaks=True)
+            st["healed"] = fix
+        return jsonify(st)
+    except Exception as ex:
+        return jsonify({"ok": False, "error": str(ex)[:300]})
+
+
+@app.route("/api/xkeen/killswitch-preview")
+@requires_auth
+def api_xkeen_killswitch_preview():
+    """Текст хука, который будет записан на роутер при текущих параметрах (для предпросмотра)."""
+    mode = (request.args.get("mode") or "protect").strip()
+    if mode not in xkeen_killswitch.MODES:
+        return jsonify({"ok": False, "error": "режим: protect | observe"})
+    params, perr = _ks_read_params()
+    if not params:
+        return jsonify({"ok": False, "error": perr})
+    try:
+        hook = xkeen_killswitch.build_hook(params["mark"], params["ports"], params["wan"],
+                                           mode=mode, ipv6=params["ipv6"])
+    except ValueError as ex:
+        return jsonify({"ok": False, "error": str(ex)})
+    return jsonify({"ok": True, "hook": hook, "params": params, "hook_path": xkeen_killswitch.HOOK_PATH,
+                    "cron_line": xkeen_killswitch.CRON_LINE})
+
+
+@app.route("/api/xkeen/killswitch-apply", methods=["POST"])
+@requires_auth
+def api_xkeen_killswitch_apply():
+    """Поставить/обновить kill-switch в заданном режиме. Body: mode=protect|observe."""
+    data = request.get_json(silent=True) or request.form
+    mode = (data.get("mode") or "protect").strip()
+    if mode not in xkeen_killswitch.MODES:
+        return jsonify({"ok": False, "error": "режим: protect | observe"})
+    try:
+        res = keenetic_ensure_killswitch(mode=mode, force=True)
+    except Exception as ex:
+        return jsonify({"ok": False, "error": str(ex)[:300]})
+    ok = res.get("action") in ("installed", "updated", "current")
+    return jsonify({"ok": ok, **res})
+
+
+@app.route("/api/xkeen/killswitch-remove", methods=["POST"])
+@requires_auth
+def api_xkeen_killswitch_remove():
+    """Снять kill-switch полностью (файл, cron, правила). Для отладки/отката."""
+    r = keenetic_ssh(xkeen_killswitch.remove_command(), timeout=30)
+    out = r.get("stdout") or ""
+    if "KS_REMOVE_OK" in out:
+        return jsonify({"ok": True, "msg": "kill-switch снят: хук, cron-строка и правила удалены"})
+    return jsonify({"ok": False, "error": ((r.get("stderr") or out)[-300:]).strip() or "не удалось снять"})
 
 
 WG_EXE_PATHS = [r"C:\Program Files\WireGuard\wg.exe", r"C:\Program Files (x86)\WireGuard\wg.exe"]
@@ -3683,6 +3897,11 @@ def _xkeen_error_handler(ex):
     """Catch-all для exception'ов на /xkeen и /api/xkeen/* — вместо 'Internal Server Error'
     показываем юзеру конкретный traceback (он диагностирует или присылает разработчику)."""
     import traceback
+    from werkzeug.exceptions import HTTPException
+    # v1.1.0: HTTP-исключения (404 на несуществующий путь, 405 и т.п.) — не ошибки приложения.
+    # Раньше они попадали сюда и через `raise ex` превращались в 500 «Internal Server Error».
+    if isinstance(ex, HTTPException):
+        return ex
     if request.path.startswith("/xkeen") or request.path.startswith("/api/xkeen"):
         tb = traceback.format_exc()
         # Также печатаем в stderr (попадёт в dashboard.log через Tee-Object)
@@ -4720,33 +4939,10 @@ def api_xkeen_set_target(role):
 
 # Список ВСЕХ файлов XKeen-конфигурации которые попадают в backup.
 # Только конкретные пути (whitelist) — для безопасности restore не зальёт что попало.
-XKEEN_BACKUP_FILES = [
-    # Активные xray-конфиги (то что читает xray прямо сейчас)
-    "/opt/etc/xray/configs/01_log.json",
-    "/opt/etc/xray/configs/02_dns.json",
-    "/opt/etc/xray/configs/03_inbounds.json",
-    "/opt/etc/xray/configs/04_outbounds.json",
-    "/opt/etc/xray/configs/05_routing.json",
-    "/opt/etc/xray/configs/06_policy.json",
-    # Шаблоны и backup-конфиги (наш v6 watchdog template + legacy)
-    "/opt/etc/xray/configs.bak/05_routing.template.json",
-    "/opt/etc/xray/configs.bak/05_routing.primary.json",
-    "/opt/etc/xray/configs.bak/05_routing.failover.json",
-    "/opt/etc/xray/configs.bak/05_routing.original-balancer.json",
-    "/opt/etc/xray/configs.bak/07_observatory.disabled.json",
-    # Watchdog
-    "/opt/etc/xray/watchdog.sh",
-    "/opt/etc/xray/watchdog.config",
-    "/opt/etc/xray/watchdog.state",
-    # Sidecar с дружелюбными именами провайдера/подписки (для UI дашборда)
-    "/opt/etc/xray/outbound_meta.json",
-    "/opt/etc/xray/subscription_meta.json",
-    "/opt/etc/xray/domain_notes.json",  # v1.7.0: примечания к доменам AI/YT/DIRECT/BLOCK
-    # Cron-задачи (включая watchdog cron и xkeen autoupdate)
-    "/opt/var/spool/cron/crontabs/root",
-    # SSH authorized keys (на случай если ключ потеряется)
-    "/opt/etc/dropbear/authorized_keys",
-]
+# v1.1.0: список путей snapshot вынесен в xkeen_backup_paths.py — он общий с ежедневным
+# xkeen_snapshot_daily.py (раньше списки разъезжались: daily терял sidecar-файлы). Там же
+# динамические пути (хуки /opt/etc/ndm/netfilter.d/zz_*.sh: WG-хуки и kill-switch панели).
+XKEEN_BACKUP_FILES = list(xkeen_backup_paths.STATIC_FILES)
 
 
 def _fetch_subscription(sub_url, ua=None, timeout=15):
@@ -5690,25 +5886,19 @@ def api_xkeen_subscription_sync():
 @app.route("/api/xkeen/backup", methods=["GET"])
 @requires_auth
 def api_xkeen_backup():
-    """Скачивает snapshot ВСЕХ конфигов XKeen в JSON-bundle.
-    Содержит 16 файлов: все xray-конфиги (01-06), шаблоны watchdog,
-    сам watchdog.sh + config + state, crontab, authorized_keys."""
+    """Скачивает snapshot ВСЕХ конфигов XKeen в JSON-bundle (формат v7).
+    Состав — xkeen_backup_paths: xray-конфиги (01-06), шаблоны watchdog, watchdog.sh + config +
+    state + aiprobe, sidecar-файлы панели, crontab, authorized_keys, хуки netfilter.d/zz_*.sh."""
     import time as _time
-    # Собираем bundle через jq на роутере — компактно и читаемо
-    # Для каждого существующего файла строим объект {path, content}
-    cmd_parts = []
-    for p in XKEEN_BACKUP_FILES:
-        # base64 на случай бинарных артефактов (хотя у нас все текстовые)
-        # но raw читабельнее
-        cmd_parts.append(
-            f'[ -f "{p}" ] && jq -n --arg p "{p}" --rawfile c "{p}" '
-            '\'{path: $p, content: $c}\''
-        )
-    cmd = "(" + " ; ".join(cmd_parts) + ") | jq -s --arg ts \"$(date)\" '{version: \"v7\", timestamp: $ts, files: .}'"
+    # Собираем bundle через jq на роутере — компактно и читаемо: для каждого существующего
+    # файла объект {path, content}; отсутствующие пропускаются.
+    cmd = xkeen_backup_paths.build_snapshot_command()
     r = keenetic_ssh(cmd, timeout=30)
     if not r["ok"]:
         return jsonify({"ok": False, "stderr": r["stderr"][:500]}), 500
-    fname = f"xkeen-snapshot-{_time.strftime('%Y%m%d-%H%M%S')}.json"
+    # Имя БЕЗ формата ежедневного файла (xkeen-snapshot-<ts>.json): если пользователь положит
+    # скачанный файл в backups\, ретеншн xkeen_snapshot_daily.py его не тронет.
+    fname = f"xkeen-snapshot-download-{_time.strftime('%Y%m%d-%H%M%S')}.json"
     return Response(
         r["stdout"],
         mimetype="application/json",
@@ -5723,13 +5913,7 @@ def api_xkeen_backup_to_disk():
     без всплывающего «Save As» диалога. Бэкап такой же как api_xkeen_backup,
     просто пишется на сервер а не отдаётся клиенту."""
     import time as _time
-    cmd_parts = []
-    for p in XKEEN_BACKUP_FILES:
-        cmd_parts.append(
-            f'[ -f "{p}" ] && jq -n --arg p "{p}" --rawfile c "{p}" '
-            '\'{path: $p, content: $c}\''
-        )
-    cmd = "(" + " ; ".join(cmd_parts) + ") | jq -s --arg ts \"$(date)\" '{version: \"v7\", timestamp: $ts, files: .}'"
+    cmd = xkeen_backup_paths.build_snapshot_command()
     r = keenetic_ssh(cmd, timeout=30)
     if not r["ok"]:
         return jsonify({"ok": False, "stderr": r["stderr"][:500]})
@@ -5979,17 +6163,18 @@ def api_xkeen_restore():
     if not items:
         return jsonify({"ok": False, "stderr": "snapshot пустой или невалидный формат"})
 
-    # SECURITY: разрешаем писать только в whitelist путей
-    allowed = set(XKEEN_BACKUP_FILES)
+    # SECURITY: разрешаем писать только в whitelist путей (фиксированный список + хуки
+    # /opt/etc/ndm/netfilter.d/zz_*.sh с безопасным именем — см. xkeen_backup_paths.is_restorable)
+    allowed = xkeen_backup_paths.is_restorable
     ts = _time.strftime('%Y%m%d-%H%M%S')
 
     # ВАЛИДАЦИЯ ДО ЛЮБОЙ ЗАПИСИ: обрезанный/битый snapshot не должен попасть на роутер и
     # уронить xray (для watchdog.sh обычный апгрейд делает sh -n — restore обязан тоже).
-    # JSON-конфиги проверяем локально; watchdog.sh — через `sh -n` на роутере. Любая ошибка
-    # → ничего не пишем (атомарность «всё или ничего»).
+    # JSON-конфиги проверяем локально; *.sh (watchdog, хуки) — через `sh -n` на роутере.
+    # Любая ошибка → ничего не пишем (атомарность «всё или ничего»).
     val_errors = []
     for path, content in items:
-        if path not in allowed:
+        if not allowed(path):
             continue
         base = os.path.basename(path)
         if path.endswith(".json"):
@@ -6009,12 +6194,13 @@ def api_xkeen_restore():
     errors = []
     skipped = []
     for path, content in items:
-        if path not in allowed:
+        if not allowed(path):
             skipped.append(f"{path} (не в whitelist)")
             continue
-        # Бэкап текущего
+        # Бэкап текущего; каталог создаём — на чистом роутере /opt/etc/ndm/netfilter.d может
+        # отсутствовать, и `cat >` без mkdir молча падал
         keenetic_ssh(f"cp {path} {path}.bak-pre-restore-{ts} 2>/dev/null || true")
-        r = keenetic_ssh(f"cat > {path}", stdin_data=content, timeout=15)
+        r = keenetic_ssh(f"mkdir -p $(dirname {path}) && cat > {path}", stdin_data=content, timeout=15)
         if r["ok"]:
             restored.append(path)
         else:
@@ -6023,17 +6209,32 @@ def api_xkeen_restore():
     if errors:
         return jsonify({"ok": False, "stderr": "Ошибки:\n" + "\n".join(errors), "restored": restored})
 
-    # chmod +x для скриптов
-    keenetic_ssh("chmod +x /opt/etc/xray/watchdog.sh")
+    # chmod +x для скриптов (watchdog.sh и хуки netfilter.d) — snapshot права не хранит,
+    # а cron молча не запускает неисполняемый файл
+    exec_paths = [p for p in restored if xkeen_backup_paths.needs_exec_bit(p)]
+    if exec_paths:
+        keenetic_ssh("chmod +x " + " ".join(exec_paths), timeout=10)
     # Перезаливаем crontab если был в bundle
     if "/opt/var/spool/cron/crontabs/root" in [p for p, _ in items]:
         keenetic_ssh("crontab /opt/var/spool/cron/crontabs/root 2>/dev/null || true")
+    # v1.1.0: kill-switch политики — привести к актуальным параметрам роутера (старый snapshot
+    # мог быть без хука, или метка политики/порты на этом роутере другие). Best-effort.
+    ks_note = ""
+    try:
+        ks = keenetic_ensure_killswitch()
+        if ks.get("action") in ("installed", "updated"):
+            ks_note = f"\n🛡 Kill-switch политики XKeen: {ks['action']} ({ks.get('detail', '')})"
+        elif ks.get("action") in ("failed", "skip"):
+            ks_note = f"\n⚠ Kill-switch политики XKeen: {ks.get('detail', '')}"
+    except Exception as ex:
+        ks_note = f"\n⚠ Kill-switch политики XKeen: {ex}"
     # Перезапуск xray
     apply = keenetic_ssh("/opt/etc/xray/watchdog.sh && xkeen -restart", timeout=30)
 
     msg = f"✅ Восстановлено {len(restored)} файлов. Бэкап текущих: *.bak-pre-restore-{ts}"
     if skipped:
         msg += f"\n⚠️ Пропущены (не в whitelist): {len(skipped)} — " + ", ".join(skipped[:3])
+    msg += ks_note
     return jsonify({
         "ok": True,
         "stdout": msg,
@@ -7535,7 +7736,13 @@ DEFAULT_WATCHDOG_CONFIG = '''# /opt/etc/xray/watchdog.config — управля�
 PRIMARY_TAG=""
 FAILOVER_TAGS=""
 AI_TAG=""
-AI_DOMAINS="anthropic.com chatgpt.com claude.ai claudeusercontent.com featureassets.org featuregates.org oaistatic.com oaiusercontent.com openai.com sora.com statsig.com"
+# гео-сервисы (country.is ipinfo.io ip-api.com) идут через AI-канал: по ним watchdog проверяет,
+# из какой страны виден AI-выход (сквозная AI-проба)
+AI_DOMAINS="country.is ipinfo.io ip-api.com anthropic.com chatgpt.com claude.ai claudeusercontent.com featureassets.org featuregates.org oaistatic.com oaiusercontent.com openai.com sora.com statsig.com"
+# v2fly-категории для AI-канала (пусто = только домены выше)
+AI_EXT_CATEGORIES=""
+# IP-диапазоны AI-провайдеров — соединения по чистому IP мимо доменных правил (Anthropic)
+AI_IP_RANGES="160.79.104.0/23 2607:6bc0::/48"
 AI_FAIL_BLOCK="1"
 # цепочка резерва AI: теги через пробел, порядок = приоритет перебора (пусто = цепочки нет)
 AI_FAILOVER_TAGS=""
@@ -7543,11 +7750,22 @@ AI_FAILOVER_TAGS=""
 AI_CHAIN_ALLOW_RU="0"
 YT_TAG=""
 YT_DOMAINS="ggpht.com googlevideo.com youtu.be youtube-nocookie.com youtube.com youtubei.googleapis.com yt3.ggpht.com yt4.ggpht.com ytimg.com"
+YT_EXT_CATEGORIES=""
+YT_GEOIP_CATEGORIES=""
 YT_FAIL_BLOCK="0"
 # цепочка резерва YouTube: теги через пробел, порядок = приоритет перебора
 YT_FAILOVER_TAGS=""
 # для YouTube российский узел штатен (меньше рекламы, нет троттлинга) — по умолчанию разрешён
 YT_CHAIN_ALLOW_RU="1"
+# «Зарубежные сервисы» (Meta/Instagram/Telegram/Discord) — свой канал, структура как у YouTube
+FOREIGN_TAG=""
+FOREIGN_DOMAINS=""
+FOREIGN_EXT_CATEGORIES=""
+FOREIGN_GEOIP_CATEGORIES=""
+FOREIGN_FAIL_BLOCK="0"
+# «Через IPv6» — домены IPv6-only сайтов → узел с IPv6-egress
+IPV6_TAG=""
+IPV6_DOMAINS=""
 DIRECT_DOMAINS=""
 BLOCK_DOMAINS=""
 PRIMARY_PROBE_URL="https://www.cloudflare.com/cdn-cgi/trace"
@@ -7707,13 +7925,17 @@ def _bootstrap_collect_state():
         always_overwrite=True)
 
     tmpl_local = _bootstrap_find("05_routing.template.json.cur")
+    # v1.1.0: НЕ перезаписывать без галочки. Живой шаблон на рабочем роутере несёт список IP
+    # VPN-серверов (direct-исключения), который панель поддерживает авто-синком; встроенный
+    # baseline их не знает — перезапись роняла исключения до следующей мутации outbound'ов.
+    # Обновление СТРУКТУРЫ шаблона на рабочем роутере — через «Синхронизация структуры».
     add("routing_template",
         "Шаблон routing для watchdog (с placeholder'ами __AI_RULE__/__YT_RULE_BLOCK__/...)",
         "/opt/etc/xray/configs.bak/05_routing.template.json",
         tmpl_local,
         "text",
         "bootstrap/05_routing.template.json.cur",
-        always_overwrite=True)
+        always_overwrite=False)
 
     add("watchdog_config",
         "Конфиг watchdog (PRIMARY/FAILOVER/AI/YT_TAG, домены, threshold'ы)",
@@ -7789,6 +8011,23 @@ def _bootstrap_collect_state():
         "action": "keep" if log_exists else "create",
     })
 
+    # v1.1.0: kill-switch политики XKeen — хук netfilter.d + cron, генерируется панелью по метке
+    # политики XKeen и портам перехвата (не файл baseline). Уже стоит → keep (при галочке
+    # «Перезаписать» перегенерируется под актуальные параметры).
+    r = keenetic_ssh(f"test -x {xkeen_killswitch.HOOK_PATH} && echo EXISTS", timeout=5)
+    ks_exists = "EXISTS" in (r["stdout"] or "")
+    state["items"].append({
+        "key": "killswitch",
+        "label": "Kill-switch политики XKeen (хук netfilter.d + cron) — в окне перезапуска XKeen клиенты политики не выходят в интернет напрямую",
+        "remote_path": xkeen_killswitch.HOOK_PATH,
+        "local_path": None,
+        "mode": "generated",
+        "source": "генерируется по метке политики XKeen и портам перехвата",
+        "remote_size": 1 if ks_exists else None,
+        "local_size": 0,
+        "action": "keep" if ks_exists else "create",
+    })
+
     # Подсчёт
     for it in state["items"]:
         if it["action"] == "create":
@@ -7852,6 +8091,20 @@ def _bootstrap_deploy_item(item, overwrite_existing):
                     "msg": f"уже содержит {n} записей — не затираем (защита sidecar-метаданных)",
                     "action_taken": "skip",
                 }
+
+    # v1.1.0: kill-switch — не файл baseline, а генерация по параметрам роутера. Без галочки
+    # «Перезаписать» — поставить, если нет, или обновить при дрейфе; с галочкой — перегенерировать.
+    elif key == "killswitch":
+        try:
+            ks = keenetic_ensure_killswitch(mode=None, force=overwrite_existing)
+        except Exception as ex:
+            return {"ok": False, "msg": f"kill-switch: {ex}", "action_taken": "fail"}
+        act = ks.get("action")
+        if act in ("installed", "updated"):
+            return {"ok": True, "msg": f"kill-switch {act}: {ks.get('detail', '')}", "action_taken": "create" if act == "installed" else "overwrite"}
+        if act == "current":
+            return {"ok": True, "msg": "kill-switch уже актуален — пропущено", "action_taken": "skip"}
+        return {"ok": False, "msg": f"kill-switch: {ks.get('detail', '')}", "action_taken": "fail"}
 
     # Скип уже существующего, если не выбрано перезаписать
     elif item["action"] == "keep" and not overwrite_existing:
@@ -8159,8 +8412,11 @@ def api_keenetic_bootstrap_apply():
     # со ссылками на эти tag'и. Если watchdog запустится раньше — xray упадёт с
     # «outbound tag 'direct' not found». Потом routing_template и watchdog.sh.
     # Cron — последним.
+    # Kill-switch — последним: ему нужна политика XKeen в Keenetic (метка), к XKeen-файлам
+    # он не привязан.
     order = ["log_dir", "watchdog_config", "outbound_meta", "subscription_meta",
-             "domain_notes", "outbounds_defaults", "routing_template", "watchdog_sh", "cron_entry"]
+             "domain_notes", "outbounds_defaults", "routing_template", "watchdog_sh", "cron_entry",
+             "killswitch"]
     items_by_key = {it["key"]: it for it in state["items"]}
 
     for key in order:
@@ -8597,6 +8853,40 @@ def api_xkeen_diagnose():
         fix_label="🔧 Добавить cron-задачу" if not has_cron else None,
         fix_explain=("Без cron-задачи watchdog не будет автоматически проверять каналы и переключаться "
                      "при падении. xray запустится один раз, но failover не сработает." if not has_cron else None),
+    )
+
+    # ---- 7b. Kill-switch политики XKeen (v1.1.0) ----
+    try:
+        _ks = keenetic_killswitch_status(with_leaks=False)
+    except Exception as _ex:
+        _ks = {"ok": False, "error": str(_ex)}
+    _ks_state = _ks.get("state") if _ks.get("ok") else "error"
+    _ks_ok = _ks_state in ("protect", "observe")
+    _ksp = _ks.get("params") or {}
+    if _ks_state == "absent":
+        _ks_detail = ("хук не установлен — в окне xkeen -restart (его делает и watchdog при переключении "
+                      "каналов) клиенты политики XKeen выходят в интернет напрямую, с домашним IP")
+    elif _ks_state == "broken":
+        _ks_detail = "хук есть, но не в порядке: " + ("; ".join(_ks.get("drift") or [])
+                                                     or "переход не первый в FORWARD / нет cron-строки / нет +x")
+    elif _ks_state == "observe":
+        _ks_detail = "режим наблюдения — прямые соединения политики только считаются, не режутся"
+    elif _ks_state == "protect":
+        _ks_detail = (f"защита активна: метка {_ksp.get('mark')}, порты {' '.join(_ksp.get('ports') or [])}, "
+                      f"WAN {_ksp.get('wan')}" + (", IPv6" if _ksp.get("ipv6") else ""))
+    else:
+        _ks_detail = _ks.get("error") or _ks.get("params_error") or "не удалось проверить"
+    if _ks.get("ok") and _ks.get("params_error"):
+        _ks_detail += "\n" + _ks["params_error"]
+    _add(
+        "killswitch", "Kill-switch политики XKeen", _ks_ok,
+        "warning" if not _ks_ok else "info",
+        _ks_detail,
+        fix_id="install_killswitch" if _ks_state in ("absent", "broken") else None,
+        fix_label="🛡 Установить kill-switch" if _ks_state == "absent" else ("🛡 Починить kill-switch" if _ks_state == "broken" else None),
+        fix_explain=("Панель сгенерирует хук netfilter.d по метке политики XKeen и портам перехвата, поставит "
+                     "cron-строку самолечения и проверит, что переход стоит первым в FORWARD. Пока XKeen жив, "
+                     "правило ничего не режет." if _ks_state in ("absent", "broken") else None),
     )
 
     # ---- 8. Watchdog log: последние ошибки ----
@@ -9147,6 +9437,13 @@ XKEEN_AUTO_FIXES = {
         "explain": ("Добавить запись `*/1 * * * * /opt/etc/xray/watchdog.sh` в crontab. Watchdog будет "
                     "проверять каналы каждую минуту и переключаться при падении."),
     },
+    "install_killswitch": {
+        "label": "Установить / починить kill-switch политики XKeen",
+        "explain": ("Сгенерировать хук /opt/etc/ndm/netfilter.d/zz_xkeen_killswitch.sh по метке политики "
+                    "XKeen и портам перехвата, поставить cron-строку самолечения и проверить правила. "
+                    "Пока XKeen жив — правило пустое; в окне xkeen -restart новые соединения клиентов "
+                    "политики на перехватываемые порты режутся, чтобы не уйти напрямую с домашним IP."),
+    },
     "install_extended_geoip": {
         "label": "Установить расширенный geoip.dat (Loyalsoldier)",
         "explain": (
@@ -9249,6 +9546,17 @@ def api_xkeen_auto_fix():
         added = bool((r2.get("stdout") or "").strip())
         log_lines.append(f"crontab после fix: {r2.get('stdout') or '(пусто!)'}")
         ok = added
+
+    elif fix_id == "install_killswitch":
+        ks = keenetic_ensure_killswitch(force=True)
+        log_lines.append(f"{ks.get('action')}: {ks.get('detail', '')}")
+        _st = ks.get("status") or {}
+        if _st:
+            log_lines.append("---")
+            log_lines.append(f"state={_st.get('state')} cron={_st.get('cron')} "
+                             f"v4 jumps={_st.get('v4', {}).get('jumps')} first={_st.get('v4', {}).get('first')} "
+                             f"rules={_st.get('v4', {}).get('chain_rules')} act={_st.get('v4', {}).get('act')}")
+        ok = ks.get("action") in ("installed", "updated", "current")
 
     elif fix_id == "install_extended_geoip":
         # Скачивает Loyalsoldier geoip.dat (содержит и страны, и сервисы).
@@ -11836,13 +12144,15 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 <h2 class="sec-backup">💾 Бэкап и восстановление <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— все настройки XKeen одним файлом</span></h2>
 <div class="card">
   <p class="subtitle" style="margin-top: 0;">
-    Сохраняет/восстанавливает <strong>ВСЕ настройки XKeen</strong> одним файлом — 16 конфигов:
+    Сохраняет/восстанавливает <strong>ВСЕ настройки XKeen</strong> одним файлом — конфиги xray, watchdog, sidecar-файлы панели и хуки netfilter.d:
     <details style="display: inline; margin-left: 4px;" data-xk-keep-inline>
       <summary style="cursor: pointer; display: inline; color: #2a7;">список файлов</summary>
       <div style="margin-top: 6px; padding: 8px; background: #f9f9f4; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.85em;">
         Активные xray (01-06): <code>01_log.json</code> · <code>02_dns.json</code> · <code>03_inbounds.json</code> · <code>04_outbounds.json</code> · <code>05_routing.json</code> · <code>06_policy.json</code><br>
         Шаблоны/legacy: <code>05_routing.template.json</code> · <code>05_routing.{primary,failover,original-balancer}.json</code> · <code>07_observatory.disabled.json</code><br>
-        Watchdog: <code>watchdog.sh</code> · <code>watchdog.config</code> · <code>watchdog.state</code><br>
+        Watchdog: <code>watchdog.sh</code> · <code>watchdog.config</code> · <code>watchdog.state</code> · <code>watchdog.aiprobe</code><br>
+        Sidecar панели: <code>outbound_meta.json</code> · <code>subscription_meta.json</code> · <code>domain_notes.json</code><br>
+        Хуки: <code>netfilter.d/zz_*.sh</code> (WG-хуки и kill-switch панели — при восстановлении получают <code>+x</code>)<br>
         Системное: <code>crontab</code> · <code>dropbear authorized_keys</code>
       </div>
     </details>
@@ -11854,8 +12164,9 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   </div>
   <div style="margin-top: 8px;">
     <a href="/api/xkeen/backup" class="btn btn-secondary" download style="font-size:0.85em;">📥 Скачать в Downloads (с диалогом)</a>
-    <span class="subtitle" style="margin-left: 8px;">альтернативный путь — если хочешь сохранить вне стандартной папки бэкапов</span>
+    <span class="subtitle" style="margin-left: 8px;">альтернативный путь — файл <code>xkeen-snapshot-download-&lt;ts&gt;.json</code>, вне стандартной папки бэкапов</span>
   </div>
+  <p class="subtitle" style="margin: 8px 0 0; color: #7a5500;">⚠ Snapshot содержит <code>watchdog.config</code> с токеном Telegram-бота (если он настроен) и <code>authorized_keys</code> — не передавать посторонним и не выкладывать.</p>
   <div style="margin-top: 12px;">
     <input type="file" id="restore-file" accept=".json" style="font-size: 0.9em;">
     <button class="btn btn-warn" onclick="restoreSnapshot()">🔄 Восстановить из файла</button>
@@ -12030,7 +12341,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
       Если на роутере уже стоит XKeen но он <strong>пустой</strong> (только что после <code>xkeen -i</code>) —
       эта кнопка дольёт всё что нужно для управления через панель:
       <strong>watchdog.sh</strong> + <strong>05_routing.template.json</strong> + <strong>watchdog.config</strong> (с дефолтами) +
-      <strong>cron-запись</strong> (раз в минуту) + директория логов + пустые meta-файлы.
+      <strong>cron-запись</strong> (раз в минуту) + директория логов + пустые meta-файлы +
+      <strong>kill-switch политики XKeen</strong> (хук netfilter.d + cron; нужна политика <code>XKeen</code> в Keenetic).
       <br>Перед тем как заливать — покажет план: что есть, что будет создано, что перезаписано.
       Сами outbound'ы (<code>04_outbounds.json</code>) и текущий routing — <strong>не трогает</strong>.
     </p>
@@ -12370,6 +12682,41 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
 </details>
 
 
+<!-- ===== 🛡 KILL-SWITCH ПОЛИТИКИ XKEEN (v1.1.0) ===== -->
+<details class="section-collapsible">
+<summary><h2 class="sec-killswitch">🛡 Kill-switch политики XKeen <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— в окне перезапуска XKeen трафик не уходит напрямую</span></h2></summary>
+<div class="card">
+  <p class="subtitle" style="margin-top: 0;">
+    При <code>xkeen -restart</code> (его делает и watchdog при переключении каналов) XKeen сначала снимает перехват, потом перезапускает xray —
+    несколько секунд устройства из политики XKeen ходят в интернет <strong>напрямую, с домашним IP</strong>. AI-сервисы запоминают это как вход из другой страны.
+    Kill-switch закрывает окно: первое правило в <code>FORWARD</code> режет <em>новые</em> соединения клиентов политики на перехватываемые порты (80, 443 и то, что добавлено в XKeen),
+    пока перехват не вернётся. Пока XKeen жив — правило пустое: такой трафик до него не доходит.
+  </p>
+  <div id="ks-status" style="margin: 10px 0; padding: 10px 14px; border-radius: 4px; background: #f5f5f5; color: #555;">⏳ проверяю состояние на роутере…</div>
+  <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+    <button type="button" class="btn" id="btn-ks-protect" onclick="ksApply('protect')" title="Поставить или обновить хук в режиме защиты: новые прямые соединения клиентов политики в окне перезапуска XKeen режутся.">🛡 Включить защиту</button>
+    <button type="button" class="btn btn-secondary" id="btn-ks-observe" onclick="ksApply('observe')" title="Тот же хук, но вместо DROP стоит RETURN: ничего не режется, панель только считает прямые соединения. Для проверки перед включением защиты.">👁 Только наблюдение</button>
+    <button type="button" class="btn btn-secondary" onclick="ksRefresh(true)" title="Перечитать состояние с роутера; если хук стоит, но правила разъехались — привести в порядок.">🔄 Обновить</button>
+    <button type="button" class="btn btn-secondary" onclick="ksPreview()" title="Показать текст хука, который панель запишет на роутер при текущих параметрах.">📄 Показать хук</button>
+    <button type="button" class="btn btn-secondary" style="color: #c33;" onclick="ksRemove()" title="Снять kill-switch полностью: файл хука, cron-строку и правила. Окно перезапуска снова откроется.">✕ Снять</button>
+  </div>
+  <pre id="ks-preview" style="display: none; margin-top: 10px; font-size: 0.78em; background: #1e1e1e; color: #ddd; padding: 10px; border-radius: 4px; max-height: 360px; overflow: auto; white-space: pre;"></pre>
+  <details data-xk-keep-inline style="margin-top: 12px;">
+    <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.92em;">📚 Что именно ставится, режимы и ограничения</summary>
+    <div style="margin-top: 8px; font-size: 0.9em; line-height: 1.55;">
+      <ul style="margin: 0 0 0 20px; padding: 0;">
+        <li><strong>Хук</strong> <code>/opt/etc/ndm/netfilter.d/zz_xkeen_killswitch.sh</code> + cron-строка раз в минуту (самолечение после пересборки правил Keenetic). Генерируется панелью по метке политики <code>XKeen</code> (Keenetic ставит её на трафик привязанных устройств — метка живёт и когда XKeen лежит) и по портам перехвата из <code>port_proxying.lst</code> + 80, 443.</li>
+        <li><strong>Исключения</strong> те же, что у XKeen: DNAT (пробросы портов), DSCP 62, приватные сети и списки <code>user_exclude</code> / <code>geo_exclude</code> / <code>ext_exclude</code> — что XKeen не перехватывает, то и kill-switch пропускает.</li>
+        <li><strong>WG-интерфейсы</strong>, заведённые в анти-DPI через панель, закрываются тоже (у них нет метки политики — правило по интерфейсу).</li>
+        <li><strong>Режим наблюдения</strong> — вместо DROP стоит RETURN: ничего не режется, панель показывает число прямых соединений клиентов политики. Удобно включить на день перед защитой: если при живом XKeen счётчик остаётся нулём — исключения совпали.</li>
+        <li><strong>Не закрывает:</strong> уже установленные соединения (FASTNAT ведёт их мимо netfilter), трафик самого роутера, устройства вне политики, минуту после загрузки роутера до монтирования <code>/opt</code>. Если политика выходит не через основной WAN (dual-WAN) — правило привязано к default-маршруту.</li>
+        <li>Диагностика («🚑 Восстановление и диагностика») проверяет kill-switch и умеет его починить; «🚀 Развернуть на чистом XKeen» ставит его вместе с остальным.</li>
+      </ul>
+    </div>
+  </details>
+</div>
+</details>
+
 <!-- ===== 🚑 RESCUE / RECOVERY / AUTO-REPAIR (v1.5.1) ===== -->
 <details class="section-collapsible">
 <summary><h2 class="sec-rescue">🚑 Восстановление и диагностика <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— если xkeen не запускается / что-то сломалось</span></h2></summary>
@@ -12384,7 +12731,7 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
 
   <div style="margin: 12px 0;">
     <button id="btn-diagnose" type="button" class="btn-primary" style="background:#c33; color:#fff;">🔬 Диагностика XKeen</button>
-    <span style="margin-left: 8px; font-size: 0.85em; color: #888;">Запустит 12 проверок состояния (xray binary, configs, версия watchdog, geoip.dat, cron, curl/RCI, ...) и предложит auto-fix для каждой найденной проблемы.</span>
+    <span style="margin-left: 8px; font-size: 0.85em; color: #888;">Запустит 13 проверок состояния (xray binary, configs, версия watchdog, geoip.dat, cron, curl/RCI, ...) и предложит auto-fix для каждой найденной проблемы.</span>
   </div>
 
   <div id="diagnose-output" style="margin-top: 12px;"></div>
@@ -12436,6 +12783,7 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>direct + block</code></td><td style="padding: 5px 10px;">В <code>04_outbounds.json</code> отсутствуют outbound'ы с <code>tag=direct</code> или <code>tag=block</code>. Без них не работает «🌐 Напрямую» и BLOCK-список. Auto-fix: <strong>🔧 Добавить direct + block</strong> (existing outbound'ы из подписки сохраняются).</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>routing.json валиден</code></td><td style="padding: 5px 10px;"><code>05_routing.json</code> содержит синтаксическую ошибку JSON (trailing comma, битый escape, etc). Auto-fix: <strong>🔧 Перегенерить routing</strong>. После v9 watchdog сам не записывает битый JSON (см. v1.5.0 changelog), но если файл уже битый — нужна перегенерация.</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>cron watchdog</code></td><td style="padding: 5px 10px;">Cron-задача для watchdog отсутствует — failover при падении канала не сработает. Auto-fix: <strong>🔧 Добавить cron</strong> (запись <code>*/1 * * * * /opt/etc/xray/watchdog.sh</code>).</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>kill-switch политики</code></td><td style="padding: 5px 10px;">Хук <code>zz_xkeen_killswitch.sh</code> не установлен, потерял <code>+x</code>/cron-строку, переход не первый в <code>FORWARD</code> или параметры (метка политики, порты) разошлись с роутером. Auto-fix «🛡 Установить kill-switch» перегенерирует хук и проверит правила. Подробнее — «🛡 Kill-switch политики XKeen» в Помощи.</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>watchdog log без ошибок</code></td><td style="padding: 5px 10px;">В <code>/opt/var/log/xray/watchdog.log</code> свежие WARN/ERROR. Auto-fix НЕТ — нужно посмотреть детали в раскрытой проверке. Может быть нормально (временная недоступность канала).</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>geoip.dat категории</code></td><td style="padding: 5px 10px;">GeoIP-категории из routing (например <code>geoip:telegram</code>) отсутствуют в установленном <code>geoip.dat</code> → xray падает на старте. Auto-fix: <strong>📥 Установить расширенный geoip.dat</strong> (от Loyalsoldier — содержит сервисы telegram/discord, а не только страны cn/ru/us).</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>curl + RCI Keenetic</code></td><td style="padding: 5px 10px;">На роутере нет рабочего <code>curl</code> (watchdog пробит им каналы) или недоступен RCI Keenetic (<code>localhost:79</code> — DNS-профили/политики). Auto-fix НЕТ — проверь <code>opkg install curl</code> и доступность веб-интерфейса роутера.</td></tr>
@@ -14547,6 +14895,43 @@ xkeen -restart</pre>
         <li>В «📋 Все outbounds» увидишь все конфиги с роутера — никуда не делись.</li>
       </ol>
       <p>Если потерял и роутер — нужен последний snapshot + новый роутер с XKeen (см. «🛠️ Установка XKeen с нуля» → «🚀 Развернуть на чистом XKeen» → «🔄 Восстановить из файла»).</p>
+    </div>
+  </details>
+
+  <details class="help-section" id="help-killswitch">
+    <summary>🛡 Kill-switch политики XKeen — окно перезапуска</summary>
+    <div class="help-body">
+      <h4>В чём проблема</h4>
+      <p>Команда <code>xkeen -restart</code> (её выполняет и watchdog при переключении каналов, и обновление GeoFile по cron) работает так:
+      сначала снимаются правила перехвата, затем останавливается и запускается xray, и только после старта правила возвращаются.
+      Несколько секунд (при медленных проверках — десятки) устройства из политики XKeen ходят в интернет <strong>напрямую</strong>, с адресом домашнего провайдера.
+      AI-сервисы фиксируют это как вход из другой страны, а уже установленное соединение может жить часами.</p>
+
+      <h4>Что делает kill-switch</h4>
+      <ul>
+        <li>Первым правилом в <code>FORWARD</code> стоит переход в цепочку <code>xkeen_ks</code> для трафика клиентов политики. Клиентов определяет <strong>метка политики</strong> — её ставит сам Keenetic на пакеты привязанных устройств, поэтому метка есть и когда XKeen лежит.</li>
+        <li>Внутри цепочки — те же исключения, что у перехвата XKeen (DNAT, DSCP 62, приватные сети, списки <code>user_exclude</code>/<code>geo_exclude</code>/<code>ext_exclude</code>), затем DROP <em>новых</em> TCP/UDP-соединений на перехватываемые порты.</li>
+        <li>Пока XKeen жив, перехват забирает этот трафик раньше <code>FORWARD</code> — правило пустое и ни на что не влияет. Когда перехвата нет — соединения режутся, вместо утечки клиент видит таймаут и повторяет попытку после возврата XKeen.</li>
+        <li>WG-интерфейсы, заведённые в анти-DPI через панель, закрываются правилом по интерфейсу (метки политики у них нет).</li>
+      </ul>
+
+      <h4>Как включить и проверить</h4>
+      <ol>
+        <li>Раздел «🛡 Kill-switch политики XKeen» → <strong>«👁 Только наблюдение»</strong>. Панель покажет метку политики, порты и WAN, а счётчик «прямых соединений» — сколько соединений клиентов политики идут мимо xray прямо сейчас.</li>
+        <li>При живом XKeen счётчик должен быть нулём (или показывать только старые соединения, оставшиеся с прошлых перезапусков). Если он растёт — исключения XKeen и панели разошлись: посмотрите, что за адреса, и сообщите в Issues.</li>
+        <li><strong>«🛡 Включить защиту»</strong>. Дальше хук поддерживает себя сам: cron раз в минуту возвращает правила после пересборки firewall Keenetic, панель при открытии страницы сверяет параметры и чинит расхождения.</li>
+        <li>«🚑 Восстановление и диагностика» → «🔬 Диагностика XKeen» — отдельная проверка kill-switch с auto-fix. «🚀 Развернуть на чистом XKeen» ставит kill-switch вместе с остальным.</li>
+      </ol>
+
+      <h4>Ограничения</h4>
+      <ul>
+        <li>Режутся только <strong>новые</strong> соединения. Уже установленные идут через FASTNAT мимо netfilter — их kill-switch не рвёт.</li>
+        <li>После перезагрузки роутера защита появляется, когда смонтирован <code>/opt</code> и отработал cron (до минуты).</li>
+        <li>Не касается устройств вне политики XKeen и трафика самого роутера.</li>
+        <li>WAN определяется по default-маршруту роутера. Если политика XKeen выходит через другой WAN (dual-WAN), правило нужно править вручную.</li>
+        <li>Нужна политика с именем <code>XKeen</code> в Keenetic (как для самого XKeen). Без неё панель сообщит «политика не найдена».</li>
+      </ul>
+      <p>Хук лежит в <code>/opt/etc/ndm/netfilter.d/zz_xkeen_killswitch.sh</code>, попадает в snapshot «💾 Бэкап и восстановление» и восстанавливается вместе с остальным. Правки в файле панель перезапишет — менять поведение стоит через панель.</p>
     </div>
   </details>
 
@@ -19006,10 +19391,13 @@ async function bootstrapApply() {
     return;
   }
   const overwrite = document.getElementById('bootstrap-overwrite').checked;
-  const overwriteCount = [...document.querySelectorAll('.bootstrap-item-cb:checked')]
-    .filter(cb => cb.closest('tr').textContent.includes('УЖЕ ЕСТЬ')).length;
+  // Перезапись = «УЖЕ ЕСТЬ» при галочке + «ПЕРЕЗАПИСАТЬ» (перезаписывается всегда) — раньше
+  // второе не считалось, и подтверждение молчало о перезаписи существующих файлов
+  const rows = [...document.querySelectorAll('.bootstrap-item-cb:checked')].map(cb => cb.closest('tr').textContent);
+  const overwriteCount = rows.filter(t => t.includes('ПЕРЕЗАПИСАТЬ')).length
+    + (overwrite ? rows.filter(t => t.includes('УЖЕ ЕСТЬ')).length : 0);
   let confirmMsg = `Развернуть ${keys.length} компонент(ов) на роутере?`;
-  if (overwrite && overwriteCount > 0) {
+  if (overwriteCount > 0) {
     confirmMsg += `\n\n⚠ Будет перезаписано ${overwriteCount} существующих файлов (бэкапы создадутся автоматически с суффиксом .bak-bootstrap-YYYYMMDD-HHMMSS).`;
   }
   if (!confirm(confirmMsg)) return;
@@ -19058,6 +19446,104 @@ async function bootstrapApply() {
   });
   if (a) a.addEventListener('click', bootstrapApply);
 })();
+
+// ============== KILL-SWITCH ПОЛИТИКИ XKEEN (v1.1.0) ==============
+function ksRender(j) {
+  const box = document.getElementById('ks-status');
+  if (!box) return;
+  if (!j || !j.ok) {
+    box.style.background = '#fde8e8'; box.style.color = '#6a1a1a';
+    box.innerHTML = '❌ ' + escapeHtml((j && j.error) || 'нет данных от роутера');
+    return;
+  }
+  const st = j.state;
+  const p = j.params || {};
+  const map = {
+    protect: ['#d4eedd', '#1a5a1a', '🟢 Защита активна'],
+    observe: ['#fff3cd', '#5a3a1c', '🟡 Режим наблюдения — прямые соединения только считаются'],
+    broken:  ['#fde8e8', '#6a1a1a', '🔴 Установлен, но не в порядке'],
+    absent:  ['#fde8e8', '#6a1a1a', '🔴 Не установлен — окно перезапуска XKeen открыто'],
+  };
+  const m = map[st] || ['#eee', '#333', st];
+  box.style.background = m[0]; box.style.color = m[1];
+  let html = `<strong>${m[2]}</strong>`;
+  if (p.mark) {
+    html += `<div style="margin-top: 6px; font-size: 0.9em;">Метка политики <code>${escapeHtml(p.mark)}</code> (${escapeHtml(p.policy_desc || 'XKeen')}) · порты <code>${escapeHtml((p.ports || []).join(' '))}</code> · WAN <code>${escapeHtml(p.wan || '?')}</code>${p.ipv6 ? ' · IPv6' : ''}${(j.wg_ifaces || []).length ? ' · WG: <code>' + escapeHtml(j.wg_ifaces.join(', ')) + '</code>' : ''}</div>`;
+  }
+  if (j.params_error) html += `<div style="margin-top: 6px; font-size: 0.9em;">⚠ ${escapeHtml(j.params_error)}</div>`;
+  if (j.installed) {
+    const v4 = j.v4 || {}, v6 = j.v6 || {};
+    html += `<div style="margin-top: 4px; font-size: 0.85em; opacity: 0.85;">cron: ${j.cron ? '✅' : '❌'} · IPv4: переходов ${v4.jumps || 0}, первый в FORWARD ${v4.first ? '✅' : '❌'}, правил в цепочке ${v4.chain_rules || 0}, действие <code>${escapeHtml(v4.act || '—')}</code>${j.v6_needed ? ` · IPv6: переходов ${v6.jumps || 0}, первый ${v6.first ? '✅' : '❌'}` : ''}</div>`;
+  }
+  if ((j.drift || []).length) html += `<div style="margin-top: 4px; font-size: 0.85em;">⚠ ${escapeHtml(j.drift.join('; '))}</div>`;
+  if (j.leaks) {
+    const L = j.leaks;
+    html += `<div style="margin-top: 6px; font-size: 0.9em;">Прямых соединений клиентов политики сейчас: <strong>${L.count}</strong>${L.count ? ' — ' + escapeHtml((L.samples || []).slice(0, 4).join(' · ')) : ' — утечек нет'}</div>`;
+  }
+  if (j.healed && j.healed.action) html += `<div style="margin-top: 4px; font-size: 0.85em; opacity: 0.85;">самолечение: ${escapeHtml(j.healed.action)} — ${escapeHtml(j.healed.detail || '')}</div>`;
+  box.innerHTML = html;
+  const bp = document.getElementById('btn-ks-protect'), bo = document.getElementById('btn-ks-observe');
+  if (bp) bp.textContent = (st === 'protect') ? '🛡 Защита включена' : '🛡 Включить защиту';
+  if (bo) bo.textContent = (st === 'observe') ? '👁 Наблюдение включено' : '👁 Только наблюдение';
+}
+
+async function ksRefresh(heal) {
+  const box = document.getElementById('ks-status');
+  if (!box) return;
+  try {
+    const r = await fetch('/api/xkeen/killswitch-status' + (heal ? '?heal=1' : ''));
+    ksRender(await r.json());
+  } catch (e) {
+    box.innerHTML = '❌ ' + escapeHtml(e.message);
+  }
+}
+
+async function ksApply(mode) {
+  const msg = (mode === 'protect')
+    ? 'Включить защиту?\n\nНа роутер запишется хук netfilter.d и cron-строка. Пока XKeen жив, правило ничего не режет; в окне перезапуска XKeen новые прямые соединения клиентов политики будут отброшены.'
+    : 'Включить режим наблюдения?\n\nТот же хук, но без DROP: ничего не режется, панель только считает прямые соединения клиентов политики.';
+  if (!confirm(msg)) return;
+  flash(true, '⏳ Ставлю kill-switch на роутер…', null, { noScroll: true });
+  try {
+    const r = await fetch('/api/xkeen/killswitch-apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) });
+    const j = await r.json();
+    if (j.ok) flash(true, `🛡 Kill-switch: ${escapeHtml(j.action || '')} — ${escapeHtml(j.detail || '')}`, null, { noScroll: true });
+    else flash(false, 'Kill-switch не установлен', j.detail || j.error || JSON.stringify(j), { noScroll: true });
+  } catch (e) {
+    flash(false, 'Сетевая ошибка', String(e), { noScroll: true });
+  }
+  ksRefresh(false);
+}
+
+async function ksPreview() {
+  const pre = document.getElementById('ks-preview');
+  if (!pre) return;
+  if (pre.style.display !== 'none') { pre.style.display = 'none'; return; }
+  pre.style.display = 'block';
+  pre.textContent = '⏳ читаю параметры с роутера…';
+  try {
+    const r = await fetch('/api/xkeen/killswitch-preview?mode=protect');
+    const j = await r.json();
+    pre.textContent = j.ok ? (`# ${j.hook_path}\n# cron: ${j.cron_line}\n\n` + j.hook) : ('❌ ' + (j.error || 'нет данных'));
+  } catch (e) {
+    pre.textContent = '❌ ' + e.message;
+  }
+}
+
+async function ksRemove() {
+  if (!confirm('Снять kill-switch полностью?\n\nБудут удалены хук, cron-строка и правила. В окне перезапуска XKeen клиенты политики снова смогут выходить напрямую.')) return;
+  try {
+    const r = await fetch('/api/xkeen/killswitch-remove', { method: 'POST' });
+    const j = await r.json();
+    if (j.ok) flash(true, j.msg || 'снят', null, { noScroll: true });
+    else flash(false, 'Не удалось снять kill-switch', j.error || JSON.stringify(j), { noScroll: true });
+  } catch (e) {
+    flash(false, 'Сетевая ошибка', String(e), { noScroll: true });
+  }
+  ksRefresh(false);
+}
+
+document.addEventListener('DOMContentLoaded', () => { if (document.getElementById('ks-status')) ksRefresh(true); });
 
 // ============== TG-BOT SETTINGS ==============
 async function tgLoad() {
@@ -19219,14 +19705,14 @@ async function tgClear() {
 
 // ============== 🚑 RECOVERY / DIAGNOSE / AUTO-REPAIR (v1.5.1) ==============
 // Self-healing fix через UI без SSH. Юзер жмёт «🔬 Диагностика» → видит
-// таблицу 12 проверок с ✅/❌ → для каждой failed предлагается «🔧 Применить fix».
+// таблицу 13 проверок с ✅/❌ → для каждой failed предлагается «🔧 Применить fix».
 
 async function runDiagnose() {
   const btn = document.getElementById('btn-diagnose');
   const out = document.getElementById('diagnose-output');
   btn.disabled = true;
   btn.textContent = '⏳ Проверяю...';
-  out.innerHTML = '<p style="color:#888; font-style:italic;">Запускаю 12 проверок через SSH (xray, xkeen-status, валидность конфигов, watchdog.config + версия, JSON-синтаксис, geoip.dat, cron, curl/RCI-политика, Entware tar, ошибки в логах)...</p>';
+  out.innerHTML = '<p style="color:#888; font-style:italic;">Запускаю 13 проверок через SSH (xray, xkeen-status, валидность конфигов, watchdog.config + версия, JSON-синтаксис, geoip.dat, cron, curl/RCI-политика, Entware tar, ошибки в логах)...</p>';
   try {
     const res = await fetch('/api/xkeen/diagnose');
     const j = await res.json();
