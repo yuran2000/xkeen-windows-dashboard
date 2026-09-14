@@ -9,9 +9,9 @@ directly into this repository (not installed from PyPI).
 | PyPI | https://pypi.org/project/rkn-block-checker/ |
 | Author | Dmitry Vinogradov |
 | License | MIT (see `LICENSE` in this folder) |
-| Vendored version | **v0.5.0** |
-| Vendored commit | `80d522626536d8f9e7240f99d795ff73ee45929c` |
-| Vendored on | 2026-05-22 |
+| Vendored version | **v0.6.0** |
+| Vendored commit | `7884a26d6560b3ac92031cb71d2cfe097d1e2a4f` |
+| Vendored on | 2026-09-14 (first vendored 2026-05-22 at v0.5.0) |
 
 ## Why vendored instead of `pip install`
 
@@ -23,6 +23,17 @@ clone of this repo carries everything needed, no extra install step.
 folder (with `Copyright (c) 2026 Dmitry Vinogradov`) must stay alongside it. That
 is the only requirement — modifications are allowed, our own code keeps its own
 license.
+
+## Not vendored: the upstream Web UI
+
+Since v0.6.0 upstream ships a local web page (`web.py` + `index.html`, `rkn-check startweb`).
+We do **not** copy those two files: the dashboard has its own UI on top of `core.py`,
+and `cli.py` imports `.web` lazily (only inside the `startweb` branch), so nothing else
+depends on them. When updating, skip `web.py` and `index.html` deliberately.
+
+What we actually need from v0.6.0: `core.py` (HTTP 429 with stub-like words → `DOWN/LOW`
+instead of a false `HTTP_STUB/HIGH`) and `network.py` (TLS probe without certificate
+verification, so a broken cert no longer looks like TLS DPI).
 
 ## Runtime dependency
 
@@ -38,9 +49,9 @@ files + LICENSE over this folder (PowerShell, run from the repo root):
 ```powershell
 $gh = (Get-Command gh.exe).Source
 $repo = 'MayersScott/rkn-block-checker'
-$ref  = 'v0.6.0'   # <-- set to the new tag
+$ref  = 'v0.7.0'   # <-- set to the new tag
 $dst  = '.\rkn_checker'   # эта папка в репозитории
-$files = & $gh api "repos/$repo/contents/rkn_checker?ref=$ref" --jq '.[].name'
+$files = & $gh api "repos/$repo/contents/rkn_checker?ref=$ref" --jq '.[].name' | Where-Object { $_ -notin @('web.py','index.html') }
 foreach ($f in $files) {
   $b64 = (& $gh api "repos/$repo/contents/rkn_checker/$f`?ref=$ref" --jq '.content') -join ''
   [IO.File]::WriteAllBytes("$dst\$f", [Convert]::FromBase64String(($b64 -replace '\s','')))
