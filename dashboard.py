@@ -222,7 +222,7 @@ import xkeen_killswitch
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.1.1"
+_VERSION_FALLBACK = "1.1.2"
 
 
 def _find_git():
@@ -3790,9 +3790,25 @@ def keenetic_sync_structure():
     keenetic_ssh(f"sh {WATCHDOG_REMOTE_PATH} 2>&1 | tail -3", timeout=120)
 
     # 5. xray -test (валидность конфига; ОБЯЗАТЕЛЬНО с XRAY_LOCATION_ASSET)
-    test = keenetic_ssh(
-        f'XRAY_LOCATION_ASSET=/opt/etc/xray/dat /opt/sbin/xray run -test -confdir {cfgdir} 2>&1; echo "RC=$?"',
-        timeout=30)
+    # 🔴 Гонка: watchdog (cron-тик раз в минуту или его фоновый `xkeen -restart &`) в это же
+    # время перезапускает xray, а S05xkeen при рестарте делает `killall xray` (затем -9) — под
+    # нож попадает и тестовый процесс `xray run -test` → в выводе «Killed», RC=137 → конфиг
+    # ложно «невалиден» → ложный «сеть не отвечает» → авто-откат здоровой структуры.
+    # Поэтому: дождаться тишины (нет идущего xkeen -restart) и повторить тест, если его убили.
+    test = {}
+    for _attempt in range(4):
+        for _ in range(10):
+            busy = keenetic_ssh("ps w 2>/dev/null | grep -E '[x]keen -restart|[S]05xkeen' | wc -l", timeout=10)
+            if (busy.get("stdout") or "0").strip() in ("", "0"):
+                break
+            _t.sleep(3)
+        test = keenetic_ssh(
+            f'XRAY_LOCATION_ASSET=/opt/etc/xray/dat /opt/sbin/xray run -test -confdir {cfgdir} 2>&1; echo "RC=$?"',
+            timeout=30)
+        out = test.get("stdout") or ""
+        if "RC=0" in out or not ("RC=137" in out or "Killed" in out):
+            break
+        _t.sleep(5)
     valid = "RC=0" in (test.get("stdout") or "")
     _rec("xray -test", valid, "" if valid else (test.get("stdout") or "")[-300:])
 
@@ -7046,7 +7062,9 @@ def api_xkeen_routing_template_rules():
     # на JSON-объекты или пустоту. Для парсинга самого template убираем строки целиком.
     # NB: "__DEFAULT_TAG__" внутри кавычек как string-value остаётся — это валидный JSON.
     clean = _strip_json_comments(raw)
-    clean = re.sub(r'^\s*__[A-Z_]+__\s*$', '', clean, flags=re.MULTILINE)
+    # [A-Z0-9_]: в имени placeholder'а бывает цифра (__IPV6_RULE_BLOCK__) — без неё строка оставалась
+    # и парсинг template падал («Не удалось распарсить template») на любом шаблоне с каналом IPv6.
+    clean = re.sub(r'^\s*__[A-Z0-9_]+__\s*$', '', clean, flags=re.MULTILINE)
     try:
         tmpl = json.loads(clean)
     except Exception as ex:
@@ -7065,13 +7083,20 @@ def api_xkeen_routing_template_rules():
             continue
         # Network/protocol-based правила (UDP-block, bittorrent)
         if r.get("network") and r.get("port"):
-            parsed.append({
+            item = {
                 "type": "udp-block" if outbound == "block" else "network",
                 "network": r.get("network"),
                 "ports": [p.strip() for p in str(r.get("port")).split(",")],
                 "outbound": outbound,
                 "description": _describe_network_rule(r.get("network"), r.get("port"), outbound),
-            })
+            }
+            # Правило «QUIC → напрямую» (template v13) несёт список IP эндпоинтов — показываем
+            # его здесь же, а не отдельным ip-list пунктом (это одно правило, не два).
+            if r.get("ip") and isinstance(r["ip"], list):
+                item["ips"] = [x for x in r["ip"] if isinstance(x, str) and not x.startswith("geoip:")]
+            parsed.append(item)
+            if item.get("ips"):
+                continue
             continue
         if r.get("protocol"):
             parsed.append({
@@ -7184,10 +7209,77 @@ def _describe_network_rule(network, port, outbound):
     if network == "udp":
         if "135" in p or "137" in p or "138" in p or "139" in p:
             return "UDP NetBIOS (135-139) — блокировка чтобы Windows-PC не утекали имена через VPN. Иначе можно засветить имя хоста для DNS-сниффинга."
+        if "443" in p and outbound == "direct":
+            return ("UDP 443 (QUIC) к VPN-эндпоинтам из списка — напрямую, минуя блок ниже: клиенты "
+                    "QUIC-протоколов (Hysteria2 и т.п.) на устройствах за роутером иначе не подключатся. "
+                    "Список IP тот же, что в direct-правиле эндпоинтов; панель синхронизирует оба.")
         if "443" in p:
             return "UDP 443 (QUIC) — блокировка, потому что QUIC обходит TPROXY-перехват (xray работает поверх TCP). Без блока браузеры пытаются Quic, не идут через VPN."
         return f"UDP порты {port} → {outbound}"
     return f"{network} порты {port} → {outbound}"
+
+
+_IPV4_LITERAL_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+_TEMPLATE_IP_ARRAY_RE = re.compile(r'("ip"\s*:\s*\[)([\s\S]*?)(\s*\])')
+
+
+def _endpoint_ipv4s_from_outbounds(ob_data):
+    """IPv4-адреса VPN-эндпоинтов из outbounds (vless.vnext + trojan/ss.servers).
+
+    Адрес может быть доменом — тогда резолвим его в IPv4 здесь, на ПК (роутер routing-правила
+    по домену для UDP не сматчит: sniffing tproxy-инбаунда не разбирает QUIC). Нерезолвящийся
+    домен молча пропускаем — лучше неполный список, чем сломанный синк.
+    Возврат: (ips: set[str], resolved: {domain: [ip, ...]})."""
+    import socket
+    ips, resolved = set(), {}
+    for ob in ob_data.get("outbounds", []) or []:
+        settings = ob.get("settings") or {}
+        addrs = [(v or {}).get("address", "") for v in (settings.get("vnext") or [])]
+        addrs += [(s or {}).get("address", "") for s in (settings.get("servers") or [])]
+        for addr in addrs:
+            addr = (addr or "").strip()
+            if not addr:
+                continue
+            if _IPV4_LITERAL_RE.match(addr):
+                ips.add(addr)
+                continue
+            if ":" in addr:          # IPv6-литерал — не наш формат списка
+                continue
+            if addr in resolved:
+                ips.update(resolved[addr])
+                continue
+            try:
+                got = sorted({ai[4][0] for ai in socket.getaddrinfo(addr, None, socket.AF_INET)})
+            except Exception:
+                got = []
+            resolved[addr] = got
+            ips.update(got)
+    return ips, resolved
+
+
+def _template_ip_arrays(tmpl_raw):
+    """Все массивы "ip": [...] template, состоящие ТОЛЬКО из IPv4-литералов (список VPN-эндпоинтов
+    в direct-правиле и в правиле «QUIC → напрямую»). Массивы с geoip:/CIDR не трогаем."""
+    out = []
+    for m in _TEMPLATE_IP_ARRAY_RE.finditer(tmpl_raw):
+        items = [x.strip().strip('"') for x in m.group(2).split(",") if x.strip()]
+        if items and all(_IPV4_LITERAL_RE.match(x) for x in items):
+            out.append(m)
+    return out
+
+
+def _template_replace_ip_arrays(tmpl_raw, final_ips):
+    """Переписать ВСЕ IPv4-массивы эндпоинтов одним и тем же списком (с конца, чтобы не сбить смещения).
+    Возврат: (new_text, current_ips: set) — current_ips = что было до замены (объединение массивов)."""
+    arrays = _template_ip_arrays(tmpl_raw)
+    current = set()
+    for m in arrays:
+        current.update(re.findall(r'"((?:\d{1,3}\.){3}\d{1,3})"', m.group(2)))
+    new_ips_block = ",\n          ".join(f'"{ip}"' for ip in sorted(final_ips))
+    new_text = tmpl_raw
+    for m in reversed(arrays):
+        new_text = new_text[:m.start()] + f'{m.group(1)}\n          {new_ips_block}\n        ]' + new_text[m.end():]
+    return new_text, current
 
 
 @app.route("/api/xkeen/sync-template-ips", methods=["POST"])
@@ -7217,18 +7309,7 @@ def api_xkeen_sync_template_ips():
     except Exception as ex:
         return jsonify({"ok": False, "error": f"Не удалось распарсить outbounds: {ex}"}), 500
 
-    ipv4_re = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
-    found_ips = set()
-    for ob in ob_data.get("outbounds", []) or []:
-        settings = ob.get("settings") or {}
-        for v in settings.get("vnext") or []:
-            addr = (v or {}).get("address", "")
-            if ipv4_re.match(addr):
-                found_ips.add(addr)
-        for s in settings.get("servers") or []:
-            addr = (s or {}).get("address", "")
-            if ipv4_re.match(addr):
-                found_ips.add(addr)
+    found_ips, resolved = _endpoint_ipv4s_from_outbounds(ob_data)
 
     # 2. Template
     tmpl_path = f"{cfg.KEENETIC_XRAY_BAK_DIR}/05_routing.template.json"
@@ -7236,14 +7317,11 @@ def api_xkeen_sync_template_ips():
     if not tmpl_raw:
         return jsonify({"ok": False, "error": f"Не удалось прочитать {tmpl_path} с роутера"}), 502
 
-    # Surgical regex: единственное "ip": [ ... ] в template. Сохраняем все остальные строки,
-    # placeholder'ы (__XXX_BLOCK__) и комментарии — НЕ трогаем.
-    ip_array_re = re.compile(r'("ip"\s*:\s*\[)([\s\S]*?)(\s*\])')
-    m = ip_array_re.search(tmpl_raw)
-    if not m:
+    # Surgical: переписываем только IPv4-массивы эндпоинтов (direct-правило + «QUIC → напрямую»,
+    # template v13). Остальные строки, placeholder'ы (__XXX_BLOCK__) и комментарии — НЕ трогаем.
+    if not _template_ip_arrays(tmpl_raw):
         return jsonify({"ok": False, "error": 'В template не найден IP-массив "ip": [...]. Возможно template был сильно изменён.'}), 500
-
-    current_ips = set(re.findall(r'"((?:\d{1,3}\.){3}\d{1,3})"', m.group(2)))
+    new_tmpl, current_ips = _template_replace_ip_arrays(tmpl_raw, found_ips)
     to_add = sorted(found_ips - current_ips)
     to_remove = sorted(current_ips - found_ips)
     final_ips = sorted(found_ips)
@@ -7258,16 +7336,14 @@ def api_xkeen_sync_template_ips():
         "no_changes": (not to_add and not to_remove),
         "applied": False,
         "template_path": tmpl_path,
+        "resolved_domains": {d: ips for d, ips in resolved.items()},
+        "unresolved_domains": sorted(d for d, ips in resolved.items() if not ips),
     }
 
     if not apply or result["no_changes"]:
         return jsonify(result)
 
-    # 3. Surgical replace + бэкап + write
-    new_ips_block = ",\n          ".join(f'"{ip}"' for ip in final_ips)
-    new_array_text = f'{m.group(1)}\n          {new_ips_block}\n        ]'
-    new_tmpl = tmpl_raw[:m.start()] + new_array_text + tmpl_raw[m.end():]
-
+    # 3. Бэкап + write (new_tmpl собран выше)
     import time as _time
     ts = _time.strftime('%Y%m%d-%H%M%S')
     bak = f"{tmpl_path}.bak-{ts}"
@@ -7328,40 +7404,23 @@ def _auto_sync_template_ips_silent():
     except Exception as ex:
         return {"ok": False, "changed": False, "error": f"parse outbounds: {ex}"}
 
-    ipv4_re = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
-    found_ips = set()
-    for ob in ob_data.get("outbounds", []) or []:
-        settings = ob.get("settings") or {}
-        for v in settings.get("vnext") or []:
-            addr = (v or {}).get("address", "")
-            if ipv4_re.match(addr):
-                found_ips.add(addr)
-        for s in settings.get("servers") or []:
-            addr = (s or {}).get("address", "")
-            if ipv4_re.match(addr):
-                found_ips.add(addr)
+    found_ips, _resolved = _endpoint_ipv4s_from_outbounds(ob_data)
 
     tmpl_path = f"{cfg.KEENETIC_XRAY_BAK_DIR}/05_routing.template.json"
     tmpl_raw = keenetic_read_file(tmpl_path, timeout=10)
     if not tmpl_raw:
         return {"ok": False, "changed": False, "error": "не прочитал template"}
 
-    ip_array_re = re.compile(r'("ip"\s*:\s*\[)([\s\S]*?)(\s*\])')
-    m = ip_array_re.search(tmpl_raw)
-    if not m:
+    if not _template_ip_arrays(tmpl_raw):
         return {"ok": False, "changed": False, "error": "IP-массив не найден в template"}
 
-    current_ips = set(re.findall(r'"((?:\d{1,3}\.){3}\d{1,3})"', m.group(2)))
+    # Оба IPv4-массива эндпоинтов (direct + «QUIC → напрямую», template v13) — одним списком
+    new_tmpl, current_ips = _template_replace_ip_arrays(tmpl_raw, found_ips)
     to_add = sorted(found_ips - current_ips)
     to_remove = sorted(current_ips - found_ips)
 
     if not to_add and not to_remove:
         return {"ok": True, "changed": False, "added": [], "removed": []}
-
-    final_ips = sorted(found_ips)
-    new_ips_block = ",\n          ".join(f'"{ip}"' for ip in final_ips)
-    new_array_text = f'{m.group(1)}\n          {new_ips_block}\n        ]'
-    new_tmpl = tmpl_raw[:m.start()] + new_array_text + tmpl_raw[m.end():]
 
     import time as _time
     ts = _time.strftime('%Y%m%d-%H%M%S')
@@ -17810,8 +17869,11 @@ function renderRoutingTemplateRules(j) {
         break;
       case 'udp-block':
       case 'network':
-        typeLabel = '🚫 Network';
+        typeLabel = rule.outbound === 'direct' ? '🔓 Network' : '🚫 Network';
         itemsHtml = '<ul class="rt-items"><li>' + escapeHtml(rule.network) + '</li>' + rule.ports.map(p => '<li>порт ' + escapeHtml(p) + '</li>').join('') + '</ul>';
+        if (rule.ips && rule.ips.length) {
+          itemsHtml += '<ul class="rt-items">' + rule.ips.map(i => '<li>' + escapeHtml(i) + '</li>').join('') + '</ul>';
+        }
         break;
       case 'inbound-default':
         typeLabel = '🎯 Catch-all';

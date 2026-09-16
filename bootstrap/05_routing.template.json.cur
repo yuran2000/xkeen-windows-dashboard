@@ -1,4 +1,4 @@
-// Watchdog template v12 (2026-05-27): подменяются 9 placeholder'ов через watchdog.sh:
+// Watchdog template v13 (2026-09-16): подменяются 9 placeholder'ов через watchdog.sh:
 //   __DEFAULT_TAG__       — основной outbound для всего обычного трафика
 //   __BLOCK_RULE_BLOCK__  — block-правило с пользовательскими доменами (BLOCK_DOMAINS) — ПЕРВЫМ по приоритету
 //   __DIRECT_RULE_BLOCK__ — direct-правило с пользовательскими доменами (DIRECT_DOMAINS)
@@ -18,6 +18,21 @@
     "rules": [
       { "inboundTag": ["redirect","tproxy"], "outboundTag": "block", "type": "field",
         "network": "udp", "port": "135, 137, 138, 139" },
+      { "inboundTag": ["redirect","tproxy"], "outboundTag": "direct", "type": "field",
+        "network": "udp", "port": "443",
+        "ip": [
+          "94.156.237.35",
+          "95.85.233.195",
+          "178.215.238.35",
+          "144.31.14.34",
+          "130.49.190.39",
+          "81.177.214.11",
+          "193.202.11.18",
+          "37.18.15.174",
+          "78.159.246.239",
+          "81.94.148.168",
+          "78.159.250.11"
+        ] },
       { "inboundTag": ["redirect","tproxy"], "outboundTag": "block", "type": "field",
         "network": "udp", "port": "443" },
       { "inboundTag": ["redirect","tproxy"], "outboundTag": "direct", "type": "field",
