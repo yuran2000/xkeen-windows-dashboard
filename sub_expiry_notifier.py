@@ -29,6 +29,7 @@ from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config_local as cfg
+import ssh_bin
 
 LOG_FILE = r"C:\xray-dashboard\sub_expiry_notifier.log"
 WARNING_THRESHOLD_DAYS = 3   # начинать предупреждать за N дней
@@ -55,9 +56,9 @@ def log(msg):
 def ssh_cat(remote_path, timeout=10):
     """Прочитать файл с роутера через SSH-cat. Возвращает текст или None."""
     args = [
-        "ssh", "-i", cfg.KEENETIC_SSH_KEY, "-p", str(cfg.KEENETIC_PORT),
+        ssh_bin.ssh_exe(), "-i", cfg.KEENETIC_SSH_KEY, "-p", str(cfg.KEENETIC_PORT),
         "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=NUL",
+        "-o", "UserKnownHostsFile=" + ssh_bin.null_known_hosts(),
         "-o", "ConnectTimeout=10",
         "-o", "BatchMode=yes",
         "-o", "LogLevel=ERROR",

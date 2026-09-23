@@ -216,13 +216,14 @@ import threading as _threading
 # отдельные модули без Flask, чтобы их можно было проверять офлайн.
 import xkeen_backup_paths
 import xkeen_killswitch
+import ssh_bin
 
 # ============== ВЕРСИЯ ПАНЕЛИ ==============
 # Hardcoded fallback. Обновляется руками при каждом release (см. CONTRIBUTING.md).
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.1.2"
+_VERSION_FALLBACK = "1.1.3"
 
 
 def _find_git():
@@ -772,13 +773,14 @@ def _ssh_args(extra_cmd=None):
     """Базовые SSH-аргументы для роутера.
     UserKnownHostsFile=NUL — SYSTEM-аккаунт не имеет .ssh/known_hosts в
     C:\\Windows\\System32\\config\\systemprofile\\.ssh\\, без NUL ssh пытается туда
-    писать и может зависнуть/упасть."""
+    писать и может зависнуть/упасть. Бинарник и значение NUL берёт ssh_bin: ssh из
+    Git for Windows создал бы вместо устройства файл ./NUL."""
     args = [
-        "ssh",
+        ssh_bin.ssh_exe(),
         "-i", cfg.KEENETIC_SSH_KEY,
         "-p", str(cfg.KEENETIC_PORT),
         "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=NUL",
+        "-o", "UserKnownHostsFile=" + ssh_bin.null_known_hosts(),
         "-o", "ConnectTimeout=10",
         "-o", "BatchMode=yes",
         "-o", "LogLevel=ERROR",  # подавить "Warning: Permanently added..."
@@ -5982,7 +5984,7 @@ def api_xkeen_migration_backup():
 
     # Pre-check: scp доступен на этом PC?
     try:
-        v = subprocess.run(["scp", "-V"], capture_output=True, timeout=5)
+        v = subprocess.run([ssh_bin.ssh_exe("scp"), "-V"], capture_output=True, timeout=5)
         # scp -V пишет в stderr, exit code часто != 0 — нам только важно что бинарник нашёлся
     except FileNotFoundError:
         return jsonify({
@@ -6080,12 +6082,12 @@ def api_xkeen_migration_backup():
     # которому нужен sftp-server на роутере (`/opt/libexec/sftp-server`). На большинстве
     # Keenetic он не установлен → "sftp-server: not found". Прецедент 2026-05-20.
     scp_args = [
-        "scp",
+        ssh_bin.ssh_exe("scp"),
         "-O",
         "-i", cfg.KEENETIC_SSH_KEY,
         "-P", str(cfg.KEENETIC_PORT),
         "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=NUL",
+        "-o", "UserKnownHostsFile=" + ssh_bin.null_known_hosts("scp"),
         "-o", "BatchMode=yes",
         "-o", "LogLevel=ERROR",
         f"{cfg.KEENETIC_USER}@{cfg.KEENETIC_HOST}:{remote_tar}",
@@ -7717,11 +7719,11 @@ def api_keenetic_test_connection():
         return jsonify({"ok": False, "stage": "key", "error": f"SSH-ключ не найден: {ssh_key}"})
 
     args = [
-        "ssh",
+        ssh_bin.ssh_exe(),
         "-i", ssh_key,
         "-p", str(port),
         "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=NUL",
+        "-o", "UserKnownHostsFile=" + ssh_bin.null_known_hosts(),
         "-o", "ConnectTimeout=5",
         "-o", "BatchMode=yes",
         "-o", "LogLevel=ERROR",

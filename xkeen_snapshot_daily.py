@@ -18,6 +18,7 @@ import glob
 import re
 
 import xkeen_backup_paths
+import ssh_bin
 
 # Читаем настройки из config_local.py (тот же что dashboard.py использует).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,8 +43,8 @@ def main():
     os.makedirs(BACKUP_DIR, exist_ok=True)
     remote_cmd = xkeen_backup_paths.build_snapshot_command()
     ssh = [
-        "ssh", "-i", SSH_KEY, "-p", str(SSH_PORT),
-        "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=NUL",
+        ssh_bin.ssh_exe(), "-i", SSH_KEY, "-p", str(SSH_PORT),
+        "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=" + ssh_bin.null_known_hosts(),
         "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
         f"{SSH_USER}@{SSH_HOST}", remote_cmd,
     ]
