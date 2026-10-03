@@ -1,4 +1,27 @@
 #!/bin/sh
+# XKeen failover watchdog v31 (2026-10-03, исправления по ревью v29/v30: «качели», ручная смена канала, честные алерты):
+#   • «Качели» block ↔ глухой основной у YouTube/«Зарубежных» с блокировкой при падении (*_FAIL_BLOCK=1):
+#     раньше глухота основного при пустой цепочке уводила роль в block, block сбрасывал латч глухоты
+#     (в blackhole мерить нечего), сторож возвращал роль на основной, через 6-9 минут снова признавал
+#     его глухим — и так по кругу, с рестартом xray на каждом шаге. Теперь в block роль уходит ТОЛЬКО
+#     когда основной мёртв по TCP (*_BLOCKED=1). Если он лишь глух, а живых в цепочке нет — роль
+#     остаётся на основном (трафик и так никуда не утекает), одно предупреждение в TG за эпизод.
+#   • Смена основного канала в панели: в state теперь PRI_MAIN / YT_MAIN / FGN_MAIN. Если основной
+#     сменили, карантин возврата прежнего узла (D*_LEFT) к новому не применяется, сквозная проба
+#     сразу меряет новый узел, а вместо ложных «✅ вернулся на основной» / «ожил» в логе честное
+#     «основной сменён в настройках (A → B)».
+#   • Алерт глухоты обещает «Переключаюсь на резерв» только если роли есть куда уходить; иначе —
+#     «резерв для канала не настроен — трафик идёт через него как есть».
+#   • Основной недоступен/глух, а failover-каналы все недоступны (или их нет): 🚨 один раз за эпизод
+#     (флаг PRI_NOALT в state; раньше — каждые FAIL_THRESHOLD тиков или каждую минуту), строка
+#     «DEEP-PROBE: основной … глух → форсирую failover» — раз в 5 минут (DPRI_FSINCE). Без резерва
+#     глухой основной failover больше не форсирует — переключаться всё равно некуда.
+#   • Результат последнего замера сквозной пробы в state: DPRI_RES / DYT_RES / DFGN_RES = ok|fail|none
+#     (none — на этом узле замера ещё не было, канал служебный direct/block/пустой или проба выключена).
+# XKeen failover watchdog v30 (2026-10-02, общая цепочка резерва для «Зарубежных»):
+#   FOREIGN_CHAIN_USE_COMMON=1 → канал «Заблокированные в РФ» при падении/глухоте своего узла идёт
+#   по ОБЩЕЙ цепочке FAILOVER_TAGS (как основное подключение), с тем же RU-фильтром. Пусто/0 —
+#   своя цепочка FOREIGN_FAILOVER_TAGS (v29) или прежнее поведение, если и она пуста.
 # XKeen failover watchdog v29 (2026-10-02, сквозные пробы для ВСЕХ каналов):
 #   ПРОБЛЕМА (поймана 2026-10-02): узел YouTube-канала принимал TCP-соединения (проба «жив»,
 #   41 мс), но трафик СКВОЗЬ себя не пропускал — YouTube не открывался больше часа, а
@@ -369,35 +392,48 @@ _state_field() {
   printf '%s' "$_sf"
 }
 
+# v30: «писать ли эту строку в лог сейчас» для состояний, которые длятся долго (карантин возврата):
+# истина в первую минуту каждой пятиминутки от начала состояния. Иначе 30 минут карантина =
+# 30 одинаковых строк, и окно «последние 30 строк» в панели не показывает ничего, кроме них.
+# Аргумент — сколько секунд состояние уже длится.
+_log_every5() {
+  [ $(( ${1:-0} % 300 )) -lt 60 ]
+}
+
 # Проверяет, идёт ли трафик СКВОЗЬ канал роли (а не «отвечает ли порт узла», как probe_tag).
 # Запрос уходит через выделенный socks-inbound, привязанный правилом к ДЕЙСТВУЮЩЕМУ каналу
 # роли, поэтому меряется именно он — включая резерв, если роль уже на него ушла.
-# Вызов: deep_probe_check <ROLE> <порт> <url> <действующий тег> <имя для человека>
-# Результат в DP_DEAF (латч 0/1) / DP_CTR / DP_TS / DP_TAG — вызывающий кладёт их в state.
+# Вызов: deep_probe_check <ROLE> <порт> <url> <действующий тег> <имя для человека> [есть_резерв 1/0]
+# Результат в DP_DEAF (латч 0/1) / DP_CTR / DP_TS / DP_TAG / DP_RES — вызывающий кладёт их в state.
+# v31: DP_RES — итог последнего замера на ЭТОМ теге: ok | fail | none (замера ещё не было, тег
+# служебный или проба выключена). «есть_резерв» (6-й аргумент, по умолчанию 1) решает, что честно
+# писать в алерте глухоты: «переключаюсь на резерв» или «резерв не настроен».
 # 🔴 Латч, а не разовый флаг: замер идёт раз в DEEP_PROBE_INTERVAL, а тик watchdog — раз в
 # минуту. Разовый «down» (так было в v27) гас на следующем тике, порог state-машины не
 # набирался, и переключение не происходило никогда.
 deep_probe_check() {
-  _dpr_role="$1"; _dpr_port="$2"; _dpr_url="$3"; _dpr_tag="$4"; _dpr_name="$5"
+  _dpr_role="$1"; _dpr_port="$2"; _dpr_url="$3"; _dpr_tag="$4"; _dpr_name="$5"; _dpr_alt="${6:-1}"
   _dpr_now=$(date +%s)
   DP_CTR=$(_state_field "D${_dpr_role}_CTR" 0)
   DP_TS=$(_state_field "D${_dpr_role}_TS" 0)
   DP_DEAF=$(_state_field "D${_dpr_role}_DEAF" 0)
   DP_TAG=$(_state_field "D${_dpr_role}_TAG" "")
   DP_CTR=$(_num "$DP_CTR" 0); DP_TS=$(_num "$DP_TS" 0); DP_DEAF=$(_num "$DP_DEAF" 0)
+  DP_RES=$(_state_field "D${_dpr_role}_RES" none)
+  case "$DP_RES" in ok|fail|none) ;; *) DP_RES=none ;; esac
   if [ "$DEEP_PROBE_ENABLE" != "1" ]; then
-    DP_CTR=0; DP_DEAF=0
+    DP_CTR=0; DP_DEAF=0; DP_RES=none
     return 0
   fi
   # Роль не настроена, ушла в block или идёт напрямую — мерить нечем. Счётчики обнуляем:
   # в block проба уходит в blackhole, и латч глухоты заморозился бы навсегда.
   case "$_dpr_tag" in
-    ""|block|direct) DP_CTR=0; DP_DEAF=0; DP_TAG="$_dpr_tag"; return 0 ;;
+    ""|block|direct) DP_CTR=0; DP_DEAF=0; DP_TAG="$_dpr_tag"; DP_RES=none; return 0 ;;
   esac
   # Канал роли сменился (ушли на резерв, вернулись, сменили руками в панели) — прошлые
   # замеры описывают ДРУГОЙ узел. Сбрасываем счётчики и даём новому каналу осесть.
   if [ "$_dpr_tag" != "$DP_TAG" ]; then
-    DP_CTR=0; DP_DEAF=0; DP_TS="$_dpr_now"; DP_TAG="$_dpr_tag"
+    DP_CTR=0; DP_DEAF=0; DP_TS="$_dpr_now"; DP_TAG="$_dpr_tag"; DP_RES=none
     return 0
   fi
   [ $((_dpr_now - DP_TS)) -ge "$DEEP_PROBE_INTERVAL" ] 2>/dev/null || return 0
@@ -411,13 +447,20 @@ deep_probe_check() {
     elif [ "$DP_CTR" -ge 1 ] 2>/dev/null; then
       log "DEEP-PROBE ($_dpr_name): канал $_dpr_tag ответил (код $_dpr_code) — счётчик сброшен"
     fi
-    DP_CTR=0; DP_DEAF=0
+    DP_CTR=0; DP_DEAF=0; DP_RES=ok
   else
-    DP_CTR=$((DP_CTR + 1))
+    DP_CTR=$((DP_CTR + 1)); DP_RES=fail
     if [ "$DP_CTR" -ge "$DEEP_PROBE_THRESHOLD" ] 2>/dev/null; then
       if [ "$DP_DEAF" != "1" ]; then
-        log "DEEP-PROBE DEAF ($_dpr_name): канал $_dpr_tag глух — отвечает по TCP, но трафик сквозь не идёт ($DP_CTR проб подряд)"
-        tg_alert "🕳 <b>$_dpr_name: канал не пропускает трафик</b> — <code>$_dpr_tag</code> отвечает по TCP, но запросы сквозь него не проходят (~$((DP_CTR * DEEP_PROBE_INTERVAL / 60)) мин). Переключаюсь на резерв."
+        # v31: обещать переключение — только если роли есть куда уходить.
+        if [ "$_dpr_alt" = "1" ]; then
+          _dpr_next="Переключаюсь на резерв."; _dpr_lnext=""
+        else
+          _dpr_next="Резерв для канала не настроен — трафик идёт через него как есть."
+          _dpr_lnext="; резерв для канала не настроен — трафик идёт через него как есть"
+        fi
+        log "DEEP-PROBE DEAF ($_dpr_name): канал $_dpr_tag глух — отвечает по TCP, но трафик сквозь не идёт ($DP_CTR проб подряд)$_dpr_lnext"
+        tg_alert "🕳 <b>$_dpr_name: канал не пропускает трафик</b> — <code>$_dpr_tag</code> отвечает по TCP, но запросы сквозь него не проходят (~$((DP_CTR * DEEP_PROBE_INTERVAL / 60)) мин). $_dpr_next"
       fi
       DP_DEAF=1
     else
@@ -1052,6 +1095,15 @@ FOREIGN_CHAIN_ROUNDS=$(_num "${FOREIGN_CHAIN_ROUNDS:-2}" 2)
 # по умолчанию не берём, но решает владелец.
 FOREIGN_CHAIN_ALLOW_RU=${FOREIGN_CHAIN_ALLOW_RU:-0}
 FOREIGN_CHAIN_SWITCH_COOLDOWN=$(_num "${FOREIGN_CHAIN_SWITCH_COOLDOWN:-300}" 300)
+# v30: «Зарубежные» могут ехать по ОБЩЕЙ цепочке резерва (FAILOVER_TAGS) — той же, что страхует
+# основное подключение. Удобно, когда канал «Зарубежных» = основной: при его падении оба уедут на
+# один и тот же первый живой узел. Фильтр RU (FOREIGN_CHAIN_ALLOW_RU) действует и здесь — для
+# заблокированных в РФ сервисов российский узел бесполезен, пусть даже он есть в общей цепочке.
+# Явная настройка, а не молчаливый дефолт: поведение чужих установок не должно меняться само.
+FOREIGN_CHAIN_USE_COMMON=$(_num "${FOREIGN_CHAIN_USE_COMMON:-0}" 0)
+if [ "$FOREIGN_CHAIN_USE_COMMON" = "1" ]; then
+  FOREIGN_FAILOVER_TAGS="$FAILOVER_TAGS"
+fi
 # 4) Пускать ли РОССИЙСКИЕ узлы в цепочку — настройка, а не хардкод (решает владелец):
 #    AI  — по умолчанию 0 (RU-exit = бан Anthropic/OpenAI, это защита);
 #    YT  — по умолчанию 1 (для YouTube RU-узел штатный и желательный: меньше рекламы,
@@ -1403,6 +1455,18 @@ if [ ! -f "$CONFIG_DIR/05_routing.json.lastgood" ] && [ -f "$CONFIG_DIR/05_routi
   fi
 fi
 
+# v31: основной канал могли сменить в панели. Тогда прежние замеры сквозной пробы и карантин
+# возврата описывают СТАРЫЙ узел: к новому их применять нельзя (карантин держал бы новый основной
+# в стороне до 30 минут, а латч глухоты старого форсировал бы failover с исправного нового).
+# Пусто в state (апгрейд с v30) = «не менялся».
+_pri_main_prev=$(_state_field PRI_MAIN "$PRIMARY_TAG"); [ -z "$_pri_main_prev" ] && _pri_main_prev="$PRIMARY_TAG"
+_pri_main_chg=0
+if [ "$_pri_main_prev" != "$PRIMARY_TAG" ]; then
+  _pri_main_chg=1
+  log "PRIMARY: основной канал сменён в настройках ($_pri_main_prev → $PRIMARY_TAG)"
+fi
+PRI_MAIN="$PRIMARY_TAG"
+
 # ---------- Force-mode override ----------
 case "$FORCE_MODE" in
   primary)
@@ -1431,34 +1495,55 @@ case "$FORCE_MODE" in
       PRIMARY_ALIVE=0
       PROBE_CODE="down"
     fi
+    _pri_tcp="$PROBE_CODE"   # v31: что сказала TCP-проба ДО поправки на глухоту (для честного алерта)
+    # v31: флаг «про отсутствие живого резерва уже сообщили» (epoch первого алерта, 0 = нет).
+    PRI_NOALT=$(_num "$(_state_field PRI_NOALT 0)" 0)
+    # Есть ли вообще куда переключаться (общая цепочка FAILOVER_TAGS не пуста).
+    _pri_has_alt=0
+    for t in $(echo "$FAILOVER_TAGS" | tr ',' ' '); do _pri_has_alt=1; break; done
 
     # v29: TCP-проба сказала «жив» — но узел может принимать соединения и не выпускать их
     # наружу (деградация его аплинка). Меряем ДЕЙСТВУЮЩИЙ канал насквозь, через собственный
     # inbound socks-deep-pri (в v27 проба ходила через socks-local и мерила чужой канал).
     if [ "$DEEP_PROBE_ENABLE" = "1" ]; then
-      deep_probe_check PRI "$DEEP_PROBE_PORT_PRI" "$DEEP_PROBE_URL_PRI" "$CUR_DEFAULT" "Основной канал"
-      DPRI_CTR="$DP_CTR"; DPRI_TS="$DP_TS"; DPRI_DEAF="$DP_DEAF"; DPRI_TAG="$DP_TAG"
+      # v31: основной сменили в панели, а роль на основном → меряем уже НОВЫЙ основной
+      # (deep_probe_check увидит другой тег и сбросит счётчики/латч старого).
+      _dpri_meas="$CUR_DEFAULT"
+      [ "$_pri_main_chg" = "1" ] && [ "$CUR" = "primary" ] && _dpri_meas="$PRIMARY_TAG"
+      deep_probe_check PRI "$DEEP_PROBE_PORT_PRI" "$DEEP_PROBE_URL_PRI" "$_dpri_meas" "Основной канал" "$_pri_has_alt"
+      DPRI_CTR="$DP_CTR"; DPRI_TS="$DP_TS"; DPRI_DEAF="$DP_DEAF"; DPRI_TAG="$DP_TAG"; DPRI_RES="$DP_RES"
       DPRI_LEFT=$(_num "$(_state_field DPRI_LEFT 0)" 0)
+      [ "$_pri_main_chg" = "1" ] && DPRI_LEFT=0
+      DPRI_FSINCE=$(_num "$(_state_field DPRI_FSINCE 0)" 0)
       _dp_now2=$(date +%s)
       if [ "$DPRI_DEAF" = "1" ] && [ "$CUR" = "primary" ]; then
-        # Глух именно основной — форсируем штатный failover (латч держит «down» все
-        # следующие тики, поэтому порог FAIL_THRESHOLD наберётся) и заводим карантин на
-        # возврат: TCP оживёт раньше, чем узел снова начнёт пропускать трафик.
-        if [ "$PROBE_CODE" = "up" ]; then
-          log "DEEP-PROBE: основной $CUR_DEFAULT глух → форсирую failover"
-          PROBE_CODE="down"
-          PRIMARY_ALIVE=0
+        # Начало эпизода «основной глух» — для строк лога раз в 5 минут.
+        [ "$DPRI_FSINCE" -gt 0 ] 2>/dev/null || DPRI_FSINCE="$_dp_now2"
+        if [ "$_pri_has_alt" = "1" ]; then
+          # Глух именно основной — форсируем штатный failover (латч держит «down» все
+          # следующие тики, поэтому порог FAIL_THRESHOLD наберётся) и заводим карантин на
+          # возврат: TCP оживёт раньше, чем узел снова начнёт пропускать трафик.
+          if [ "$PROBE_CODE" = "up" ]; then
+            _log_every5 $((_dp_now2 - DPRI_FSINCE)) && log "DEEP-PROBE: основной $CUR_DEFAULT глух → форсирую failover"
+            PROBE_CODE="down"
+            PRIMARY_ALIVE=0
+          fi
+          DPRI_LEFT="$_dp_now2"
+        else
+          # v31: резерва нет (FAILOVER_TAGS пуст) — форсировать некуда, только честная строка в лог.
+          _log_every5 $((_dp_now2 - DPRI_FSINCE)) && log "DEEP-PROBE: основной $CUR_DEFAULT глух, а резерв (FAILOVER_TAGS) не настроен — трафик идёт через него как есть"
         fi
-        DPRI_LEFT="$_dp_now2"
       elif [ "$CUR" = "failover" ] && [ "$PROBE_CODE" = "up" ] && [ "$DPRI_LEFT" -gt 0 ] 2>/dev/null \
            && [ $((_dp_now2 - DPRI_LEFT)) -lt "$DEEP_RETURN_HOLD" ] 2>/dev/null; then
         # Уходили с основного ПО ГЛУХОТЕ: TCP-проба скажет «жив» мгновенно, а трафик сквозь
         # может по-прежнему не идти. Держим карантин, иначе прыжки туда-обратно.
         PROBE_CODE="down"
-        log "DEEP-PROBE: основной $PRIMARY_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((DEEP_RETURN_HOLD - (_dp_now2 - DPRI_LEFT)))с, остаюсь на резерве"
+        _log_every5 $((_dp_now2 - DPRI_LEFT)) && log "DEEP-PROBE: основной $PRIMARY_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((DEEP_RETURN_HOLD - (_dp_now2 - DPRI_LEFT)))с, остаюсь на резерве"
       fi
       # Вернулись на основной и он пропускает трафик — карантин больше не нужен.
       [ "$CUR" = "primary" ] && [ "$DPRI_DEAF" != "1" ] && DPRI_LEFT=0
+      # Эпизод «основной глух» закончился (или роль уже на резерве) — счёт времени с нуля.
+      if [ "$DPRI_DEAF" != "1" ] || [ "$CUR" != "primary" ]; then DPRI_FSINCE=0; fi
     fi
 
     case "$CUR/$PROBE_CODE" in
@@ -1466,6 +1551,7 @@ case "$FORCE_MODE" in
         CTR=0
         NEW_STATE=primary
         NEW_DEFAULT="$PRIMARY_TAG"
+        PRI_NOALT=0
         ;;
       primary/down)
         CTR=$((CTR+1))
@@ -1482,8 +1568,22 @@ case "$FORCE_MODE" in
             # Все failover-каналы мёртвы — оставляем primary (хуже не сделаем)
             NEW_STATE=primary
             NEW_DEFAULT="$PRIMARY_TAG"
-            log "WARN: PRIMARY down AND все failover-каналы недоступны — оставляю default=$PRIMARY_TAG"
-            tg_alert "🚨 <b>XKeen watchdog</b>: PRIMARY ($PRIMARY_TAG) и ВСЕ failover каналы недоступны! Default остаётся $PRIMARY_TAG. Проверь интернет."
+            # v31: алерт — один раз за эпизод (PRI_NOALT), а не каждые FAIL_THRESHOLD тиков:
+            # латч глухоты держит «down» часами, и каждые 2 минуты прилетал бы тот же 🚨.
+            _pna_now=$(date +%s)
+            if [ "$PRI_NOALT" -gt 0 ] 2>/dev/null; then
+              _log_every5 $((_pna_now - PRI_NOALT)) && log "WARN: PRIMARY down AND все failover-каналы недоступны — оставляю default=$PRIMARY_TAG (алерт уже отправлен)"
+            else
+              PRI_NOALT="$_pna_now"
+              log "WARN: PRIMARY down AND все failover-каналы недоступны — оставляю default=$PRIMARY_TAG"
+              if [ "$_pri_tcp" = "up" ] && [ "${DPRI_DEAF:-0}" = "1" ]; then
+                tg_alert "🚨 <b>XKeen watchdog</b>: основной канал <code>$PRIMARY_TAG</code> отвечает, но не пропускает трафик, а все failover каналы недоступны! Default остаётся $PRIMARY_TAG."
+              else
+                tg_alert "🚨 <b>XKeen watchdog</b>: PRIMARY ($PRIMARY_TAG) и ВСЕ failover каналы недоступны! Default остаётся $PRIMARY_TAG. Проверь интернет."
+              fi
+            fi
+          else
+            PRI_NOALT=0
           fi
           CTR=0
         else
@@ -1498,6 +1598,7 @@ case "$FORCE_MODE" in
           NEW_STATE=primary
           NEW_DEFAULT="$PRIMARY_TAG"
           CTR=0
+          PRI_NOALT=0
         else
           # Пока остаёмся в failover, но обновим если текущий default умер
           NEW_STATE=failover
@@ -1505,6 +1606,7 @@ case "$FORCE_MODE" in
           # трафик; без этого мы бы на нём и остались (TCP-проба всегда говорит «жив»).
           if [ "${DPRI_DEAF:-0}" != "1" ] && probe_tag "$CUR_DEFAULT" ""; then
             NEW_DEFAULT="$CUR_DEFAULT"
+            PRI_NOALT=0
           else
             # Текущий failover-канал умер — перевыбираем
             NEW_DEFAULT=""
@@ -1514,7 +1616,7 @@ case "$FORCE_MODE" in
                 NEW_DEFAULT="$t"; break
               fi
             done
-            [ -z "$NEW_DEFAULT" ] && NEW_DEFAULT="$CUR_DEFAULT"
+            if [ -z "$NEW_DEFAULT" ]; then NEW_DEFAULT="$CUR_DEFAULT"; else PRI_NOALT=0; fi
           fi
         fi
         ;;
@@ -1525,6 +1627,7 @@ case "$FORCE_MODE" in
         # v29: глухой резерв (отвечает по TCP, трафик не пропускает) тоже считаем мёртвым.
         if [ "${DPRI_DEAF:-0}" != "1" ] && probe_tag "$CUR_DEFAULT" ""; then
           NEW_DEFAULT="$CUR_DEFAULT"
+          PRI_NOALT=0
         else
           NEW_DEFAULT=""
           for t in $(echo "$FAILOVER_TAGS" | tr ',' ' '); do
@@ -1535,8 +1638,17 @@ case "$FORCE_MODE" in
           done
           if [ -z "$NEW_DEFAULT" ]; then
             NEW_DEFAULT="$CUR_DEFAULT"  # все мертвы, не меняем
-            log "WARN: все failover-каналы мертвы, default остаётся $CUR_DEFAULT"
-            tg_alert "🚨 <b>XKeen watchdog</b>: все failover каналы недоступны! Default = $CUR_DEFAULT (не работает). Проверь интернет."
+            # v31: раньше 🚨 летел КАЖДУЮ минуту, пока резерв мёртв/глух. Теперь — один раз за эпизод.
+            _pna_now=$(date +%s)
+            if [ "$PRI_NOALT" -gt 0 ] 2>/dev/null; then
+              _log_every5 $((_pna_now - PRI_NOALT)) && log "WARN: все failover-каналы мертвы, default остаётся $CUR_DEFAULT (алерт уже отправлен)"
+            else
+              PRI_NOALT="$_pna_now"
+              log "WARN: все failover-каналы мертвы, default остаётся $CUR_DEFAULT"
+              tg_alert "🚨 <b>XKeen watchdog</b>: все failover каналы недоступны! Default = $CUR_DEFAULT (не работает). Проверь интернет."
+            fi
+          else
+            PRI_NOALT=0
           fi
         fi
         ;;
@@ -1720,10 +1832,32 @@ EFFECTIVE_YT_TAG="$YT_TAG"
 YT_PROBE_CODE=""
 # v29: сквозная проба YouTube-канала. Меряем ДЕЙСТВУЮЩИЙ канал роли (основной или резерв,
 # если роль уже ушла на него) — правило socks-deep-yt в routing указывает ровно на него.
+# v31: основной YouTube могли сменить в панели (YT_MAIN в state — каким он был на прошлом тике).
+# Тогда карантин возврата и латч глухоты описывают СТАРЫЙ узел — к новому их не применяем, а
+# «вернулся на основной» в TG не шлём: это ручная смена, а не восстановление.
+_yt_main_prev=$(_state_field YT_MAIN "$YT_TAG"); [ -z "$_yt_main_prev" ] && _yt_main_prev="$YT_TAG"
+_yt_main_chg=0
+if [ "$_yt_main_prev" != "$YT_TAG" ]; then
+  _yt_main_chg=1
+  log "YT: основной YouTube сменён в настройках ($_yt_main_prev → $YT_TAG)"
+fi
+YT_MAIN="$YT_TAG"
 _yt_eff_now=$(_state_field YT_EFF "$YT_TAG"); [ -z "$_yt_eff_now" ] && _yt_eff_now="$YT_TAG"
-deep_probe_check YT "$DEEP_PROBE_PORT_YT" "$DEEP_PROBE_URL_YT" "$_yt_eff_now" "YouTube"
-DYT_CTR="$DP_CTR"; DYT_TS="$DP_TS"; DYT_DEAF="$DP_DEAF"; DYT_TAG="$DP_TAG"
+# Роль сидела на старом основном → с этого тика она на новом: мерить надо его.
+[ "$_yt_main_chg" = "1" ] && [ "$_yt_eff_now" = "$_yt_main_prev" ] && _yt_eff_now="$YT_TAG"
+# v31: есть ли роли куда уходить при глухоте — непустая цепочка резерва (block для глухого, но
+# живого по TCP основного больше не используется, см. ниже).
+_yt_has_alt=0
+if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ -n "$(echo "$YT_FAILOVER_TAGS" | tr -d ' ,')" ]; then
+  _yt_has_alt=1
+fi
+deep_probe_check YT "$DEEP_PROBE_PORT_YT" "$DEEP_PROBE_URL_YT" "$_yt_eff_now" "YouTube" "$_yt_has_alt"
+DYT_CTR="$DP_CTR"; DYT_TS="$DP_TS"; DYT_DEAF="$DP_DEAF"; DYT_TAG="$DP_TAG"; DYT_RES="$DP_RES"
 DYT_LEFT=$(_num "$(_state_field DYT_LEFT 0)" 0)
+[ "$_yt_main_chg" = "1" ] && DYT_LEFT=0
+# v31: «про то, что уходить некуда, уже предупредили» — живёт, пока длится глухота.
+DYT_NOALT=$(_num "$(_state_field DYT_NOALT 0)" 0)
+[ "${DYT_DEAF:-0}" = "1" ] || DYT_NOALT=0
 # v27: блок активен, если включён kill-switch ИЛИ задана своя цепочка резерва для YouTube.
 # (Раньше вход зависел только от YT_FAIL_BLOCK.) Для YT, в отличие от AI, RU-узлы РАЗРЕШЕНЫ —
 # «Россия без рекламы» это штатный и желательный выход для YouTube.
@@ -1735,6 +1869,8 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
   killswitch_decide "$YT_PROBE_CODE" "$YT_BLOCKED" "$YT_KCTR"
   YT_BLOCKED="$KS_BLOCKED"; YT_KCTR="$KS_CTR"
   _yt_eff_prev=$(grep -o 'YT_EFF=[^ ]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2-)
+  # v31: роль была на старом основном, а его сменили в панели — считаем, что она на новом.
+  [ "$_yt_main_chg" = "1" ] && [ "$_yt_eff_prev" = "$_yt_main_prev" ] && _yt_eff_prev="$YT_TAG"
   # v29: уходим по цепочке не только когда узел не отвечает по TCP (YT_BLOCKED), но и когда
   # действующий канал ГЛУХ — отвечает, а трафик сквозь не пропускает (случай 02.10).
   if [ "$YT_BLOCKED" = "1" ] || [ "${DYT_DEAF:-0}" = "1" ]; then
@@ -1753,7 +1889,7 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
     # по-прежнему не идти.
     if [ "$YT_BLOCKED" != "1" ] && [ -n "$_yt_eff_prev" ] && [ "$_yt_eff_prev" != "$YT_TAG" ]; then
       if [ "$DYT_LEFT" -gt 0 ] 2>/dev/null && [ $((_yt_now0 - DYT_LEFT)) -lt "$DEEP_RETURN_HOLD" ] 2>/dev/null; then
-        log "YT: основной $YT_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((DEEP_RETURN_HOLD - (_yt_now0 - DYT_LEFT)))с"
+        _log_every5 $((_yt_now0 - DYT_LEFT)) && log "YT: основной $YT_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((DEEP_RETURN_HOLD - (_yt_now0 - DYT_LEFT)))с"
       elif probe_tag "$YT_TAG" ""; then
         _yt_pick="$YT_TAG"; _yt_pick_idx=0
       fi
@@ -1801,7 +1937,9 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
         # мгновенно, а канал может всё ещё не пропускать трафик). Счётчики пробы обнулит сам
         # deep_probe_check на следующем тике: действующий тег роли сменился.
         if [ "${DYT_DEAF:-0}" = "1" ] && [ "$_yt_pick" != "$YT_TAG" ]; then DYT_LEFT="$_yt_now"; fi
-        if [ "$_yt_pick" = "$YT_TAG" ]; then
+        if [ "$_yt_pick" = "$YT_TAG" ] && [ "$_yt_main_chg" = "1" ]; then
+          log "YT: основной сменён в настройках — YouTube идёт через новый основной $YT_TAG (был $_yt_eff_prev)"
+        elif [ "$_yt_pick" = "$YT_TAG" ]; then
           log "YT-FAILOVER-RETURN: резерв $_yt_eff_prev непригоден → YouTube вернулся на основной $YT_TAG"
           tg_alert "✅ <b>YouTube вернулся на основной канал</b> <code>$YT_TAG</code>."
         elif [ "${DYT_DEAF:-0}" = "1" ]; then
@@ -1821,12 +1959,32 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
         else
           EFFECTIVE_YT_TAG="$YT_TAG"
         fi
-        log "YT-FAILOVER: основной $YT_TAG и вся цепочка не ответили (круг $YT_CMISS из $YT_CHAIN_ROUNDS) — жду ещё тик, маршрут не меняю"
-      elif [ "${YT_FAIL_BLOCK:-0}" = "1" ]; then
+        if [ "$YT_BLOCKED" = "1" ]; then
+          log "YT-FAILOVER: основной $YT_TAG и вся цепочка не ответили (круг $YT_CMISS из $YT_CHAIN_ROUNDS) — жду ещё тик, маршрут не меняю"
+        else
+          log "YT-FAILOVER: канал ${_yt_eff_prev:-$YT_TAG} глух, живых узлов в цепочке нет (круг $YT_CMISS из $YT_CHAIN_ROUNDS) — жду ещё тик, маршрут не меняю"
+        fi
+      elif [ "${YT_FAIL_BLOCK:-0}" = "1" ] && [ "$YT_BLOCKED" = "1" ]; then
+        # v31: block — ТОЛЬКО когда основной мёртв по TCP. Глухой, но отвечающий основной
+        # в block не уводим: block сбрасывает латч глухоты (мерить нечего), сторож вернул бы
+        # роль на основной, через 6-9 мин снова признал бы его глухим — «качели» с рестартами.
         EFFECTIVE_YT_TAG="block"
         if [ "$_yt_eff_prev" != "block" ]; then
           log "YT-KILL-SWITCH: основной $YT_TAG и вся цепочка недоступны $YT_CMISS круга подряд → YouTube в block"
           tg_alert "🚫 <b>YouTube-трафик заблокирован</b>: основной <code>$YT_TAG</code> и вся цепочка резерва не отвечают уже $YT_CMISS круга подряд."
+        fi
+      elif [ "$YT_BLOCKED" != "1" ]; then
+        # v31: основной отвечает по TCP, но действующий канал глух, а живых в цепочке нет.
+        # Остаёмся на основном (трафик и так никуда не утекает), block не включаем, и одно
+        # предупреждение в TG за эпизод глухоты — без xkeen-restart на каждом круге.
+        EFFECTIVE_YT_TAG="$YT_TAG"
+        [ -n "$_yt_eff_prev" ] && [ "$_yt_eff_prev" != "$YT_TAG" ] && log "YT: канал $_yt_eff_prev глух, живых узлов в цепочке нет, основной $YT_TAG отвечает по TCP → YouTube на основном"
+        if [ "$DYT_NOALT" != "1" ]; then
+          DYT_NOALT=1
+          log "YT: переключиться некуда — канал ${_yt_eff_prev:-$YT_TAG} глух, живых узлов в цепочке нет; остаюсь на основном $YT_TAG (block не включаю: основной отвечает по TCP)"
+          if [ "$_yt_has_alt" = "1" ]; then
+            tg_alert "⚠️ <b>YouTube: переключиться некуда</b> — канал <code>${_yt_eff_prev:-$YT_TAG}</code> не пропускает трафик, а живых узлов в цепочке резерва нет. Трафик остаётся на основном <code>$YT_TAG</code>; блокировка не включается, пока он отвечает."
+          fi
         fi
       else
         # Галочка выключена (дефолт для YT) — оставляем YT_TAG, как было раньше.
@@ -1842,12 +2000,16 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
       # TCP, но по-прежнему не пропускает трафик, и будем прыгать туда-обратно.
       if [ "$DYT_LEFT" -gt 0 ] 2>/dev/null && [ $((_yt_now2 - DYT_LEFT)) -lt "$DEEP_RETURN_HOLD" ] 2>/dev/null; then
         EFFECTIVE_YT_TAG="$_yt_eff_prev"
-        log "YT: основной $YT_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((DEEP_RETURN_HOLD - (_yt_now2 - DYT_LEFT)))с, остаюсь на $_yt_eff_prev"
+        _log_every5 $((_yt_now2 - DYT_LEFT)) && log "YT: основной $YT_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((DEEP_RETURN_HOLD - (_yt_now2 - DYT_LEFT)))с, остаюсь на $_yt_eff_prev"
       else
         DYT_LEFT=0
         YT_SW_TS="$_yt_now2"
-        log "YT-FAILOVER-RETURN: основной $YT_TAG ожил → YouTube вернулся на него (был $_yt_eff_prev)"
-        tg_alert "✅ <b>YouTube вернулся на основной канал</b> <code>$YT_TAG</code>."
+        if [ "$_yt_main_chg" = "1" ]; then
+          log "YT: основной сменён в настройках — YouTube идёт через новый основной $YT_TAG (был $_yt_eff_prev)"
+        else
+          log "YT-FAILOVER-RETURN: основной $YT_TAG ожил → YouTube вернулся на него (был $_yt_eff_prev)"
+          tg_alert "✅ <b>YouTube вернулся на основной канал</b> <code>$YT_TAG</code>."
+        fi
       fi
     fi
   fi
@@ -1866,10 +2028,27 @@ EFFECTIVE_FOREIGN_TAG="$FOREIGN_TAG"
 FOREIGN_PROBE_CODE=""
 # v29: сквозная проба действующего заграничного канала (Telegram как цель — ради него канал
 # и заведён; узел может пропускать всё, кроме него).
+# v31: смена основного «Зарубежных» в панели (FGN_MAIN) — как у YouTube выше.
+_fgn_main_prev=$(_state_field FGN_MAIN "$FOREIGN_TAG"); [ -z "$_fgn_main_prev" ] && _fgn_main_prev="$FOREIGN_TAG"
+_fgn_main_chg=0
+if [ "$_fgn_main_prev" != "$FOREIGN_TAG" ]; then
+  _fgn_main_chg=1
+  log "FOREIGN: основной канал «Заблокированные в РФ» сменён в настройках ($_fgn_main_prev → $FOREIGN_TAG)"
+fi
+FGN_MAIN="$FOREIGN_TAG"
 _fgn_eff_now=$(_state_field FGN_EFF "$FOREIGN_TAG"); [ -z "$_fgn_eff_now" ] && _fgn_eff_now="$FOREIGN_TAG"
-deep_probe_check FGN "$DEEP_PROBE_PORT_FGN" "$DEEP_PROBE_URL_FGN" "$_fgn_eff_now" "Заграничный канал"
-DFGN_CTR="$DP_CTR"; DFGN_TS="$DP_TS"; DFGN_DEAF="$DP_DEAF"; DFGN_TAG="$DP_TAG"
+[ "$_fgn_main_chg" = "1" ] && [ "$_fgn_eff_now" = "$_fgn_main_prev" ] && _fgn_eff_now="$FOREIGN_TAG"
+_fgn_has_alt=0
+if [ -n "$FOREIGN_DOMAINS$FOREIGN_EXT_CATEGORIES$FOREIGN_GEOIP_CATEGORIES" ] && [ -n "$FOREIGN_TAG" ] && [ "$FOREIGN_TAG" != "block" ] \
+   && [ -n "$(echo "$FOREIGN_FAILOVER_TAGS" | tr -d ' ,')" ]; then
+  _fgn_has_alt=1
+fi
+deep_probe_check FGN "$DEEP_PROBE_PORT_FGN" "$DEEP_PROBE_URL_FGN" "$_fgn_eff_now" "Заграничный канал" "$_fgn_has_alt"
+DFGN_CTR="$DP_CTR"; DFGN_TS="$DP_TS"; DFGN_DEAF="$DP_DEAF"; DFGN_TAG="$DP_TAG"; DFGN_RES="$DP_RES"
 DFGN_LEFT=$(_num "$(_state_field DFGN_LEFT 0)" 0)
+[ "$_fgn_main_chg" = "1" ] && DFGN_LEFT=0
+DFGN_NOALT=$(_num "$(_state_field DFGN_NOALT 0)" 0)
+[ "${DFGN_DEAF:-0}" = "1" ] || DFGN_NOALT=0
 # v29: блок активен, если включён kill-switch ИЛИ задана цепочка резерва (раньше — только
 # kill-switch, поэтому при смерти своего узла Telegram/Instagram просто пропадали).
 _fgn_active=0
@@ -1880,6 +2059,7 @@ if [ -n "$FOREIGN_DOMAINS$FOREIGN_EXT_CATEGORIES$FOREIGN_GEOIP_CATEGORIES" ] && 
   killswitch_decide "$FOREIGN_PROBE_CODE" "$FOREIGN_BLOCKED" "$FOREIGN_KCTR"
   FOREIGN_BLOCKED="$KS_BLOCKED"; FOREIGN_KCTR="$KS_CTR"
   _fgn_eff_prev=$(_state_field FGN_EFF "")
+  [ "$_fgn_main_chg" = "1" ] && [ "$_fgn_eff_prev" = "$_fgn_main_prev" ] && _fgn_eff_prev="$FOREIGN_TAG"
   if [ "$FOREIGN_BLOCKED" = "1" ] || [ "${DFGN_DEAF:-0}" = "1" ]; then
     _fgn_now=$(date +%s)
     _fgn_prev_idx=0; _fgn_i=0
@@ -1891,7 +2071,7 @@ if [ -n "$FOREIGN_DOMAINS$FOREIGN_EXT_CATEGORIES$FOREIGN_GEOIP_CATEGORIES" ] && 
     # Сюда можно попасть и из-за глухоты РЕЗЕРВА — тогда первый кандидат снова основной.
     if [ "$FOREIGN_BLOCKED" != "1" ] && [ -n "$_fgn_eff_prev" ] && [ "$_fgn_eff_prev" != "$FOREIGN_TAG" ]; then
       if [ "$DFGN_LEFT" -gt 0 ] 2>/dev/null && [ $((_fgn_now - DFGN_LEFT)) -lt "$DEEP_RETURN_HOLD" ] 2>/dev/null; then
-        log "FOREIGN: основной $FOREIGN_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((DEEP_RETURN_HOLD - (_fgn_now - DFGN_LEFT)))с"
+        _log_every5 $((_fgn_now - DFGN_LEFT)) && log "FOREIGN: основной $FOREIGN_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((DEEP_RETURN_HOLD - (_fgn_now - DFGN_LEFT)))с"
       elif probe_tag "$FOREIGN_TAG" ""; then
         _fgn_pick="$FOREIGN_TAG"; _fgn_pick_idx=0
       fi
@@ -1928,7 +2108,9 @@ if [ -n "$FOREIGN_DOMAINS$FOREIGN_EXT_CATEGORIES$FOREIGN_GEOIP_CATEGORIES" ] && 
         FGN_SW_TS="$_fgn_now"
         # Карантин заводим только когда уходим С ОСНОВНОГО по глухоте (см. YT выше).
         if [ "${DFGN_DEAF:-0}" = "1" ] && [ "$_fgn_pick" != "$FOREIGN_TAG" ]; then DFGN_LEFT="$_fgn_now"; fi
-        if [ "$_fgn_pick" = "$FOREIGN_TAG" ]; then
+        if [ "$_fgn_pick" = "$FOREIGN_TAG" ] && [ "$_fgn_main_chg" = "1" ]; then
+          log "FOREIGN: основной сменён в настройках — заграничный канал идёт через новый основной $FOREIGN_TAG (был $_fgn_eff_prev)"
+        elif [ "$_fgn_pick" = "$FOREIGN_TAG" ]; then
           log "FOREIGN-FAILOVER-RETURN: резерв $_fgn_eff_prev непригоден → заграничный канал вернулся на основной $FOREIGN_TAG"
           tg_alert "✅ <b>Заграничный канал вернулся на основной</b> <code>$FOREIGN_TAG</code>."
         elif [ "${DFGN_DEAF:-0}" = "1" ]; then
@@ -1948,11 +2130,28 @@ if [ -n "$FOREIGN_DOMAINS$FOREIGN_EXT_CATEGORIES$FOREIGN_GEOIP_CATEGORIES" ] && 
         else
           EFFECTIVE_FOREIGN_TAG="$FOREIGN_TAG"
         fi
-        log "FOREIGN-FAILOVER: основной $FOREIGN_TAG и вся цепочка не ответили (круг $FGN_CMISS из $FOREIGN_CHAIN_ROUNDS) — жду ещё тик, маршрут не меняю"
-      elif [ "${FOREIGN_FAIL_BLOCK:-0}" = "1" ]; then
+        if [ "$FOREIGN_BLOCKED" = "1" ]; then
+          log "FOREIGN-FAILOVER: основной $FOREIGN_TAG и вся цепочка не ответили (круг $FGN_CMISS из $FOREIGN_CHAIN_ROUNDS) — жду ещё тик, маршрут не меняю"
+        else
+          log "FOREIGN-FAILOVER: канал ${_fgn_eff_prev:-$FOREIGN_TAG} глух, живых узлов в цепочке нет (круг $FGN_CMISS из $FOREIGN_CHAIN_ROUNDS) — жду ещё тик, маршрут не меняю"
+        fi
+      elif [ "${FOREIGN_FAIL_BLOCK:-0}" = "1" ] && [ "$FOREIGN_BLOCKED" = "1" ]; then
+        # v31: block — ТОЛЬКО когда основной мёртв по TCP (см. YouTube выше: иначе «качели»).
         EFFECTIVE_FOREIGN_TAG="block"
         if [ "$_fgn_eff_prev" != "block" ]; then
           log "FOREIGN-KILL-SWITCH: основной $FOREIGN_TAG и вся цепочка недоступны $FGN_CMISS круга подряд → трафик в block"
+        fi
+      elif [ "$FOREIGN_BLOCKED" != "1" ]; then
+        # v31: основной отвечает по TCP, действующий канал глух, живых в цепочке нет — остаёмся
+        # на основном (реальный IP не светится: трафик идёт в туннель), block не включаем.
+        EFFECTIVE_FOREIGN_TAG="$FOREIGN_TAG"
+        [ -n "$_fgn_eff_prev" ] && [ "$_fgn_eff_prev" != "$FOREIGN_TAG" ] && log "FOREIGN: канал $_fgn_eff_prev глух, живых узлов в цепочке нет, основной $FOREIGN_TAG отвечает по TCP → заграничный канал на основном"
+        if [ "$DFGN_NOALT" != "1" ]; then
+          DFGN_NOALT=1
+          log "FOREIGN: переключиться некуда — канал ${_fgn_eff_prev:-$FOREIGN_TAG} глух, живых узлов в цепочке нет; остаюсь на основном $FOREIGN_TAG (block не включаю: основной отвечает по TCP)"
+          if [ "$_fgn_has_alt" = "1" ]; then
+            tg_alert "⚠️ <b>Заграничный канал: переключиться некуда</b> — <code>${_fgn_eff_prev:-$FOREIGN_TAG}</code> не пропускает трафик, а живых узлов в цепочке резерва нет. Трафик остаётся на основном <code>$FOREIGN_TAG</code>; блокировка не включается, пока он отвечает."
+          fi
         fi
       else
         EFFECTIVE_FOREIGN_TAG="$FOREIGN_TAG"
@@ -1966,12 +2165,16 @@ if [ -n "$FOREIGN_DOMAINS$FOREIGN_EXT_CATEGORIES$FOREIGN_GEOIP_CATEGORIES" ] && 
       _fgn_now2=$(date +%s)
       if [ "$DFGN_LEFT" -gt 0 ] 2>/dev/null && [ $((_fgn_now2 - DFGN_LEFT)) -lt "$DEEP_RETURN_HOLD" ] 2>/dev/null; then
         EFFECTIVE_FOREIGN_TAG="$_fgn_eff_prev"
-        log "FOREIGN: основной $FOREIGN_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((DEEP_RETURN_HOLD - (_fgn_now2 - DFGN_LEFT)))с, остаюсь на $_fgn_eff_prev"
+        _log_every5 $((_fgn_now2 - DFGN_LEFT)) && log "FOREIGN: основной $FOREIGN_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((DEEP_RETURN_HOLD - (_fgn_now2 - DFGN_LEFT)))с, остаюсь на $_fgn_eff_prev"
       else
         DFGN_LEFT=0
         FGN_SW_TS="$_fgn_now2"
-        log "FOREIGN-FAILOVER-RETURN: основной $FOREIGN_TAG ожил → заграничный канал вернулся на него (был $_fgn_eff_prev)"
-        tg_alert "✅ <b>Заграничный канал вернулся на основной</b> <code>$FOREIGN_TAG</code>."
+        if [ "$_fgn_main_chg" = "1" ]; then
+          log "FOREIGN: основной сменён в настройках — заграничный канал идёт через новый основной $FOREIGN_TAG (был $_fgn_eff_prev)"
+        else
+          log "FOREIGN-FAILOVER-RETURN: основной $FOREIGN_TAG ожил → заграничный канал вернулся на него (был $_fgn_eff_prev)"
+          tg_alert "✅ <b>Заграничный канал вернулся на основной</b> <code>$FOREIGN_TAG</code>."
+        fi
       fi
     fi
   fi
@@ -2010,7 +2213,11 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
       if health_check 8; then
         cp "$CONFIG_DIR/05_routing.json" "$CONFIG_DIR/05_routing.json.lastgood" 2>/dev/null
         LAST_BAD_MD5=""   # успешное применение — снимаем «бракованную» метку
-        if [ "$NEW_DEFAULT" != "$CUR_DEFAULT" ]; then
+        if [ "$NEW_DEFAULT" != "$CUR_DEFAULT" ] && [ "$_pri_main_chg" = "1" ] && [ "$NEW_DEFAULT" = "$PRIMARY_TAG" ] \
+           && [ "$CUR_DEFAULT" = "$_pri_main_prev" ]; then
+          # v31: это смена основного канала в панели, а не авария/восстановление — без TG.
+          log "SWITCH default $CUR_DEFAULT -> $NEW_DEFAULT: основной канал сменён в настройках"
+        elif [ "$NEW_DEFAULT" != "$CUR_DEFAULT" ]; then
           log "SWITCH default $CUR_DEFAULT -> $NEW_DEFAULT (state=$CUR/$NEW_STATE probe=$PROBE_CODE)"
           tg_alert "🚦 <b>XKeen watchdog</b>: default переключён <code>$CUR_DEFAULT</code> → <code>$NEW_DEFAULT</code>${PROBE_CODE:+ (probe=$PROBE_CODE)}"
         else
@@ -2135,7 +2342,7 @@ fi
 # кругов и cooldown обнулялись бы каждый тик.
 for _v in AI_CMISS AI_SW_TS AI_LEFT_TS YT_CMISS YT_SW_TS FGN_CMISS FGN_SW_TS \
           DPRI_CTR DPRI_TS DPRI_DEAF DPRI_LEFT DYT_CTR DYT_TS DYT_DEAF DYT_LEFT \
-          DFGN_CTR DFGN_TS DFGN_DEAF DFGN_LEFT; do
+          DFGN_CTR DFGN_TS DFGN_DEAF DFGN_LEFT PRI_NOALT DPRI_FSINCE DYT_NOALT DFGN_NOALT; do
   eval "_cur=\$$_v"
   if [ -z "$_cur" ]; then
     _old=$(tr ' ' '\n' < "$STATE_FILE" 2>/dev/null | grep "^$_v=" | head -1 | cut -d= -f2); [ -z "$_old" ] && _old=0
@@ -2151,6 +2358,21 @@ for _v in DPRI_TAG DYT_TAG DFGN_TAG; do
     eval "$_v=\$_old"
   fi
 done
+# v31: итог последнего замера сквозной пробы (ok|fail|none). Не выставлен в этом тике (принудительный
+# режим, проба PRI выключена) — переносим прежний; при выключенной пробе — none и без латча
+# глухоты: панель не должна показывать устаревший «ok»/«глух», которого никто не меряет.
+for _v in DPRI_RES DYT_RES DFGN_RES; do
+  eval "_cur=\$$_v"
+  if [ -z "$_cur" ]; then
+    _old=$(_state_field "$_v" none)
+    case "$_old" in ok|fail|none) ;; *) _old=none ;; esac
+    eval "$_v=\$_old"
+  fi
+done
+if [ "$DEEP_PROBE_ENABLE" != "1" ]; then
+  DPRI_RES=none; DPRI_DEAF=0; DPRI_CTR=0
+fi
+# PRI_MAIN/YT_MAIN/FGN_MAIN выставляются каждый тик (до блоков ролей) — переносить не нужно.
 # AI_EFF — что РЕАЛЬНО применено для AI в этом тике (основной / резерв цепочки / block).
 # Нужен, чтобы (а) не спамить алертами о переключении, (б) AI-probe отличал blackhole от резерва.
-echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR AI_EFF=$EFFECTIVE_AI_TAG DEEP_CTR=$DEEP_CTR DEEP_TS=$DEEP_TS AI_CMISS=$AI_CMISS AI_SW_TS=$AI_SW_TS AI_LEFT_TS=$AI_LEFT_TS YT_EFF=$EFFECTIVE_YT_TAG YT_CMISS=$YT_CMISS YT_SW_TS=$YT_SW_TS FGN_EFF=$EFFECTIVE_FOREIGN_TAG FGN_CMISS=$FGN_CMISS FGN_SW_TS=$FGN_SW_TS DPRI_CTR=$DPRI_CTR DPRI_TS=$DPRI_TS DPRI_DEAF=$DPRI_DEAF DPRI_LEFT=$DPRI_LEFT DPRI_TAG=$DPRI_TAG DYT_CTR=$DYT_CTR DYT_TS=$DYT_TS DYT_DEAF=$DYT_DEAF DYT_LEFT=$DYT_LEFT DYT_TAG=$DYT_TAG DFGN_CTR=$DFGN_CTR DFGN_TS=$DFGN_TS DFGN_DEAF=$DFGN_DEAF DFGN_LEFT=$DFGN_LEFT DFGN_TAG=$DFGN_TAG" > "$STATE_FILE"
+echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR AI_EFF=$EFFECTIVE_AI_TAG DEEP_CTR=$DEEP_CTR DEEP_TS=$DEEP_TS AI_CMISS=$AI_CMISS AI_SW_TS=$AI_SW_TS AI_LEFT_TS=$AI_LEFT_TS YT_EFF=$EFFECTIVE_YT_TAG YT_CMISS=$YT_CMISS YT_SW_TS=$YT_SW_TS FGN_EFF=$EFFECTIVE_FOREIGN_TAG FGN_CMISS=$FGN_CMISS FGN_SW_TS=$FGN_SW_TS DPRI_CTR=$DPRI_CTR DPRI_TS=$DPRI_TS DPRI_DEAF=$DPRI_DEAF DPRI_LEFT=$DPRI_LEFT DPRI_TAG=$DPRI_TAG DYT_CTR=$DYT_CTR DYT_TS=$DYT_TS DYT_DEAF=$DYT_DEAF DYT_LEFT=$DYT_LEFT DYT_TAG=$DYT_TAG DFGN_CTR=$DFGN_CTR DFGN_TS=$DFGN_TS DFGN_DEAF=$DFGN_DEAF DFGN_LEFT=$DFGN_LEFT DFGN_TAG=$DFGN_TAG PRI_MAIN=$PRI_MAIN YT_MAIN=$YT_MAIN FGN_MAIN=$FGN_MAIN DPRI_RES=$DPRI_RES DYT_RES=$DYT_RES DFGN_RES=$DFGN_RES PRI_NOALT=$PRI_NOALT DPRI_FSINCE=$DPRI_FSINCE DYT_NOALT=$DYT_NOALT DFGN_NOALT=$DFGN_NOALT" > "$STATE_FILE"

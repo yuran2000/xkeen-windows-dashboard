@@ -810,10 +810,14 @@ def keenetic_ssh(cmd, timeout=15, stdin_data=None):
     locale (cp1251) теряются строки с UTF-8 кириллицей (например watchdog.config с комментариями)."""
     try:
         stdin_bytes = stdin_data.encode("utf-8") if isinstance(stdin_data, str) else stdin_data
+        # stdin: без данных — ЯВНО DEVNULL. Иначе ssh.exe наследует stdin процесса панели, и два
+        # параллельных вызова из разных потоков делят его: второй висит до таймаута, даже когда
+        # первый уже закончил (воспроизведено: echo во время фонового grep — 40 с вместо 0,4 с).
+        _stdin_kw = {"input": stdin_bytes} if stdin_bytes is not None else {"stdin": subprocess.DEVNULL}
         result = subprocess.run(
             _ssh_args(cmd),
             capture_output=True, timeout=timeout,
-            input=stdin_bytes,
+            **_stdin_kw,
         )
         return {
             "ok": result.returncode == 0,
@@ -849,6 +853,141 @@ def keenetic_read_file(remote_path, timeout=10):
     """Прочитать файл с роутера через cat. Вернёт str или None при ошибке."""
     r = keenetic_ssh(f"cat {remote_path}", timeout=timeout)
     return r["stdout"] if r["ok"] else None
+
+
+GEOIP_DAT_PATH = "/opt/etc/xray/dat/geoip.dat"
+GEOIP_V2FLY_DAT_PATH = "/opt/etc/xray/dat/geoip_v2fly.dat"   # его ежедневно обновляет xkeen -ug
+GEOIP_EXTENDED_MIN_SIZE = 5 * 1024 * 1024   # расширенная база ~16-20 МБ, база «только страны» — сотни КБ
+
+# Проверка категории telegram в geoip.dat — ДОРОГАЯ: на роутере (BusyBox, MIPS) grep по 16 МБ идёт
+# ~9 с. Поэтому её НЕ делаем на каждую загрузку страницы, а один раз на версию файла: кэш в памяти
+# процесса по ключу (size, mtime), заполняет фоновый поток. Пока результата нет — has_telegram=None.
+_GEOIP_TG_CACHE = {}          # (size, mtime) -> True/False
+_GEOIP_TG_PENDING = {}        # (size, mtime) -> threading.Thread (идёт проверка)
+_GEOIP_TG_FAILED = {}         # (size, mtime) -> epoch неудачной проверки (повтор не раньше чем через 5 мин)
+_GEOIP_TG_LOCK = _threading.Lock()
+_GEOIP_TG_RETRY_SEC = 300
+_GEOIP_TG_TIMEOUT = 60
+
+
+def _geoip_tg_check_worker(key):
+    """Фон: grep -q -a -F TELEGRAM по geoip.dat (через симлинк — по цели). Коды в .dat — ЗАГЛАВНЫЕ."""
+    result = None
+    try:
+        r = keenetic_ssh(
+            f'if grep -q -a -F TELEGRAM {GEOIP_DAT_PATH} 2>/dev/null; then echo TG_YES; else echo TG_NO; fi',
+            timeout=_GEOIP_TG_TIMEOUT)
+        out = (r.get("stdout") or "") if r and r.get("ok") else ""
+        if "TG_YES" in out:
+            result = True
+        elif "TG_NO" in out:
+            result = False
+    except Exception:
+        result = None
+    with _GEOIP_TG_LOCK:
+        _GEOIP_TG_PENDING.pop(key, None)
+        if result is None:
+            _GEOIP_TG_FAILED[key] = _time_mod.time()
+        else:
+            _GEOIP_TG_CACHE[key] = result
+            _GEOIP_TG_FAILED.pop(key, None)
+
+
+def _geoip_tg_lookup(key):
+    """Есть ли категория telegram в geoip.dat данной версии (size, mtime): True/False из кэша,
+    None — ещё не знаем (проверка запущена в фоне или недавно не удалась)."""
+    with _GEOIP_TG_LOCK:
+        if key in _GEOIP_TG_CACHE:
+            return _GEOIP_TG_CACHE[key]
+        if key in _GEOIP_TG_PENDING:
+            return None
+        failed_at = _GEOIP_TG_FAILED.get(key)
+        if failed_at and (_time_mod.time() - failed_at) < _GEOIP_TG_RETRY_SEC:
+            return None
+        th = _threading.Thread(target=_geoip_tg_check_worker, args=(key,), daemon=True,
+                               name="geoip-tg-check")
+        _GEOIP_TG_PENDING[key] = th
+    th.start()
+    return None
+
+
+def keenetic_geoip_dat_status(timeout=15):
+    """Состояние /opt/etc/xray/dat/geoip.dat на роутере — ОДНОЙ лёгкой SSH-командой (~1 с).
+
+    Размер и время файла (для симлинка — по цели), признак симлинка и куда он указывает, размер и
+    время geoip_v2fly.dat (его ежедневно обновляет xkeen -ug; geoip.dat XKeen не трогает).
+    Категорию telegram здесь НЕ ищем (9 с на роутере) — см. _geoip_tg_lookup: результат
+    приходит из кэша по версии файла, до готовности has_telegram=None.
+
+    Расширенная база = размер > 5 МБ и has_telegram не False (None — «ещё проверяем»).
+
+    Возвращает dict или None при ошибке SSH / таймауте / нераспознанном выводе."""
+    f = GEOIP_DAT_PATH
+    v = GEOIP_V2FLY_DAT_PATH
+    cmd = (
+        f'F={f}; V={v}; L=""; T="$F"; '
+        'if [ -L "$F" ]; then L=$(readlink "$F" 2>/dev/null); T=$(readlink -f "$F" 2>/dev/null); fi; '
+        'if [ -f "$T" ]; then echo "G=$(wc -c < "$T" 2>/dev/null || echo 0)|$(date -r "$T" +%s 2>/dev/null || echo 0)|$L"; '
+        'else echo "G=0|0|$L"; fi; '
+        'if [ -f "$V" ]; then echo "V=$(wc -c < "$V" 2>/dev/null || echo 0)|$(date -r "$V" +%s 2>/dev/null || echo 0)"; '
+        'else echo "V=0|0"; fi'
+    )
+    try:
+        r = keenetic_ssh(cmd, timeout=timeout)
+    except Exception:
+        return None
+    if not r or not r.get("ok"):
+        return None
+    g_line = v_line = None
+    for ln in (r.get("stdout") or "").splitlines():
+        ln = ln.strip()
+        if ln.startswith("G="):
+            g_line = ln[2:]
+        elif ln.startswith("V="):
+            v_line = ln[2:]
+    if g_line is None or v_line is None:
+        return None
+    gp = g_line.split("|", 2)
+    vp = v_line.split("|")
+    if len(gp) != 3 or len(vp) != 2:
+        return None
+    try:
+        size, mtime = int(gp[0].strip()), int(gp[1].strip())
+        v_size, v_mtime = int(vp[0].strip()), int(vp[1].strip())
+    except ValueError:
+        return None
+    if min(size, mtime, v_size, v_mtime) < 0:
+        return None
+    link = gp[2].strip()
+
+    def _fmt(ts):
+        try:
+            return datetime.fromtimestamp(ts).strftime("%d.%m %H:%M") if ts > 0 else ""
+        except (OverflowError, OSError, ValueError):
+            return ""
+
+    exists = size > 0
+    has_tg = _geoip_tg_lookup((size, mtime)) if exists else False
+    big = size > GEOIP_EXTENDED_MIN_SIZE
+    return {
+        "exists": exists,
+        "size": size,
+        "size_mb": round(size / 1024 / 1024, 1),
+        "mtime": mtime,
+        "mtime_str": _fmt(mtime),
+        "is_link": bool(link),
+        "link_target": link or None,
+        # «связан с ежедневно обновляемой базой» — симлинк именно на geoip_v2fly.dat (в той же папке)
+        "linked_to_v2fly": bool(link) and link.rsplit("/", 1)[-1] == "geoip_v2fly.dat" and exists,
+        "v2fly_exists": v_size > 0,
+        "v2fly_size": v_size,
+        "v2fly_size_mb": round(v_size / 1024 / 1024, 1),
+        "v2fly_mtime": v_mtime,
+        "v2fly_mtime_str": _fmt(v_mtime),
+        "v2fly_usable": v_size > GEOIP_EXTENDED_MIN_SIZE,   # можно связать geoip.dat с ним
+        "has_telegram": has_tg,                               # True / False / None (проверяется)
+        "is_extended": bool(exists and big and has_tg is not False),
+    }
 
 
 _JSON_LINE_COMMENT_RE = re.compile(r'^\s*//.*$', re.MULTILINE)
@@ -2020,11 +2159,15 @@ def _list_remote_dat():
     """Список dat-файлов на роутере: [{name, size, mtime}, ...].
 
     Резолвит симлинки (geosite_zkeen.dat → zkeen.dat) — итог по реальным именам.
+    Исключение — стандартные имена geoip.dat / geosite.dat: если это симлинк (панель связывает
+    geoip.dat с ежедневно обновляемым geoip_v2fly.dat), файл остаётся в списке под СВОИМ именем,
+    иначе он молча пропадал бы при дедупе по цели ссылки.
     Игнорирует *.bak-* (старые бэкапы).
     """
     r = keenetic_ssh(
         f"for f in {_DAT_REMOTE_DIR}/*.dat; do "
-        "  base=$(basename \"$(readlink -f \"$f\")\"); "
+        "  own=$(basename \"$f\"); base=$(basename \"$(readlink -f \"$f\")\"); "
+        "  case \"$own\" in geoip.dat|geosite.dat) base=\"$own\";; esac; "
         "  case \"$base\" in *.bak-*) continue;; esac; "
         "  size=$(wc -c < \"$f\" 2>/dev/null || echo 0); "
         "  mtime=$(date -r \"$f\" +%s 2>/dev/null || echo 0); "
@@ -2691,9 +2834,10 @@ def keenetic_get_routing_active():
     return {"default_outbound": default_outbound, "rules_count": len(rules)}
 
 
-def keenetic_get_watchdog():
-    """Читает watchdog.state (формат: 'primary|failover counter default_tag EFFECTIVE_AI=<tag> EFFECTIVE_YT=<tag>')
-    + последние строки watchdog.log."""
+def keenetic_get_watchdog(deep_hold_sec=None):
+    """Читает watchdog.state (формат: 'primary|failover counter default_tag EFFECTIVE_AI=<tag> EFFECTIVE_YT=<tag> …KEY=VAL')
+    + последние строки watchdog.log. deep_hold_sec — DEEP_RETURN_HOLD из config для расчёта
+    остатка карантина возврата (None = дефолт 1800)."""
     # Один SSH-вызов на оба файла: state + aiprobe. Отдельное чтение aiprobe вторым
     # соединением на тяжёлой странице стабильно не успевало (таймаут) → ai_probe=null
     # и бейдж «насквозь» молча пропадал. Маркер =AIPROBE= (только ASCII: ssh от SYSTEM перекодирует argv в cp1251, и не-ASCII разделитель приезжает битым) разделяет вывод.
@@ -2709,6 +2853,11 @@ def keenetic_get_watchdog():
     effective_yt = None
     effective_foreign = None
     last_bad_md5 = None
+    # watchdog v29: все KEY=VAL из parts[3:] — общим словарём (новые поля подхватываются
+    # автоматически; старые роутеры ≤ v28 просто не дадут ключей → None/«нет данных»).
+    # Сравнение — по токенам через split('=', 1), а не regex по сырой строке:
+    # EFFECTIVE_AI= и AI_EFF= — РАЗНЫЕ ключи, хвостовое совпадение недопустимо.
+    fields = {}
     if state_raw:
         parts = state_raw.strip().split()
         if len(parts) >= 1:
@@ -2719,16 +2868,54 @@ def keenetic_get_watchdog():
                 counter = 0
             if len(parts) >= 3:
                 current_default = parts[2]
-            # Парсим EFFECTIVE_AI=<tag> и EFFECTIVE_YT=<tag> из любой позиции
             for p in parts[3:]:
-                if p.startswith("EFFECTIVE_AI="):
-                    effective_ai = p.split("=", 1)[1]
-                elif p.startswith("EFFECTIVE_YT="):
-                    effective_yt = p.split("=", 1)[1]
-                elif p.startswith("EFFECTIVE_FOREIGN="):
-                    effective_foreign = p.split("=", 1)[1]
-                elif p.startswith("LAST_BAD_MD5="):
-                    last_bad_md5 = p.split("=", 1)[1] or None
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    if k:
+                        fields[k] = v
+            effective_ai = fields.get("EFFECTIVE_AI")
+            effective_yt = fields.get("EFFECTIVE_YT")
+            effective_foreign = fields.get("EFFECTIVE_FOREIGN")
+            last_bad_md5 = fields.get("LAST_BAD_MD5") or None
+
+    def _f_int(key):
+        v = (fields.get(key) or "").strip()
+        m = re.match(r"-?\d+", v)
+        return int(m.group(0)) if m else 0
+
+    # Сквозные пробы ролей (D{PRI,YT,FGN}_CTR/_TS/_DEAF/_LEFT/_TAG). Карантин возврата —
+    # DEEP_RETURN_HOLD из config (дефолт 1800 с). Если у роли нет ни одного поля — None:
+    # UI обязан пережить старый watchdog без падений.
+    # Карантин передаёт вызывающий (xkeen_page берёт его из targets) — без лишнего SSH на
+    # тяжёлой странице; None = дефолт watchdog 1800 с.
+    _now = _time_mod.time()
+    try:
+        _hold = int(deep_hold_sec) if deep_hold_sec is not None else 1800
+    except (TypeError, ValueError):
+        _hold = 1800
+    deep = {}
+    for role_key, pfx in (("pri", "DPRI_"), ("yt", "DYT_"), ("fgn", "DFGN_")):
+        if not any(k.startswith(pfx) for k in fields):
+            deep[role_key] = None
+            continue
+        ts = _f_int(pfx + "TS")
+        left = _f_int(pfx + "LEFT")
+        hold_left = None
+        if left > 0:
+            hold_left = max(0, int((_hold - (_now - left)) // 60))
+        deep[role_key] = {
+            "ctr": _f_int(pfx + "CTR"),
+            "ts": ts,
+            "deaf": (fields.get(pfx + "DEAF") or "0").strip() == "1",
+            "left": left,
+            "tag": (fields.get(pfx + "TAG") or "").strip() or None,
+            "age_min": max(0, int((_now - ts) // 60)) if ts > 0 else None,
+            "hold_left_min": hold_left,
+            # watchdog v31: итог последнего замера ok|fail|none (none — не измеряется: замера на
+            # этом узле ещё не было, канал служебный или проба выключена). Старый сторож — None.
+            "res": ((fields.get(pfx + "RES") or "").strip()
+                    if (fields.get(pfx + "RES") or "").strip() in ("ok", "fail", "none") else None),
+        }
     log_lines = keenetic_tail_log(cfg.KEENETIC_WATCHDOG_LOG, n=30)
     # Сквозная AI-проба watchdog (файл watchdog.aiprobe: ts|country|last_alert|empty|stage).
     # Зачем: handshake-проба панели («жив · N мс») меряет достижимость СЕРВЕРА, а не туннеля.
@@ -2758,6 +2945,12 @@ def keenetic_get_watchdog():
         "last_bad_md5": last_bad_md5,
         "log": log_lines,
         "ai_probe": ai_probe,
+        # watchdog v29 (при добавлении ключа — продублировать в quick-fail литерал xkeen_page):
+        "fields": fields,
+        "deep": deep,
+        "fgn_eff": (fields.get("FGN_EFF") or "").strip() or None,
+        "yt_eff": (fields.get("YT_EFF") or "").strip() or None,
+        "ai_eff": (fields.get("AI_EFF") or "").strip() or None,
     }
 
 
@@ -2822,6 +3015,18 @@ def keenetic_get_watchdog_targets(strict=False):
     # иначе UI показывал бы «выкл» там, где watchdog применяет «вкл» (рассинхрон настройки).
     _ai_ru_raw = (cfg_d.get("AI_CHAIN_ALLOW_RU", "") or "").strip()
     _yt_ru_raw = (cfg_d.get("YT_CHAIN_ALLOW_RU", "") or "").strip()
+    # watchdog v29/v30: цепочка резерва у «📱 Зарубежных сервисов». Дефолт ALLOW_RU = 0
+    # (российский узел для сервисов, заблокированных в РФ, бесполезен — watchdog его пропустит).
+    # FOREIGN_CHAIN_USE_COMMON=1 — вместо собственного списка действует общая FAILOVER_TAGS.
+    foreign_chain_list = [t.strip() for t in re.split(r"[,\s]+", cfg_d.get("FOREIGN_FAILOVER_TAGS", "")) if t.strip()]
+    _fg_ru_raw = (cfg_d.get("FOREIGN_CHAIN_ALLOW_RU", "") or "").strip()
+    _fg_common_raw = (cfg_d.get("FOREIGN_CHAIN_USE_COMMON", "") or "").strip()
+    # Сквозная проба всех ролей (watchdog v29). Числа санитизируем: первое целое в значении,
+    # иначе дефолт watchdog — пустая/битая строка в UI не должна превращаться в 0.
+    def _wd_int(key, default):
+        m = re.search(r"-?\d+", (cfg_d.get(key, "") or ""))
+        return int(m.group(0)) if m else default
+    _deep_en_raw = (cfg_d.get("DEEP_PROBE_ENABLE", "") or "").strip()
     ai_domains_str = cfg_d.get("AI_DOMAINS", "")
     ai_domains_list = [d.strip() for d in re.split(r"[\s,]+", ai_domains_str) if d.strip()]
     yt_domains_str = cfg_d.get("YT_DOMAINS", "")
@@ -2857,6 +3062,13 @@ def keenetic_get_watchdog_targets(strict=False):
         "foreign_ext_categories": cfg_d.get("FOREIGN_EXT_CATEGORIES", "").strip(),
         "foreign_geoip_categories": cfg_d.get("FOREIGN_GEOIP_CATEGORIES", "").strip(),
         "foreign_fail_block": cfg_d.get("FOREIGN_FAIL_BLOCK", "0") == "1",
+        "foreign_failover_tags": foreign_chain_list,
+        "foreign_chain_allow_ru": (_fg_ru_raw == "1") if _fg_ru_raw else False,
+        "foreign_chain_use_common": (_fg_common_raw == "1"),
+        "deep_probe_enable": (_deep_en_raw != "0") if _deep_en_raw else True,
+        "deep_probe_interval": _wd_int("DEEP_PROBE_INTERVAL", 180),
+        "deep_probe_threshold": _wd_int("DEEP_PROBE_THRESHOLD", 2),
+        "deep_return_hold": _wd_int("DEEP_RETURN_HOLD", 1800),
         "ipv6_tag":     cfg_d.get("IPV6_TAG"),
         "ipv6_domains": ipv6_domains_list,
         "direct_domains": direct_domains_list,
@@ -2881,10 +3093,12 @@ def _build_watchdog_config(d):
         "YT_TAG", "YT_DOMAINS", "YT_EXT_CATEGORIES", "YT_GEOIP_CATEGORIES", "YT_FAIL_BLOCK",
         "YT_FAILOVER_TAGS", "YT_CHAIN_ALLOW_RU",
         "FOREIGN_TAG", "FOREIGN_DOMAINS", "FOREIGN_EXT_CATEGORIES", "FOREIGN_GEOIP_CATEGORIES", "FOREIGN_FAIL_BLOCK",
+        "FOREIGN_FAILOVER_TAGS", "FOREIGN_CHAIN_ALLOW_RU", "FOREIGN_CHAIN_USE_COMMON",
         "IPV6_TAG", "IPV6_DOMAINS",
         "DIRECT_DOMAINS",
         "BLOCK_DOMAINS",
         "PRIMARY_PROBE_URL", "FAIL_THRESHOLD", "PASS_THRESHOLD",
+        "DEEP_PROBE_ENABLE", "DEEP_PROBE_INTERVAL", "DEEP_PROBE_THRESHOLD", "DEEP_RETURN_HOLD",
         "TG_BOT_TOKEN", "TG_CHAT_ID",
         "FORCE_MODE",
     ]
@@ -3035,7 +3249,7 @@ def keenetic_write_watchdog_config(updates):
         if "YT_FAILOVER_TAGS" not in cur: cur["YT_FAILOVER_TAGS"] = ""
         if not (cur.get("YT_CHAIN_ALLOW_RU") or "").strip(): cur["YT_CHAIN_ALLOW_RU"] = "1"
         if "YT_EXT_CATEGORIES" not in cur: cur["YT_EXT_CATEGORIES"] = ""
-        # v1.6.0 (2026-05-18): YT_GEOIP_CATEGORIES — для IP-only приложений (Telegram Desktop, Discord).
+        # v1.6.0 (2026-05-18): YT_GEOIP_CATEGORIES — для IP-only приложений (Telegram Desktop).
         # Когда юзер добавляет "telegram" — watchdog v10 сгенерит отдельное правило
         # {"ip": ["geoip:telegram"], "outboundTag": YT_TAG} в 05_routing.json.
         if "YT_GEOIP_CATEGORIES" not in cur: cur["YT_GEOIP_CATEGORIES"] = ""
@@ -3047,6 +3261,22 @@ def keenetic_write_watchdog_config(updates):
         if "FOREIGN_EXT_CATEGORIES" not in cur: cur["FOREIGN_EXT_CATEGORIES"] = ""
         if "FOREIGN_GEOIP_CATEGORIES" not in cur: cur["FOREIGN_GEOIP_CATEGORIES"] = ""
         if "FOREIGN_FAIL_BLOCK" not in cur: cur["FOREIGN_FAIL_BLOCK"] = "0"
+        # watchdog v29/v30: цепочка резерва «Зарубежных сервисов» + флаг «общая цепочка FAILOVER».
+        # Флаги пишем ЯВНО числом (как *_CHAIN_ALLOW_RU): пустое значение = дефолт watchdog,
+        # и UI-галочка разъехалась бы с реальностью.
+        if "FOREIGN_FAILOVER_TAGS" not in cur: cur["FOREIGN_FAILOVER_TAGS"] = ""
+        if not (cur.get("FOREIGN_CHAIN_ALLOW_RU") or "").strip(): cur["FOREIGN_CHAIN_ALLOW_RU"] = "0"
+        if not (cur.get("FOREIGN_CHAIN_USE_COMMON") or "").strip(): cur["FOREIGN_CHAIN_USE_COMMON"] = "0"
+        # watchdog v29: сквозная проба всех ролей. Числа — ТОЛЬКО числом: пустая строка в
+        # [ "$X" -ge … ] на ash даёт «bad number» и ломает тик watchdog.
+        # 🔴 Дефолты дописываем, ТОЛЬКО если на роутере актуальный сторож (current/upgraded).
+        # Старый v27/v28 читает тот же DEEP_PROBE_ENABLE, но его проба ходит через socks-local
+        # и меряет ЧУЖОЙ канал — включив её дефолтом, получили бы ложные переключения.
+        if _wd_sync.get("action") in ("current", "upgraded"):
+            if not (cur.get("DEEP_PROBE_ENABLE") or "").strip(): cur["DEEP_PROBE_ENABLE"] = "1"
+            if not (cur.get("DEEP_PROBE_INTERVAL") or "").strip(): cur["DEEP_PROBE_INTERVAL"] = "180"
+            if not (cur.get("DEEP_PROBE_THRESHOLD") or "").strip(): cur["DEEP_PROBE_THRESHOLD"] = "2"
+            if not (cur.get("DEEP_RETURN_HOLD") or "").strip(): cur["DEEP_RETURN_HOLD"] = "1800"
         # «🌐 Через IPv6» канал (IPV6_*): домены IPv6-only сайтов → выходной узел с IPv6-egress.
         # Узел обязан: (1) egress IPv6 (freedom не UseIPv4), (2) routeOnly:false на входе (вернуть домен из fake-IP).
         if "IPV6_TAG" not in cur: cur["IPV6_TAG"] = ""
@@ -3185,6 +3415,10 @@ def keenetic_remove_outbound(tag):
         return {"ok": False, "stderr": f"tag '{tag}' в цепочке резерва AI-канала. Сначала убери его из цепочки (карточка «🤖 AI» → «⛓️ Цепочка резерва»)."}
     if tag in (targets.get("yt_failover_tags") or []):
         return {"ok": False, "stderr": f"tag '{tag}' в цепочке резерва YouTube-канала. Сначала убери его из цепочки (карточка «📺 YouTube» → «⛓️ Цепочка резерва»)."}
+    # Собственную цепочку FOREIGN защищаем и при включённой «общей цепочке»: список в config
+    # остаётся, и при выключении галочки тег-зомби проснулся бы.
+    if tag in (targets.get("foreign_failover_tags") or []):
+        return {"ok": False, "stderr": f"tag '{tag}' в цепочке резерва канала «Зарубежные сервисы». Сначала убери его из цепочки (карточка «📱 Зарубежные сервисы» → «⛓️ Цепочка резерва»)."}
     raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
     if not raw:
         return {"ok": False, "stderr": "не смог прочитать 04_outbounds.json"}
@@ -3235,6 +3469,7 @@ def keenetic_remove_outbounds_bulk(tags):
     failover_set = set(targets.get("failover_tags") or [])
     ai_chain_set = set(targets.get("ai_failover_tags") or [])
     yt_chain_set = set(targets.get("yt_failover_tags") or [])
+    foreign_chain_set = set(targets.get("foreign_failover_tags") or [])
     skipped = {}
     to_remove = []
     for t in tags:
@@ -3256,6 +3491,8 @@ def keenetic_remove_outbounds_bulk(tags):
             skipped[t] = "в цепочке резерва AI"
         elif t in yt_chain_set:
             skipped[t] = "в цепочке резерва YouTube"
+        elif t in foreign_chain_set:
+            skipped[t] = "в цепочке резерва «Зарубежных сервисов»"
         else:
             to_remove.append(t)
     if not to_remove:
@@ -3340,10 +3577,12 @@ def _subscription_removal_plan(key, outbounds, targets, subs):
     # укоротится (watchdog посчитает несуществующий узел мёртвым и пойдёт дальше).
     ai_chain = set(t.get("ai_failover_tags") or [])
     yt_chain = set(t.get("yt_failover_tags") or [])
+    foreign_chain = set(t.get("foreign_failover_tags") or [])
     critical = {}
     failover_tail = []
     ai_chain_tail = []
     yt_chain_tail = []
+    foreign_chain_tail = []
     for tag in member_tags:
         roles = [label for (rt, label) in critical_roles if rt and rt == tag]
         if roles:
@@ -3356,6 +3595,8 @@ def _subscription_removal_plan(key, outbounds, targets, subs):
             ai_chain_tail.append(tag)
         if tag in yt_chain:
             yt_chain_tail.append(tag)
+        if tag in foreign_chain:
+            foreign_chain_tail.append(tag)
     # Записи subscription_meta на удаление: сам ключ + pbk-тени с тем же sub_url.
     meta_keys = []
     for k, v in (subs or {}).items():
@@ -3365,7 +3606,8 @@ def _subscription_removal_plan(key, outbounds, targets, subs):
             meta_keys.append(k)
     return {"member_tags": member_tags, "critical": critical,
             "failover_tail": failover_tail, "ai_chain_tail": ai_chain_tail,
-            "yt_chain_tail": yt_chain_tail, "meta_keys": meta_keys}
+            "yt_chain_tail": yt_chain_tail, "foreign_chain_tail": foreign_chain_tail,
+            "meta_keys": meta_keys}
 
 
 def keenetic_remove_subscription(key, dry_run=False):
@@ -3397,6 +3639,7 @@ def keenetic_remove_subscription(key, dry_run=False):
     removed_from_failover = []
     removed_from_ai_chain = []
     removed_from_yt_chain = []
+    removed_from_foreign_chain = []
     _chain_updates = {}
     if plan["failover_tail"]:
         drop = set(plan["failover_tail"])
@@ -3407,6 +3650,9 @@ def keenetic_remove_subscription(key, dry_run=False):
     if plan.get("yt_chain_tail"):
         drop = set(plan["yt_chain_tail"])
         _chain_updates["YT_FAILOVER_TAGS"] = " ".join(t for t in (targets.get("yt_failover_tags") or []) if t not in drop)
+    if plan.get("foreign_chain_tail"):
+        drop = set(plan["foreign_chain_tail"])
+        _chain_updates["FOREIGN_FAILOVER_TAGS"] = " ".join(t for t in (targets.get("foreign_failover_tags") or []) if t not in drop)
     if _chain_updates:
         wd = keenetic_write_watchdog_config(_chain_updates)
         if not (isinstance(wd, dict) and wd.get("ok")):
@@ -3415,6 +3661,7 @@ def keenetic_remove_subscription(key, dry_run=False):
         removed_from_failover = list(plan["failover_tail"])
         removed_from_ai_chain = list(plan.get("ai_chain_tail") or [])
         removed_from_yt_chain = list(plan.get("yt_chain_tail") or [])
+        removed_from_foreign_chain = list(plan.get("foreign_chain_tail") or [])
     # 2. Снести серверы (bulk: бэкап 04_outbounds + рестарт + откат + чистка outbound_meta).
     removed_outbounds = []
     if member_tags:
@@ -3453,10 +3700,13 @@ def keenetic_remove_subscription(key, dry_run=False):
         msg += f" Из цепочки резерва AI убрано: {len(removed_from_ai_chain)}."
     if removed_from_yt_chain:
         msg += f" Из цепочки резерва YouTube убрано: {len(removed_from_yt_chain)}."
+    if removed_from_foreign_chain:
+        msg += f" Из цепочки резерва «Зарубежных сервисов» убрано: {len(removed_from_foreign_chain)}."
     return {"ok": True, "removed": removed_outbounds, "removed_meta": removed_meta,
             "removed_from_failover": removed_from_failover,
             "removed_from_ai_chain": removed_from_ai_chain,
-            "removed_from_yt_chain": removed_from_yt_chain, "stdout": msg}
+            "removed_from_yt_chain": removed_from_yt_chain,
+            "removed_from_foreign_chain": removed_from_foreign_chain, "stdout": msg}
 
 
 def keenetic_find_orphan_sub_meta(outbounds=None, subs=None):
@@ -3946,6 +4196,7 @@ def xkeen_page():
     # Все поля должны быть заполнены дефолтами т.к. в шаблоне есть `|tojson` filter
     # который падает на jinja Undefined.
     if not is_keenetic_reachable():
+        _router_reachable = False   # для баннера GeoIP: «роутер недоступен», а не «не прочитался»
         outbounds = []
         routing = {"default_outbound": None}
         watchdog = {
@@ -3958,6 +4209,12 @@ def xkeen_page():
             "last_bad_md5": None,
             "log": [],
             "ai_probe": None,   # без него {{ watchdog.ai_probe|tojson }} падает на Undefined
+            # watchdog v29: все KEY=VAL из state + сквозные пробы ролей (None = нет данных)
+            "fields": {},
+            "deep": None,
+            "fgn_eff": None,
+            "yt_eff": None,
+            "ai_eff": None,
         }
         # ВАЖНО: набор ключей ДОЛЖЕН 1:1 совпадать с keenetic_get_watchdog_targets() —
         # шаблон итерирует targets.foreign_domains / targets.ipv6_domains ({% for %}),
@@ -3987,6 +4244,13 @@ def xkeen_page():
             "foreign_ext_categories": "",
             "foreign_geoip_categories": "",
             "foreign_fail_block": None,
+            "foreign_failover_tags": [],
+            "foreign_chain_allow_ru": False,
+            "foreign_chain_use_common": False,
+            "deep_probe_enable": True,
+            "deep_probe_interval": 180,
+            "deep_probe_threshold": 2,
+            "deep_return_hold": 1800,
             "ipv6_tag": None,
             "ipv6_domains": [],
             "direct_domains": [],
@@ -3994,10 +4258,13 @@ def xkeen_page():
             "force_mode": "auto",
         }
     else:
+        _router_reachable = True
         outbounds = keenetic_get_outbounds() or []
         routing = keenetic_get_routing_active() or {}
-        watchdog = keenetic_get_watchdog() or {}
+        # targets — ПЕРЕД watchdog: карантин возврата (DEEP_RETURN_HOLD) нужен для расчёта
+        # остатка карантина в watchdog.deep без второго чтения config.
         targets = keenetic_get_watchdog_targets() or {}
+        watchdog = keenetic_get_watchdog(deep_hold_sec=targets.get("deep_return_hold")) or {}
     active_outbound = routing.get("default_outbound")
     primary_tag = targets.get("primary_tag")
     failover_tag = targets.get("failover_tag")
@@ -4007,6 +4274,7 @@ def xkeen_page():
     failover_tags = targets.get("failover_tags") or []
     ai_chain_tags = targets.get("ai_failover_tags") or []
     yt_chain_tags = targets.get("yt_failover_tags") or []
+    foreign_chain_tags = targets.get("foreign_failover_tags") or []
     # Статусы outbound'ов — НЕ probим автоматически (это шум на серверах
     # провайдеров + лаг рендера ~3 сек). Берём только из кэша. Если кэш пуст
     # (свежий рестарт дашборда или 60s TTL истёк) — UI покажет «⚪ нажми кнопку».
@@ -4049,6 +4317,10 @@ def xkeen_page():
         o["in_yt_chain"] = (o["tag"] in yt_chain_tags)
         o["ai_chain_position"] = (ai_chain_tags.index(o["tag"]) + 1) if o["tag"] in ai_chain_tags else 0
         o["yt_chain_position"] = (yt_chain_tags.index(o["tag"]) + 1) if o["tag"] in yt_chain_tags else 0
+        # watchdog v29: цепочка «Зарубежных сервисов» (собственный список; при use_common
+        # действует FAILOVER_TAGS — он уже учтён в in_failover_chain).
+        o["in_foreign_chain"] = (o["tag"] in foreign_chain_tags)
+        o["foreign_chain_position"] = (foreign_chain_tags.index(o["tag"]) + 1) if o["tag"] in foreign_chain_tags else 0
         st = statuses.get(o["tag"], {})
         o["status_ok"]   = st.get("ok")
         o["status_ms"]   = st.get("ms")
@@ -4078,9 +4350,11 @@ def xkeen_page():
             and not o["is_failover"]
             and not o["is_ai"]
             and not o["is_yt"]
+            and not o["is_foreign"]
             and not o["in_failover_chain"]
             and not o["in_ai_chain"]
             and not o["in_yt_chain"]
+            and not o["in_foreign_chain"]
         )
     # Только vless-outbounds можно выбрать как primary/failover
     vless_tags = [o["tag"] for o in outbounds if o["protocol"] == "vless"]
@@ -4251,6 +4525,7 @@ def xkeen_page():
             # pbk="" → строка «✏️ Подписка» не показывается (это не подписка).
             any_active = any(it.get("is_primary") or it.get("is_failover") or it.get("is_ai")
                              or it.get("is_yt") or it.get("is_foreign") or it.get("in_failover_chain")
+                             or it.get("in_ai_chain") or it.get("in_yt_chain") or it.get("in_foreign_chain")
                              for it in items)
             inactive_tags = [it["tag"] for it in items if it.get("is_inactive")]
             outbound_groups.append({
@@ -4291,7 +4566,10 @@ def xkeen_page():
                 pbk_display = ""
                 sni_display = ""
 
-            any_active = any(it.get("is_primary") or it.get("is_failover") or it.get("is_ai") or it.get("in_failover_chain") for it in items)
+            any_active = any(it.get("is_primary") or it.get("is_failover") or it.get("is_ai") or it.get("is_yt")
+                             or it.get("is_foreign") or it.get("in_failover_chain")
+                             or it.get("in_ai_chain") or it.get("in_yt_chain") or it.get("in_foreign_chain")
+                             for it in items)
             sub_m = sub_meta_all.get(canonical_key, {}) if canonical_key else {}
             # Ручное имя группы из subscription_meta.json имеет приоритет над автоопределением.
             # Пример: автоимя по hostname `sub.provider-d.com` → "Provider D", но провайдер себя
@@ -4493,6 +4771,9 @@ def xkeen_page():
         structure = _structure_drift_status() if outbounds else None
     except Exception:
         structure = None
+    # Состояние geoip.dat (есть ли категория telegram) — для секции «🌍 GeoIP-категории».
+    # Quick-fail / пустые outbounds → None: шаблон пишет «состояние неизвестно», ничего не утверждая.
+    geoip_status = keenetic_geoip_dat_status() if outbounds else None
     return render_template_string(
         XKEEN_TEMPLATE,
         outbounds=outbounds,
@@ -4516,6 +4797,8 @@ def xkeen_page():
         domain_notes_json=json.dumps(domain_notes, ensure_ascii=False),  # v1.7.0
         cfg=cfg,  # доступ к EXTERNAL_DOMAIN/HOME_DOMAIN/LAN_HOST из config_local в шаблонах
         structure=structure,  # дрейф версий watchdog/template — для баннера
+        geoip_status=geoip_status,  # состояние geoip.dat (None = неизвестно) — баннер GeoIP
+        geoip_router_reachable=_router_reachable,  # None-статус: «роутер недоступен» vs «не прочитался»
         chain_tag_info=chain_tag_info,  # v1.0.99 — справка по каналам для редактора цепочек
     )
 
@@ -5723,6 +6006,7 @@ def api_xkeen_subscription_sync():
     removed_from_failover = []
     removed_from_ai_chain = []
     removed_from_yt_chain = []
+    removed_from_foreign_chain = []
     failover_cleanup_error = ""
     if remove_orphans and removed_tags:
         removed_set = set(removed_tags)
@@ -5742,6 +6026,13 @@ def api_xkeen_subscription_sync():
         if yt_chain_after != yt_chain_current:
             removed_from_yt_chain = [t for t in yt_chain_current if t in removed_set]
             _chain_updates["YT_FAILOVER_TAGS"] = " ".join(yt_chain_after)
+        # Цепочка «Зарубежных сервисов» (watchdog v29) — чистим и при use_common=1: собственный
+        # список в config остаётся и проснулся бы при выключении галочки.
+        foreign_chain_current = list(targets.get("foreign_failover_tags") or [])
+        foreign_chain_after = [t for t in foreign_chain_current if t not in removed_set]
+        if foreign_chain_after != foreign_chain_current:
+            removed_from_foreign_chain = [t for t in foreign_chain_current if t in removed_set]
+            _chain_updates["FOREIGN_FAILOVER_TAGS"] = " ".join(foreign_chain_after)
         if _chain_updates:
             # write_watchdog_config возвращает {"ok": bool, ...}. Если SSH-запись или запуск
             # watchdog.sh провалится — outbound уже удалён из 04_outbounds.json, но tag-зомби
@@ -6094,7 +6385,7 @@ def api_xkeen_migration_backup():
         local_path,
     ]
     try:
-        scp_r = subprocess.run(scp_args, capture_output=True, timeout=600)  # большой файл — 10 мин max
+        scp_r = subprocess.run(scp_args, capture_output=True, timeout=600, stdin=subprocess.DEVNULL)  # большой файл — 10 мин max
     except subprocess.TimeoutExpired:
         keenetic_ssh(f"rm -f {remote_tar}", timeout=10)
         return jsonify({"ok": False, "stage": "scp",
@@ -6430,7 +6721,7 @@ def keenetic_validate_route_categories(names, kind="geoip", timeout=30):
     kind='geoip'   → правило ip:["geoip:NAME"] в geoip.dat;                 sentinel 'private'
     kind='geosite' → правило domain:["ext:geosite_v2fly.dat:NAME"] в geosite_v2fly.dat; sentinel 'google'
 
-    Зачем: сохранение категории, которой нет в .dat (например geoip:discord в базовом geoip.dat,
+    Зачем: сохранение категории, которой нет в .dat (например geoip:discord — его нет ни в одной базе,
     или опечатка в geosite-категории), генерит правило, на котором xray НЕ стартует → весь VPN
     ложится (инцидент 2026-05-23). Проверяем ДО записи в watchdog.config.
 
@@ -6489,10 +6780,11 @@ def _cat_missing_msg(missing, kind="geoip"):
         )
     return (
         "❌ В установленном geoip.dat нет geoip-категорий: " + ", ".join(missing) + ".\n"
-        "Базовый XKeen geoip.dat содержит не все сервисы (например discord). Варианты:\n"
-        "  • нажми «📥 Установить расширенный geoip.dat (Loyalsoldier)» — там эти категории есть, потом сохрани снова;\n"
-        "  • либо убери эти категории. Instagram/FB/Telegram уже идут в загран-выход по доменам и v2fly-категориям; "
-        "geoip нужен только для IP-only клиентов (Telegram Desktop, Discord).\n"
+        "Категории сервисов в расширенном geoip.dat: telegram, cloudflare, google, facebook, twitter, "
+        "netflix, fastly, cloudfront. Категории discord нет ни в одной базе — Discord направляется доменными правилами. Варианты:\n"
+        "  • если панель показывает, что в geoip.dat нет категории telegram, — нажать «📥 Установить / обновить расширенный geoip.dat», потом сохранить снова;\n"
+        "  • либо убрать эти категории. Instagram/FB/Telegram уже идут в загран-выход по доменам и v2fly-категориям; "
+        "geoip нужен только для IP-only клиентов (Telegram Desktop).\n"
         "Сохранение отменено — роутер не тронут, xray работает."
     )
 
@@ -6500,11 +6792,11 @@ def _cat_missing_msg(missing, kind="geoip"):
 @app.route("/api/xkeen/set-yt-geoip-categories", methods=["POST"])
 @requires_auth
 def api_xkeen_set_yt_geoip_categories():
-    """Обновить список geoip-категорий для YT-канала (telegram, discord, ...).
+    """Обновить список geoip-категорий для YT-канала (telegram, ...).
     Зачем: IP-only приложения (Telegram Desktop) коннектятся напрямую к IP датацентров
     минуя DNS — доменные правила их не ловят. geoip:NAME матчит по IP-диапазонам из geoip.dat.
     Watchdog v10 сгенерит ОТДЕЛЬНОЕ правило {"ip": ["geoip:NAME"], "outboundTag": YT_TAG}.
-    Body: categories=<строка через пробел/запятую>, например "telegram discord"."""
+    Body: categories=<строка через пробел/запятую>, например "telegram"."""
     raw = request.form.get("categories", "").strip()
     categories = []
     for c in re.split(r"[\s,]+", raw):
@@ -6557,7 +6849,8 @@ def api_xkeen_set_foreign_ext_categories():
 @app.route("/api/xkeen/set-foreign-geoip-categories", methods=["POST"])
 @requires_auth
 def api_xkeen_set_foreign_geoip_categories():
-    """geoip-категории для канала «Зарубежные сервисы» (telegram, discord, facebook, twitter).
+    """geoip-категории для канала «Зарубежные сервисы» (telegram, facebook, twitter, ...;
+    discord в geoip.dat нет — только доменные правила).
     Для IP-only приложений (Telegram Desktop коннектится к IP датацентров минуя DNS).
     Watchdog сгенерит ОТДЕЛЬНОЕ правило {"ip": ["geoip:NAME"], "outboundTag": FOREIGN_TAG}.
     Body: categories=<строка через пробел/запятую>, например "telegram"."""
@@ -6677,17 +6970,28 @@ def wd_is_ru_tag(tag):
 @app.route("/api/xkeen/set-channel-chain", methods=["POST"])
 @requires_auth
 def api_xkeen_set_channel_chain():
-    """Цепочка резерва канала AI или YouTube + флаг «пускать RU-узлы».
-    Body: kind=ai|yt, tags=<теги через запятую, порядок = приоритет>, allow_ru=1|0 (необязателен).
+    """Цепочка резерва канала AI, YouTube или «Зарубежные сервисы» + флаг «пускать RU-узлы».
+    Body: kind=ai|yt|foreign, tags=<теги через запятую, порядок = приоритет>, allow_ru=1|0 (необязателен),
+    use_common=1|0 (только foreign, необязателен: 1 = действует общая цепочка FAILOVER_TAGS).
     Пустой tags разрешён — это «цепочки нет», поведение как до watchdog v27
-    (основной упал → сразу kill-switch/default)."""
+    (основной упал → сразу kill-switch/default). Поля allow_ru/use_common, которые не пришли,
+    НЕ затираются (так removeFromChannelChain не сбивает галочки)."""
     kind = (request.form.get("kind") or "").strip().lower()
-    if kind not in ("ai", "yt"):
-        return jsonify({"ok": False, "stderr": "kind должен быть ai или yt"})
-    label     = "AI" if kind == "ai" else "YouTube"
-    key_chain = "AI_FAILOVER_TAGS" if kind == "ai" else "YT_FAILOVER_TAGS"
-    key_ru    = "AI_CHAIN_ALLOW_RU" if kind == "ai" else "YT_CHAIN_ALLOW_RU"
-    key_main  = "ai_tag" if kind == "ai" else "yt_tag"
+    _KINDS = {
+        "ai":      {"label": "AI", "key_chain": "AI_FAILOVER_TAGS", "key_ru": "AI_CHAIN_ALLOW_RU",
+                    "key_main": "ai_tag", "t_allow_ru": "ai_chain_allow_ru"},
+        "yt":      {"label": "YouTube", "key_chain": "YT_FAILOVER_TAGS", "key_ru": "YT_CHAIN_ALLOW_RU",
+                    "key_main": "yt_tag", "t_allow_ru": "yt_chain_allow_ru"},
+        "foreign": {"label": "Зарубежные сервисы", "key_chain": "FOREIGN_FAILOVER_TAGS", "key_ru": "FOREIGN_CHAIN_ALLOW_RU",
+                    "key_main": "foreign_tag", "t_allow_ru": "foreign_chain_allow_ru"},
+    }
+    if kind not in _KINDS:
+        return jsonify({"ok": False, "stderr": "kind должен быть ai, yt или foreign"})
+    _k = _KINDS[kind]
+    label     = _k["label"]
+    key_chain = _k["key_chain"]
+    key_ru    = _k["key_ru"]
+    key_main  = _k["key_main"]
 
     raw = (request.form.get("tags") or "").strip()
     parsed = [t.strip() for t in re.split(r"[,\s]+", raw) if t.strip()]
@@ -6737,19 +7041,48 @@ def api_xkeen_set_channel_chain():
 
     updates = {key_chain: " ".join(tags)}
     allow_ru_raw = request.form.get("allow_ru")
-    allow_ru = (targets.get("ai_chain_allow_ru") if kind == "ai" else targets.get("yt_chain_allow_ru"))
+    allow_ru = bool(targets.get(_k["t_allow_ru"]))
     if allow_ru_raw is not None:
         allow_ru = (allow_ru_raw == "1")
         updates[key_ru] = "1" if allow_ru else "0"
+    # «Общая цепочка» — только у FOREIGN (watchdog v30: FOREIGN_CHAIN_USE_COMMON=1 подменяет
+    # собственный список на FAILOVER_TAGS; RU-фильтр по FOREIGN_CHAIN_ALLOW_RU действует и там).
+    use_common = bool(targets.get("foreign_chain_use_common")) if kind == "foreign" else False
+    if kind == "foreign":
+        use_common_raw = request.form.get("use_common")
+        if use_common_raw is not None:
+            use_common = (use_common_raw == "1")
+            updates["FOREIGN_CHAIN_USE_COMMON"] = "1" if use_common else "0"
 
     # Предупреждения (не блокируют): что именно watchdog сделает с этой цепочкой.
-    ru_in_chain = [t for t in tags if wd_is_ru_tag(t)]
+    # При «общей цепочке» реально действует FAILOVER_TAGS (без основного канала роли — watchdog
+    # его в переборе пропускает), поэтому RU-узлы считаем по ней, а не по собственному списку.
+    if use_common:
+        effective_chain = [t for t in (targets.get("failover_tags") or []) if t and t != main_tag]
+    else:
+        effective_chain = tags
+    ru_in_chain = [t for t in effective_chain if wd_is_ru_tag(t)]
     if ru_in_chain and not allow_ru:
-        notes.append("watchdog ПРОПУСТИТ как российские: " + ", ".join(ru_in_chain) +
-                     " (галочка «пускать RU-узлы» выключена)")
+        if kind == "foreign" and use_common:
+            notes.append("watchdog ПРОПУСТИТ как российские (из общей цепочки FAILOVER): " + ", ".join(ru_in_chain) +
+                         " — для сервисов, заблокированных в РФ, российский узел бесполезен")
+        elif kind == "foreign":
+            notes.append("watchdog ПРОПУСТИТ как российские: " + ", ".join(ru_in_chain) +
+                         " — для сервисов, заблокированных в РФ, российский узел бесполезен")
+        else:
+            notes.append("watchdog ПРОПУСТИТ как российские: " + ", ".join(ru_in_chain) +
+                         " (галочка «пускать RU-узлы» выключена)")
     if ru_in_chain and allow_ru and kind == "ai":
         notes.append("⚠️ в цепочке AI есть российские узлы (" + ", ".join(ru_in_chain) +
                      ") — Anthropic/OpenAI могут заблокировать аккаунт за RU-IP")
+    if ru_in_chain and allow_ru and kind == "foreign":
+        notes.append("⚠️ в " + ("общей цепочке" if use_common else "цепочке") + " есть российские узлы (" +
+                     ", ".join(ru_in_chain) + ") — через них сервисы, заблокированные в РФ, не откроются")
+    if use_common:
+        common_list = [t for t in (targets.get("failover_tags") or [])]
+        common_txt = " → ".join(common_list) if common_list else "пусто"
+        notes.append("действует общая цепочка резерва (FAILOVER): " + common_txt +
+                     "; собственный список сохранён, но не действует, пока включена галочка")
 
     if dropped_dup:
         notes.append("повторов убрано: " + str(dropped_dup))
@@ -6757,10 +7090,13 @@ def api_xkeen_set_channel_chain():
     result = keenetic_write_watchdog_config(updates)
     if isinstance(result, dict) and result.get("ok"):
         chain_txt = " → ".join(tags) if tags else "пусто (цепочки нет)"
-        result["stdout"] = ("Цепочка резерва " + label + ": " + chain_txt +
+        head = ("Цепочка резерва " + label + " (собственный список): " if use_common
+                else "Цепочка резерва " + label + ": ")
+        result["stdout"] = (head + chain_txt +
                             (". " + "; ".join(notes) if notes else "")) + " " + (result.get("stdout") or "")
         result["chain"] = tags
         result["notes"] = notes
+        result["use_common"] = use_common
     return jsonify(result)
 
 
@@ -7734,7 +8070,7 @@ def api_keenetic_test_connection():
         'echo "==CONFIGS=="; ls -1 ' + (data.get("xray_configs") or cfg.KEENETIC_XRAY_CONFIGS) + ' 2>&1 | head -10'
     ]
     try:
-        result = subprocess.run(args, capture_output=True, timeout=12)
+        result = subprocess.run(args, capture_output=True, timeout=12, stdin=subprocess.DEVNULL)
         stdout = result.stdout.decode("utf-8", errors="replace")
         stderr = result.stderr.decode("utf-8", errors="replace")
         if result.returncode == 0:
@@ -7824,6 +8160,12 @@ FOREIGN_DOMAINS=""
 FOREIGN_EXT_CATEGORIES=""
 FOREIGN_GEOIP_CATEGORIES=""
 FOREIGN_FAIL_BLOCK="0"
+# цепочка резерва «Зарубежных сервисов»: теги через пробел, порядок = приоритет перебора
+FOREIGN_FAILOVER_TAGS=""
+# российский узел для сервисов, заблокированных в РФ, бесполезен — по умолчанию пропускается
+FOREIGN_CHAIN_ALLOW_RU="0"
+# 1 = вместо собственной цепочки действует общая цепочка резерва FAILOVER_TAGS
+FOREIGN_CHAIN_USE_COMMON="0"
 # «Через IPv6» — домены IPv6-only сайтов → узел с IPv6-egress
 IPV6_TAG=""
 IPV6_DOMAINS=""
@@ -7836,6 +8178,14 @@ PRIMARY_PROBE_URL="https://www.cloudflare.com/cdn-cgi/trace"
 FAIL_THRESHOLD="2"
 # сколько раз primary должен ожить подряд → switch back to primary
 PASS_THRESHOLD="3"
+# сквозная проба каналов: реальный запрос через узел роли (порт отвечает ≠ трафик идёт)
+DEEP_PROBE_ENABLE="1"
+# интервал между сквозными пробами, секунд
+DEEP_PROBE_INTERVAL="180"
+# сколько пустых проб подряд → роль уходит на резерв
+DEEP_PROBE_THRESHOLD="2"
+# карантин возврата на узел после ухода по глухоте, секунд
+DEEP_RETURN_HOLD="1800"
 TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 FORCE_MODE="auto"
@@ -8282,6 +8632,95 @@ def api_keenetic_tg_settings():
     except Exception as ex:
         return jsonify({"ok": False, "error": str(ex)}), 500
     return jsonify({"ok": bool(r.get("ok")), "stderr": r.get("stderr", "")})
+
+
+# ---- watchdog v29: настройки сквозной пробы каналов (DEEP_PROBE_*) ----
+# Соседний с tg-settings endpoint над тем же watchdog.config. Диапазоны валидируются ЗДЕСЬ:
+# в config уходят только целые числа — пустая/нечисловая строка в ash-сравнении даёт
+# «bad number» и ломает тик watchdog. Каждая запись = внеочередной прогон watchdog (~30 с).
+DEEP_PROBE_LIMITS = {
+    "deep_probe_interval":  (60, 900),    # секунд
+    "deep_probe_threshold": (1, 5),       # пустых проб подряд
+    "deep_return_hold_min": (5, 1440),    # минут (в config — секунды DEEP_RETURN_HOLD)
+}
+
+
+def _deep_probe_settings_from_config(cur):
+    """Текущие настройки сквозной пробы из dict конфига (пусто/битое → дефолт watchdog)."""
+    def _i(key, default):
+        m = re.search(r"-?\d+", (cur.get(key, "") or ""))
+        return int(m.group(0)) if m else default
+    en_raw = (cur.get("DEEP_PROBE_ENABLE", "") or "").strip()
+    hold_sec = _i("DEEP_RETURN_HOLD", 1800)
+    return {
+        "deep_probe_enable": (en_raw != "0") if en_raw else True,
+        "deep_probe_interval": _i("DEEP_PROBE_INTERVAL", 180),
+        "deep_probe_threshold": _i("DEEP_PROBE_THRESHOLD", 2),
+        "deep_return_hold_min": max(1, int(round(hold_sec / 60))),
+    }
+
+
+def _validate_deep_probe_settings(data):
+    """Проверка JSON {deep_probe_enable, deep_probe_interval, deep_probe_threshold,
+    deep_return_hold_min} → (updates для watchdog.config, error|None). Чистая функция — для
+    офлайн-тестов без роутера.
+    Поле, которого нет в теле, НЕ трогается: его ключ в config остаётся как был (иначе
+    отсутствующий deep_probe_enable молча выключал бы пробу). Не объект / ни одного поля → ошибка."""
+    if not isinstance(data, dict):
+        return None, "Ожидается JSON-объект с настройками сквозной пробы."
+    updates = {}
+    if "deep_probe_enable" in data:
+        en = data.get("deep_probe_enable")
+        if isinstance(en, str):
+            en = en.strip().lower() in ("1", "true", "on", "yes")
+        updates["DEEP_PROBE_ENABLE"] = "1" if bool(en) else "0"
+    names = {
+        "deep_probe_interval":  ("Интервал, с", "DEEP_PROBE_INTERVAL", 1),
+        "deep_probe_threshold": ("Порог, проб подряд", "DEEP_PROBE_THRESHOLD", 1),
+        "deep_return_hold_min": ("Карантин возврата, мин", "DEEP_RETURN_HOLD", 60),
+    }
+    for field, (title, cfg_key, mult) in names.items():
+        if field not in data:
+            continue
+        raw = data.get(field)
+        if isinstance(raw, bool):
+            return None, f"«{title}»: ожидается целое число."
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return None, f"«{title}»: ожидается целое число."
+        lo, hi = DEEP_PROBE_LIMITS[field]
+        if val < lo or val > hi:
+            return None, f"«{title}»: допустимо от {lo} до {hi}."
+        updates[cfg_key] = str(val * mult)
+    if not updates:
+        return None, "Нет ни одного поля для сохранения."
+    return updates, None
+
+
+@app.route("/api/keenetic/watchdog-settings", methods=["GET", "POST"])
+@requires_auth
+def api_keenetic_watchdog_settings():
+    """GET — текущие настройки сквозной пробы из watchdog.config.
+    POST — записать. Body JSON: {deep_probe_enable: bool, deep_probe_interval: int (60…900),
+    deep_probe_threshold: int (1…5), deep_return_hold_min: int (5…1440)}."""
+    if request.method == "GET":
+        cur = keenetic_read_watchdog_config()
+        if cur is None:
+            return jsonify({"ok": False, "error": "watchdog.config не прочитался с роутера (SSH-сбой/таймаут)."}), 503
+        return jsonify({"ok": True, **_deep_probe_settings_from_config(cur), "limits": DEEP_PROBE_LIMITS})
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Ожидается JSON-объект с настройками сквозной пробы."}), 400
+    updates, err = _validate_deep_probe_settings(data)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    try:
+        r = keenetic_write_watchdog_config(updates)
+    except Exception as ex:
+        return jsonify({"ok": False, "error": str(ex)}), 500
+    return jsonify({"ok": bool(r.get("ok")), "stderr": r.get("stderr", ""), "stdout": r.get("stdout", "")})
 
 
 @app.route("/api/keenetic/tg-test", methods=["POST"])
@@ -8965,20 +9404,26 @@ def api_xkeen_diagnose():
 
     # ---- 9. v1.6.1: geoip.dat содержит используемые GeoIP-категории ----
     # Симптом: xray test говорит "code not found in geoip.dat: TELEGRAM" → xkeen уходит в Mixed mode.
-    # Причина: стандартный v2fly geoip.dat содержит только страны (cn, ru, us...), сервисов нет.
-    # Решение: расширенный geoip.dat от Loyalsoldier (содержит и страны, и сервисы).
-    r = keenetic_ssh("grep '^YT_GEOIP_CATEGORIES=' /opt/etc/xray/watchdog.config 2>/dev/null", timeout=5)
-    geoip_line = (r.get("stdout") or "").strip()
-    geoip_cats = ""
-    if "=" in geoip_line:
-        geoip_cats = geoip_line.split("=", 1)[1].strip().strip('"')
-    clean_geoip = re.sub(r'[\s,]+', '', geoip_cats)
+    # Причина: в установленном geoip.dat нет категории сервиса (база «только страны»).
+    # Решение: расширенный geoip.dat (geoip_v2fly.dat от XKeen или Loyalsoldier) — категории
+    # telegram, cloudflare, google, facebook, twitter, netflix, fastly, cloudfront.
+    # Категории задаёт UI «Зарубежных сервисов» (FOREIGN_GEOIP_CATEGORIES); YT_GEOIP_CATEGORIES —
+    # совместимость со старыми конфигами (UI его не задаёт, watchdog очищает). Читаем оба.
+    r = keenetic_ssh("grep -E '^(FOREIGN|YT)_GEOIP_CATEGORIES=' /opt/etc/xray/watchdog.config 2>/dev/null", timeout=5)
+    _geoip_list = []
+    for _gl in (r.get("stdout") or "").splitlines():
+        if "=" not in _gl:
+            continue
+        for _c in re.split(r'[\s,]+', _gl.split("=", 1)[1].strip().strip('"').strip("'")):
+            if _c and _c not in _geoip_list:
+                _geoip_list.append(_c)
+    geoip_cats = " ".join(_geoip_list)
 
-    if not clean_geoip:
+    if not _geoip_list:
         _add(
             "geoip_categories", "geoip.dat содержит используемые категории", True,
             "info",
-            "GeoIP-категории не настроены (YT_GEOIP_CATEGORIES пуст) — проверка не нужна.",
+            "GeoIP-категории не настроены (FOREIGN_GEOIP_CATEGORIES и YT_GEOIP_CATEGORIES пусты) — проверка не нужна.",
             fix_id=None, fix_label=None, fix_explain=None,
         )
     else:
@@ -8993,10 +9438,12 @@ def api_xkeen_diagnose():
             fix_id="install_extended_geoip" if has_missing else None,
             fix_label="📥 Установить расширенный geoip.dat" if has_missing else None,
             fix_explain=(
-                "В geoip.dat нет нужной категории (например telegram). Стандартный v2fly geoip.dat "
-                "содержит только страны (cn, ru, us). Сервисы (telegram, discord) есть в расширенном "
-                "geoip.dat от Loyalsoldier/v2ray-rules-dat (~18MB). Auto-fix скачает и установит его, "
-                "потом перезапустит xkeen."
+                "В установленном geoip.dat нет нужной категории (например telegram) — стоит база "
+                "«только страны». Категории сервисов (telegram, cloudflare, google, facebook, twitter, "
+                "netflix, fastly, cloudfront) есть в расширенном geoip.dat. Auto-fix возьмёт его из "
+                "geoip_v2fly.dat рядом (XKeen обновляет его ежедневно) или скачает от Loyalsoldier, "
+                "проверит и только потом подменит рабочий файл, затем перезапустит xkeen. Категории "
+                "discord в geoip.dat нет ни в одной базе — Discord направляется доменными правилами."
             ) if has_missing else None,
         )
 
@@ -9506,13 +9953,17 @@ XKEEN_AUTO_FIXES = {
                     "политики на перехватываемые порты режутся, чтобы не уйти напрямую с домашним IP."),
     },
     "install_extended_geoip": {
-        "label": "Установить расширенный geoip.dat (Loyalsoldier)",
+        "label": "Установить / обновить расширенный geoip.dat",
         "explain": (
-            "Скачать с github.com/Loyalsoldier/v2ray-rules-dat расширенный geoip.dat (~18MB) — он "
-            "содержит категории сервисов (telegram, discord и др.) в дополнение к странам. "
-            "Стандартный v2fly geoip.dat и XKeen-installer ставят только страны — этого недостаточно "
-            "для геоблокировки конкретных сервисов. Текущий файл (если есть) будет сохранён как "
-            "geoip.dat.bak-<timestamp>. После скачивания xkeen перезапустится автоматически."
+            "Поставить расширенный geoip.dat — страны плюс категории сервисов (telegram, cloudflare, "
+            "google, facebook, twitter, netflix, fastly, cloudfront). Если на роутере есть geoip_v2fly.dat "
+            "(XKeen 2.0 обновляет его ежедневно, xkeen -ug; сам geoip.dat XKeen не обновляет) — geoip.dat "
+            "становится ссылкой на него и дальше обновляется вместе с XKeen, без скачивания. Иначе база "
+            "скачивается с github.com/Loyalsoldier/v2ray-rules-dat (~18MB) во временный файл и заменяет "
+            "рабочую только после проверки. Прежний файл сохраняется как geoip.dat.bak-<timestamp> "
+            "(хранятся 2 последние копии). Затем xkeen перезапускается; если xray не поднялся — прежняя "
+            "база возвращается автоматически. Категории discord в geoip.dat нет ни в одной базе — "
+            "Discord направляется доменными правилами."
         ),
     },
     "install_libnghttp2": {
@@ -9620,76 +10071,220 @@ def api_xkeen_auto_fix():
         ok = ks.get("action") in ("installed", "updated", "current")
 
     elif fix_id == "install_extended_geoip":
-        # Скачивает Loyalsoldier geoip.dat (содержит и страны, и сервисы).
-        # 1. Backup существующего geoip.dat (если есть) → .bak-<timestamp>
-        # 2. curl -kL → новый geoip.dat
-        # 3. xkeen -restart → xray перечитает routing с новой базой
+        # Расширенный geoip.dat (страны + категории сервисов: telegram, cloudflare, google, facebook,
+        # twitter, netflix, fastly, cloudfront). Discord в geoip.dat нет ни в одной базе.
+        # Путь 1 (предпочтительный): рядом лежит geoip_v2fly.dat > 5 МБ — его ЕЖЕДНЕВНО обновляет
+        #   xkeen -ug, а сам geoip.dat XKeen НЕ трогает (замер 03.10: до 02.10 там лежал файл от мая).
+        #   Поэтому geoip.dat делаем СИМЛИНКОМ на geoip_v2fly.dat (через временное имя + mv -f —
+        #   подмена одним rename), и база дальше обновляется вместе с XKeen. Без скачивания.
+        # Путь 2: скачивание от Loyalsoldier в geoip.dat.new. Код возврата curl НЕ теряем (никаких
+        #   pipe в tail): rc != 0 или файл ≤ 5 МБ → .new удаляется, рабочий файл не тронут.
+        # Перед заменой обычный файл geoip.dat → geoip.dat.bak-<ts>; прежний симлинк запоминаем.
+        # После замены — xkeen -restart. Если xray не поднялся или в СВЕЖИХ строках error.log
+        # ошибки загрузки — АВТО-откат (копия из .bak / прежний симлинк) + повторный рестарт.
+        # Успех → ротация: остаются 2 самые свежие geoip.dat.bak-*.
+        import shlex
         ansi_re = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        # Объединённая команда: backup + download + size check
-        download_cmd = (
-            f"if [ -f /opt/etc/xray/dat/geoip.dat ]; then "
-            f"  cp /opt/etc/xray/dat/geoip.dat /opt/etc/xray/dat/geoip.dat.bak-{ts}; "
-            f"  echo \"Backup: geoip.dat.bak-{ts}\"; "
-            f"fi; "
-            f"rm -f /opt/etc/xray/dat/geoip.dat; "
-            f"curl -kL --max-time 120 -o /opt/etc/xray/dat/geoip.dat "
-            f"https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat 2>&1 | tail -3; "
-            f"ls -la /opt/etc/xray/dat/geoip.dat 2>&1"
-        )
-        r = keenetic_ssh(download_cmd, timeout=180)
-        out = ansi_re.sub('', r.get("stdout") or "") + ansi_re.sub('', r.get("stderr") or "")
-        log_lines.append(out or "(empty)")
+        _min = GEOIP_EXTENDED_MIN_SIZE
+        _dir = "/opt/etc/xray/dat"
+        _elog = "/opt/var/log/xray/error.log"
+        _url = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+        _bak = f"geoip.dat.bak-{ts}"
 
-        # Проверка что файл скачался и имеет разумный размер (> 1MB)
-        size_check = keenetic_ssh(
-            "wc -c < /opt/etc/xray/dat/geoip.dat 2>/dev/null",
-            timeout=5,
-        )
-        try:
-            file_size = int((size_check.get("stdout") or "0").strip())
-        except (ValueError, AttributeError):
-            file_size = 0
+        def _clean(rr):
+            return ansi_re.sub('', (rr.get("stdout") or "") + (rr.get("stderr") or ""))
 
-        if file_size < 1024 * 1024:
-            log_lines.append(f"❌ Файл geoip.dat не скачался или слишком маленький ({file_size} байт)")
-            log_lines.append("   Возможно нет интернета на роутере или GitHub недоступен.")
-            ok = False
-        else:
-            log_lines.append(f"✅ geoip.dat скачан: {file_size} байт ({file_size // 1024 // 1024} MB)")
-            # Перезапуск xkeen чтобы xray перечитал
+        def _kv(text, key):
+            for _ln in text.splitlines():
+                _ln = _ln.strip()
+                if _ln.startswith(key + "="):
+                    return _ln[len(key) + 1:]
+            return None
+
+        def _restart_and_check():
+            """xkeen -restart + статус + ошибки загрузки ТОЛЬКО в строках error.log, появившихся после
+            рестарта (старые строки до рестарта не должны ни ронять, ни откатывать установку)."""
+            r_l = keenetic_ssh(f"wc -l < {_elog} 2>/dev/null || echo 0", timeout=5)
+            try:
+                base = int(((r_l.get("stdout") or "0").strip().splitlines() or ["0"])[-1].strip() or "0")
+            except ValueError:
+                base = 0
             r2 = keenetic_ssh("xkeen -restart 2>&1 | tail -8", timeout=90)
             log_lines.append("---")
             log_lines.append(ansi_re.sub('', r2.get("stdout") or "") or "(empty)")
-            # Status check
-            r3 = keenetic_ssh("xkeen -status 2>&1", timeout=10)
-            status = ansi_re.sub('', (r3.get("stdout") or "") + (r3.get("stderr") or ""))
+            status = _clean(keenetic_ssh("xkeen -status 2>&1", timeout=10))
             log_lines.append("---")
             log_lines.append(status)
-            # ok если xray запущен. v1.7.17: Mixed/TPROXY/Redirect — все валидные режимы
-            # работы XKeen, не маркер ошибки. Раньше считал Mixed как failure но юзер
-            # подтвердил через checkip.amazonaws.com что VPN полностью работает в Mixed-режиме.
-            # Реальный показатель ошибки загрузки категории — failed to load в error.log.
-            is_running = "запущен" in status and "не запущен" not in status
-            # Доп. проверка: в error.log не должно быть свежих "failed to load" про geoip/geosite
-            r4 = keenetic_ssh("tail -50 /opt/var/log/xray/error.log 2>/dev/null | grep -iE 'failed to load|cannot find|no such file' | tail -5", timeout=5)
-            load_errors = (r4.get("stdout") or "").strip()
+            running = "запущен" in status and "не запущен" not in status
+            r4 = keenetic_ssh(
+                f'N=$(wc -l < {_elog} 2>/dev/null || echo 0); '
+                f'if [ "$N" -lt {base} ] 2>/dev/null; then tail -50 {_elog}; else tail -n +{base + 1} {_elog}; fi 2>/dev/null '
+                "| grep -iE 'failed to load|cannot find|no such file' | tail -5",
+                timeout=5)
+            return running, (r4.get("stdout") or "").strip(), status
+
+        # 1. Что сейчас: обычный файл / симлинк (куда) / нет файла; размер geoip_v2fly.dat.
+        r0 = keenetic_ssh(
+            f'cd {_dir} 2>/dev/null || {{ echo "NODIR=1"; exit 0; }}; rm -f geoip.dat.new; '
+            'if [ -L geoip.dat ]; then echo "CUR=link"; echo "CURLINK=$(readlink geoip.dat)"; '
+            'elif [ -f geoip.dat ]; then echo "CUR=file"; else echo "CUR=none"; fi; '
+            'if [ -f geoip_v2fly.dat ]; then echo "V2FLY=$(wc -c < geoip_v2fly.dat 2>/dev/null || echo 0)"; '
+            'else echo "V2FLY=0"; fi',
+            timeout=20)
+        o0 = _clean(r0)
+        cur = _kv(o0, "CUR")
+        cur_link = (_kv(o0, "CURLINK") or "").strip()
+        try:
+            v2_size = int((_kv(o0, "V2FLY") or "0").strip() or "0")
+        except ValueError:
+            v2_size = 0
+        verify_fail = None
+        mode = None
+        if _kv(o0, "NODIR"):
+            verify_fail = f"на роутере нет папки {_dir} — XKeen установлен не полностью."
+        elif not r0.get("ok") or cur is None:
+            verify_fail = ("не удалось прочитать состояние баз на роутере ("
+                           + (o0.strip()[:300] or "пустой ответ") + ").")
+        elif v2_size > _min:
+            if cur == "link" and cur_link.rsplit("/", 1)[-1] == "geoip_v2fly.dat":
+                mode = "noop"
+                log_lines.append("geoip.dat уже ссылается на geoip_v2fly.dat и обновляется вместе с XKeen "
+                                 "ежедневно — менять нечего, xkeen не перезапускался.")
+            else:
+                mode = "link"
+                log_lines.append(f"Источник: geoip_v2fly.dat на роутере ({v2_size // 1024 // 1024} MB) — его "
+                                 "ежедневно обновляет XKeen (xkeen -ug). geoip.dat станет ссылкой на него, "
+                                 "без скачивания.")
+        else:
+            mode = "curl"
+            log_lines.append("Источник: скачивание с github.com/Loyalsoldier/v2ray-rules-dat "
+                             "(geoip_v2fly.dat рядом нет или он меньше 5 МБ).")
+            rc_ = keenetic_ssh(
+                f'cd {_dir} || exit 1; rm -f geoip.dat.new; '
+                f'curl -kL --fail -sS --max-time 120 -o geoip.dat.new {_url} 2>&1; rc=$?; '
+                'echo "CURL_RC=$rc"; '
+                'if [ "$rc" != "0" ]; then rm -f geoip.dat.new; fi; '
+                'if [ -f geoip.dat.new ]; then echo "NEW=$(wc -c < geoip.dat.new 2>/dev/null || echo 0)"; '
+                'else echo "NEW=0"; fi',
+                timeout=180)
+            oc = _clean(rc_)
+            curl_rc = (_kv(oc, "CURL_RC") or "").strip()
+            try:
+                new_size = int((_kv(oc, "NEW") or "0").strip() or "0")
+            except ValueError:
+                new_size = 0
+            _tail = "\n".join(l for l in oc.splitlines()
+                              if l.strip() and not l.strip().startswith(("CURL_RC=", "NEW=")))
+            if _tail:
+                log_lines.append(_tail[-1500:])
+            if not curl_rc:
+                verify_fail = ("скачивание не выполнилось (нет ответа от роутера: "
+                               + ((rc_.get("stderr") or "").strip()[:300] or "пустой вывод") + ").")
+            elif curl_rc != "0":
+                verify_fail = (f"curl завершился с кодом {curl_rc} — файл не скачан. Возможно, на роутере "
+                               "нет интернета или GitHub недоступен.")
+            elif new_size <= _min:
+                verify_fail = (f"новый файл слишком маленький ({new_size} байт, нужно > {_min}) — "
+                               "это не расширенная база.")
+            else:
+                log_lines.append(f"✅ Новый geoip.dat скачан и проверен: {new_size} байт "
+                                 f"({new_size // 1024 // 1024} MB).")
+
+        swapped = False
+        had_backup = False
+        old_link = ""
+        if mode in ("link", "curl") and verify_fail is None:
+            make_new = ("ln -sf geoip_v2fly.dat geoip.dat.new || { echo LINK_FAIL; exit 1; }; "
+                        if mode == "link" else
+                        "[ -f geoip.dat.new ] || { echo NEW_MISSING; exit 1; }; ")
+            swap_cmd = (
+                f"cd {_dir} || exit 1; "
+                'if [ -L geoip.dat ]; then echo "OLDLINK=$(readlink geoip.dat)"; '
+                f"elif [ -f geoip.dat ]; then cp geoip.dat {_bak} || {{ echo BACKUP_FAIL; rm -f geoip.dat.new; exit 1; }}; "
+                f'echo "BACKUP={_bak}"; fi; '
+                + make_new
+                + "mv -f geoip.dat.new geoip.dat && echo SWAP_OK"
+            )
+            so = _clean(keenetic_ssh(swap_cmd, timeout=60))
+            old_link = (_kv(so, "OLDLINK") or "").strip()
+            had_backup = (_kv(so, "BACKUP") or "").strip() == _bak
+            if "SWAP_OK" in so:
+                swapped = True
+                if had_backup:
+                    log_lines.append(f"Прежний geoip.dat сохранён как {_bak}.")
+                elif old_link:
+                    log_lines.append(f"Прежний geoip.dat был ссылкой на {old_link} — запомнена для отката.")
+                else:
+                    log_lines.append("Прежнего geoip.dat не было.")
+            elif "BACKUP_FAIL" in so:
+                verify_fail = "не удалось сохранить резервную копию текущего geoip.dat (мало места?) — замена отменена."
+            elif "LINK_FAIL" in so:
+                verify_fail = "не удалось создать ссылку geoip.dat → geoip_v2fly.dat — замена отменена."
+            else:
+                verify_fail = "не удалось заменить geoip.dat — замена отменена. " + so.strip()[:300]
+
+        if mode == "noop":
+            ok = True
+        elif not swapped:
+            keenetic_ssh(f"rm -f {_dir}/geoip.dat.new", timeout=10)
+            log_lines.append(f"❌ {verify_fail}")
+            log_lines.append("   Рабочий geoip.dat не тронут, временный geoip.dat.new удалён. xkeen не перезапускался.")
+            ok = False
+        else:
+            log_lines.append("✅ geoip.dat заменён: " + (
+                "теперь это ссылка на geoip_v2fly.dat — обновляется вместе с XKeen ежедневно."
+                if mode == "link" else "скачан от Loyalsoldier."))
+            is_running, load_errors, status = _restart_and_check()
             if is_running and not load_errors:
                 ok = True
-                # Информационное сообщение про режим (без флага ошибки)
+                # v1.7.17: Mixed/TPROXY/Redirect — все валидные режимы работы XKeen, не маркер ошибки.
                 if "Hybrid" in status:
-                    log_lines.append("ℹ️ xkeen в режиме Hybrid — штатный режим XKeen 2.0 (прежнее имя — Mixed). VPN работает. Проверить можно через https://checkip.amazonaws.com — должен показать IP VPN-сервера, не твоего провайдера.")
+                    log_lines.append("ℹ️ xkeen в режиме Hybrid — штатный режим XKeen 2.0 (прежнее имя — Mixed). VPN работает. Проверить можно через https://checkip.amazonaws.com — должен показать IP VPN-сервера, не IP провайдера.")
                 elif "Mixed" in status:
-                    log_lines.append("ℹ️ xkeen в режиме Mixed — это валидный режим работы (один из трёх: TPROXY/Mixed/Redirect). VPN работает. Проверить можно через https://checkip.amazonaws.com — должен показать IP VPN-сервера, не твоего провайдера.")
+                    log_lines.append("ℹ️ xkeen в режиме Mixed — это валидный режим работы (один из трёх: TPROXY/Mixed/Redirect). VPN работает. Проверить можно через https://checkip.amazonaws.com — должен показать IP VPN-сервера, не IP провайдера.")
                 elif "TPROXY" in status:
                     log_lines.append("ℹ️ xkeen в режиме TPROXY — оптимальный режим.")
-            elif is_running and load_errors:
-                log_lines.append("⚠ xray запущен, но в error.log есть ошибки загрузки категорий:")
-                log_lines.append(load_errors)
-                log_lines.append("Возможно ещё какая-то категория отсутствует в geoip.dat / geosite.dat.")
-                ok = False
+                # Ротация: хранить 2 самые свежие копии (имя = время, сортировка по имени надёжнее mtime).
+                rot = _clean(keenetic_ssh(
+                    f"cd {_dir} && ls -1 geoip.dat.bak-* 2>/dev/null | sort -r | tail -n +3 | "
+                    'while read f; do rm -f "$f" && echo "ROT=$f"; done',
+                    timeout=15))
+                removed = [l.strip()[4:] for l in rot.splitlines() if l.strip().startswith("ROT=")]
+                if removed:
+                    log_lines.append("Старые резервные копии удалены (хранятся 2 последние): " + ", ".join(removed))
             else:
-                log_lines.append("❌ xray не запустился после установки. Проверь /opt/var/log/xray/error.log на роутере.")
+                if is_running:
+                    log_lines.append("⚠ xray запущен, но после замены в error.log появились ошибки загрузки категорий:")
+                    log_lines.append(load_errors)
+                else:
+                    log_lines.append("❌ xray не запустился после замены geoip.dat.")
+                # АВТО-откат на прежнюю базу.
+                if had_backup:
+                    rb_cmd = f"cd {_dir} && cp {_bak} geoip.dat.rb && mv -f geoip.dat.rb geoip.dat && echo RB_OK"
+                    rb_what = f"копия {_bak}"
+                elif old_link:
+                    rb_cmd = (f"cd {_dir} && ln -sf {shlex.quote(old_link)} geoip.dat.rb && "
+                              "mv -f geoip.dat.rb geoip.dat && echo RB_OK")
+                    rb_what = f"прежняя ссылка на {old_link}"
+                else:
+                    rb_cmd = f"cd {_dir} && rm -f geoip.dat && echo RB_OK"
+                    rb_what = "состояние «файла не было»"
+                rb = _clean(keenetic_ssh(rb_cmd, timeout=60))
+                if "RB_OK" in rb:
+                    log_lines.append(f"↩️ Авто-откат: возвращена прежняя база ({rb_what}), xkeen перезапускается ещё раз.")
+                    run2, err2, _st2 = _restart_and_check()
+                    if run2 and not err2:
+                        log_lines.append("✅ После отката xray запущен — работает прежняя база. Расширенная база не установлена.")
+                    elif run2:
+                        log_lines.append("⚠ После отката xray запущен, но в error.log есть ошибки загрузки категорий: " + err2)
+                    else:
+                        log_lines.append("❌ После отката xray всё ещё не запущен — нужна ручная проверка роутера "
+                                         "(/opt/var/log/xray/error.log).")
+                else:
+                    log_lines.append("❌ Авто-откат не удался: " + (rb.strip()[:300] or "пустой ответ") + ".")
+                    if had_backup:
+                        log_lines.append(f"   Вернуть вручную: cp {_dir}/{_bak} {_dir}/geoip.dat && xkeen -restart")
                 ok = False
 
     elif fix_id == "install_libnghttp2":
@@ -11100,6 +11695,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     {% endif %}
     <span class="mono" style="margin-left: 8px; color: #888;">counter={{ watchdog.counter }}</span>
     <span class="mono" style="margin-left: 8px;">default сейчас → <strong style="color: {% if watchdog.current_default == targets.primary_tag %}#2a7{% else %}#e80{% endif %};">{{ watchdog.current_default or routing.default_outbound or '?' }}</strong></span>
+    {# watchdog v29: сквозная проба основного подключения (DPRI_*) — заполняет JS deepProbeNote('pri') #}
+    <span id="deep-pri-note" style="margin-left: 8px;"></span>
     {% if watchdog.current_default and watchdog.current_default != targets.primary_tag %}
       {% if watchdog.state == 'failover' %}
       <span class="subtitle" style="margin-left: 8px; color: #e80;">⚠️ работаем через резерв, PRIMARY ({{ targets.primary_tag }}) недоступен</span>
@@ -11478,7 +12075,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 
           <!-- GeoIP-категории для YT-канала удалены в v1.0.76: у YouTube/смарт-TV нет IP-only клиентов
                (всё резолвится через DNS → ловится domain-rule), а единственный практический use-case
-               (Telegram/Discord по IP) принадлежит каналу «📱 Зарубежные сервисы». Backend-endpoint
+               (Telegram по IP) принадлежит каналу «📱 Зарубежные сервисы». Backend-endpoint
                /api/xkeen/set-yt-geoip-categories оставлен для backward-compat, но через UI больше не
                управляется. Watchdog при тике автоматически очищает YT_GEOIP_CATEGORIES если оно
                непустое (миграция для роутеров, где раздел использовался). -->
@@ -11515,28 +12112,74 @@ XKEEN_TEMPLATE = r"""<!doctype html>
                 <span style="color: #c33;">🚨 АКТИВЕН — трафик заблокирован</span>
               {% elif watchdog.effective_foreign == targets.foreign_tag %}
                 <span style="color: #2a7;">✓ канал {{ watchdog.effective_foreign }} жив</span>
-              {% elif watchdog.effective_foreign %}
-                <span style="color: #e80;">⚠️ FALLBACK — идёт через {{ watchdog.effective_foreign }}</span>
               {% else %}
+                {# watchdog v29/v30: действующий список резерва — общая FAILOVER_TAGS при use_common, иначе собственная цепочка #}
+                {% set _fg_chain_eff = (targets.failover_tags or []) if targets.foreign_chain_use_common else (targets.foreign_failover_tags or []) %}
+                {% if watchdog.effective_foreign in _fg_chain_eff %}
+                <span style="color: #e80;">🔀 работает резерв из цепочки{% if targets.foreign_chain_use_common %} (общей){% endif %} — {{ watchdog.effective_foreign }} (#{{ _fg_chain_eff.index(watchdog.effective_foreign) + 1 }})</span>
+                {% elif watchdog.effective_foreign %}
+                <span style="color: #e80;">⚠️ FALLBACK — идёт через {{ watchdog.effective_foreign }}</span>
+                {% else %}
                 <span style="color: #888;">не активен (канал выключен)</span>
+                {% endif %}
               {% endif %}
             </div>
+            {% set _fg_has_chain = targets.foreign_failover_tags or targets.foreign_chain_use_common %}
             <label style="font-size: 0.85em; margin-top: 6px; display: block; cursor: pointer;">
               <input type="checkbox" id="foreign-fail-block-toggle" {% if targets.foreign_fail_block %}checked{% endif %} onchange="toggleForeignFailBlock(this.checked)">
-              Блокировать трафик если канал упал
-              <span class="subtitle" style="font-weight: normal;">— рекомендуется ВКЛ: если загран-канал умер, выпускать Meta/Telegram через RU-выход бессмысленно (всё равно заблокировано) и опасно (утечка реального IP)</span>
+              {% if _fg_has_chain %}Блокировать трафик, если вся цепочка упала{% else %}Блокировать трафик если канал упал{% endif %}
+              <span class="subtitle" style="font-weight: normal;">— рекомендуется ВКЛ: если загран-канал{% if _fg_has_chain %} и весь резерв{% endif %} умер, выпускать Meta/Telegram через RU-выход бессмысленно (всё равно заблокировано) и опасно (утечка реального IP)</span>
             </label>
             <p class="subtitle" style="margin: 4px 0 0;">
               {% if targets.foreign_fail_block %}
-                ВКЛ: если <code>{{ targets.foreign_tag }}</code> не отвечает — эти сервисы идут в <code>block</code> (drop), не утекают через RU.
+                ВКЛ: если <code>{{ targets.foreign_tag }}</code>{% if _fg_has_chain %} и вся цепочка резерва{% endif %} не отвечают — эти сервисы идут в <code>block</code> (drop), не утекают через RU.
               {% else %}
-                ВЫКЛ: при падении <code>{{ targets.foreign_tag }}</code> трафик пойдёт через default (PRIMARY/FAILOVER) — если это RU-выход, Meta/Telegram всё равно не откроются.
+                ВЫКЛ: когда <code>{{ targets.foreign_tag }}</code>{% if _fg_has_chain %} и вся цепочка резерва{% endif %} не отвечают, трафик пойдёт через default (PRIMARY/FAILOVER) — если это RU-выход, Meta/Telegram всё равно не откроются.
               {% endif %}
             </p>
             <p class="subtitle" style="margin: 6px 0 0; color:#777;">
               🛡 <strong>Анти-дребезг (watchdog v17+):</strong> когда включено, блокировка срабатывает только после <strong>3 подряд</strong> неудачных проб (≈3 мин) и снимается после 2 удачных — короткие провалы связи (потеря пакетов на пути к каналу) его не роняют и не плодят лишних <code>xkeen -restart</code>. Порог общий с AI/YouTube.
             </p>
           </div>
+
+          <!-- watchdog v29/v30: цепочка резерва канала «Зарубежные сервисы» (+ режим «общая цепочка FAILOVER») -->
+          <details class="chain-box" data-xk-keep-inline {% if targets.foreign_failover_tags or targets.foreign_chain_use_common %}open{% endif %} style="margin-top: 12px; border-top: 1px dashed #ccc; padding-top: 10px;">
+            <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">⛓️ Цепочка резерва <span style="color: #888; font-weight: 400; font-size: 0.88em;">— куда переводить «Зарубежные сервисы», если канал выше упал{% if targets.foreign_chain_use_common %} (действует общая цепочка FAILOVER){% elif targets.foreign_failover_tags %} (каналов: {{ targets.foreign_failover_tags|length }}){% else %} (сейчас пусто){% endif %}</span></summary>
+            <div style="margin-top: 8px;">
+              <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">
+                Watchdog перебирает каналы <strong>сверху вниз</strong> и переводит «Зарубежные сервисы» на первый живой. Как только оживёт более приоритетный — вернёт наверх. <strong>Основной канал сюда добавлять не нужно</strong> — он проверяется раньше цепочки, при каждой проверке (раз в минуту), и трафик вернётся на него автоматически. Блокировка (kill-switch выше) срабатывает только когда молчит <strong>вся</strong> цепочка. Пустая цепочка = прежнее поведение. Российские узлы для этих сервисов бесполезны — watchdog их пропустит, пока не включена галочка ниже.
+              </p>
+              <label style="font-size: 0.85em; display: block; cursor: pointer; margin: 0 0 8px; padding: 6px 8px; background: #f6f0fb; border: 1px solid #e3d5ee; border-radius: 4px;">
+                <input type="checkbox" id="foreign-chain-use-common" {% if targets.foreign_chain_use_common %}checked{% endif %} onchange="chainRender('foreign')">
+                Использовать общую цепочку резерва (FAILOVER)
+                <span class="subtitle" style="font-weight: normal;">— вместо собственного списка ниже действует цепочка из раздела «⛓️ Цепочка резерва (FAILOVER)». Собственный список при этом сохраняется, но не действует. Записывается кнопкой «Сохранить цепочку».</span>
+              </label>
+              <div id="foreign-chain-editor">
+                <div id="foreign-chain-list" class="chain-list"></div>
+                <div style="margin: 8px 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
+                  <select id="foreign-chain-add" style="flex: 1 1 240px; padding: 6px; font-size: 0.9em; border: 1px solid #ccc; border-radius: 4px;">
+                    <option value="">— выбрать канал —</option>
+                    {% for grp in vless_option_groups %}
+                    <optgroup label="📦 {{ grp.name }}">
+                      {% for opt in grp.options %}{% if not opt.is_direct %}
+                      <option value="{{ opt.tag }}">{{ grp.name }} · {{ opt.tag }}{% if opt.is_anti_dpi %} · 🛡️ Обход{% elif opt.is_ru %} · 🇷🇺 RU (будет пропущен){% endif %}</option>
+                      {% endif %}{% endfor %}
+                    </optgroup>
+                    {% endfor %}
+                  </select>
+                  <button type="button" id="foreign-chain-add-btn" class="btn btn-sm" style="background: #8e44ad;" onclick="chainAdd('foreign')" title="Добавить выбранный канал в конец цепочки. Порядок потом меняется стрелками.">➕ Добавить</button>
+                </div>
+              </div>
+              <div id="foreign-chain-common-view" class="subtitle" style="display: none; font-size: 0.85em; margin: 4px 0 8px; padding: 6px 8px; background: #fff; border: 1px dashed #c9b3dc; border-radius: 4px;"></div>
+              <label style="font-size: 0.85em; display: block; cursor: pointer; margin-top: 6px;">
+                <input type="checkbox" id="foreign-chain-allow-ru" {% if targets.foreign_chain_allow_ru %}checked{% endif %} onchange="chainRender('foreign')">
+                Пускать российские узлы в цепочку
+                <span class="subtitle" style="font-weight: normal;">— по умолчанию выключено: сервисы из этого канала заблокированы в РФ, через российский узел они не откроются. Действует и на общую цепочку.</span>
+              </label>
+              <button class="btn" style="margin-top: 8px; background: #8e44ad;" onclick="saveChannelChain('foreign')" title="Записать цепочку и режим общей цепочки в watchdog.config. Watchdog применит их при следующей проверке.">💾 Сохранить цепочку</button>
+              <p class="subtitle" style="margin: 6px 0 0; font-size: 0.82em;">Служебные каналы (<code>direct</code>, <code>block</code>) в цепочку не ставятся: watchdog считает их всегда живыми.</p>
+            </div>
+          </details>
         </div>
       </div>
 
@@ -11584,30 +12227,64 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             </div>
           </details>
 
-          <!-- GeoIP-категории (IP-only приложения: Telegram Desktop, Discord) -->
+          <!-- GeoIP-категории (IP-only приложения: Telegram Desktop). Баннер и подпись — по geoip_status
+               (keenetic_geoip_dat_status): None = неизвестно, is_extended = расширенная база уже стоит. -->
           <details style="margin-top: 14px; border-top: 1px dashed #ccc; padding-top: 10px;" {% if targets.foreign_geoip_categories %}open{% endif %}>
             <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">🌍 GeoIP-категории <span style="color: #888; font-weight: 400; font-size: 0.88em;">— для IP-only приложений типа Telegram Desktop</span> <a href="#help-v2fly-geoip" onclick="openHelpAnchor('help-v2fly-geoip'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; margin-left: 6px;" title="Открыть описание GeoIP-категорий в Помощи">❓ что это?</a></summary>
             <div style="margin-top: 8px;">
               <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">
-                Доменные правила не ловят приложения, которые коннектятся напрямую к IP датацентров минуя DNS — Telegram Desktop, Discord native client.
+                Доменные правила не ловят приложения, которые коннектятся напрямую к IP датацентров минуя DNS — например, Telegram Desktop.
                 Матч по IP-диапазонам из <code>geoip.dat</code>. Генерируется как <strong>отдельное правило</strong> <code>"ip": ["geoip:NAME"]</code>, outbound = этот канал.
+                Категории сервисов в geoip.dat: <code>telegram</code>, <code>cloudflare</code>, <code>google</code>, <code>facebook</code>, <code>twitter</code>, <code>netflix</code>, <code>fastly</code>, <code>cloudfront</code>. Категории <code>discord</code> в geoip.dat нет — Discord направляется доменными правилами (раздел выше).
               </p>
-              <div style="background: #fff3cd; border-left: 3px solid #f0c200; padding: 8px 10px; margin: 0 0 10px; font-size: 0.85em; color: #6a4900;">
-                ⚠️ <strong>Требует расширенный <code>geoip.dat</code></strong> (Loyalsoldier) — в базовых XKeen-базах категорий сервисов (telegram, discord) нет.
+              {% if not geoip_status %}
+              <div id="geoip-status-line" data-geoip-state="unknown" style="background: #f1f1f1; border-left: 3px solid #bbb; padding: 8px 10px; margin: 0 0 10px; font-size: 0.85em; color: #666;">
+                {% if geoip_router_reachable %}Не удалось прочитать состояние geoip.dat{% else %}Состояние geoip.dat неизвестно (роутер недоступен){% endif %}
+              </div>
+              {% elif geoip_status.is_extended and geoip_status.linked_to_v2fly %}
+              <div id="geoip-status-line" data-geoip-state="extended" data-geoip-linked="1" style="background: #e8f6e8; border-left: 3px solid #4a4; padding: 8px 10px; margin: 0 0 10px; font-size: 0.85em; color: #2a5a2a;">
+                ✅ Расширенная база geoip.dat ({{ geoip_status.size_mb|round|int }} МБ) — обновляется вместе с XKeen ежедневно (ссылка на <code>geoip_v2fly.dat</code>), последнее обновление {{ geoip_status.mtime_str or '?' }}.{% if geoip_status.has_telegram is none %} <span style="color: #777;">Наличие категории telegram проверяется в фоне.</span>{% endif %}
+              </div>
+              {% elif geoip_status.is_extended %}
+              <div id="geoip-status-line" data-geoip-state="extended" data-geoip-linked="0" style="background: #e8f6e8; border-left: 3px solid #4a4; padding: 8px 10px; margin: 0 0 10px; font-size: 0.85em; color: #2a5a2a;">
+                ✅ Расширенная база geoip.dat ({{ geoip_status.size_mb|round|int }} МБ, от {{ (geoip_status.mtime_str or '?')[:5] }}). XKeen обновляет <code>geoip_v2fly.dat</code>, а этот файл — нет.{% if geoip_status.has_telegram is none %} <span style="color: #777;">Наличие категории telegram проверяется в фоне.</span>{% endif %}
+                {% if geoip_status.v2fly_usable %}
                 <div style="margin-top: 8px;">
-                  <button type="button" class="btn btn-sm" style="background:#4a4; color:#fff; margin: 2px;" onclick="installExtendedGeoip()" title="Скачать расширенный geoip.dat (~18MB) от Loyalsoldier — содержит страны и сервисы. Делается один раз на роутер. Текущий файл сохранится в .bak.">📥 Установить расширенный geoip.dat (Loyalsoldier)</button>
+                  <button type="button" class="btn btn-sm" style="background:#4a4; color:#fff; margin: 2px;" onclick="installExtendedGeoip()" title="geoip.dat станет ссылкой на geoip_v2fly.dat ({{ geoip_status.v2fly_size_mb }} МБ, обновлён {{ geoip_status.v2fly_mtime_str or '?' }}) и дальше будет обновляться вместе с XKeen. Прежний файл сохранится в .bak; если xray после замены не запустится — он вернётся автоматически.">🔗 Связать с ежедневно обновляемой базой</button>
+                </div>
+                {% endif %}
+              </div>
+              {% elif geoip_status.exists and geoip_status.has_telegram %}
+              <div id="geoip-status-line" data-geoip-state="small-telegram" style="background: #fff3cd; border-left: 3px solid #f0c200; padding: 8px 10px; margin: 0 0 10px; font-size: 0.85em; color: #6a4900;">
+                ⚠️ В geoip.dat ({{ geoip_status.size_mb }} МБ) категория <code>telegram</code> есть, но файл заметно меньше обычной расширенной базы (больше 5 МБ) — похоже на урезанную сборку: части категорий сервисов в ней может не быть.
+                <div style="margin-top: 8px;">
+                  <button type="button" class="btn btn-sm" style="background:#4a4; color:#fff; margin: 2px;" onclick="installExtendedGeoip()" title="Если на роутере есть geoip_v2fly.dat (его ежедневно обновляет XKeen) — geoip.dat станет ссылкой на него; иначе база скачивается от Loyalsoldier (~18MB). Рабочий файл заменяется только после проверки нового, прежний сохраняется в .bak; если xray после замены не запустится — прежняя база вернётся автоматически.">📥 Установить / обновить расширенный geoip.dat</button>
                 </div>
               </div>
+              {% else %}
+              <div id="geoip-status-line" data-geoip-state="basic" style="background: #fff3cd; border-left: 3px solid #f0c200; padding: 8px 10px; margin: 0 0 10px; font-size: 0.85em; color: #6a4900;">
+                ⚠️ <strong>Требует расширенный <code>geoip.dat</code></strong> —
+                {% if not geoip_status.exists %}{% if geoip_status.is_link %}<code>geoip.dat</code> — ссылка на <code>{{ geoip_status.link_target }}</code>, но файла по ней нет.{% else %}файл <code>geoip.dat</code> на роутере не найден.{% endif %}{% elif geoip_status.has_telegram is sameas false %}в установленной базе ({{ geoip_status.size_mb }} МБ) нет категории сервиса <code>telegram</code>: это база «только страны».{% else %}установленная база ({{ geoip_status.size_mb }} МБ) слишком мала для расширенной — похоже, это база «только страны».{% endif %}
+                <div style="margin-top: 8px;">
+                  <button type="button" class="btn btn-sm" style="background:#4a4; color:#fff; margin: 2px;" onclick="installExtendedGeoip()" title="Если на роутере есть geoip_v2fly.dat (его ежедневно обновляет XKeen) — geoip.dat станет ссылкой на него; иначе база скачивается от Loyalsoldier (~18MB). Рабочий файл заменяется только после проверки нового, прежний сохраняется в .bak; если xray после замены не запустится — прежняя база вернётся автоматически.">📥 Установить / обновить расширенный geoip.dat</button>
+                </div>
+              </div>
+              {% endif %}
               <div style="margin-bottom: 6px;">
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignGeoipCat('telegram')" title="IP-диапазоны датацентров Telegram (149.154.x.x, 91.108.x.x). Нужно для Telegram Desktop — он коннектится по IP минуя DNS.">📱 telegram</button>
-                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignGeoipCat('discord')">💬 discord</button>
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignGeoipCat('facebook')">📘 facebook</button>
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addForeignGeoipCat('twitter')">🐦 twitter</button>
                 <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearForeignGeoipCats()">🗑 Очистить</button>
               </div>
-              <input id="foreign-geoip-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.foreign_geoip_categories or '' }}" placeholder="через пробел: telegram discord" />
+              <input id="foreign-geoip-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.foreign_geoip_categories or '' }}" placeholder="через пробел: telegram" />
               <button class="btn" style="margin-top: 6px; background: #8e44ad;" onclick="saveForeignGeoipCategories()">💾 Сохранить GeoIP-категории</button>
-              <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Требует расширенный geoip.dat (см. кнопку выше).</p>
+              {% if not geoip_status %}
+              <p id="geoip-status-hint" style="font-size: 0.82em; color: #888; margin: 6px 0 0;">{% if geoip_router_reachable %}Не удалось прочитать состояние geoip.dat.{% else %}Состояние geoip.dat неизвестно (роутер недоступен).{% endif %}</p>
+              {% elif geoip_status.is_extended %}
+              <p id="geoip-status-hint" style="font-size: 0.82em; color: #2a5a2a; margin: 6px 0 0;">✅ Расширенный geoip.dat на месте — категории сервисов доступны.</p>
+              {% else %}
+              <p id="geoip-status-hint" style="font-size: 0.82em; color: #6a4900; margin: 6px 0 0;">Требует расширенный geoip.dat (см. кнопку выше).</p>
+              {% endif %}
             </div>
           </details>
         </div>
@@ -11773,7 +12450,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
       <div style="background: #eefbe5; border-left: 4px solid #2a7; padding: 8px 12px; margin: 0 0 12px; border-radius: 3px; font-size: 0.88em;">
         <strong style="color: #2a7;">🛡️ Безопасно для AI:</strong> кнопки ниже меняют <strong>только default-канал</strong> (общий трафик).
         🤖 <strong>AI-sticky</strong> (<code>{{ targets.ai_tag }}</code>), 📺 <strong>YouTube-sticky</strong> (<code>{{ targets.yt_tag }}</code>) и 📱 <strong>«Зарубежные сервисы»</strong> (<code>{{ targets.foreign_tag }}</code>) <strong>не затрагиваются</strong> — продолжают идти через свои выбранные каналы.
-        Anthropic <strong>не увидит твой IP</strong> при нажатии FAILOVER — AI-трафик как шёл через <code>{{ targets.ai_tag }}</code>, так и идёт.
+        Anthropic <strong>не увидит реальный IP</strong> при нажатии FAILOVER — AI-трафик как шёл через <code>{{ targets.ai_tag }}</code>, так и идёт.
         Поменять AI/YT канал можно только через их собственные dropdown'ы выше в этом же разделе.
       </div>
       <div class="force-mode-grid">
@@ -11792,6 +12469,38 @@ XKEEN_TEMPLATE = r"""<!doctype html>
       </div>
     </div>
   </div>
+
+  <!-- watchdog v29: настройки сквозной пробы каналов (DEEP_PROBE_*) + сводка трёх ролей -->
+  <details class="subsec" data-xk-keep-inline open style="margin-top: 14px;">
+    <summary>🩺 Сквозная проба каналов <span class="subsec-hint">(идёт ли трафик через узел, а не отвечает ли его порт)</span> <a href="#help-watchdog" onclick="openHelpAnchor('help-watchdog'); return false;" style="font-size: 0.8em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Открыть раздел «⛓️ Watchdog» в Помощи — как работает сквозная проба">❓ помощь</a></summary>
+    <div class="subsec-body">
+      <p class="subtitle" style="margin: 0 0 8px;">
+        Обычная проверка смотрит, отвечает ли порт узла. Сквозная — делает реальный запрос <strong>через</strong> действующий канал роли (основной, YouTube, «Зарубежные сервисы»; у AI — своя проба). Узел, который принимает соединения, но не пропускает трафик, признаётся глухим, и роль уходит на резерв по своей цепочке.<br>
+        Реакция ≈ интервал × порог: при 180 с и пороге 2 глухой узел покидают через ~6 минут. После ухода действует карантин возврата — узел не вернут раньше, чем он пройдёт.
+      </p>
+      <div id="deep-probe-summary" style="font-size: 0.88em; margin: 0 0 10px; line-height: 1.9;"></div>
+      <form id="deep-probe-form" onsubmit="return saveDeepProbeSettings(event)" style="display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: flex-end;">
+        <label style="font-size: 0.88em; display: flex; align-items: center; gap: 6px; cursor: pointer;">
+          <input type="checkbox" id="deep-probe-enable" {% if targets.deep_probe_enable %}checked{% endif %}>
+          Проверять каналы насквозь
+        </label>
+        <label style="font-size: 0.85em; display: flex; flex-direction: column; gap: 2px;">
+          Интервал, с
+          <input type="number" id="deep-probe-interval" min="60" max="900" step="30" value="{{ targets.deep_probe_interval }}" style="width: 90px; padding: 5px; border: 1px solid #ccc; border-radius: 4px;">
+        </label>
+        <label style="font-size: 0.85em; display: flex; flex-direction: column; gap: 2px;">
+          Порог, проб подряд
+          <input type="number" id="deep-probe-threshold" min="1" max="5" step="1" value="{{ targets.deep_probe_threshold }}" style="width: 90px; padding: 5px; border: 1px solid #ccc; border-radius: 4px;">
+        </label>
+        <label style="font-size: 0.85em; display: flex; flex-direction: column; gap: 2px;">
+          Карантин возврата, мин
+          <input type="number" id="deep-return-hold-min" min="5" max="1440" step="5" value="{{ ((targets.deep_return_hold or 1800) / 60)|round|int }}" style="width: 90px; padding: 5px; border: 1px solid #ccc; border-radius: 4px;">
+        </label>
+        <button type="submit" id="deep-probe-save" class="btn btn-sm" title="Записать настройки в watchdog.config. Каждая запись — внеочередная проверка watchdog (~30 с).">💾 Сохранить</button>
+        <span id="deep-probe-status" class="subtitle" style="font-size: 0.85em;"></span>
+      </form>
+    </div>
+  </details>
 
   <details class="subsec subsec-log">
     <summary>📋 Лог watchdog <span class="subsec-hint">(последние 30 строк — события переключений)</span></summary>
@@ -11861,7 +12570,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         <td class="mono"><strong>{{ o.tag }}</strong>{% if o.note %}<br><span style="font-style:italic; font-size:0.8em; color:#3a6;">📝 {{ o.note }}</span>{% endif %}</td>
         <td class="group-cell"><span class="group-name-badge" title="pbk={{ o.group_pbk_short }}">{{ o.group_name or '?' }}</span></td>
         <td class="mono">{{ o.host }}:{{ o.port }}</td>
-        <td>{% if o.tag == watchdog.current_default %}<span class="badge badge-active">⚡ активен</span>{% endif %}{% if o.is_ai %} <span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}{% if o.is_yt %} <span class="badge" style="background:#fbdada; color:#c33">📺 YT</span>{% endif %}{% if o.in_ai_chain %} <span class="badge" style="background:#e6f3dc; color:#4a7a2a; border:1px solid #b9d9a0;" title="Резерв цепочки AI-канала, позиция {{ o.ai_chain_position }}">🤖 резерв AI №{{ o.ai_chain_position }}</span>{% endif %}{% if o.in_yt_chain %} <span class="badge" style="background:#fdeaea; color:#a33; border:1px solid #eec4c4;" title="Резерв цепочки YouTube-канала, позиция {{ o.yt_chain_position }}">📺 резерв YT №{{ o.yt_chain_position }}</span>{% endif %}{% if o.is_foreign %} <span class="badge" style="background:#efe2f7; color:#8e44ad">📱 РФ-блок</span>{% endif %} <span class="status-cell"></span></td>
+        <td>{% if o.tag == watchdog.current_default %}<span class="badge badge-active">⚡ активен</span>{% endif %}{% if o.is_ai %} <span class="badge" style="background:#d8eecc; color:#3a6">🤖 AI</span>{% endif %}{% if o.is_yt %} <span class="badge" style="background:#fbdada; color:#c33">📺 YT</span>{% endif %}{% if o.in_ai_chain %} <span class="badge" style="background:#e6f3dc; color:#4a7a2a; border:1px solid #b9d9a0;" title="Резерв цепочки AI-канала, позиция {{ o.ai_chain_position }}">🤖 резерв AI №{{ o.ai_chain_position }}</span>{% endif %}{% if o.in_yt_chain %} <span class="badge" style="background:#fdeaea; color:#a33; border:1px solid #eec4c4;" title="Резерв цепочки YouTube-канала, позиция {{ o.yt_chain_position }}">📺 резерв YT №{{ o.yt_chain_position }}</span>{% endif %}{% if o.in_foreign_chain %} <span class="badge" style="background:#efe2f7; color:#6c3483; border:1px solid #d7c0e6;" title="Резерв цепочки канала «Зарубежные сервисы», позиция {{ o.foreign_chain_position }}">📱 резерв Зарубежных №{{ o.foreign_chain_position }}</span>{% endif %}{% if o.is_foreign %} <span class="badge" style="background:#efe2f7; color:#8e44ad">📱 РФ-блок</span>{% endif %} <span class="status-cell"></span></td>
       </tr>
     {% endif %}
     {% endfor %}
@@ -12025,7 +12734,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         {% endif %}
       </td>
       <td style="vertical-align: top;">
-        {% set has_current = o.is_default or o.is_primary or o.is_failover or o.in_failover_chain or o.in_ai_chain or o.in_yt_chain or o.is_ai or o.is_yt or o.is_foreign or o.tag in ('direct','block') %}
+        {% set has_current = o.is_default or o.is_primary or o.is_failover or o.in_failover_chain or o.in_ai_chain or o.in_yt_chain or o.in_foreign_chain or o.is_ai or o.is_yt or o.is_foreign or o.tag in ('direct','block') %}
         <div style="background: #f0f5f0; border-left: 3px solid #6a9; padding: 2px 8px; border-radius: 3px; margin-bottom: 4px;">
           <span style="color:#3a6; font-size:0.72em; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px; margin-right:5px;">▼ сейчас:</span>
           {% if has_current %}
@@ -12043,6 +12752,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
               <button class="btn btn-sm" style="background:#eef7e6; color:#4a7a2a; border:1px solid #b9d9a0; padding:1px 7px; font-size:0.72em; margin-left:3px;" onclick="removeFromChannelChain('ai', '{{ o.tag }}')" title="Убрать этот канал из цепочки резерва AI">✖ из цепочки AI</button>{% endif %}
             {% if o.in_yt_chain %}<span class="badge" style="background:#fdeaea; color:#a33; border:1px solid #eec4c4;" title="Резерв цепочки YouTube-канала (позиция {{ o.yt_chain_position }}). Watchdog переведёт сюда YouTube, если каналы выше по цепочке мертвы. Менять порядок — в карточке «📺 YouTube» → «⛓️ Цепочка резерва».">📺 резерв YT №{{ o.yt_chain_position }}</span>
               <button class="btn btn-sm" style="background:#fdeaea; color:#a33; border:1px solid #eec4c4; padding:1px 7px; font-size:0.72em; margin-left:3px;" onclick="removeFromChannelChain('yt', '{{ o.tag }}')" title="Убрать этот канал из цепочки резерва YouTube">✖ из цепочки YT</button>{% endif %}
+            {% if o.in_foreign_chain %}<span class="badge" style="background:#efe2f7; color:#6c3483; border:1px solid #d7c0e6;" title="Резерв цепочки канала «Зарубежные сервисы» (позиция {{ o.foreign_chain_position }}). Watchdog переведёт сюда зарубежные сервисы, если каналы выше по цепочке мертвы{% if targets.foreign_chain_use_common %}. Сейчас включена общая цепочка FAILOVER — собственный список не действует{% endif %}. Менять порядок — в карточке «📱 Зарубежные сервисы» → «⛓️ Цепочка резерва».">📱 резерв Зарубежных №{{ o.foreign_chain_position }}</span>
+              <button class="btn btn-sm" style="background:#efe2f7; color:#6c3483; border:1px solid #d7c0e6; padding:1px 7px; font-size:0.72em; margin-left:3px;" onclick="removeFromChannelChain('foreign', '{{ o.tag }}')" title="Убрать этот канал из цепочки резерва «Зарубежных сервисов»">✖ из цепочки Зарубежных</button>{% endif %}
             {% if o.is_foreign %}<span class="badge" style="background:#efe2f7; color:#8e44ad">📱 РФ-блок</span>{% endif %}
             {% if o.tag in ('direct','block') %}<span class="badge badge-dim">служ.</span>{% endif %}
           {% else %}
@@ -12303,10 +13014,10 @@ XKEEN_TEMPLATE = r"""<!doctype html>
       <tr><td><strong>SSH доступ</strong></td><td class="mono">ssh -p {{ keenetic_settings.current.port or 222 }} -i {{ keenetic_settings.current.ssh_key or 'C:\\Users\\<username>\\.ssh\\id_ed25519' }} root@{{ keenetic_settings.current.host or '192.168.1.1' }}</td></tr>
       <tr><td><strong>xray конфиги</strong></td><td class="mono">/opt/etc/xray/configs/0{1..7}_*.json</td></tr>
       <tr><td><strong>Routing шаблон</strong></td><td class="mono">/opt/etc/xray/configs.bak/05_routing.template.json — placeholder'ы <code>__DEFAULT_TAG__</code>, <code>__AI_RULE_BLOCK__</code>, <code>__DIRECT_RULE_BLOCK__</code> (v5)</td></tr>
-      <tr><td><strong>Watchdog config</strong></td><td class="mono">/opt/etc/xray/watchdog.config — PRIMARY_TAG, FAILOVER_TAGS, AI_TAG, AI_DOMAINS, AI_FAIL_BLOCK, DIRECT_DOMAINS, PRIMARY_PROBE_URL, FAIL/PASS_THRESHOLD, FORCE_MODE, TG_*</td></tr>
-      <tr><td><strong>Watchdog script</strong></td><td class="mono">/opt/etc/xray/watchdog.sh — v6 с каскадным failover, probe-of-PRIMARY (curl), AI kill-switch, md5-compare</td></tr>
-      <tr><td><strong>Watchdog state</strong></td><td class="mono">/opt/etc/xray/watchdog.state — формат: <code>&lt;state&gt; &lt;counter&gt; &lt;current_default_tag&gt;</code></td></tr>
-      <tr><td><strong>Watchdog log</strong></td><td class="mono">/opt/var/log/xray/watchdog.log — события переключений</td></tr>
+      <tr><td><strong>Watchdog config</strong></td><td class="mono">/opt/etc/xray/watchdog.config — PRIMARY_TAG, FAILOVER_TAGS; роли AI_* / YT_* / FOREIGN_* / IPV6_* (тег, домены, категории, *_FAIL_BLOCK, *_FAILOVER_TAGS, *_CHAIN_ALLOW_RU, FOREIGN_CHAIN_USE_COMMON), DIRECT/BLOCK_DOMAINS, PRIMARY_PROBE_URL, FAIL/PASS_THRESHOLD, DEEP_PROBE_* / DEEP_RETURN_HOLD, FORCE_MODE, TG_*</td></tr>
+      <tr><td><strong>Watchdog script</strong></td><td class="mono">/opt/etc/xray/watchdog.sh — каскадный failover PRIMARY→FAILOVER, цепочки резерва каналов, kill-switch каналов, сквозные пробы ролей, md5-compare routing. Версия — в первой строке файла; панель сверяет её со встроенной и обновляет при «Сохранить»</td></tr>
+      <tr><td><strong>Watchdog state</strong></td><td class="mono">/opt/etc/xray/watchdog.state — одна строка: <code>&lt;state&gt; &lt;counter&gt; &lt;current_default_tag&gt;</code> + поля <code>KEY=val</code> (EFFECTIVE_AI/YT/FOREIGN, LAST_BAD_MD5, *_BLOCKED, AI_EFF/YT_EFF/FGN_EFF, сквозные пробы <code>D{PRI,YT,FGN}_CTR/_TS/_DEAF/_LEFT/_TAG</code> …)</td></tr>
+      <tr><td><strong>Watchdog log</strong></td><td class="mono">/opt/var/log/xray/watchdog.log — события переключений, kill-switch, цепочек (<code>YT-FAILOVER</code>, <code>FOREIGN-FAILOVER</code>) и сквозных проб (<code>DEEP-PROBE</code>)</td></tr>
       <tr><td><strong>Cron daemon</strong></td><td class="mono">/opt/sbin/crond -L /dev/null</td></tr>
       <tr><td><strong>Crontab</strong></td><td class="mono">/opt/etc/crontabs/root — управление через <code>crontab -l</code> / <code>crontab -e</code></td></tr>
       <tr><td><strong>Cron-задачи</strong></td><td class="mono">*/1 * * * * /opt/etc/xray/watchdog.sh<br>00 17 * * * /opt/sbin/xkeen -ug</td></tr>
@@ -12317,11 +13028,13 @@ XKEEN_TEMPLATE = r"""<!doctype html>
       </td></tr>
     </table>
     <p class="subtitle" style="margin-top: 10px;">
-      <strong>Watchdog v6 (2026-05-14)</strong>: запускается cron'ом каждую минуту, читает <code>watchdog.config</code>,
+      <strong>Watchdog</strong>: запускается cron'ом каждую минуту, читает <code>watchdog.config</code>,
       пингует PRIMARY через curl (PRIMARY_PROBE_URL, exit-codes 7/28 = down). При FAIL_THRESHOLD (default 2) fail подряд переключается
       в failover (каскадно: первый живой из FAILOVER_TAGS). При PASS_THRESHOLD (default 3) pass подряд возвращается на PRIMARY.
-      Дополнительно: AI kill-switch (если AI_FAIL_BLOCK=1 и AI_TAG мёртв → AI-домены идут в <code>block</code>).
-      Генерит финальный <code>05_routing.json</code> из template'а через awk-подмену <code>__DEFAULT_TAG__</code> / <code>__AI_RULE_BLOCK__</code> / <code>__DIRECT_RULE_BLOCK__</code>;
+      Каналы AI / YouTube / «Зарубежные сервисы»: собственные цепочки резерва (<code>*_FAILOVER_TAGS</code>), kill-switch
+      (<code>*_FAIL_BLOCK=1</code> и вся цепочка мертва → домены канала идут в <code>block</code>), сквозные пробы ролей
+      (<code>DEEP_PROBE_*</code>: реальный запрос через узел; глухой узел → резерв, карантин возврата <code>DEEP_RETURN_HOLD</code>).
+      Генерит финальный <code>05_routing.json</code> из template'а через подмену placeholder'ов (<code>__DEFAULT_TAG__</code>, <code>__AI_RULE_BLOCK__</code>, <code>__YT_RULE_BLOCK__</code>, <code>__FOREIGN_RULE_BLOCK__</code>, <code>__IPV6_RULE_BLOCK__</code>, <code>__DIRECT_RULE_BLOCK__</code>);
       запись только если md5 отличается. Все изменения через эту панель автоматически бэкапят оригиналы на роутере (<code>*.bak-&lt;timestamp&gt;</code>).
     </p>
   </div>
@@ -12846,7 +13559,7 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>cron watchdog</code></td><td style="padding: 5px 10px;">Cron-задача для watchdog отсутствует — failover при падении канала не сработает. Auto-fix: <strong>🔧 Добавить cron</strong> (запись <code>*/1 * * * * /opt/etc/xray/watchdog.sh</code>).</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>kill-switch политики</code></td><td style="padding: 5px 10px;">Хук <code>zz_xkeen_killswitch.sh</code> не установлен, потерял <code>+x</code>/cron-строку, переход не первый в <code>FORWARD</code> или параметры (метка политики, порты) разошлись с роутером. Auto-fix «🛡 Установить kill-switch» перегенерирует хук и проверит правила. Подробнее — «🛡 Kill-switch политики XKeen» в Помощи.</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>watchdog log без ошибок</code></td><td style="padding: 5px 10px;">В <code>/opt/var/log/xray/watchdog.log</code> свежие WARN/ERROR. Auto-fix НЕТ — нужно посмотреть детали в раскрытой проверке. Может быть нормально (временная недоступность канала).</td></tr>
-          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>geoip.dat категории</code></td><td style="padding: 5px 10px;">GeoIP-категории из routing (например <code>geoip:telegram</code>) отсутствуют в установленном <code>geoip.dat</code> → xray падает на старте. Auto-fix: <strong>📥 Установить расширенный geoip.dat</strong> (от Loyalsoldier — содержит сервисы telegram/discord, а не только страны cn/ru/us).</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>geoip.dat категории</code></td><td style="padding: 5px 10px;">GeoIP-категории из routing (например <code>geoip:telegram</code>) отсутствуют в установленном <code>geoip.dat</code> → xray падает на старте. Auto-fix: <strong>📥 Установить / обновить расширенный geoip.dat</strong> — берёт <code>geoip_v2fly.dat</code> с роутера (если в нём есть telegram) или скачивает от Loyalsoldier; рабочий файл заменяется только после проверки нового. Категории сервисов в расширенной базе: telegram, cloudflare, google, facebook, twitter, netflix, fastly, cloudfront (discord там нет — только доменными правилами). Проверяются категории канала «📱 Зарубежные сервисы».</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>curl + RCI Keenetic</code></td><td style="padding: 5px 10px;">На роутере нет рабочего <code>curl</code> (watchdog пробит им каналы) или недоступен RCI Keenetic (<code>localhost:79</code> — DNS-профили/политики). Auto-fix НЕТ — проверь <code>opkg install curl</code> и доступность веб-интерфейса роутера.</td></tr>
           <tr><td style="padding: 5px 10px; vertical-align: top;"><code>Entware GNU tar</code></td><td style="padding: 5px 10px;">Установлен BusyBox tar (не GNU) — миграция через <code>tar</code> может не работать (нет <code>--exclude</code> и пр.). Auto-fix НЕТ — <code>opkg install tar</code> ставит GNU tar.</td></tr>
         </tbody>
@@ -13634,7 +14347,7 @@ Use this token to access the HTTP API:
     </div>
   </details>
 
-  <details class="help-section">
+  <details class="help-section" id="help-channels">
     <summary>📡 Каналы: PRIMARY · FAILOVER · AI · YouTube · «Зарубежные сервисы»</summary>
     <div class="help-body">
       <h4>🟢 PRIMARY — основной канал</h4>
@@ -13656,18 +14369,19 @@ Use this token to access the HTTP API:
       <p><strong>Kill-switch выключен по умолчанию</strong> — если YT-канал и его цепочка резерва (см. ниже) молчат, YouTube идёт через PRIMARY (с рекламой, но работает).</p>
 
 
-      <h4>⛓️ Цепочка резерва у каналов AI и YouTube</h4>
-      <p>У AI-канала и YouTube-канала есть <strong>собственная цепочка резерва</strong> — отдельная от цепочки PRIMARY/FAILOVER. Настраивается в карточке канала: <strong>⛓️ Цепочка резерва</strong>.</p>
+      <h4>⛓️ Цепочка резерва у каналов AI, YouTube и «Зарубежных сервисов»</h4>
+      <p>У каналов AI, YouTube и «Зарубежные сервисы» есть <strong>собственная цепочка резерва</strong> — отдельная от цепочки PRIMARY/FAILOVER. Настраивается в карточке канала: <strong>⛓️ Цепочка резерва</strong>.</p>
       <p><strong>Как это работает.</strong> Основной канал упал → watchdog перебирает цепочку <strong>сверху вниз</strong> и переводит трафик на первый живой канал. Как только оживает более приоритетный (или сам основной) — трафик возвращается наверх, залипания на дальнем резерве не происходит. Блокировка (kill-switch) включается <strong>последней мерой</strong>, когда молчит вся цепочка: не после первого промаха, а после двух пустых кругов подряд — чтобы короткая просадка связи не роняла канал в блок.</p>
       <p><strong>Порядок = приоритет.</strong> Первым ставится самый желанный резерв. Для AI-канала полезно ставить в начало узлы с постоянным адресом (например, собственный VPS): AI-сервисы спокойнее относятся к стабильному IP, чем к смене страны. Разумно, чтобы дальше в цепочке шли узлы <strong>других</strong> провайдеров или хостов — иначе падение одного сервера уносит всю цепочку разом.</p>
-      <p><strong>Галочка «Пускать российские узлы в цепочку».</strong> Для AI по умолчанию выключена: российский выход = блокировка аккаунта у Anthropic и OpenAI. Для YouTube по умолчанию включена: там российский выход штатен — меньше рекламы и нет замедления Google-CDN. Российским узел считается по имени тега: <code>RU</code>, <code>Россия</code>, <code>Russia</code> или флаг в названии. Если узел российский, но в имени этого нет, фильтр его не распознает — панель показывает такое предупреждение прямо в списке цепочки.</p>
+      <p><strong>Галочка «Пускать российские узлы в цепочку».</strong> Для AI по умолчанию выключена: российский выход = блокировка аккаунта у Anthropic и OpenAI. Для YouTube по умолчанию включена: там российский выход штатен — меньше рекламы и нет замедления Google-CDN. Для «Зарубежных сервисов» по умолчанию выключена: эти сервисы заблокированы в РФ, через российский узел они не откроются — такой узел в цепочке просто пропускается. Российским узел считается по имени тега: <code>RU</code>, <code>Россия</code>, <code>Russia</code> или флаг в названии. Если узел российский, но в имени этого нет, фильтр его не распознает — панель показывает такое предупреждение прямо в списке цепочки.</p>
       <p><strong>Что в цепочку не ставится.</strong> Служебные каналы <code>direct</code> (напрямую без VPN) и <code>block</code>: watchdog считает их всегда живыми, и трафик ушёл бы напрямую с IP роутера — для AI это ровно то, от чего защищает kill-switch.</p>
-      <p><strong>Проверка состояния.</strong> В карточке канала строка Kill-switch показывает, что работает прямо сейчас: сам канал, резерв из цепочки (с его номером) или блокировка. Переключения приходят и в Telegram-алерты, если бот настроен.</p>
+      <p><strong>Галочка «Использовать общую цепочку резерва (FAILOVER)»</strong> — только у «Зарубежных сервисов». Когда включена, вместо собственного списка действует цепочка из раздела «⛓️ Цепочка резерва (FAILOVER)» — та же, что подхватывает трафик при падении PRIMARY. Собственный список при этом сохраняется, но не действует; фильтр российских узлов действует и на общую цепочку. Удобно, когда отдельный резерв для зарубежных сервисов не нужен, а общая цепочка уже собрана из заграничных узлов.</p>
+      <p><strong>Проверка состояния.</strong> В карточке канала строка Kill-switch показывает, что работает прямо сейчас: сам канал, резерв из цепочки (с его номером) или блокировка. Рядом с выбранным каналом — результат <strong>сквозной пробы</strong> (идёт ли трафик через узел, а не отвечает ли его порт; см. раздел «⛓️ Watchdog»). Переключения приходят и в Telegram-алерты, если бот настроен.</p>
 
       <h4>📱 «Зарубежные сервисы»-sticky outbound</h4>
       <p>Sticky-канал для <strong>зарубежных сервисов</strong>: Meta/Instagram, WhatsApp, Telegram, Twitter/X, Discord (список <code>📱 Список доменов</code> в этом канале).</p>
       <p>Зачем отдельно от YouTube: у них <strong>противоположные</strong> требования к выходу. YouTube хочет <strong>российский</strong> выход (де-троттл + меньше рекламы), а Meta/Telegram <strong>заблокированы</strong> — российский выход блокировку НЕ обходит (DPI режет TLS даже через RU-IP). Поэтому здесь выбирай <strong>заграничный</strong> выход (🇳🇱/🇩🇪/🇪🇪). <em>(Раньше Instagram сидел в YouTube-канале с RU-выходом и не открывался — «вместо сайта скачивался файл».)</em></p>
-      <p><strong>GeoIP-категория <code>telegram</code> обязательна</strong> в этом канале для iOS — iPhone-Telegram бьёт по IP минуя DNS, без неё MTProto-соединения улетят в PRIMARY, и если PRIMARY=RU — Telegram зависнет в «Connecting» (на ПК работает через DNS-домен, поэтому проблема ловит только iOS). На «Зарубежные сервисы» эту категорию ставит UI-кнопка в подсекции «🌍 GeoIP-категории». Опционально — <code>discord</code>/<code>facebook</code>/<code>twitter</code>.</p>
+      <p><strong>GeoIP-категория <code>telegram</code> обязательна</strong> в этом канале для iOS — iPhone-Telegram бьёт по IP минуя DNS, без неё MTProto-соединения улетят в PRIMARY, и если PRIMARY=RU — Telegram зависнет в «Connecting» (на ПК работает через DNS-домен, поэтому проблема ловит только iOS). На «Зарубежные сервисы» эту категорию ставит UI-кнопка в подсекции «🌍 GeoIP-категории». Опционально — <code>facebook</code>/<code>twitter</code>. Категории <code>discord</code> в geoip.dat нет — Discord направляется доменными правилами.</p>
       <p><strong>Kill-switch (рекомендую включён)</strong>: если загран-канал упал — эти сервисы идут в <code>block</code>, а не через PRIMARY. Иначе при RU-default они всё равно не откроются (Meta/X недоступны для RU-IP), а реальный IP засветится. Подробнее — отдельная тема <a href="#help-foreign" onclick="openHelpAnchor('help-foreign'); return false;">«📱 Канал Зарубежные сервисы»</a>.</p>
 
       <h4>🌐 «Через IPv6» — sticky outbound</h4>
@@ -13721,12 +14435,12 @@ Use this token to access the HTTP API:
   <details class="help-section" id="help-v2fly-geoip">
     <summary>🩻 v2fly категории и 🌍 GeoIP-категории — что это и когда нужно</summary>
     <div class="help-body">
-      <p>В AI- и YT-секциях есть <strong>дополнительные свёрнутые блоки</strong> рядом с обычным списком доменов:</p>
+      <p>В секциях каналов есть <strong>дополнительные свёрнутые блоки</strong> рядом с обычным списком доменов:</p>
       <ul>
         <li><strong>🩻 v2fly категории</strong> — автообновляемые списки <em>доменов</em></li>
-        <li><strong>🌍 GeoIP-категории</strong> — списки <em>IP-диапазонов</em> (только в YT)</li>
+        <li><strong>🌍 GeoIP-категории</strong> — списки <em>IP-диапазонов</em> (только в канале «📱 Зарубежные сервисы»)</li>
       </ul>
-      <p>Оба <strong>необязательны</strong>. Если ручных доменов в списке достаточно — можешь не трогать.</p>
+      <p>Оба <strong>необязательны</strong>. Если ручных доменов в списке достаточно — их можно не трогать.</p>
 
       <h4>🩻 v2fly категории — зачем</h4>
       <p>Это списки доменов которые ведёт <a href="https://github.com/v2fly/domain-list-community/tree/master/data" target="_blank" rel="noopener">v2fly community</a>. Watchdog подставляет их как <code>ext:geosite_v2fly.dat:NAME</code> рядом с твоими ручными доменами.</p>
@@ -13741,21 +14455,28 @@ Use this token to access the HTTP API:
       </ol>
 
       <h4>🌍 GeoIP-категории — зачем</h4>
-      <p>Доменные правила не ловят трафик приложений, которые коннектятся <strong>напрямую к IP-датацентров минуя DNS</strong>. Классический пример — <strong>Telegram Desktop</strong> и <strong>Discord native client</strong>: они идут на IP вроде <code>149.154.x.x</code> / <code>91.108.x.x</code>, доменное правило <code>domain:telegram.org</code> их трафик не видит.</p>
-      <p>GeoIP-категория матчит по <strong>IP-диапазонам</strong> из <code>geoip.dat</code>. Watchdog генерирует <strong>отдельное правило</strong> <code>"ip": ["geoip:telegram"]</code> с тем же outboundTag что у YT-домен правила (и с тем же kill-switch через YT_FAIL_BLOCK).</p>
-      <p><strong>Когда использовать</strong>: если приложение «зависает на Connecting», а тот же сервис через браузер работает — это IP-only-проблема. Добавь категорию (<code>telegram</code>, <code>discord</code>) → трафик пойдёт через YT-канал по IP.</p>
+      <p>Доменные правила не ловят трафик приложений, которые коннектятся <strong>напрямую к IP-датацентров минуя DNS</strong>. Классический пример — <strong>Telegram Desktop</strong>: он идёт на IP вроде <code>149.154.x.x</code> / <code>91.108.x.x</code>, доменное правило <code>domain:telegram.org</code> его трафик не видит.</p>
+      <p>GeoIP-категория матчит по <strong>IP-диапазонам</strong> из <code>geoip.dat</code>. Секция «🌍 GeoIP-категории» находится в канале <strong>«📱 Зарубежные сервисы»</strong>. Watchdog генерирует <strong>отдельное правило</strong> <code>"ip": ["geoip:telegram"]</code> с тем же outboundTag, что у доменного правила этого канала (и с тем же kill-switch через FOREIGN_FAIL_BLOCK).</p>
+      <p><strong>Когда использовать</strong>: если приложение «зависает на Connecting», а тот же сервис через браузер работает — это IP-only-проблема. Добавьте категорию (обычно <code>telegram</code>) → трафик пойдёт через канал «Зарубежные сервисы» по IP.</p>
+      <p><strong>Какие категории сервисов есть в geoip.dat</strong>: <code>telegram</code>, <code>cloudflare</code>, <code>google</code>, <code>facebook</code>, <code>twitter</code>, <code>netflix</code>, <code>fastly</code>, <code>cloudfront</code> (плюс страны: <code>ru</code>, <code>us</code>, <code>cn</code> и т.д., и <code>private</code>). Категории <code>discord</code> в geoip.dat нет ни в одной базе — Discord направляется доменными правилами (пресет и v2fly-категория <code>discord</code>).</p>
 
-      <h4>🌍 GeoIP-категории — обязательный шаг</h4>
-      <div class="warn">⚠️ XKeen-installer ставит GeoIP-базы только <strong>со странами</strong> (geoip_refilter, geoip_zkeen) — категорий <em>сервисов</em> (telegram, discord) в них <strong>нет</strong>. Если после сохранения GeoIP-категории xkeen уходит в режим <strong>Mixed/Hybrid</strong> — нужно установить <strong>расширенный <code>geoip.dat</code></strong> от Loyalsoldier.</div>
-      <p>В UI GeoIP-секции есть зелёная кнопка <strong>📥 Установить расширенный geoip.dat (Loyalsoldier)</strong> — один клик, без SSH:</p>
+      <h4>🌍 GeoIP-категории — какая база geoip.dat нужна</h4>
+      <p>Категории сервисов есть только в <strong>расширенной</strong> базе <code>geoip.dat</code>. XKeen 2.0 сам <strong>ежедневно обновляет</strong> базы (<code>xkeen -ug</code> по расписанию), и расширенная база обычно уже стоит — отдельно ничего ставить не нужно.</p>
+      <p>Панель сама проверяет <code>geoip.dat</code> на роутере и показывает результат в секции «🌍 GeoIP-категории»:</p>
+      <ul>
+        <li><strong>✅ зелёная строка</strong> «Расширенная база geoip.dat установлена» — всё в порядке, категории можно добавлять сразу;</li>
+        <li><strong>⚠️ жёлтый блок</strong> с кнопкой — в установленной базе нет категории <code>telegram</code> (база «только страны») или файла нет;</li>
+        <li><strong>серая строка</strong> «состояние неизвестно» — роутер не ответил, панель ничего не утверждает.</li>
+      </ul>
+      <p>Кнопка <strong>📥 Установить / обновить расширенный geoip.dat</strong> нужна, <strong>только если панель показывает, что категории telegram в geoip.dat нет</strong>. Что она делает, без SSH:</p>
       <ol>
-        <li>Бэкап текущего geoip.dat → <code>.bak-&lt;timestamp&gt;</code></li>
-        <li>Скачивание ~18MB с <a href="https://github.com/Loyalsoldier/v2ray-rules-dat" target="_blank" rel="noopener">github.com/Loyalsoldier/v2ray-rules-dat</a></li>
-        <li>Автоматический <code>xkeen -restart</code></li>
-        <li>Verify через Get-NetTCPConnection</li>
+        <li>Берёт <code>geoip_v2fly.dat</code> рядом на роутере (его обновляет XKeen), если в нём есть категория telegram; иначе скачивает ~18MB с <a href="https://github.com/Loyalsoldier/v2ray-rules-dat" target="_blank" rel="noopener">github.com/Loyalsoldier/v2ray-rules-dat</a> во временный файл <code>geoip.dat.new</code></li>
+        <li>Проверяет новый файл: размер больше 5 МБ и категория telegram на месте. Если проверка не прошла — временный файл удаляется, рабочий <code>geoip.dat</code> не трогается</li>
+        <li>Только после успешной проверки: текущий <code>geoip.dat</code> → <code>.bak-&lt;timestamp&gt;</code>, новый файл встаёт на место рабочего</li>
+        <li>Автоматический <code>xkeen -restart</code> и проверка, что xray запустился без ошибок загрузки баз</li>
       </ol>
-      <p>Делается <strong>один раз на роутер</strong>. Дальше можно добавлять любые geoip-категории через UI без SSH.</p>
-      <div class="tip">💡 <strong>Self-healing</strong> в секции 🚑 «Восстановление и диагностика» имеет check #9 «geoip.dat содержит используемые категории». Если он fail — там та же кнопка установки расширенного geoip.dat в auto-fix.</div>
+      <p>В логе установки видно, какой источник сработал (geoip_v2fly.dat на роутере или скачивание).</p>
+      <div class="tip">💡 <strong>Self-healing</strong> в секции 🚑 «Восстановление и диагностика» имеет проверку «geoip.dat содержит используемые категории»: она берёт категории канала «📱 Зарубежные сервисы» (и старое поле YouTube-канала, если оно осталось в конфиге) и прогоняет <code>xray run -test</code>. Если какой-то категории в базе нет — там же появится кнопка установки расширенного geoip.dat.</div>
 
       <h4>Разница между всеми тремя списками (на примере YT)</h4>
       <ul>
@@ -13820,7 +14541,7 @@ Use this token to access the HTTP API:
           <p>В textarea появятся домены. Жми <strong>«💾 Сохранить YT-домены»</strong>.</p>
 
           <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #1a5276;">
-            💡 <strong>Пресет нужен для web-версии</strong> (в браузере) — там трафик идёт по DNS (открыл youtube.com → DNS lookup → правило сработало). Для <strong>десктоп- и мобильных приложений</strong> некоторые сервисы (Telegram Desktop, Discord native) ходят по IP без DNS — для них пресета недостаточно, нужен GeoIP (см. Шаг 5).
+            💡 <strong>Пресет нужен для web-версии</strong> (в браузере) — там трафик идёт по DNS (открыл youtube.com → DNS lookup → правило сработало). Для <strong>десктоп- и мобильных приложений</strong> некоторые сервисы (например, Telegram Desktop) ходят по IP без DNS — для них пресета недостаточно, нужен GeoIP (см. Шаг 5). Discord направляется только доменными правилами — категории discord в geoip.dat нет.
           </div>
 
           <h4 style="margin: 12px 0 6px;">Шаг 4. v2fly категории (для автоподхвата новых доменов)</h4>
@@ -13864,14 +14585,14 @@ Use this token to access the HTTP API:
               <tr>
                 <td style="border:1px solid #ccc; padding:6px 10px;"><strong>Discord</strong></td>
                 <td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ обязательно</td>
-                <td style="border:1px solid #ccc; padding:6px 10px; color:#e80;">⚠ опционально</td>
-                <td style="border:1px solid #ccc; padding:6px 10px;">Web и desktop в основном по DNS, но WebRTC/voice могут идти по IP — GeoIP помогает, но не критично.</td>
+                <td style="border:1px solid #ccc; padding:6px 10px; color:#888;">нет категории</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">Web и desktop ходят по DNS — доменные правила (пресет + v2fly-категория <code>discord</code>) покрывают клиент. Категории <code>discord</code> в geoip.dat нет ни в одной базе.</td>
               </tr>
               <tr style="background:#f0fff0;">
                 <td style="border:1px solid #ccc; padding:6px 10px;"><strong>WhatsApp</strong></td>
                 <td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ обязательно</td>
                 <td style="border:1px solid #ccc; padding:6px 10px; color:#888;">не нужна</td>
-                <td style="border:1px solid #ccc; padding:6px 10px;">Web и мобильный клиент ходят по DNS (whatsapp.com/whatsapp.net + wa.me + Meta MQTT-эндпоинты). Категории <code>whatsapp</code> в Loyalsoldier geoip.dat нет — а <code>facebook</code> захватил бы FB/IG, не подходит. ⚠ <strong>Для первичного linking устройства</strong> пресета может быть недостаточно — клиент при первой авторизации (сканировании QR) ходит на доп. Edge-серверы по IP. Лайфхак: временно поставь PRIMARY = VPN → сделай linking → верни PRIMARY обратно. Дальше всё покрывается пресетом. Заблокирован DPI в РФ с 2025-08.</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">Web и мобильный клиент ходят по DNS (whatsapp.com/whatsapp.net + wa.me + Meta MQTT-эндпоинты). Категории <code>whatsapp</code> в geoip.dat нет — а <code>facebook</code> захватил бы FB/IG, не подходит. ⚠ <strong>Для первичного linking устройства</strong> пресета может быть недостаточно — клиент при первой авторизации (сканировании QR) ходит на доп. Edge-серверы по IP. Лайфхак: временно поставь PRIMARY = VPN → сделай linking → верни PRIMARY обратно. Дальше всё покрывается пресетом. Заблокирован DPI в РФ с 2025-08.</td>
               </tr>
               <tr>
                 <td style="border:1px solid #ccc; padding:6px 10px;"><strong>TikTok / Twitch / Twitter / Reddit / Spotify</strong></td>
@@ -13883,7 +14604,7 @@ Use this token to access the HTTP API:
           </table>
 
           <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin: 4px 0; font-size: 0.9em;">
-            ⚠ Если после сохранения GeoIP <code>xkeen -status</code> покажет «в режиме <strong>Mixed/Hybrid</strong>» — <strong>проверь <code>error.log</code></strong>: если там <code>code not found</code>/<code>failed to load</code>, то категория действительно не найдена в geoip.dat → в жёлтом блоке там же нажми зелёную кнопку <strong>«📥 Установить расширенный geoip.dat (Loyalsoldier)»</strong>. <em>Если error.log чистый — Mixed/Hybrid это валидный режим работы XKeen, VPN работает (проверка через <code>https://checkip.amazonaws.com</code> покажет VPN-IP).</em>
+            ⚠ Если после сохранения GeoIP <code>xkeen -status</code> покажет «в режиме <strong>Mixed/Hybrid</strong>» — <strong>проверьте <code>error.log</code></strong>: если там <code>code not found</code>/<code>failed to load</code>, то категория действительно не найдена в geoip.dat. Если секция «🌍 GeoIP-категории» показывает, что категории telegram в geoip.dat нет, — нажмите зелёную кнопку <strong>«📥 Установить / обновить расширенный geoip.dat»</strong> в жёлтом блоке там же. <em>Если error.log чистый — Mixed/Hybrid это валидный режим работы XKeen, VPN работает (проверка через <code>https://checkip.amazonaws.com</code> покажет VPN-IP).</em>
           </div>
 
           <h4 style="margin: 12px 0 6px;">Шаг 6. Проверка</h4>
@@ -14090,8 +14811,15 @@ nslookup instagram.com 8.8.8.8     # напрямую через Google — ес
         <li><strong>GeoIP-категории</strong> — для приложений, которые ходят на IP <em>мимо DNS</em> (Telegram Desktop коннектится прямо к датацентрам). Доменные правила их не ловят — добавь <code>telegram</code> в GeoIP, чтобы и они шли через загран-выход.</li>
       </ol>
 
+      <h4>⛓️ Цепочка резерва и общая цепочка</h4>
+      <p>В карточке канала есть блок <strong>«⛓️ Цепочка резерва»</strong>: список заграничных узлов, на которые watchdog переведёт зарубежные сервисы, если выбранный выход упал. Перебор сверху вниз, возврат на более приоритетный узел — автоматически. Российские узлы по умолчанию <strong>пропускаются</strong> (сервисы этого канала заблокированы в РФ, через RU-выход они не откроются); пускать их можно галочкой, но смысла в этом почти нет.</p>
+      <p>Галочка <strong>«Использовать общую цепочку резерва (FAILOVER)»</strong> заменяет собственный список на общую цепочку из раздела «⛓️ Цепочка резерва (FAILOVER)». Собственный список при этом сохраняется, но не действует — строка под редактором показывает, какая цепочка действует и какие её узлы будут пропущены. Записывается кнопкой «Сохранить цепочку».</p>
+
+      <h4>🩺 Сквозная проба</h4>
+      <p>Раз в несколько минут watchdog делает реальный запрос к <code>api.telegram.org</code> <strong>через</strong> действующий узел канала. Если узел принимает соединения, но ответа нет несколько проб подряд — он признаётся глухим, и канал уходит на резерв по цепочке; после ухода действует карантин возврата. Результат виден рядом с выбранным выходом в карточке («✅ насквозь», «⏳ проба пуста», «🕳 трафик не идёт»). Подробнее — <a href="#help-watchdog" onclick="openHelpAnchor('help-watchdog'); return false;">раздел «⛓️ Watchdog»</a>.</p>
+
       <h4>🛡️ Kill-switch (защита от утечки)</h4>
-      <p>Если включён (<code>FOREIGN_FAIL_BLOCK=1</code>) и заграничный выход <strong>упадёт</strong> — трафик Meta/Telegram <strong>блокируется</strong>, а не уходит через провайдера напрямую. Зачем: иначе при падении канала сервисы всё равно не откроются (Meta/Telegram недоступны для RU-IP), а твой <strong>реальный IP засветится</strong>. Лучше временно заблокировать до восстановления канала. Восстанавливается автоматически, как только выход оживёт.</p>
+      <p>Если включён (<code>FOREIGN_FAIL_BLOCK=1</code>) и заграничный выход <strong>упадёт</strong> (вместе со всей цепочкой резерва, если она задана) — трафик Meta/Telegram <strong>блокируется</strong>, а не уходит через провайдера напрямую. Зачем: иначе при падении канала сервисы всё равно не откроются (Meta/Telegram недоступны для RU-IP), а <strong>реальный IP засветится</strong>. Лучше временно заблокировать до восстановления канала. Восстанавливается автоматически, как только выход оживёт.</p>
 
       <div style="background: #f6f0fb; border-left: 3px solid #8e44ad; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #5b2c6f;">
         💡 <strong>Совет по надёжности</strong>: если выбрать для этого канала <strong>тот же сервер</strong>, что и основной (PRIMARY), то при его падении ляжет и инстаграм. Для независимого резерва выбери <strong>другой</strong> заграничный узел.
@@ -14142,7 +14870,7 @@ another-server.io   # ✏️</pre>
     </div>
   </details>
 
-  <details class="help-section">
+  <details class="help-section" id="help-watchdog">
     <summary>⛓️ Watchdog — как переключается между PRIMARY и FAILOVER</summary>
     <div class="help-body">
       <h4>Принцип работы</h4>
@@ -14164,6 +14892,14 @@ another-server.io   # ✏️</pre>
 
       <h4>Гистерезис против флапа</h4>
       <p><strong>2 fail / 3 pass</strong> подряд — это защита от мерцания: один случайный потеря пакета не вызовет переключения. Только устойчивые проблемы.</p>
+
+      <h4>🩺 Сквозная проба всех каналов</h4>
+      <p><strong>Что проверяет.</strong> Обычная проверка смотрит, отвечает ли <em>порт</em> узла (handshake). Сквозная проба делает реальный HTTP-запрос <strong>через</strong> выделенный служебный socks-inbound, который watchdog направляет на действующий канал роли: для основного подключения — <code>cloudflare.com/cdn-cgi/trace</code>, для YouTube — <code>youtube.com/generate_204</code>, для «Зарубежных сервисов» — <code>api.telegram.org</code>. У AI-канала своя проба (проверка страны выхода), она описана в разделе «📨 TG-алерты».</p>
+      <p><strong>Чем отличается от обычной.</strong> Узел может принимать соединения, но не пропускать трафик — типовая картина после сбоя у провайдера VPN или когда xray на роутере стартовал раньше WAN. Проверка порта тогда зелёная, а сайты не открываются. Сквозная проба ловит именно это: «порт отвечает» ≠ «трафик идёт».</p>
+      <p><strong>Пороги.</strong> Пробы идут с интервалом <code>DEEP_PROBE_INTERVAL</code> (по умолчанию 180 с). Если подряд <code>DEEP_PROBE_THRESHOLD</code> проб (по умолчанию 2) остались без ответа — узел признаётся <strong>глухим</strong>, и роль уходит на резерв по своей цепочке (основное подключение — на FAILOVER). Реакция ≈ интервал × порог: при значениях по умолчанию около 6 минут. После ухода действует <strong>карантин возврата</strong> <code>DEEP_RETURN_HOLD</code> (по умолчанию 30 мин): раньше срока на глухой узел не вернут, даже если он ожил — защита от качелей. Настройки — в блоке «🩺 Сквозная проба каналов» в разделе «🎯 Основное и резервное подключение».</p>
+      <p><strong>Что видно в панели.</strong> Рядом с выбранным каналом роли: «✅ насквозь: отвечает (N мин назад)», «⏳ сквозная проба пуста (N из порога)», «🕳 трафик сквозь канал не идёт» и «⏸ карантин возврата: ещё M мин». Сводка по трём ролям — в том же блоке настроек. Если роутер недоступен или watchdog на нём старее этой функции, панель ничего не утверждает — покажет «нет данных».</p>
+      <p><strong>Строки в логе watchdog.</strong> <code>DEEP-PROBE …</code> — события сквозной пробы (узел признан глухим / снова отвечает / карантин); <code>YT-FAILOVER … глух</code> и <code>FOREIGN-FAILOVER …</code> — переключения ролей на резерв по глухоте и возврат. Регулярные успешные пробы в лог не пишутся, чтобы не вытеснять события.</p>
+      <p><strong>В Telegram</strong> приходят алерты об уходе роли на резерв по глухоте и о возврате (см. раздел «📨 TG-алерты»).</p>
     </div>
   </details>
 
@@ -14225,7 +14961,7 @@ another-server.io   # ✏️</pre>
     </div>
   </details>
 
-  <details class="help-section">
+  <details class="help-section" id="help-tg-alerts">
     <summary>📨 TG-алерты — что приходит в Telegram</summary>
     <div class="help-body">
       <h4>Бот: <strong>Telegram-бот</strong> (любой, заводится в секции «🤖 Telegram-бот для алертов» наверху страницы)</h4>
@@ -14239,6 +14975,8 @@ another-server.io   # ✏️</pre>
         <li>📺 <strong>YT kill-switch активен/снят</strong> — то же для YouTube (если включён)</li>
         <li>📱 <strong>FOREIGN kill-switch активен/снят</strong> — то же для канала «Зарубежные сервисы» (если включён <code>FOREIGN_FAIL_BLOCK</code>)</li>
         <li>🤖 <strong>AI exit-IP светит небезопасной страной</strong> — раз в 10 мин watchdog probe'ит реальный exit-IP AI-канала через изолированный <code>socks-ai-check:10818</code> на роутере и спрашивает <code>ipinfo.io/country</code>. Если страна в чёрном списке (<code>AI_PROBE_BAD_COUNTRIES</code>, по умолчанию <code>RU BY CN IR KP SY</code>) — TG-алерт с просьбой сменить узел в разделе «🤖 AI». При возврате в безопасную страну — отдельный алерт о восстановлении. Это защита от ситуации когда коммерческий VPN маршрутизирует через резервный exit в санкционной стране — Anthropic/OpenAI режут такие IP («App unavailable», «403 Request not allowed»). Период тишины между алертами — <code>AI_PROBE_ALERT_COOLDOWN</code>.</li>
+        <li>🕳 <strong>Канал глух насквозь</strong> — сквозная проба роли (основное подключение, YouTube, «Зарубежные сервисы») несколько раз подряд не прошла через узел: роль переведена на резерв из её цепочки, узел в карантине возврата. Отдельный алерт — когда роль вернулась на основной узел.</li>
+        <li>⛓️ <strong>Резерв цепочки канала</strong> — YouTube / «Зарубежные сервисы» переключены на узел из собственной (или общей) цепочки резерва, либо вернулись на основной канал.</li>
         <li>⚠️ <strong>Failover-каналов мало (≤2 живых)</strong> — резерв под угрозой</li>
         <li>✅ <strong>Failover-каналы восстановились</strong> — резерв снова в норме</li>
         <li>🚨 <strong>Полный отказ</strong> — PRIMARY И ВСЕ failover мертвы (катастрофа)</li>
@@ -14917,8 +15655,8 @@ xkeen -restart</pre>
             <li><strong>Web UI Keenetic завис после применения политики</strong> — это нормально на 1-2 минуты (пересборка iptables). Если затянулось — reboot роутера через ndmsv2 SSH (admin@host:22 → <code>system reboot</code>) или через Web UI Управление.</li>
             <li><strong>Залипшая пустая политика, нельзя удалить через Web UI</strong> — через Keenetic CLI (см. опциональный шаг «Удаление политики через Keenetic CLI»).</li>
             <li><strong>«unzip: replace?» / прерывание prompt'ом</strong> — всегда используй <code>unzip -o</code> (force overwrite, без интерактивности).</li>
-            <li><strong>Telegram Desktop / Discord native виснет на «Connecting»</strong> — это IP-only-проблема. Доменные правила их не ловят, нужны GeoIP-категории. См. подраздел «🩻 v2fly категории и 🌍 GeoIP-категории» выше.</li>
-            <li><strong>geoip:telegram не работает (xkeen в Mixed/Hybrid + в error.log <code>code not found</code>)</strong> — стандартный <code>geoip.dat</code> от XKeen-installer содержит только страны. Нужен расширенный от Loyalsoldier — кнопка в самой панели в секции «🌍 GeoIP-категории». ⚠ Если в Mixed/Hybrid но в error.log пусто — это просто другой режим работы XKeen, VPN при этом работает. Проверь через <code>curl https://checkip.amazonaws.com</code> с устройства в политике XKeen — должен показать VPN-IP.</li>
+            <li><strong>Telegram Desktop виснет на «Connecting»</strong> — это IP-only-проблема. Доменные правила его не ловят, нужна GeoIP-категория <code>telegram</code> (Discord направляется только доменными правилами — категории discord в geoip.dat нет). См. подраздел «🩻 v2fly категории и 🌍 GeoIP-категории» выше.</li>
+            <li><strong>geoip:telegram не работает (xkeen в Mixed/Hybrid + в error.log <code>code not found</code>)</strong> — в установленном <code>geoip.dat</code> нет категории (база «только страны»). XKeen 2.0 обычно сам держит расширенную базу (<code>xkeen -ug</code> ежедневно); если секция «🌍 GeoIP-категории» показывает, что категории telegram нет, — там же кнопка «📥 Установить / обновить расширенный geoip.dat». ⚠ Если в Mixed/Hybrid но в error.log пусто — это просто другой режим работы XKeen, VPN при этом работает. Проверь через <code>curl https://checkip.amazonaws.com</code> с устройства в политике XKeen — должен показать VPN-IP.</li>
             <li><strong>Полная переустановка</strong> — <code>xkeen -remove</code> снесёт всё подчистую (xray + конфиги + cron). Можно начать заново с Шага 5.</li>
           </ul>
           <p class="muted">💡 Актуальная официальная документация и обсуждение проблем — в Telegram-канале XKeen
@@ -15577,6 +16315,15 @@ const WATCHDOG_AI_PROBE = {{ watchdog.ai_probe|tojson }};
 const WATCHDOG_EFFECTIVE_YT = {{ watchdog.effective_yt|tojson }};
 const AI_FAIL_BLOCK = {{ targets.ai_fail_block|tojson }};
 const YT_FAIL_BLOCK = {{ targets.yt_fail_block|tojson }};
+// watchdog v29/v30: канал «Зарубежные сервисы» + сквозные пробы ролей.
+// WATCHDOG_DEEP = {pri:{ctr,ts,deaf,left,tag,age_min,hold_left_min}|null, yt:…, fgn:…} либо null
+// (роутер недоступен / старый watchdog без полей D{PRI,YT,FGN}_*).
+const WATCHDOG_EFFECTIVE_FOREIGN = {{ watchdog.effective_foreign|tojson }};
+const FOREIGN_FAIL_BLOCK = {{ targets.foreign_fail_block|tojson }};
+const WATCHDOG_DEEP = {{ watchdog.deep|tojson }};
+const WATCHDOG_FAILOVER_TAGS = {{ (targets.failover_tags or [])|tojson }};
+const DEEP_PROBE_THRESHOLD = {{ (targets.deep_probe_threshold or 2)|tojson }};
+const DEEP_PROBE_ENABLE = {{ 'false' if targets.deep_probe_enable is sameas false else 'true' }};
 // opts: { showTagInTitle: bool, activeNote: string-html }
 // showTagInTitle=false (default) — заголовок без Matrix-плашки с tag (имя уже видно в dropdown'е),
 //   остаются только бейджи 📦/🛡️/📺 и дата истечения.
@@ -15730,6 +16477,9 @@ function applyStatusesToMeta(statuses) {
   if (typeof refreshYTInfo === 'function') refreshYTInfo();
   if (typeof refreshAIActiveInfo === 'function') refreshAIActiveInfo();
   if (typeof refreshYTActiveInfo === 'function') refreshYTActiveInfo();
+  if (typeof refreshForeignInfo === 'function') refreshForeignInfo();
+  if (typeof refreshForeignActiveInfo === 'function') refreshForeignActiveInfo();
+  if (typeof refreshPrimaryInfo === 'function') refreshPrimaryInfo();
 }
 // Probe канала AI/YT прямо из info-блока (мини-кнопка 🔄 рядом со статус-бейджем).
 // Endpoint probes всех outbound'ов разом — это 1-3 сек, нормально для UX.
@@ -15759,15 +16509,94 @@ async function probeChannelFromInfo(role) {
 // v1.0.99: позиция канала в цепочке резерва своей роли (1..N) или 0, если он не оттуда.
 // Один helper на все индикаторы — чтобы разные места UI не расходились в формулировках.
 function chainPositionOf(roleLabel, tag) {
-  const kind = roleLabel === 'AI' ? 'ai' : (roleLabel === 'YouTube' ? 'yt' : null);
+  const kind = roleLabel === 'AI' ? 'ai' : (roleLabel === 'YouTube' ? 'yt' : (roleLabel === 'Зарубежные сервисы' ? 'foreign' : null));
   if (!kind || !tag) return 0;
   // CHAIN_STATE объявлен ниже по файлу через const: до его инициализации даже typeof
   // бросает ReferenceError (temporal dead zone), поэтому именно try/catch, не проверка.
   try {
-    return CHAIN_STATE[kind] ? CHAIN_STATE[kind].tags.indexOf(tag) + 1 : 0;
+    const st = CHAIN_STATE[kind];
+    if (!st) return 0;
+    // FOREIGN в режиме «общая цепочка»: реально действует FAILOVER_TAGS, а не собственный список.
+    // Статусы — по СОХРАНЁННОМУ режиму (что сейчас в config у сторожа), галочка — только для редактора.
+    if (kind === 'foreign' && st.useCommon) return WATCHDOG_FAILOVER_TAGS.indexOf(tag) + 1;
+    return st.tags.indexOf(tag) + 1;
   } catch (e) {
     return 0;
   }
+}
+
+// Режим «общая цепочка» у FOREIGN для РЕДАКТОРА — читается с чекбокса (переключение = только
+// перерисовка, в config пишет кнопка «Сохранить цепочку»); до рендера — из CHAIN_STATE.foreign.useCommon.
+// Статусы каналов (chainPositionOf) смотрят на сохранённый CHAIN_STATE.foreign.useCommon, не сюда.
+function chainUseCommon() {
+  const cb = document.getElementById('foreign-chain-use-common');
+  if (cb) return !!cb.checked;
+  try { return !!(CHAIN_STATE.foreign && CHAIN_STATE.foreign.useCommon); } catch (e) { return false; }
+}
+
+// Сквозная проба роли (watchdog v29): roleKey 'pri' | 'yt' | 'fgn'. Данные — WATCHDOG_DEEP.
+// null (старый watchdog / роутер недоступен) → пусто: ничего не утверждаем.
+// Есть ли у роли куда уходить при глухоте: основной — общая цепочка FAILOVER; YouTube — своя
+// цепочка; Зарубежные — своя или общая (по СОХРАНЁННОМУ режиму). Нет резерва — сторож роль не
+// переключает, и обещать это в подсказке нельзя.
+function deepRoleHasReserve(roleKey) {
+  try {
+    if (roleKey === 'pri') return WATCHDOG_FAILOVER_TAGS.length > 0;
+    if (roleKey === 'yt') return !!(CHAIN_STATE.yt && CHAIN_STATE.yt.tags.length);
+    if (roleKey === 'fgn') {
+      const st = CHAIN_STATE.foreign;
+      if (!st) return false;
+      return st.useCommon ? WATCHDOG_FAILOVER_TAGS.length > 0 : st.tags.length > 0;
+    }
+  } catch (e) {
+    return false;
+  }
+  return false;
+}
+
+function deepProbeNote(roleKey) {
+  const d = WATCHDOG_DEEP ? WATCHDOG_DEEP[roleKey] : null;
+  if (!d) return '';
+  const age = (d.age_min == null) ? 'время пробы неизвестно'
+            : (d.age_min < 60 ? d.age_min + ' мин назад' : Math.floor(d.age_min / 60) + ' ч назад');
+  const tagPart = d.tag ? ' Узел пробы: ' + escapeHtml(d.tag) + '.' : '';
+  // watchdog v31 пишет D*_RES=none, когда мерить нечего; у сторожа без этого поля — по косвенным
+  // признакам: замеров не было, канал служебный (direct/block/пусто), проба выключена.
+  const service = !d.tag || d.tag === 'direct' || d.tag === 'block';
+  const notMeasured = d.res === 'none' || (d.res == null && (!d.ts || service || !DEEP_PROBE_ENABLE));
+  let out = '';
+  if (notMeasured) {
+    const why = !DEEP_PROBE_ENABLE
+      ? 'Сквозная проба выключена в настройках блока «🩺 Сквозная проба каналов».'
+      : (service ? 'Канал роли служебный (напрямую, блокировка или не задан) — мерить сквозь него нечего.'
+                 : 'На этом узле замера ещё не было: после смены канала первый замер проходит через интервал пробы.');
+    out = ' <span style="background:#eee; color:#666; padding:1px 6px; border-radius:3px;" title="' + why + tagPart + '">' +
+          '⚪ не измеряется</span>';
+  } else if (d.deaf) {
+    const next = deepRoleHasReserve(roleKey)
+      ? ' Сторож переключит роль на резерв из её цепочки.'
+      : ' Резерва у роли нет — трафик продолжает идти через этот канал как есть.';
+    out = ' <span style="background:#fdd; color:#b00; padding:1px 6px; border-radius:3px;"' +
+          ' title="Реальный запрос СКВОЗЬ узел не прошёл (пустых проб подряд: ' + (d.ctr || 0) + ', замер ' + age + ').' + tagPart +
+          next + ' Проверка порта при этом может быть зелёной — она меряет достижимость сервера, а не путь трафика.">' +
+          '🕳 трафик сквозь канал не идёт (проб подряд: ' + (d.ctr || 0) + ')</span>';
+  } else if (d.ctr > 0) {
+    out = ' <span style="background:#fff3cd; color:#7a4d00; padding:1px 6px; border-radius:3px;"' +
+          ' title="Последняя сквозная проба не вернула ответ (замер ' + age + ').' + tagPart +
+          ' Узел признают глухим после ' + DEEP_PROBE_THRESHOLD + ' пустых проб подряд.">' +
+          '⏳ сквозная проба пуста (' + d.ctr + ' из ' + DEEP_PROBE_THRESHOLD + ')</span>';
+  } else {
+    out = ' <span style="background:#e2f0d9; color:#2a6b2a; padding:1px 6px; border-radius:3px;"' +
+          ' title="Реальный запрос СКВОЗЬ узел прошёл (замер ' + age + ').' + tagPart +
+          ' Это честнее проверки порта: подтверждён весь путь трафика.">' +
+          '✅ насквозь: отвечает (' + age + ')</span>';
+  }
+  if (d.hold_left_min > 0) {
+    out += ' <span style="background:#eee; color:#555; padding:1px 6px; border-radius:3px;"' +
+           ' title="Роль ушла с узла по глухоте. Пока карантин не истечёт, сторож не вернёт трафик на этот узел, даже если он оживёт.">' +
+           '⏸ карантин возврата: ещё ' + d.hold_left_min + ' мин</span>';
+  }
+  return out;
 }
 
 function getChannelStatusNote(tag, effective, failBlock, roleLabel) {
@@ -15853,9 +16682,43 @@ function refreshAIInfo() {
 function refreshYTInfo() {
   const sel = document.getElementById('select-yt');
   if (!sel) return;
-  const note = getChannelStatusNote(sel.value, WATCHDOG_EFFECTIVE_YT, YT_FAIL_BLOCK, 'YouTube') + makeProbeBtn('yt');
+  const note = getChannelStatusNote(sel.value, WATCHDOG_EFFECTIVE_YT, YT_FAIL_BLOCK, 'YouTube') + deepProbeNote('yt') + makeProbeBtn('yt');
   renderOutboundInfo('info-yt', sel.value, { activeNote: note });
   syncSelectColor(sel);
+}
+// watchdog v29: карточка «📱 Зарубежные сервисы» — по образцу YouTube (+ сквозная проба DFGN_*).
+function refreshForeignInfo() {
+  const sel = document.getElementById('select-foreign');
+  if (!sel) return;
+  const note = getChannelStatusNote(sel.value, WATCHDOG_EFFECTIVE_FOREIGN, FOREIGN_FAIL_BLOCK, 'Зарубежные сервисы') + deepProbeNote('fgn') + makeProbeBtn('foreign');
+  renderOutboundInfo('info-foreign', sel.value, { activeNote: note });
+  syncSelectColor(sel);
+}
+// watchdog v29: info-блок PRIMARY со сквозной пробой DPRI_* (раньше — bindOutboundInfo без бейджа).
+// Баннер режима (Jinja) и этот блок обязаны говорить одно и то же: оба читают WATCHDOG_DEEP.pri.
+function refreshPrimaryInfo() {
+  const sel = document.getElementById('select-primary');
+  if (!sel) return;
+  const note = deepProbeNote('pri') + makeProbeBtn('primary');
+  renderOutboundInfo('info-primary', sel.value, { activeNote: note });
+  syncSelectColor(sel);
+}
+// Сводка трёх ролей одной строкой каждая — в блоке «🩺 Сквозная проба каналов» и бейдж DPRI в баннере.
+function renderDeepProbeSummary() {
+  const box = document.getElementById('deep-probe-summary');
+  if (box) {
+    if (!WATCHDOG_DEEP) {
+      box.innerHTML = '<span style="color:#888;">Нет данных сквозной пробы: роутер недоступен или watchdog на нём старее v29 (обновится при следующем «Сохранить»).</span>';
+    } else {
+      const rows = [['Основной', 'pri'], ['YouTube', 'yt'], ['Зарубежные', 'fgn']].map(function (r) {
+        const n = deepProbeNote(r[1]);
+        return '<strong>' + r[0] + '</strong> — ' + (n || '<span style="color:#888;">нет данных</span>');
+      });
+      box.innerHTML = rows.join(' &nbsp;·&nbsp; ');
+    }
+  }
+  const pri = document.getElementById('deep-pri-note');
+  if (pri) pri.innerHTML = deepProbeNote('pri');
 }
 // Info-блок «🎯 Сейчас в роутинге для AI/YT» — показывает РЕАЛЬНО работающий канал
 // (effective из watchdog state), а не sel.value. Аналог FAILOVER active-блока:
@@ -15892,6 +16755,11 @@ function refreshYTActiveInfo() {
   if (!sel) return;
   refreshActiveInfo('yt', 'info-yt-active', WATCHDOG_EFFECTIVE_YT, sel.value, 'YouTube');
 }
+function refreshForeignActiveInfo() {
+  const sel = document.getElementById('select-foreign');
+  if (!sel) return;
+  refreshActiveInfo('foreign', 'info-foreign-active', WATCHDOG_EFFECTIVE_FOREIGN, sel.value, 'Зарубежные сервисы');
+}
 
 // ===== v1.0.99: редактор цепочек резерва каналов AI / YouTube (watchdog v27) =====
 // Цепочка = порядок перебора: watchdog берёт первый ЖИВОЙ канал сверху вниз, а kill-switch
@@ -15905,8 +16773,43 @@ const CHAIN_STATE = {
         mainTag: {{ targets.ai_tag|tojson }} },
   yt: { tags: {{ (targets.yt_failover_tags or [])|tojson }}, label: 'YouTube',
         effective: WATCHDOG_EFFECTIVE_YT, mainSel: 'select-yt',
-        mainTag: {{ targets.yt_tag|tojson }} }
+        mainTag: {{ targets.yt_tag|tojson }} },
+  // watchdog v29/v30: useCommon — вместо собственного списка действует общая FAILOVER_TAGS.
+  foreign: { tags: {{ (targets.foreign_failover_tags or [])|tojson }}, label: 'Зарубежные сервисы',
+        effective: WATCHDOG_EFFECTIVE_FOREIGN, mainSel: 'select-foreign',
+        mainTag: {{ targets.foreign_tag|tojson }},
+        useCommon: {{ (targets.foreign_chain_use_common or false)|tojson }} }
 };
+
+// FOREIGN, режим «общая цепочка»: собственный редактор гасим (disabled + полупрозрачный),
+// под ним — read-only строка действующей общей цепочки с пометками RU-узлов.
+function chainRenderCommonView(allowRu) {
+  const editor = document.getElementById('foreign-chain-editor');
+  const view = document.getElementById('foreign-chain-common-view');
+  if (!editor || !view) return;
+  const useCommon = chainUseCommon();
+  editor.style.opacity = useCommon ? '0.45' : '';
+  editor.style.pointerEvents = useCommon ? 'none' : '';
+  editor.querySelectorAll('button, select').forEach(function (el) {
+    if (useCommon) { el.setAttribute('disabled', 'disabled'); el.dataset.xkCommonOff = '1'; }
+    else if (el.dataset.xkCommonOff) { el.removeAttribute('disabled'); delete el.dataset.xkCommonOff; }
+  });
+  if (!useCommon) { view.style.display = 'none'; view.innerHTML = ''; return; }
+  view.style.display = '';
+  if (!WATCHDOG_FAILOVER_TAGS.length) {
+    view.innerHTML = '⚠️ Общая цепочка резерва (FAILOVER) пуста — заполните её в разделе «⛓️ Цепочка резерва (FAILOVER)», иначе при падении канала сразу сработает настройка блокировки выше.';
+    return;
+  }
+  const parts = WATCHDOG_FAILOVER_TAGS.map(function (tag) {
+    const info = CHAIN_TAG_INFO[tag];
+    let mark = '';
+    if (!info) mark = ' <span style="color:#a55;">(нет такого outbound — будет пропущен)</span>';
+    else if (info.ru_wd && !allowRu) mark = ' <span style="color:#a55;">(российский — будет пропущен)</span>';
+    const live = (CHAIN_STATE.foreign.effective && CHAIN_STATE.foreign.effective === tag) ? ' <span style="color:#7a4d00;">⚡ сейчас трафик идёт через него</span>' : '';
+    return '<strong>' + escapeHtml(tag) + '</strong>' + mark + live;
+  });
+  view.innerHTML = 'Действует общая цепочка резерва: ' + parts.join(' → ');
+}
 
 function chainAllowRu(kind) {
   const cb = document.getElementById(kind + '-chain-allow-ru');
@@ -15934,11 +16837,15 @@ function chainRender(kind) {
           + 'каждую минуту. Добавлять его в цепочку не нужно</span></span>'
           + '</div>';
   }
+  const allowRu = chainAllowRu(kind);
   if (!st.tags.length) {
-    box.innerHTML = html + '<div class="chain-empty">Цепочка резерва пуста — при падении канала сразу сработает настройка блокировки выше.</div>';
+    box.innerHTML = html + '<div class="chain-empty">' + ((kind === 'foreign' && chainUseCommon())
+      ? 'Собственная цепочка пуста — действует общая цепочка резерва (см. ниже).'
+      : 'Цепочка резерва пуста — при падении канала сразу сработает настройка блокировки выше.') + '</div>';
+    // Режим «общая цепочка» гасит редактор ПОСЛЕ отрисовки: кнопки списка создаются заново.
+    if (kind === 'foreign') chainRenderCommonView(allowRu);
     return;
   }
-  const allowRu = chainAllowRu(kind);
   st.tags.forEach(function (tag, i) {
     const info = CHAIN_TAG_INFO[tag];
     const notes = [];
@@ -15947,14 +16854,19 @@ function chainRender(kind) {
       notes.push('⚠️ такого канала нет среди outbound-ов — watchdog его пропустит');
       skip = true;
     } else if (info.ru_wd && !allowRu) {
-      notes.push('⏭ будет пропущен: распознан как российский узел, галочка ниже выключена');
+      notes.push(kind === 'foreign'
+        ? '⏭ будет пропущен: российский узел — сервисы этого канала заблокированы в РФ, через него они не откроются'
+        : '⏭ будет пропущен: распознан как российский узел, галочка ниже выключена');
       skip = true;
+    } else if (info.ru_wd && kind === 'foreign') {
+      notes.push('⚠️ российский узел: сервисы, заблокированные в РФ, через него не откроются');
     } else if (info.ru_wd && kind === 'ai') {
       notes.push('⚠️ российский узел в AI-цепочке: Anthropic и OpenAI блокируют аккаунты за RU-адрес');
     } else if (info.ru_look && kind === 'ai') {
       notes.push('⚠️ название выглядит российским, но фильтр ищет RU / Россия / Russia / RU-флаг в теге — этот канал в цепочку пройдёт');
     }
     if (st.effective && st.effective === tag) notes.push('⚡ сейчас трафик идёт через него');
+    if (kind === 'foreign' && chainUseCommon()) notes.push('не действует: включена общая цепочка');
     const grp = info && info.group ? escapeHtml(info.group) : '';
     const grpHtml = grp ? ' <span style="color:#888; font-weight:400;">· ' + grp + '</span>' : '';
     const noteHtml = notes.length ? '<br><span class="chain-warn chain-note">' + notes.map(escapeHtml).join(' · ') + '</span>' : '';
@@ -15967,6 +16879,8 @@ function chainRender(kind) {
           + '</div>';
   });
   box.innerHTML = html;
+  // ПОСЛЕ innerHTML: только что созданные ↑/↓/✖ тоже должны стать disabled в режиме «общая цепочка».
+  if (kind === 'foreign') chainRenderCommonView(allowRu);
 }
 
 function chainMove(kind, idx, dir) {
@@ -16015,12 +16929,18 @@ async function saveChannelChain(kind) {
   const preview = st.tags.length
     ? st.tags.map(function (t, i) { return '  ' + (i + 1) + '. ' + t; }).join('\n')
     : '  (пусто — цепочки не будет)';
+  const useCommon = (kind === 'foreign') && chainUseCommon();
+  const commonTxt = useCommon
+    ? '\n\nРежим: действует ОБЩАЯ цепочка резерва (FAILOVER): ' + (WATCHDOG_FAILOVER_TAGS.length ? WATCHDOG_FAILOVER_TAGS.join(' → ') : '(пусто)')
+      + '\nСобственный список выше сохраняется, но не действует.'
+    : '';
   if (!confirm('Сохранить цепочку резерва ' + st.label + ':\n\n' + preview
-      + '\n\nРоссийские узлы: ' + (allowRu ? 'разрешены' : 'пропускаются'))) return;
+      + '\n\nРоссийские узлы: ' + (allowRu ? 'разрешены' : 'пропускаются') + commonTxt)) return;
   const fd = new FormData();
   fd.append('kind', kind);
   fd.append('tags', st.tags.join(','));
   fd.append('allow_ru', allowRu ? '1' : '0');
+  if (kind === 'foreign') fd.append('use_common', useCommon ? '1' : '0');
   flash(true, 'Сохраняю цепочку ' + st.label + '...');
   const res = await apiCall('/api/xkeen/set-channel-chain', fd);
   if (res.ok) {
@@ -16032,7 +16952,11 @@ async function saveChannelChain(kind) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  bindOutboundInfo('select-primary',  'info-primary');
+  // watchdog v29: PRIMARY — со сквозной пробой (refreshPrimaryInfo вместо bindOutboundInfo).
+  refreshPrimaryInfo();
+  const primarySel = document.getElementById('select-primary');
+  if (primarySel) primarySel.addEventListener('change', refreshPrimaryInfo);
+  renderDeepProbeSummary();
   refreshFailoverInfo();
   // При смене dropdown'а FAILOVER — только меняем фон select, info-блок не трогаем
   // (он показывает текущий активный канал, а не выбор пользователя).
@@ -16046,10 +16970,16 @@ document.addEventListener('DOMContentLoaded', () => {
   refreshYTActiveInfo();
   const ytSel = document.getElementById('select-yt');
   if (ytSel) ytSel.addEventListener('change', refreshYTInfo);
+  // watchdog v29: карточка «📱 Зарубежные сервисы» — статус, активный канал, цепочка.
+  refreshForeignInfo();
+  refreshForeignActiveInfo();
+  const foreignSel = document.getElementById('select-foreign');
+  if (foreignSel) foreignSel.addEventListener('change', refreshForeignInfo);
   // v1.0.99: списки цепочек резерва AI/YouTube рисуются на клиенте (порядок правится
   // стрелками без перезагрузки, запись — по кнопке «Сохранить цепочку»).
   chainRender('ai');
   chainRender('yt');
+  chainRender('foreign');
   // Старт самодиагностики панели
   refreshDashboardHealth();
   setInterval(refreshDashboardHealth, 15000);
@@ -18540,7 +19470,7 @@ async function saveAIIpRanges() {
 async function saveYTExtCategories() { await _saveExtCategories('/api/xkeen/set-yt-ext-categories', 'yt-ext-categories', 'YT'); }
 
 // ============== v1.6.0: YT GeoIP-категории ==============
-// Для IP-only приложений (Telegram Desktop, Discord native) — матчат по IP-диапазонам
+// Для IP-only приложений (Telegram Desktop) — матчат по IP-диапазонам
 // из geoip.dat. Отдельное правило {"ip": ["geoip:NAME"]} с outboundTag = YT_TAG.
 function addYTGeoipCat(name) { _extCatAdd('yt-geoip-categories', name); }
 function clearYTGeoipCats() {
@@ -18789,26 +19719,28 @@ function openHelpAnchor(anchorId) {
   }, 100);
 }
 
-// v1.6.1: установка расширенного geoip.dat (Loyalsoldier) одной кнопкой.
-// Скачивает на роутер ~18MB файл с GitHub + xkeen -restart. Один раз на каждый роутер.
+// v1.6.1: установка расширенного geoip.dat одной кнопкой (auto-fix install_extended_geoip).
+// Источник — geoip_v2fly.dat на роутере (XKeen обновляет ежедневно) или скачивание от Loyalsoldier;
+// рабочий файл заменяется только после проверки нового, затем xkeen -restart.
 async function installExtendedGeoip() {
   if (!confirm(
-    'Установить расширенный geoip.dat от Loyalsoldier (~18MB)?\n\n' +
-    'Это нужно один раз. После установки категории `telegram`, `discord` и другие сервисы начнут работать в правилах с "geoip:NAME".\n\n' +
-    'Текущий geoip.dat (если есть) будет сохранён как geoip.dat.bak-<timestamp>. xkeen перезапустится автоматически.\n\n' +
-    'Скачивание может занять 30-60 секунд.'
+    'Установить / обновить расширенный geoip.dat?\n\n' +
+    'Если на роутере есть geoip_v2fly.dat (его ежедневно обновляет XKeen) — geoip.dat станет ссылкой на него и дальше будет обновляться вместе с XKeen. Иначе база скачивается от Loyalsoldier (~18MB). ' +
+    'После установки категории сервисов (telegram, cloudflare, google, facebook, twitter, netflix, fastly, cloudfront) работают в правилах с "geoip:NAME".\n\n' +
+    'Текущий geoip.dat сохраняется как geoip.dat.bak-<timestamp> (хранятся 2 последние копии). xkeen перезапустится автоматически; если xray после замены не запустится — прежняя база вернётся сама.\n\n' +
+    'Может занять 30-60 секунд.'
   )) return;
   const fd = new FormData();
   fd.append('fix_id', 'install_extended_geoip');
-  flash(true, 'Скачиваю расширенный geoip.dat — это 30-60 секунд...');
+  flash(true, 'Устанавливаю расширенный geoip.dat — до 30-60 секунд...');
   try {
     const res = await fetch('/api/xkeen/auto-fix', { method: 'POST', body: fd });
     const data = await res.json();
     if (data.ok) {
-      flash(true, '✅ Установлено. xkeen перезапущен. GeoIP-категории должны работать.', data.log || '');
+      flash(true, '✅ Готово. GeoIP-категории должны работать.', data.log || '');
       setTimeout(() => location.reload(), 3500);
     } else {
-      flash(false, '❌ Не получилось — смотри лог ниже', data.log || JSON.stringify(data));
+      flash(false, '❌ Не получилось — см. лог ниже', data.log || JSON.stringify(data));
     }
   } catch (e) {
     flash(false, '❌ Ошибка запроса', String(e));
@@ -19619,6 +20551,49 @@ async function tgLoad() {
       document.getElementById('tg-chat-id').value = j.chat_id || '';
     }
   } catch (e) { /* silent — может первый раз нет связи с роутером */ }
+}
+
+// watchdog v29: форма «🩺 Сквозная проба каналов» → POST /api/keenetic/watchdog-settings.
+// Текущие значения подставлены сервером из targets.deep_*; валидация диапазонов — на сервере,
+// здесь только целые числа. Успех → flash + reload (каждая запись = внеочередной тик watchdog).
+async function saveDeepProbeSettings(ev) {
+  if (ev && ev.preventDefault) ev.preventDefault();
+  const status = document.getElementById('deep-probe-status');
+  const btn = document.getElementById('deep-probe-save');
+  const num = function (id) { const el = document.getElementById(id); return el ? parseInt(el.value, 10) : NaN; };
+  const body = {
+    deep_probe_enable: !!(document.getElementById('deep-probe-enable') || {}).checked,
+    deep_probe_interval: num('deep-probe-interval'),
+    deep_probe_threshold: num('deep-probe-threshold'),
+    deep_return_hold_min: num('deep-return-hold-min'),
+  };
+  if ([body.deep_probe_interval, body.deep_probe_threshold, body.deep_return_hold_min].some(function (v) { return isNaN(v); })) {
+    if (status) status.textContent = '❌ все поля — целые числа';
+    return false;
+  }
+  if (status) status.textContent = '💾 сохраняю...';
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch('/api/keenetic/watchdog-settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    const j = await res.json();
+    if (j.ok) {
+      if (status) status.textContent = '✅ сохранено · страница обновится';
+      flash(true, j.stdout || 'Настройки сквозной пробы сохранены');
+      setTimeout(function () { location.reload(); }, 2000);
+    } else {
+      if (status) status.textContent = '❌ ' + (j.error || j.stderr || 'не сохранено');
+      flash(false, 'Ошибка', j.error || j.stderr || JSON.stringify(j));
+    }
+  } catch (e) {
+    if (status) status.textContent = '❌ ' + e.message;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+  return false;
 }
 
 async function tgSave() {
