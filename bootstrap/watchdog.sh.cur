@@ -1,4 +1,15 @@
 #!/bin/sh
+# XKeen failover watchdog v32 (2026-10-09, ложные «узел недоступен» от медленного сайта-маскировки):
+#   • probe_tag считал узел мёртвым при любом коде curl 28 (таймаут), в том числе когда TCP-соединение
+#     установилось, а ответа не было 8 с. Проба не VLESS — Reality передаёт её сайту-маскировке (dest);
+#     если dest — сторонний сайт и он задержал ответ, живой узел признавался упавшим, AI /
+#     «Зарубежные» уходили на резерв на 1–3 минуты (до трёх раз в день), хотя трафик через узел шёл.
+#     Узлы с dest на самом сервере не страдали. Хуже всего — основной канал: каждая ложная смена
+#     default = xkeen -restart и обрыв соединений у всех клиентов. Теперь 28 = мёртв только при
+#     %{num_connects} = 0 (TCP не установился); то же для PRIMARY_PROBE_URL (код 000 при установленном
+#     TCP = жив). Помощник _probe_connected. %{time_connect} не годится: при таймауте на TLS curl пишет
+#     0 и для живого TCP. Сквозная проба (deep_probe_check) по-прежнему ловит узлы, не пропускающие трафик.
+#
 # XKeen failover watchdog v31 (2026-10-03, исправления по ревью v29/v30: «качели», ручная смена канала, честные алерты):
 #   • «Качели» block ↔ глухой основной у YouTube/«Зарубежных» с блокировкой при падении (*_FAIL_BLOCK=1):
 #     раньше глухота основного при пустой цепочке уводила роль в block, block сбрасывал латч глухоты
@@ -295,10 +306,19 @@ get_host_port() {
 # Пинг outbound по tag. Возвращает 0 если живой, 1 если мёртвый.
 # Для PRIMARY с PRIMARY_PROBE_URL — curl HTTPS. Иначе — curl TCP-probe (через https://host:port/).
 # Busybox nc на Entware слишком урезанный (нет -z/-w), поэтому используем curl exit codes:
-#   7 = couldn't connect, 28 = timeout → порт мёртв
+#   7 = couldn't connect → порт мёртв
+#   28 = timeout → мёртв, ТОЛЬКО если TCP не установился (num_connects = 0); v32: если TCP
+#        установился, а ответа не дождались — порт жив (см. _probe_connected)
 #   0 / 35 / 51 / 52 / 56 / 60 / 77 (любые SSL/HTTP-ошибки ПОСЛЕ connect) → порт жив
+# v32: был ли установлен TCP (аргумент — %{num_connects} от curl: 1 — соединение было, 0 — нет).
+# Reality отдаёт посторонний (не-VLESS) запрос сайту-маскировке (dest); если тот молчит, curl
+# выходит с 28 при живом порту. 🔴 %{time_connect} для этого НЕ годится: при таймауте на этапе TLS
+# curl 8.x пишет 0.000000 и для установленного TCP (замер на роутере 2026-10-09).
+_probe_connected() {
+  [ -n "$1" ] && [ "$1" != "0" ]
+}
 probe_tag() {
-  local tag="$1" probe_url="$2"
+  local tag="$1" probe_url="$2" _tc
   # v12: direct/block — локальные outbound'ы без удалённого сервера, "пинговать" нечем.
   # Для них "жив" = верно: если direct не работает — упал весь интернет, и failover на VPN
   # это не починит. Без этого watchdog ложно считает primary=direct "упавшим" и шлёт ложные
@@ -307,8 +327,11 @@ probe_tag() {
     direct|block|"") return 0 ;;
   esac
   if [ -n "$probe_url" ]; then
-    code=$(curl -sk --connect-timeout 5 --max-time 8 -o /dev/null -w '%{http_code}' "$probe_url" 2>/dev/null)
+    _tc=$(curl -sk --connect-timeout 5 --max-time 8 -o /dev/null -w '%{http_code} %{num_connects}' "$probe_url" 2>/dev/null)
+    code="${_tc%% *}"; _tc="${_tc#* }"
     [ -n "$code" ] && [ "$code" != "000" ] && return 0
+    # v32: HTTP-ответа нет, но TCP установился — узел жив (медленный dest у Reality)
+    [ "$code" = "000" ] && _probe_connected "$_tc" && return 0
     return 1
   fi
   # TCP-probe через curl (HTTPS-запрос — если connect успешен, любой ответ кроме timeout/refused
@@ -317,11 +340,13 @@ probe_tag() {
   [ -z "$hp" ] && return 1
   set -- $hp
   host="$1"; port="$2"
-  curl -sk --connect-timeout 5 --max-time 8 -o /dev/null "https://${host}:${port}/" 2>/dev/null
+  _tc=$(curl -sk --connect-timeout 5 --max-time 8 -o /dev/null -w '%{num_connects}' "https://${host}:${port}/" 2>/dev/null)
   rc=$?
   case "$rc" in
-    7|28) return 1 ;;  # 7=couldn't connect, 28=timeout
-    *)    return 0 ;;  # любой другой — TCP-connect был успешен
+    7)  return 1 ;;  # couldn't connect
+    28) _probe_connected "$_tc" && return 0  # v32: TCP установлен, не дождались ответа — жив
+        return 1 ;;  # timeout на connect
+    *)  return 0 ;;  # любой другой — TCP-connect был успешен
   esac
 }
 

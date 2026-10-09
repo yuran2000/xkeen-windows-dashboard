@@ -597,7 +597,7 @@ kill-switch, «📋 Лог watchdog», JS-константы (§8.4). `api_xkeen
 
 ### 6.6. Тик watchdog.sh
 
-Порядок разделов `.cur`: lock → помощники (`probe_tag`, `_num`, `is_ru_tag`, `killswitch_decide`,
+Порядок разделов `.cur`: lock → помощники (`_probe_connected`, `probe_tag`, `_num`, `is_ru_tag`, `killswitch_decide`,
 `_state_field`, `_log_every5`, `deep_probe_check`, `tg_alert`, `generate_routing`, `routing_changed`,
 `validate_routing_xray`, `health_check`) → досыл TG → UDP-залип (v19) → `53` в `port_exclude.lst` (v21)
 → очистка `YT_GEOIP_CATEGORIES` (v23) → self-heal `socks-ai-check` (v24) → параметры v27/v29/v30 →
@@ -606,6 +606,13 @@ PRIMARY и state-машина (глухота `DPRI_DEAF` форсирует dow
 цепочки) → Apply (`generate_routing <default> <ai> <yt> <foreign> <ipv6>` → `routing_changed` →
 анти-флап → `validate_routing_xray` → `mv` → `xkeen -restart` → `health_check` → `.lastgood` или
 `AUTO-ROLLBACK`) → обход FAILOVER → Save state.
+
+**`probe_tag` (TCP-проба узла, v32).** curl на `https://host:port/` (или `PRIMARY_PROBE_URL`): код 7 →
+мёртв; код 28 (таймаут) → мёртв **только** при `%{num_connects}` = 0 (`_probe_connected`); прочие коды
+→ жив. Проба — не VLESS: Reality отдаёт её сайту-маскировке (`dest`), и сторонний `dest` может молчать
+при живом узле (до v32 это давало ложные уходы на резерв и лишние `xkeen -restart`). 🔴
+`%{time_connect}` как признак соединения не годится: при таймауте на этапе TLS curl пишет 0 и для
+установленного TCP. Тест — `tests/test_probe_tag.py`.
 
 Плейсхолдеры template: `__DEFAULT_TAG__`, `__BLOCK_RULE_BLOCK__`, `__DIRECT_RULE_BLOCK__`,
 `__AI_RULE_BLOCK__`, `__YT_RULE_BLOCK__`, `__YT_RULE_GEOIP__`, `__FOREIGN_RULE_BLOCK__`,
@@ -920,6 +927,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
 | `test_backup_paths.py` | `STATIC_FILES`, `is_restorable`, `needs_exec_bit`, `build_snapshot_command` |
 | `test_geoip_status.py` | `keenetic_geoip_dat_status` (+ фоновая проверка `telegram`), все состояния секции GeoIP, auto-fix `install_extended_geoip` (симлинк, скачивание, авто-откат, ротация бэкапов), категории в диагностике |
 | `test_killswitch.py` | генератор хука, разбор статуса/утечек |
+| `test_probe_tag.py` | `probe_tag`/`_probe_connected` из `.cur` в `sh` с подменным curl: таймаут при установленном TCP = жив, без соединения = мёртв (нет `sh` — SKIP) |
 | `test_template_ips.py` | `.cur`-template (версия, два IPv4-массива), синк IP эндпоинтов |
 | `test_v29_ui_offline.py` | цепочка «Зарубежных» (`allow_ru`/`use_common`), `watchdog-settings`, `fields`/`deep`, quick-fail ⊇ ключей, рендер обоими путями |
 
@@ -983,3 +991,4 @@ git log -1 --format='%an <%ae>'       # под кем последний ком�
 |---|---|
 | 2026-10-03 | Создание. Описано рабочее дерево: панель на базе v1.1.3 с UI для watchdog v29/v30 (цепочка и «общая цепочка» «Зарубежных», сквозная проба ролей и её настройки, статус `geoip.dat` и его связь с `geoip_v2fly.dat`), `bootstrap/watchdog.sh.cur` v30, template v13; 87 маршрутов, 13 проверок диагностики, 6 офлайн-тестов. |
 | 2026-10-03 | Независимое ревью → watchdog v31 (поля `*_RES`, `*_MAIN`, `*_NOALT`, `DPRI_FSINCE`; §6.3, §7.6); SSH-слой: `stdin=DEVNULL` во всех запусках ssh/scp (§5.2); geoip: статус без скана файла, проверка telegram в фоне с кэшем по `(size, mtime)`, auto-fix делает `geoip.dat` симлинком на `geoip_v2fly.dat`, откат при падении xray, 2 бэкапа. |
+| 2026-10-09 | watchdog v32: `probe_tag` — таймаут curl при установленном TCP (`%{num_connects}`) больше не считается смертью узла (§6.6, помощник `_probe_connected`); тест `tests/test_probe_tag.py` (§10.3), офлайн-тестов 7. |
