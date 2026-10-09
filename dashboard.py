@@ -223,7 +223,7 @@ import ssh_bin
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.1.4"
+_VERSION_FALLBACK = "1.1.5"
 
 
 def _find_git():
