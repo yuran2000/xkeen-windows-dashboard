@@ -343,6 +343,36 @@ app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=getattr(cfg, "SESSION_
 # умолчанию, Firefox/Safari — нет). Ссылка на панель (GET верхнего уровня) вход сохраняет.
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
+from urllib.parse import urlsplit  # noqa: E402  (CSRF-проверка ниже)
+
+_CSRF_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+
+@app.before_request
+def _csrf_origin_guard():
+    """CSRF: изменяющий запрос, чей Origin (а если его нет — Referer) указывает на другой хост,
+    отклоняется 403. Сравнивается host:port с заголовком Host запроса; доп. адреса (панель за обратным
+    прокси, меняющим Host) — cfg.TRUSTED_ORIGINS. Без обоих заголовков (скрипты, curl, офлайн-тесты)
+    запрос проходит: браузер на POST/fetch Origin шлёт всегда. «Origin: null» (sandbox, file://) — отказ."""
+    if request.method not in _CSRF_METHODS:
+        return None
+    src = request.headers.get("Origin")
+    if src is None:
+        src = request.headers.get("Referer")
+        if src is None:
+            return None
+    try:
+        host = urlsplit(src).netloc.lower()
+    except Exception:
+        host = ""
+    allowed = {(request.host or "").lower()} | {str(h).lower() for h in (getattr(cfg, "TRUSTED_ORIGINS", []) or [])}
+    if host and host in allowed:
+        return None
+    msg = "Запрос отклонён: он отправлен со страницы другого сайта (защита от CSRF)."
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": msg}), 403
+    return Response(msg, status=403, mimetype="text/plain; charset=utf-8")
+
 # Лог запросов подписки (in-memory, последние N)
 SUBS_LOG = []  # list of dicts: {time, ip, user_agent, app, app_version, platform, platform_version}
 

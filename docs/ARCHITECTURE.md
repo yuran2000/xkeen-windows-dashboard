@@ -127,7 +127,9 @@ cfg` — **весь код читает настройки как `cfg.*`**; п�
 (`{current, overridden}`). Пароль, порт, токен подписки — только `config_local.py`/`config.ini`. Тут же
 `_WATCHDOG_CFG_LOCK`, `app`, `PERMANENT_SESSION_LIFETIME` (`cfg.SESSION_DAYS`), `SESSION_COOKIE_SAMESITE`
 (`"Lax"` явно: cookie не уходит с кросс-сайт POST — защита от CSRF без токенов), `SUBS_LOG`.
-`requires_auth` — на каждом маршруте (`before_request` не используется). `collect_dynamic_data`,
+`requires_auth` — на каждом маршруте. Единственный `before_request` — `_csrf_origin_guard`: изменяющий
+запрос (`_CSRF_METHODS`) с `Origin` (или `Referer`, если `Origin` нет) чужого хоста → 403 до обработчика
+(JSON для `/api/*`); без обоих заголовков (скрипты, тесты) — проходит; доп. адреса — `cfg.TRUSTED_ORIGINS`. `collect_dynamic_data`,
 `parse_xray_config` и соседи — только для `/`.
 
 ### 3.3. `XKEEN MANAGEMENT (Phase 1)`
@@ -999,6 +1001,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
 | `test_probe_tag.py` | `probe_tag`/`_probe_connected` из `.cur` в `sh` с подменным curl: таймаут при установленном TCP = жив, без соединения = мёртв (нет `sh` — SKIP) |
 | `test_template_ips.py` | `.cur`-template (версия, два IPv4-массива), синк IP эндпоинтов |
 | `test_wg_clients_offline.py` | выдача WG на имитации Keenetic (RCI, ACL, NAT, маршруты, save, хуки): режимы, ЛВС и подмена адреса, ручной путь, s2s, линки, отзыв (метка save, возврат NAT/маршрута, чужие пиры, заворот), гонка за индекс, откат, битый/занятый реестр, X25519 = RFC 7748, рендер `/xkeen` |
+| `test_csrf_offline.py` | `_csrf_origin_guard`: чужой Origin/Referer/`null`/другой порт → 403 до обработчика, свой хост, без заголовков и GET — проходят, `TRUSTED_ORIGINS`, `SameSite=Lax` |
 | `test_v29_ui_offline.py` | цепочка «Зарубежных» (`allow_ru`/`use_common`), `watchdog-settings`, `fields`/`deep`, quick-fail ⊇ ключей, рендер обоими путями |
 
 Новая функциональность = новые проверки по тому же образцу (подмена `D.*` **до** создания `test_client`).
@@ -1061,5 +1064,6 @@ git log -1 --format='%an <%ae>'       # под кем последний ком�
 |---|---|
 | 2026-10-03 | Создание. Описано рабочее дерево: панель на базе v1.1.3 с UI для watchdog v29/v30 (цепочка и «общая цепочка» «Зарубежных», сквозная проба ролей и её настройки, статус `geoip.dat` и его связь с `geoip_v2fly.dat`), `bootstrap/watchdog.sh.cur` v30, template v13; 87 маршрутов, 13 проверок диагностики, 6 офлайн-тестов. |
 | 2026-10-03 | Независимое ревью → watchdog v31 (поля `*_RES`, `*_MAIN`, `*_NOALT`, `DPRI_FSINCE`; §6.3, §7.6); SSH-слой: `stdin=DEVNULL` во всех запусках ssh/scp (§5.2); geoip: статус без скана файла, проверка telegram в фоне с кэшем по `(size, mtime)`, auto-fix делает `geoip.dat` симлинком на `geoip_v2fly.dat`, откат при падении xray, 2 бэкапа. |
+| 2026-10-10 | CSRF: `_csrf_origin_guard` (`before_request`) — изменяющие запросы с чужим `Origin`/`Referer` → 403, `cfg.TRUSTED_ORIGINS`; тест `test_csrf_offline.py`, офлайн-тестов 9. |
 | 2026-10-10 | WG-доступы: модуль `wg_clients.py` — выдача в один клик через RCI, правила по режиму выхода, NAT, хук подмены адреса WG → ЛВС, отзыв, инвентарь (§3.4а); раздел UI переделан в 4 подпункта + диалог правил; маршрут `wg-new-client` и редактор permit-строк удалены, `wg-acl`/`wg-acl-apply` — новая логика, +5 маршрутов (91); тест `test_wg_clients_offline.py`, офлайн-тестов 8. Дополнительные проверки: метка save после снятия заворота, возврат заворота при сорванном удалении, решение о завороте по итоговому режиму, предзаполнение режима по хуку, отказ выдачи без адреса подключения, снятие подмены со старыми LANNET/LANIF, `SESSION_COOKIE_SAMESITE=Lax`, снятие заворота у выключенного интерфейса. Проверка граничных случаев: хук подмены не создавался на роутере без хука (`echo END` в конце чтения), SSH-порт панели закрыт на своём .1, ЛВС при туннельном `KEENETIC_HOST` — с `br0`, кнопка бэкапа запросом; повторная проверка: ЛВС только с моста `brN`, без ЛВС запись останавливается, `wg_xray_connect` не выдаёт «поставлен» при незаписанном хуке; показ по догадке при неподтверждённой ЛВС; в тесте 115 проверок. |
 | 2026-10-09 | watchdog v32: `probe_tag` — таймаут curl при установленном TCP (`%{num_connects}`) больше не считается смертью узла (§6.6, помощник `_probe_connected`); тест `tests/test_probe_tag.py` (§10.3), офлайн-тестов 7. |
