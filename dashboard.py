@@ -13898,10 +13898,10 @@ Use this token to access the HTTP API:
       if(d.reg_err){ re.style.display = ''; re.innerHTML = '❌ <b>Реестр выданного не читается</b> — выдача и отзыв остановлены, файл не тронут: <code>' + esc(d.reg_err) + '</code>. Рядом лежит копия <code>wg_clients.json.bak</code>.'; }
       else { re.style.display = 'none'; }
     }
-    var list = d.clients || [], manual = d.manual || [];
-    var active = list.filter(function(c){ return c.status !== 'revoked'; }).length;
-    if(st) st.textContent = (d.ok ? '' : '⚠ роутер не прочитан: ' + (d.error || '') + ' · ') + 'Выдано панелью: ' + active
-      + (list.length > active ? (' · отозвано: ' + (list.length - active)) : '') + (manual.length ? (' · создано вручную: ' + manual.length) : '');
+    /* отозванные с роутера удалены — в списке не показываются (запись остаётся в реестре как история) */
+    var list = (d.clients || []).filter(function(c){ return c.status !== 'revoked'; }), manual = d.manual || [];
+    if(st) st.textContent = (d.ok ? '' : '⚠ роутер не прочитан: ' + (d.error || '') + ' · ') + 'Выдано панелью: ' + list.length
+      + (manual.length ? (' · создано вручную: ' + manual.length) : '');
     if(!box) return;
     if(!list.length && !manual.length){ box.innerHTML = '<div class="muted">Пока ничего не выдано.</div>'; return; }
     var h = '<table style="width:100%; border-collapse:collapse; font-size:0.9em;"><thead><tr style="background:#f3f6fa; text-align:left;">'
