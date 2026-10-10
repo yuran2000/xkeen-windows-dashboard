@@ -357,6 +357,12 @@ check("1 подсеть не занятая выключенным (.3) и су�
       R.ifaces[k1]["addr"])
 check("1 заворот xray не ставился", not R.hooks)
 
+lst = c.get("/api/xkeen/wg-clients").get_json()
+man = {m["iface"]: m for m in lst.get("manual", [])}
+check("1m «Выданные»: созданные вручную доступы показаны, линк и выданное панелью — нет",
+      "Wireguard2" in man and "Wireguard4" in man and "Wireguard0" not in man and k1 not in man
+      and man["Wireguard2"]["desc"] == "Home-1", sorted(man))
+
 # 2. только ЛВС + SMB -> подмена адреса
 d = post("/api/xkeen/wg-issue", {"name": "NAS user", "exit": "", "services": ["smb_pc"], "create": True})
 k2 = next(k for k, v in R.ifaces.items() if v["desc"] == "NAS user")

@@ -1424,6 +1424,27 @@ def apply_rules(iface, exit_mode, full=False, services=None, extra=""):
     return ok, msg, exit_mode
 
 
+def manual_view(state):
+    """Доступы на роутере, выданные НЕ панелью (нет ключа пира в активном реестре) и не линки — для
+    списка «Выданные» серыми строками: правила можно, отзыв нет (панель удаляет только своё)."""
+    if not state.get("ok"):
+        return []
+    try:
+        pubs = {c.get("client_pub") for c in registry_read().values() if c.get("status") != "revoked"}
+    except RegistryError:
+        return []
+    out = []
+    for f in state.get("ifaces", []):
+        if f.get("is_link") or any(p in pubs for p in f.get("peers", [])):
+            continue
+        addr = f.get("addr") or ""
+        out.append({"iface": f["name"], "desc": f.get("desc") or f["name"], "port": f.get("port"),
+                    "subnet": str(ipaddress.ip_interface(f"{addr}/24").network) if addr else "",
+                    "xray_on": f.get("index") in state.get("hooks", {})})
+    out.sort(key=lambda x: x["iface"])
+    return out
+
+
 def clients_view(state):
     """Записи реестра для списка «Выданные» с привязкой к роутеру. -> (clients, reg_err)."""
     reg_err = ""

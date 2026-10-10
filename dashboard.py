@@ -1947,6 +1947,7 @@ def api_wg_clients():
         "services": s.services,
         "endpoint_host": wg_clients.endpoint_host(), "endpoint_warn": wg_clients.endpoint_warning(),
         "lan_warn": lan_warn, "exit_modes": wg_clients.EXIT_MODES,
+        "manual": wg_clients.manual_view(state),
     })
 
 
@@ -13897,11 +13898,12 @@ Use this token to access the HTTP API:
       if(d.reg_err){ re.style.display = ''; re.innerHTML = '❌ <b>Реестр выданного не читается</b> — выдача и отзыв остановлены, файл не тронут: <code>' + esc(d.reg_err) + '</code>. Рядом лежит копия <code>wg_clients.json.bak</code>.'; }
       else { re.style.display = 'none'; }
     }
-    var list = d.clients || [];
+    var list = d.clients || [], manual = d.manual || [];
     var active = list.filter(function(c){ return c.status !== 'revoked'; }).length;
-    if(st) st.textContent = (d.ok ? '' : '⚠ роутер не прочитан: ' + (d.error || '') + ' · ') + 'Выдано: ' + active + (list.length > active ? (' · отозвано: ' + (list.length - active)) : '');
+    if(st) st.textContent = (d.ok ? '' : '⚠ роутер не прочитан: ' + (d.error || '') + ' · ') + 'Выдано панелью: ' + active
+      + (list.length > active ? (' · отозвано: ' + (list.length - active)) : '') + (manual.length ? (' · создано вручную: ' + manual.length) : '');
     if(!box) return;
-    if(!list.length){ box.innerHTML = '<div class="muted">Пока ничего не выдано.</div>'; return; }
+    if(!list.length && !manual.length){ box.innerHTML = '<div class="muted">Пока ничего не выдано.</div>'; return; }
     var h = '<table style="width:100%; border-collapse:collapse; font-size:0.9em;"><thead><tr style="background:#f3f6fa; text-align:left;">'
       + '<th style="padding:4px 6px;">Имя</th><th style="padding:4px 6px;">Режим</th><th style="padding:4px 6px;">Туннель</th><th style="padding:4px 6px;">Порт</th><th style="padding:4px 6px;">Создан</th><th style="padding:4px 6px;">На роутере</th><th></th></tr></thead><tbody>';
     list.forEach(function(c){
@@ -13923,6 +13925,14 @@ Use this token to access the HTTP API:
       h += '<tr style="border-top:1px solid #e3e8ee;' + (rev ? ' opacity:0.5;' : '') + '"><td style="padding:4px 6px;"><b>' + esc(c.name) + '</b></td><td style="padding:4px 6px;">' + mode + '</td>'
         + '<td style="padding:4px 6px; font-family:monospace;">' + esc(c.subnet) + '</td><td style="padding:4px 6px; font-family:monospace;">' + esc(c.port) + '</td>'
         + '<td style="padding:4px 6px;" class="muted">' + esc(c.created) + '</td><td style="padding:4px 6px;">' + where + '</td><td style="padding:4px 6px; white-space:nowrap; text-align:right;">' + act + '</td></tr>';
+    });
+    /* доступы на роутере, созданные не через панель (линки не показываются): правила можно, отзыв нет */
+    manual.forEach(function(m){
+      h += '<tr style="border-top:1px solid #e3e8ee; color:#666; background:#fafafa;"><td style="padding:4px 6px;"><b>' + esc(m.desc) + '</b></td>'
+        + '<td style="padding:4px 6px;">' + (m.xray_on ? '🛡 через xray · ' : '') + '<span class="muted" title="создано не через «Выдать доступ»: панель его не удаляет">создано вручную</span></td>'
+        + '<td style="padding:4px 6px; font-family:monospace;">' + esc(m.subnet || '—') + '</td><td style="padding:4px 6px; font-family:monospace;">' + esc(m.port || '—') + '</td>'
+        + '<td style="padding:4px 6px;" class="muted">—</td><td style="padding:4px 6px;"><code>' + esc(m.iface) + '</code></td>'
+        + '<td style="padding:4px 6px; white-space:nowrap; text-align:right;"><button type="button" class="btn" data-rules="' + esc(m.iface) + '">🔒 Правила</button></td></tr>';
     });
     box.innerHTML = h + '</tbody></table>';
     wireListButtons(box);
