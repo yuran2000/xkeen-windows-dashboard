@@ -13670,7 +13670,7 @@ Use this token to access the HTTP API:
         <label><input type="checkbox" id="wgiCreate" checked> 🚀 <b>Сразу создать на роутере</b> — подключение, правила и NAT по режиму, конфигурация роутера сохраняется. Останется отдать клиенту QR / <code>.conf</code>.</label>
         <div id="wgiManual" style="display:none; margin:4px 0 0 22px; padding:6px 10px; background:#eef4fb; border-radius:4px; font-size:0.88em;">📋 Ручной путь: серверный <code>.conf</code> → в Keenetic <b>Интернет → Другие подключения → WireGuard → «Загрузить из файла»</b> → включить подключение → здесь в «📋 Выданные» нажать <b>«🔒 Правила»</b> (правила и NAT). Без этого шага интернета у клиента не будет, а ЛВС будет открыта полностью.</div>
       </div>
-      <button type="button" class="btn" id="wgiBtn">🔑 Выдать доступ</button>
+      <button type="button" class="btn" id="wgiBtn" disabled title="читаю роутер…">🔑 Выдать доступ</button>
       <div id="wgiSlot" class="muted" style="margin-top:8px; font-size:0.88em;">Свободный слот на роутере: читаю…</div>
 
       <div id="wgiOut" style="display:none; margin-top:12px;">
@@ -13828,7 +13828,7 @@ Use this token to access the HTTP API:
     check();
   }
 
-  var WG = {services: [], lan: '', exitModes: {}, issued: null, routerItems: []};
+  var WG = {services: [], lan: '', exitModes: {}, issued: null, routerItems: [], retry: 2};
 
   /* ---------- ➕ Выдать доступ ---------- */
   function renderServices(box, list, checked, prefix){
@@ -13850,12 +13850,26 @@ Use this token to access the HTTP API:
   }
   function exitLabel(k){ return (WG.exitModes && WG.exitModes[k] != null) ? WG.exitModes[k] : k; }
 
+  /* «Выдать доступ» активна только когда слот вычислен и ЛВС известна: иначе выдача всё равно
+     получит отказ сервера */
+  function setIssueReady(ok, why){
+    var b = $('wgiBtn'); if(!b) return;
+    b.disabled = !ok;
+    b.title = ok ? '' : (why || '');
+  }
   function renderSlot(d){
     var el = $('wgiSlot'); if(!el) return;
-    if(!d.ok){ el.innerHTML = '⚠ Роутер не прочитан — слот не вычислен: ' + esc(d.error || ''); return; }
+    if(!d.ok){
+      setIssueReady(false, 'роутер не прочитан');
+      el.innerHTML = '⚠ Роутер не прочитан — слот не вычислен, выдача недоступна: ' + esc(d.error || '')
+        + (WG.retry > 0 ? ' · повторяю через 4 с…' : ' <button type="button" class="btn" id="wgiRetry">🔄 Повторить</button>');
+      var rb = $('wgiRetry'); if(rb) rb.addEventListener('click', function(){ this.disabled = true; loadClients(); });
+      return;
+    }
     var s = d.slot;
-    if(!s){ el.textContent = ''; return; }
-    if(s.full){ el.innerHTML = '<b style="color:#b02a37;">⛔ Кончились ' + esc(s.why) + '</b> (занято ' + s.used + ' из ' + s.max + ') — отзовите ненужный доступ.'; return; }
+    if(!s){ setIssueReady(false, 'слот не вычислен'); el.textContent = ''; return; }
+    if(s.full){ setIssueReady(false, 'нет свободного места'); el.innerHTML = '<b style="color:#b02a37;">⛔ Кончились ' + esc(s.why) + '</b> (занято ' + s.used + ' из ' + s.max + ') — отзовите ненужный доступ.'; return; }
+    setIssueReady(!d.lan_warn, 'ЛВС роутера не определена');
     var t = 'Новому доступу достанется: подсеть <code>' + esc(d.prefix) + '.' + s.sub_x + '.0/24</code> (роутер .1, клиент .2), порт <code>' + s.port + '</code>, интерфейс <code>' + esc(s.iface) + '</code> · занято ' + s.used + ' из ' + s.max + '.';
     if(d.endpoint_warn) t += '<br><b style="color:#b02a37;">⚠ ' + esc(d.endpoint_warn) + '</b>';
     if(d.lan_warn) t += '<br><b style="color:#b26a00;">⚠ ' + esc(d.lan_warn) + '</b>';
@@ -13868,10 +13882,13 @@ Use this token to access the HTTP API:
       WG.services = d.services || []; WG.lan = d.lan || ''; WG.exitModes = d.exit_modes || {};
       if($('wgiEp')) $('wgiEp').textContent = d.endpoint_host || '?';
       if($('wgiLan')) $('wgiLan').textContent = WG.lan || '?';
-      if($('wgiSvc') && !$('wgiSvc').getAttribute('data-filled')){ renderServices($('wgiSvc'), WG.services, [], 'wgiSvc'); $('wgiSvc').setAttribute('data-filled', '1'); }
+      if($('wgiSvc') && !$('wgiSvc').getAttribute('data-filled') && (d.ok || WG.services.length)){ renderServices($('wgiSvc'), WG.services, [], 'wgiSvc'); $('wgiSvc').setAttribute('data-filled', '1'); }
       renderSlot(d);
       renderClients(d);
-    }).catch(function(e){ if(st) st.textContent = '⚠ ошибка: ' + e; });
+      /* сразу после рестарта панели страница шлёт роутеру залп запросов — первое чтение может не успеть */
+      if(!d.ok && WG.retry > 0){ WG.retry--; setTimeout(loadClients, 4000); }
+      else if(d.ok){ WG.retry = 2; }
+    }).catch(function(e){ if(st) st.textContent = '⚠ ошибка: ' + e; setIssueReady(false, 'ошибка чтения'); });
   }
 
   function renderClients(d){
