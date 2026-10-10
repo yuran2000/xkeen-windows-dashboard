@@ -25,7 +25,7 @@ LAN = "192.168.1.0/24"
 D.cfg.WG_LAN_SUBNET = LAN
 D.cfg.WG_LAN_IF = "br0"
 D.cfg.WG_ENDPOINT_HOST = ""
-D.cfg.WG_BLOCK_EXTRA = ["172.172.0.0/16"]
+D.cfg.WG_BLOCK_EXTRA = ["172.20.0.0/16"]
 D.cfg.WG_SERVICES = [
     {"id": "rdp_pc", "label": "RDP к ПК", "ips": ["192.168.1.10"], "ports": "3389"},
     {"id": "smb_pc", "label": "Общие папки ПК", "ips": ["192.168.1.10"], "ports": "139,445"},
@@ -53,7 +53,7 @@ class Router:
         self.masq = None      # MAP в хуке подмены
         self.fail = set()     # имитация сбоев: "save", "acl_read", "post", "noiface", "xray_off"
         self.calls = []
-        self.add("Wireguard0", "Office-link", "172.16.106.2", 16653, peers={"LINKPUB=": "198.51.100.20:16656"})
+        self.add("Wireguard0", "Office-link", "172.16.50.2", 51820, peers={"LINKPUB=": "198.51.100.20:51820"})
         self.add("Wireguard2", "Home-1", "172.173.1.1", 48001, peers={"HOMEPUB=": None})
         self.add("Wireguard4", "Old-down", "172.173.3.1", 48003, peers={"OLDPUB=": None}, up=False)
         self.save()
@@ -258,7 +258,10 @@ def fake_keenetic_ssh(cmd, timeout=15, stdin_data=None):
         i = int(re.search(r"nwg(\d+)\.sh", cmd).group(1))
         return _res(0, (f"/opt/etc/ndm/netfilter.d/zz_wg_xray_nwg{i}.sh\n1\n" if i in R.hooks else "0\n") + "END\n")
     if cmd.startswith("sed -n 's/^MAP="):
-        return _res(0, (R.masq + "\n" if R.masq else "") + "END\n" + R.masq_old)
+        if not cmd.rstrip().endswith("echo END"):
+            # как в настоящем sh: код цепочки = код последней команды; sed по отсутствующему хуку — 1/2
+            return _res(0 if R.masq is not None else 2, (R.masq + "\n" if R.masq else "") + "END\n" + R.masq_old)
+        return _res(0, (R.masq + "\n" if R.masq else "") + "SEP\n" + R.masq_old + "END\n")
     if cmd == "sh -s":
         s = stdin_data.decode() if isinstance(stdin_data, bytes) else stdin_data
         R.last_masq_script = s
@@ -288,6 +291,7 @@ def fake_xray_disconnect(iface_id):
 
 
 REAL_XRAY_DISCONNECT = D.wg_xray_disconnect
+REAL_XRAY_CONNECT = D.wg_xray_connect
 D.keenetic_ssh = fake_keenetic_ssh
 D.wg_xray_connect = fake_xray_connect
 D.wg_xray_disconnect = fake_xray_disconnect
@@ -726,6 +730,73 @@ D.keenetic_get_wireguard_interfaces, D.keenetic_ssh = saved_gwi, saved_ssh
 check("24 критик: заворот снимается у интерфейса без адреса", dd is not None and dd.get("ok")
       and "SUBNET=$(sed -n 's/^SUBNET=//p' /opt/etc/ndm/netfilter.d/zz_wg_xray_nwg6.sh" in (captured[0] if captured else ""), dd)
 
+# 25. Исправления после проверки граничных случаев
+# хука подмены ещё нет — это пустая карта, а не сбой (иначе хук не создавался бы никогда)
+D._wg_prepare()
+R.masq, R.masq_old = None, ""
+check("25 нет хука подмены: пустая карта, не сбой", W._masq_hook_state() == ({}, "", ""), W._masq_hook_state())
+check("25 нет хука: подмена ставится с нуля", W.lan_masq_set("Wireguard45", ["172.173.245.0/24"]) is None
+      and mask_of("Wireguard45").get("Wireguard45") == ["172.173.245.0/24"], R.masq)
+W.lan_masq_set("Wireguard45", [])
+check("25 последний убран: хук удалён", R.masq is None)
+# SSH-порт панели к роутеру закрыт на своём .1 в режиме xray
+saved_port = getattr(D.cfg, "KEENETIC_PORT", 222)
+D.cfg.KEENETIC_PORT = 2222
+D._wg_prepare()
+L = W.acl_lines([], "xray", "172.173.4.1")
+check("25 xray: свой SSH-порт роутера закрыт", "deny tcp 0.0.0.0 0.0.0.0 172.173.4.1 255.255.255.255 port eq 2222" in L)
+D.cfg.KEENETIC_PORT = saved_port
+# ЛВС: адрес KEENETIC_HOST на туннельном интерфейсе / имя -> мост br0
+saved_ssh, saved_host = D.keenetic_ssh, D.cfg.KEENETIC_HOST
+for host, out, want in (
+        ("10.8.0.1", "H nwg3 10.8.0.1/24\nB br0 192.168.40.1/24\n", ("192.168.40.0/24", "br0")),
+        ("router.example", "B br0 192.168.41.1/24\n", ("192.168.41.0/24", "br0")),
+        ("192.168.42.1", "H br0 192.168.42.1/23\nB br0 192.168.42.1/23\n", ("192.168.42.0/23", "br0")),
+        ("203.0.113.9", "B br0 10.20.30.1/24\nH eth3 203.0.113.9/24\n", ("10.20.30.0/24", "br0"))):
+    D.cfg.KEENETIC_HOST = host
+    D._WG_LAN_CACHE.update(ts=0.0, val=None)
+    D.keenetic_ssh = lambda cmd, timeout=15, stdin_data=None, _o=out: _res(0, _o)
+    check(f"25 ЛВС при KEENETIC_HOST={host}", D._keenetic_lan_net() == want, D._keenetic_lan_net())
+D.keenetic_ssh, D.cfg.KEENETIC_HOST = saved_ssh, saved_host
+D._WG_LAN_CACHE.update(ts=0.0, val=None)
+
+# 26. После повторной проверки: ЛВС не прочитана -> запись на роутер остановлена, не угадывается
+saved_ssh, saved_lan = D.keenetic_ssh, D.cfg.WG_LAN_SUBNET
+D.cfg.WG_LAN_SUBNET = ""
+D._WG_LAN_CACHE.update(ts=0.0, val=None)
+D.keenetic_ssh = lambda cmd, timeout=15, stdin_data=None: (_res(255, "", "timeout") if cmd.startswith("ip -o -4 addr show")
+                                                           else saved_ssh(cmd, timeout=timeout, stdin_data=stdin_data))
+n = len(R.calls)
+before_ifaces = sorted(R.ifaces)
+d = post("/api/xkeen/wg-issue", {"name": "No LAN", "exit": "direct", "create": True})
+check("26 ЛВС не прочитана: выдача отказана, роутер не тронут", not d.get("ok") and "ЛВС роутера не определена" in d.get("error", "")
+      and sorted(R.ifaces) == before_ifaces and not any("base64 -d | curl" in x for x in R.calls[n:]), d)
+d = post("/api/xkeen/wg-acl-apply", {"iface_id": "Wireguard2", "exit": "direct"})
+check("26 ЛВС не прочитана: правила отказаны", not d.get("ok") and "ЛВС роутера не определена" in d.get("error", ""), d)
+lst = c.get("/api/xkeen/wg-clients").get_json()
+check("26 список: предупреждение и ЛВС с «?»", lst.get("lan", "").endswith(" ?") and "не определена" in lst.get("lan_warn", ""), lst.get("lan"))
+inv = c.get("/api/xkeen/wg-router").get_json()
+it = {i["iface"]: i for i in inv.get("items", [])}
+check("26 ЛВС-догадка: доступ НЕ превращается в линк, conf-шаблон есть, предупреждение есть",
+      not it["Wireguard2"]["is_link"] and it["Wireguard2"]["conf_tpl"] and "не определена" in inv.get("lan_warn", ""), it.get("Wireguard2"))
+f = c.get("/api/xkeen/wg-acl?iface_id=Wireguard2").get_json()
+check("26 форма правил открывается с предупреждением", f.get("ok") and "не определена" in f.get("lan_warn", ""), f.get("error"))
+check("26 _keenetic_lan_net(guess=False) без кэша: None", D._keenetic_lan_net(guess=False) == (None, "br0"))
+D.keenetic_ssh, D.cfg.WG_LAN_SUBNET = saved_ssh, saved_lan
+D._WG_LAN_CACHE.update(ts=0.0, val=None)
+# хук заворота не записался -> не «поставлен»
+saved_rp, saved_ssh = D._wg_resolve_params, D.keenetic_ssh
+D._wg_resolve_params = lambda iid: ({"kernel": "nwg7", "subnet": "172.173.7.0/24", "lan_ip": "192.168.1.1", "dns_port": "41102",
+                                     "mss": 1240, "lan_net": LAN, "lan_if": "br0"}, None)
+cap = []
+D.keenetic_ssh = lambda cmd, timeout=15, stdin_data=None: (cap.append(cmd), _res(1, "WG_CONN_WRITEFAIL\n"))[1]
+dx = REAL_XRAY_CONNECT("Wireguard7")
+check("26 хук не записан: ok=False", dx.get("ok") is False and "не записан" in dx.get("error", ""), dx)
+check("26 команда: запись — условие для остального", cap and "|| { rm -f" in cap[0] and "echo WG_CONN_WRITEFAIL; exit 1; }" in cap[0])
+D.keenetic_ssh = lambda cmd, timeout=15, stdin_data=None: _res(0, "WG_CONN_OK\n")
+check("26 хук записан и правило встало: ok", REAL_XRAY_CONNECT("Wireguard7").get("connected") is True)
+D._wg_resolve_params, D.keenetic_ssh = saved_rp, saved_ssh
+
 # 22. ключи X25519 совпадают с эталоном RFC 7748 (вектор 6.1)
 alice = bytes.fromhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
 k = bytearray(alice)
@@ -745,7 +816,8 @@ D.is_keenetic_reachable = lambda *a, **kw: False
 D.keenetic_ssh = lambda cmd, timeout=15, stdin_data=None: _res(1, "")   # quick-fail: роутер «молчит»
 html = c.get("/xkeen").get_data(as_text=True)
 check("23 /xkeen рендерится с новым разделом", "Ошибка при рендеринге" not in html and 'id="wgiBtn"' in html
-      and 'id="wgrList"' in html and 'id="wgRulesDlg"' in html and "wg-new-client" not in html)
+      and 'id="wgrList"' in html and 'id="wgRulesDlg"' in html and "wg-new-client" not in html
+      and "data-backup=" in html and "function backupDl" in html)
 
 print(f"\ntest_wg_clients_offline: {'OK' if not fails else 'FAIL'} (провалов: {fails}) | реестр во временной папке {TMP}")
 sys.exit(1 if fails else 0)

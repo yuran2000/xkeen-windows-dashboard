@@ -38,6 +38,7 @@ class Settings:
         self.endpoint_host = ""              # белый IP / DDNS роутера; пусто — WAN-адрес
         self.mtu = 1324                      # PPPoE + WG
         self.services = []                   # пресеты доступа в ЛВС: [{id, label, ips:[...], ports}]
+        self.admin_ports = []                # доп. порты управления роутером (напр. свой SSH-порт)
         self.registry_path = "wg_clients.json"
         for k, v in kw.items():
             setattr(self, k, v)
@@ -597,7 +598,7 @@ def acl_lines(grants, exit_mode, own_ip=None):
                     add(f"permit {proto} 0.0.0.0 0.0.0.0 {net} {mask} port eq {tok[1]}")
         add(f"permit icmp 0.0.0.0 0.0.0.0 {net} {mask}")
     if exit_mode == "xray" and own_ip:
-        for p in ROUTER_ADMIN_PORTS:
+        for p in sorted(set(ROUTER_ADMIN_PORTS) | {int(x) for x in (S.admin_ports or []) if str(x).isdigit()}):
             add(f"deny tcp 0.0.0.0 0.0.0.0 {own_ip} 255.255.255.255 port eq {p}")
         add(f"permit tcp 0.0.0.0 0.0.0.0 {own_ip} 255.255.255.255")
         add(f"permit udp 0.0.0.0 0.0.0.0 {own_ip} 255.255.255.255")
@@ -878,12 +879,15 @@ def _masq_hook_text(mp):
 
 def _masq_hook_state():
     """(MAP, LANNET, LANIF) из хука на роутере; LANNET/LANIF — только проверенного формата (идут в
-    shell-команду), иначе "". None — хук не прочитан."""
-    rc, out, err = ssh(f"sed -n 's/^MAP=\"\\(.*\\)\"$/\\1/p' {MASQ_HOOK} 2>/dev/null; echo END; "
-                       f"sed -n 's/^LANNET=/N /p; s/^LANIF=/I /p' {MASQ_HOOK} 2>/dev/null")
-    if rc != 0 or "END" not in out:
+    shell-команду), иначе "". Хука нет — пустая карта (это не сбой). None — хук не прочитан.
+    🔴 Команда обязана кончаться `echo END`: код возврата цепочки — код ПОСЛЕДНЕЙ команды, и sed по
+    отсутствующему файлу (1/2) превратил бы «хука ещё нет» в «сбой чтения» — хук не создавался бы никогда."""
+    rc, out, err = ssh(f"sed -n 's/^MAP=\"\\(.*\\)\"$/\\1/p' {MASQ_HOOK} 2>/dev/null; echo SEP; "
+                       f"sed -n 's/^LANNET=/N /p; s/^LANIF=/I /p' {MASQ_HOOK} 2>/dev/null; echo END")
+    if rc != 0 or "END" not in out or "SEP" not in out:
         return None
-    head, _, tail = out.partition("END")
+    head, _, rest = out.partition("SEP")
+    tail = rest.partition("END")[0]
     kv = {ln[0]: ln[2:].strip() for ln in tail.splitlines() if ln[:2] in ("N ", "I ")}
     olan = kv.get("N", "") if re.fullmatch(r"\d+\.\d+\.\d+\.\d+/\d+", kv.get("N", "")) else ""
     olif = kv.get("I", "") if re.fullmatch(r"[\w.-]+", kv.get("I", "")) else ""

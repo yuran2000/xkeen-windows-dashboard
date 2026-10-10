@@ -1422,29 +1422,45 @@ def _build_wg_xray_hook(kernel, subnet, lan_ip, dns_port, mss, lan_net=None, lan
 _WG_LAN_CACHE = {"ts": 0.0, "val": None}
 
 
-def _keenetic_lan_net():
+def _keenetic_lan_net(guess=True):
+    net, lif, _known = _keenetic_lan_net_ex(guess)
+    return net, lif
+
+
+def _keenetic_lan_net_ex(guess=True):
     """(LAN-подсеть, её интерфейс) роутера — по адресу cfg.KEENETIC_HOST в `ip addr` роутера (а не
-    хардкодом: на чужих роутерах и LAN, и bridge другие). Кэш 10 мин. Не прочиталось — (<адрес>/24,
-    br0) без кэша; адрес не IPv4 — (None, br0)."""
+    хардкодом: на чужих роутерах и LAN, и bridge другие), если этот адрес на мосту brN. Иначе (панель
+    ходит к удалённому роутеру по WG/VPN, адрес на WAN-интерфейсе или KEENETIC_HOST — имя) — с моста br0.
+    Кэш 10 мин. Не прочиталось — последнее удачное определение; кэша нет — при guess=True догадка
+    (<адрес>/24, br0) без кэша, при guess=False (None, br0): выдача по догадке записала бы на роутер
+    чужую сеть (allow-ips, хук подмены). -> (сеть, интерфейс, known): known=False — догадка/неизвестно."""
     import ipaddress
     now = _time_mod.time()
     if _WG_LAN_CACHE["val"] and now - _WG_LAN_CACHE["ts"] < 600:
-        return _WG_LAN_CACHE["val"]
+        return _WG_LAN_CACHE["val"] + (True,)
     lan_ip = getattr(cfg, "KEENETIC_HOST", "") or ""
-    if not re.match(r"\d+\.\d+\.\d+\.\d+$", lan_ip):
-        return None, "br0"
-    r = keenetic_ssh(f"ip -o -4 addr show 2>/dev/null | awk -v ip={lan_ip} '{{split($4,a,\"/\"); if(a[1]==ip){{print $2, $4; exit}}}}'", timeout=8)
-    parts = (r.get("stdout") or "").strip().split()
+    is_ip = bool(re.match(r"\d+\.\d+\.\d+\.\d+$", lan_ip))
+    r = keenetic_ssh("ip -o -4 addr show 2>/dev/null | awk -v ip=" + (lan_ip if is_ip else "none")
+                     + " '{split($4,a,\"/\"); if(a[1]==ip) print \"H\", $2, $4; if($2==\"br0\") print \"B\", $2, $4}'",
+                     timeout=20)
+    rows = {}
+    for ln in (r.get("stdout") or "").splitlines():
+        p = ln.split()
+        if len(p) >= 3 and p[0] in ("H", "B") and p[0] not in rows:
+            rows[p[0]] = (p[2], p[1])
+    pick = rows.get("H") if rows.get("H") and re.fullmatch(r"br\d+", rows["H"][1]) else rows.get("B")
     try:
-        if len(parts) >= 2:
-            val = (str(ipaddress.ip_network(parts[1], strict=False)), parts[0])
+        if pick:
+            val = (str(ipaddress.ip_network(pick[0], strict=False)), pick[1])
             _WG_LAN_CACHE.update(ts=now, val=val)
-            return val
+            return val + (True,)
         if _WG_LAN_CACHE["val"]:                  # сбой чтения: последнее удачное определение лучше догадки
-            return _WG_LAN_CACHE["val"]
-        return str(ipaddress.ip_network(lan_ip + "/24", strict=False)), "br0"
+            return _WG_LAN_CACHE["val"] + (True,)
+        if is_ip and guess:
+            return str(ipaddress.ip_network(lan_ip + "/24", strict=False)), "br0", False
+        return None, "br0", False
     except Exception:
-        return None, "br0"
+        return None, "br0", False
 
 
 def _wg_resolve_params(iface_id):
@@ -1501,13 +1517,16 @@ def wg_xray_connect(iface_id):
     b64 = base64.b64encode(hook.encode("utf-8")).decode("ascii")
     cron_line = f"*/1 * * * * {path} >/dev/null 2>&1"
     cmd = (
-        f"echo {b64} | base64 -d > {path}.new && sh -n {path}.new && "
-        f"mv {path}.new {path} && chmod +x {path} && sh {path}; "
+        f"{{ echo {b64} | base64 -d > {path}.new && sh -n {path}.new && "
+        f"mv {path}.new {path} && chmod +x {path}; }} || {{ rm -f {path}.new; echo WG_CONN_WRITEFAIL; exit 1; }}; "
+        f"sh {path}; "
         f"(crontab -l 2>/dev/null | grep -vF '{path}'; echo '{cron_line}') | crontab -; "
         f"iptables -t nat -S PREROUTING | grep -q -- '-i {kernel} -p tcp -j xkeen' && echo WG_CONN_OK || echo WG_CONN_PENDING"
     )
     r = keenetic_ssh(cmd, timeout=40)
     out = r.get("stdout") or ""
+    if "WG_CONN_WRITEFAIL" in out:
+        return {"ok": False, "error": f"хук {kernel} не записан на роутер (base64 / sh -n / mv) — заворот НЕ включён"}
     if "WG_CONN_OK" in out:
         return {"ok": True, "connected": True, "kernel": kernel,
                 "msg": f"{kernel} подключён к анти-DPI (хук + cron self-heal)"}
@@ -1826,10 +1845,12 @@ def _wg_settings():
     """wg_clients.Settings из cfg.WG_* (см. config_local.example.py) + ЛВС роутера, если не задана."""
     lan_net = getattr(cfg, "WG_LAN_SUBNET", "") or ""
     lan_if = getattr(cfg, "WG_LAN_IF", "") or ""
+    known = bool(lan_net)
     if not lan_net or not lan_if:
-        dn, di = _keenetic_lan_net()
+        dn, di, dk = _keenetic_lan_net_ex(guess=True)
+        known = known or (bool(dn) and dk)
         lan_net, lan_if = lan_net or dn or "192.168.1.0/24", lan_if or di or "br0"
-    return wg_clients.Settings(
+    s = wg_clients.Settings(
         lan_subnet=lan_net, lan_if=lan_if,
         prefix=getattr(cfg, "WG_SUBNET_PREFIX", "172.173"),
         subnet_start=int(getattr(cfg, "WG_SUBNET_START", 1)),
@@ -1839,13 +1860,25 @@ def _wg_settings():
         dns=getattr(cfg, "WG_DNS", "9.9.9.9"),
         endpoint_host=getattr(cfg, "WG_ENDPOINT_HOST", "") or "",
         mtu=int(getattr(cfg, "WG_MTU", 1324)),
+        admin_ports=[getattr(cfg, "KEENETIC_PORT", 222)],   # SSH панели к роутеру — закрыть на «своём» .1
         services=list(getattr(cfg, "WG_SERVICES", []) or []),
         registry_path=os.path.join(_app_base_dir(), "wg_clients.json"),
     )
+    # ЛВС — догадка (не прочитана с роутера, кэша нет): показ по догадке, запись — отказ (_wg_prepare)
+    s.lan_known = known
+    return s
 
 
-def _wg_prepare():
-    wg_clients.configure(_wg_ssh, _wg_settings())
+_WG_LAN_UNKNOWN = ("ЛВС роутера не определена (не прочитана с роутера) — изменения на роутере остановлены, "
+                   "чтобы не записать чужую сеть. Повторите позже или задайте WG_LAN_SUBNET в config_local.py.")
+
+
+def _wg_prepare(write=False):
+    """Настроить wg_clients на текущий запрос. write=True (запись на роутер) — без известной ЛВС
+    отказ: возвращает текст ошибки, иначе ""."""
+    s = _wg_settings()
+    wg_clients.configure(_wg_ssh, s)
+    return _WG_LAN_UNKNOWN if write and not getattr(s, "lan_known", True) else ""
 
 
 def _wg_xray_on(iface):
@@ -1877,13 +1910,11 @@ def api_wg_clients():
     clients, reg_err = wg_clients.clients_view(state)
     slot = wg_clients.free_slot(state) if state.get("ok") else None
     s = wg_clients.S
-    lan_warn = ""
-    if not (getattr(cfg, "WG_LAN_SUBNET", "") or "") and not _WG_LAN_CACHE["val"]:
-        lan_warn = (f"ЛВС роутера не определена автоматически — взята {s.lan_subnet}. Если это не так, "
-                    f"задайте WG_LAN_SUBNET в config_local.py (влияет на «полный доступ к ЛВС» и подмену адреса).")
+    lan_warn = "" if getattr(s, "lan_known", True) else _WG_LAN_UNKNOWN
     return jsonify({
         "ok": bool(state.get("ok")), "error": state.get("err", ""), "clients": clients, "reg_err": reg_err,
-        "slot": slot, "prefix": s.prefix, "lan": s.lan_subnet, "services": s.services,
+        "slot": slot, "prefix": s.prefix, "lan": s.lan_subnet if getattr(s, "lan_known", True) else s.lan_subnet + " ?",
+        "services": s.services,
         "endpoint_host": wg_clients.endpoint_host(), "endpoint_warn": wg_clients.endpoint_warning(),
         "lan_warn": lan_warn, "exit_modes": wg_clients.EXIT_MODES,
     })
@@ -1894,7 +1925,9 @@ def api_wg_clients():
 def api_wg_issue():
     """Выдать доступ: ключи, слот, .conf + QR; при create — интерфейс, правила, NAT, save, заворот."""
     data = request.get_json(silent=True) or request.form
-    _wg_prepare()
+    err = _wg_prepare(write=True)
+    if err:
+        return jsonify({"ok": False, "error": err})
     res = wg_clients.issue(
         data.get("name"), exit_mode=(data.get("exit") or ""), full=_wg_bool(data.get("full")),
         services=_wg_list(data.get("services")), extra=data.get("extra") or "",
@@ -1915,7 +1948,9 @@ def api_wg_issue():
 def api_wg_revoke():
     """Отозвать выданный доступ: заворот в xray -> NAT/маршрут -> интерфейс -> save."""
     data = request.get_json(silent=True) or request.form
-    _wg_prepare()
+    err = _wg_prepare(write=True)
+    if err:
+        return jsonify({"ok": False, "error": err})
     ok, msg = wg_clients.revoke((data.get("id") or "").strip(), xray_off=_wg_xray_off, xray_on=_wg_xray_on)
     return jsonify({"ok": ok, "msg": msg} if ok else {"ok": False, "error": msg})
 
@@ -1933,6 +1968,7 @@ def api_wg_router():
     hooks = wg_clients.xray_hooks() if inv.get("ok") else None
     live = {i.get("index") for i in inv.get("items", [])}
     inv["orphan_hooks"] = sorted(f"nwg{k}" for k in (hooks or {}) if k not in live)
+    inv["lan_warn"] = "" if getattr(wg_clients.S, "lan_known", True) else _WG_LAN_UNKNOWN
     return jsonify(inv)
 
 
@@ -1961,7 +1997,9 @@ def api_wg_acl_get():
     """Правила интерфейса для формы: текущие (человекочитаемо) + предзаполнение режима и доступа."""
     _wg_prepare()
     res = wg_clients.rules_form((request.args.get("iface_id") or "").strip())
-    res.update({"services": wg_clients.S.services, "lan": wg_clients.S.lan_subnet,
+    known = getattr(wg_clients.S, "lan_known", True)
+    res.update({"services": wg_clients.S.services, "lan_warn": "" if known else _WG_LAN_UNKNOWN,
+                "lan": wg_clients.S.lan_subnet if known else wg_clients.S.lan_subnet + " ?",
                 "exit_modes": wg_clients.EXIT_MODES})
     return jsonify(res)
 
@@ -1974,7 +2012,9 @@ def api_wg_acl_apply():
     data = request.get_json(silent=True) or request.form
     iface = (data.get("iface_id") or "").strip()
     exit_mode = data.get("exit")
-    _wg_prepare()
+    err = _wg_prepare(write=True)
+    if err:
+        return jsonify({"ok": False, "error": err})
     ok, msg, eff = wg_clients.apply_rules(iface, exit_mode, full=_wg_bool(data.get("full")),
                                           services=_wg_list(data.get("services")), extra=data.get("extra") or "")
     if not ok:
@@ -13912,7 +13952,8 @@ Use this token to access the HTTP API:
       var items = WG.routerItems;
       var links = items.filter(function(i){ return i.is_link; }).length;
       var online = items.filter(function(i){ return i.online; }).length;
-      if(st) st.textContent = 'Всего: ' + items.length + ' · доступов: ' + (items.length - links) + ' · линков: ' + links + ' · онлайн: ' + online;
+      if(st) st.textContent = 'Всего: ' + items.length + ' · доступов: ' + (items.length - links) + ' · линков: ' + links + ' · онлайн: ' + online
+        + (d.lan_warn ? ' · ⚠ ' + d.lan_warn : '');
       var conn = items.filter(function(i){ return i.xray; });
       var cb = $('wgrConn');
       if(cb){ cb.style.display = ''; cb.innerHTML = '<b>В анти-DPI заведено' + (conn.length ? ' (' + conn.length + '):</b> ' + conn.map(function(i){ return 'nwg' + esc(i.index) + ' · ' + esc(i.desc); }).join(', ') : ':</b> пока ничего'); }
@@ -13935,7 +13976,7 @@ Use this token to access the HTTP API:
         act += '<button type="button" class="btn" data-rules="' + esc(i.iface) + '">🔒 Правила</button> ';
       }
       if(i.conf_tpl) act += '<button type="button" class="btn" data-conf="' + n + '">💾 conf</button> ';
-      act += '<a class="btn" href="/api/xkeen/wg-backup?iface=' + encodeURIComponent(i.iface) + '">💾 бэкап</a>';
+      act += '<button type="button" class="btn" data-backup="' + esc(i.iface) + '">💾 бэкап</button>';
       h += '<tr style="border-top:1px solid #e3e8ee;' + (i.is_link ? ' background:#eef6fb;' : '') + '"><td style="padding:4px 6px; white-space:nowrap;">' + (i.is_link ? '🔗 линк' : '🧑 доступ') + '</td>'
         + '<td style="padding:4px 6px;"><b>' + esc(i.desc) + '</b>' + badges + '</td><td style="padding:4px 6px; font-family:monospace;">' + esc(i.iface) + '</td>'
         + '<td style="padding:4px 6px; font-family:monospace;">' + esc(i.subnet || i.addr || '—') + '</td><td style="padding:4px 6px; font-family:monospace;">' + esc(i.port || '—') + '</td>'
@@ -13946,8 +13987,26 @@ Use this token to access the HTTP API:
     wireListButtons(box);
     var xb = box.querySelectorAll('button[data-xray]');
     for(var k = 0; k < xb.length; k++){ xb[k].addEventListener('click', function(){ xrayToggle(WG.routerItems[+this.getAttribute('data-xray')], this); }); }
+    var bkb = box.querySelectorAll('button[data-backup]');
+    for(var q = 0; q < bkb.length; q++){ bkb[q].addEventListener('click', function(){ backupDl(this.getAttribute('data-backup'), this); }); }
     var cfb = box.querySelectorAll('button[data-conf]');
     for(var m = 0; m < cfb.length; m++){ cfb[m].addEventListener('click', function(){ var it = WG.routerItems[+this.getAttribute('data-conf')]; dlText(it.conf_tpl, it.fname); }); }
+  }
+
+  /* бэкап — запросом: ошибка (сессия истекла, роутер не ответил) показывается на странице, а не
+     уводит с неё (на странице может быть показанный один раз .conf с приватным ключом) */
+  function backupDl(iface, btn){
+    var ot = btn.textContent; btn.disabled = true; btn.textContent = '…';
+    fetch('/api/xkeen/wg-backup?iface=' + encodeURIComponent(iface)).then(function(r){
+      var ct = r.headers.get('Content-Type') || '';
+      if(!r.ok || r.redirected || ct.indexOf('text/plain') < 0){
+        return r.text().then(function(t){ throw new Error(r.redirected ? 'сессия истекла — войдите заново' : (t || ('HTTP ' + r.status)).slice(0, 200)); });
+      }
+      var cd = r.headers.get('Content-Disposition') || '';
+      var m = /filename="([^"]+)"/.exec(cd);
+      return r.text().then(function(t){ dlText(t, m ? m[1] : ('wg-backup-' + iface + '.txt')); });
+    }).then(function(){ btn.disabled = false; btn.textContent = ot; })
+      .catch(function(e){ btn.disabled = false; btn.textContent = ot; flash(false, esc('Бэкап ' + iface + ': ' + (e && e.message ? e.message : e))); });
   }
 
   function xrayToggle(i, btn){
@@ -13993,7 +14052,8 @@ Use this token to access the HTTP API:
       $('wgRTitle').textContent = '🔒 Правила — ' + d.desc + ' (' + iface + ')';
       WG.exitModes = d.exit_modes || WG.exitModes;
       var cur = d.current;
-      var h = '<div style="font-weight:600;">Сейчас на роутере:</div>';
+      var h = (d.lan_warn ? '<div style="margin-bottom:6px; color:#b02a37; font-weight:600;">⚠ ' + esc(d.lan_warn) + '</div>' : '')
+        + '<div style="font-weight:600;">Сейчас на роутере:</div>';
       if(cur === null || cur === undefined) h += '<div style="color:#b02a37;">⚠ правила не прочитаны</div>';
       else if(!cur.length) h += '<div class="muted">правил нет</div>';
       else h += '<ul style="margin:4px 0; font-family:monospace; font-size:0.85em; max-height:160px; overflow:auto;">' + cur.map(function(x){ return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>';
