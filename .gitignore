@@ -62,3 +62,8 @@ _screenshot_helper.py
 _github_screenshot_helper.py
 _filter_*_callback.py
 _wg_review*.diff
+
+# Реестр выданных WireGuard-доступов (имена клиентов, публичные ключи)
+wg_clients.json
+wg_clients.json.bak
+wg_clients.json.tmp

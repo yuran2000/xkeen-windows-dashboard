@@ -76,6 +76,7 @@ pythonw не сохраняется. Разработка: `start.bat` (конс
 |---|---|
 | `dashboard.py` | монолит: конфиг, SSH-слой, логика, маршруты, шаблоны `DYNAMIC_TEMPLATE`, `LOGIN_TEMPLATE`, `TEMPLATE`, `XKEEN_TEMPLATE` |
 | `xkeen_killswitch.py` | генератор netfilter.d-хука kill-switch политики XKeen, разбор статуса/утечек; без Flask |
+| `wg_clients.py` | WireGuard-доступы: ключи X25519, скан роутера и свободный слот, интерфейс через RCI, access-list/NAT по режиму выхода, хук подмены адреса WG → ЛВС, отзыв, инвентарь, реестр выданного; без Flask (§3.4а) |
 | `xkeen_backup_paths.py` | пути снапшота (`STATIC_FILES`, `DYNAMIC_GLOBS`), `build_snapshot_command`, `is_restorable`, `needs_exec_bit` |
 | `ssh_bin.py` | `ssh_exe()` (встроенный OpenSSH по полному пути), `null_known_hosts()` |
 | `geosite_scanner.py` | декодер `.dat`: `DatCache`, `detect_dat_type`, `lookup_domain`, `lookup_ip`, `list_categories` |
@@ -96,7 +97,7 @@ pythonw не сохраняется. Разработка: `start.bat` (конс
 | `.gitattributes`, `.gitignore`, `icons8-favicon-64.png` | переводы строк (§9.5), исключения, иконка |
 
 Вне git: `config_local.py`, `config.ini`, `runtime_settings.json`, `backups/` (снапшоты, `dat_cache/`,
-`entware_backup_*.tar.gz`), `*.log`, `.ssh/`, `.venv/`, `*.bak-*`.
+`entware_backup_*.tar.gz`), `*.log`, `.ssh/`, `.venv/`, `*.bak-*`, `wg_clients.json` (+ `.bak`, `.tmp`).
 
 ---
 
@@ -124,7 +125,8 @@ cfg` — **весь код читает настройки как `cfg.*`**; п�
 `load_runtime_settings`, `save_runtime_settings`, `apply_runtime_overrides()` (`setattr(cfg, …)` при
 импорте и после `POST /api/keenetic/settings` — без рестарта), `get_keenetic_settings_merged()`
 (`{current, overridden}`). Пароль, порт, токен подписки — только `config_local.py`/`config.ini`. Тут же
-`_WATCHDOG_CFG_LOCK`, `app`, `PERMANENT_SESSION_LIFETIME` (`cfg.SESSION_DAYS`), `SUBS_LOG`.
+`_WATCHDOG_CFG_LOCK`, `app`, `PERMANENT_SESSION_LIFETIME` (`cfg.SESSION_DAYS`), `SESSION_COOKIE_SAMESITE`
+(`"Lax"` явно: cookie не уходит с кросс-сайт POST — защита от CSRF без токенов), `SUBS_LOG`.
 `requires_auth` — на каждом маршруте (`before_request` не используется). `collect_dynamic_data`,
 `parse_xray_config` и соседи — только для `/`.
 
@@ -144,7 +146,12 @@ RCI: `_keenetic_rci` (GET `localhost:79/rci/<path>` curl'ом на роутер�
 `keenetic_get_wireguard_interfaces`, `WG_SPLIT_ALLOWEDIPS` (без RFC1918 — иначе
 Windows-клиент включает свой kill-switch), `build_wg_client_conf`, `build_wg_server_conf`,
 `_build_wg_xray_hook` — **источник истины** хука `zz_wg_xray_<iface>.sh` (ручные правки на роутере
-перезатираются).
+перезатираются); `wg_xray_connect(iface_id)` / `wg_xray_disconnect(iface_id)` — установка и снятие хука
+(dict-результат; маршруты `wg-connect`/`wg-disconnect` — обёртки, их же зовут выдача, отзыв и правила;
+снятие после чистки по факту прогоняет хук подмены адреса `wg_clients.MASQ_HOOK`). Снятие НЕ требует адреса
+интерфейса (выключенный его не имеет): подсеть для MASQUERADE — из `SUBNET=` самого хука, иначе из интерфейса. `_keenetic_lan_net()` —
+(ЛВС, её интерфейс) по адресу `cfg.KEENETIC_HOST` в `ip addr` роутера, кэш `_WG_LAN_CACHE` 10 мин; при сбое
+чтения — последнее удачное определение, иначе `<адрес>/24, br0`.
 
 ### 3.4. `KILL-SWITCH ПОЛИТИКИ XKEEN (v1.1.0)` и соседи
 
@@ -153,13 +160,53 @@ Windows-клиент включает свой kill-switch), `build_wg_client_co
 политики, `observe` — только счёт; `build_hook`, `install_command`, `remove_command`, `parse_status`,
 `parse_leaks`). В панели: `_KS_LOCK`, `_ks_read_params()` (метка политики по RCI `show/ip/policy`,
 порты, WAN), `keenetic_killswitch_status()` (`absent`/`broken`/`observe`/`protect`, дрейф, утечки),
-`keenetic_ensure_killswitch(mode, force)` (идемпотентно, маркер `KS_INSTALL_OK`). Дальше без маркера:
-`api_wg_new_client` (`WG_EXE_PATHS`), `_keenetic_rci_post` (POST parse-команд ndm), ACL WG
-(`wg_apply_acl`: отвязать → удалить → создать → привязать → перечитать → `system configuration
-save`; сбой посередине = fail-closed), DAT-кэш (`_fetch_dat_via_ssh`, `_list_remote_dat`, `_get_dat_cache` → `<base>/backups/dat_cache`), anti-bot
+`keenetic_ensure_killswitch(mode, force)` (идемпотентно, маркер `KS_INSTALL_OK`). Kill-switch сам
+перечитывает хуки `zz_wg_xray_*` (WG под заворотом пропускаются в FORWARD); хук подмены адреса под этот
+шаблон не попадает. Дальше без маркера: блок `WG-ДОСТУПЫ` (§3.4а), DAT-кэш (`_fetch_dat_via_ssh`, `_list_remote_dat`, `_get_dat_cache` → `<base>/backups/dat_cache`), anti-bot
 (`_chrome_fp_probe`), sidecar-файлы (`keenetic_read_domain_notes`, `keenetic_write_domain_notes`,
 `keenetic_read_sub_meta`, `keenetic_write_sub_meta`, `keenetic_set_sub_meta` — дата по ключу-`sub_url`
 копируется во все pbk-«тени» подписки).
+
+### 3.4а. `WG-ДОСТУПЫ` — выдача WireGuard-доступов (`wg_clients.py`)
+
+Логика — модуль `wg_clients.py` без Flask; связь с роутером через `configure(ssh_fn, settings)`:
+панельный `_wg_ssh` (адаптер `keenetic_ssh` → `(rc, stdout, stderr)`) и `_wg_settings()` →
+`wg_clients.Settings` из `cfg.WG_*` (`config_local.example.py`, раздел WIREGUARD-ДОСТУПЫ) + ЛВС с роутера.
+`_wg_prepare()` — в начале каждого WG-маршрута. Реестр выданного — `<base>/wg_clients.json`
+(`_app_base_dir`), атомарная запись, битый не затирается (`RegistryError`), приватных ключей нет.
+- Топология: доступ = свой `WireguardN` и своя `/24` `<prefix>.X.0/24` (роутер .1, клиент .2); доступ на
+  роутере ищется **по ключу клиента** среди пиров (`iface_by_pub`), не по имени.
+- `scan_router` — fail-closed: `/rci/show/interface` + `/rci/interface` + хуки xray (`xray_hooks`) обязаны
+  прочитаться; WAN-адрес (интерфейс с `defaultgw`) запоминается в `_WAN` — это endpoint по умолчанию
+  (`endpoint_host`, `endpoint_warning` для пустого/серого). `free_slot` — низший свободный индекс (не под
+  хуком xray), подсеть, порт.
+- `_is_link` — линк (не трогаем): endpoint у пира или чужая сеть в allow-ips; своя s2s из реестра — не линк,
+  пока все сети пира в своей /24, ЛВС и `remote_lan`.
+- `issue` — проверка ввода (`NAME_RE`, `collect_grants`, `parse_remote_lan`) → скан → нет адреса подключения
+  (`endpoint_host` пуст) — отказ до реестра и роутера → имя не занято → слот →
+  `genkey` ×2 → `client_conf` / `router_conf` / `router_block_text` → запись реестра с меткой
+  `router_dirty` → [`create_iface` (проверка 404 индекса, один RCI parse-массив, сверка публичного ключа,
+  откат) → `apply_acl` → при режиме xray `xray_on` = `_wg_xray_on`].
+- `apply_acl` — отвязать → удалить → создать (`acl_lines`: разрешённое в ЛВС → [xray: порты управления
+  своего .1 закрыты, сам .1 открыт] → deny `BLOCK_NETS` + `<prefix>.0.0/16` + `block_extra` + свой WAN →
+  permit) → привязать → `auto-delete` → перечитать и сверить число → NAT (`ip nat` только `direct`) →
+  save → `lan_masq_set`. Режимы — `EXIT_MODES`: `direct`, `xray`, `""` (только ЛВС).
+- Подмена адреса WG → ЛВС — один хук `MASQ_HOOK` (`zz_wg_lan_masq.sh`); какие подсети чьи — в самом
+  хуке строкой `MAP="WireguardN=a,b …"` (`lan_masq_read`, `_masq_hook_state`, `_parse_map`): роутер — источник
+  истины. `lan_masq_set` снимает и правила со старыми `LANNET`/`LANIF` из хука (ЛВС или мост сменились);
+  значения из хука идут в команду только после проверки формата.
+- `revoke` / `delete_iface` — отказ для линка и интерфейса с чужими пирами; заворот снимается через
+  `xray_off`, и только ПОСЛЕ этого ставится метка `router_dirty` (`before_change`): хук xray — файлы и cron,
+  не конфигурация Keenetic, а метка без единой команды конфигурации привела бы к лишнему save; NAT →
+  маршрут → `no interface` → не удалился — вернуть снятое, включая заворот (`xray_on`); save; «отозван»
+  только после save; «на роутере нет» → save только по метке (не закрепить чужое несохранённое).
+- `rules_form` / `apply_rules` — форма «🔒 Правила». Режим предзаполняется по факту: есть хук заворота →
+  `xray` (раньше NAT и записи реестра — заворот могли включить кнопкой), признак `xray_on` для
+  предупреждения в подтверждении. `apply_rules` → `(ok, msg, итоговый режим)`: для site-to-site режим
+  всегда `""`. `api_wg_acl_apply` решает по итоговому режиму: `xray` — включить заворот (и если хук не
+  прочитан: включение идемпотентно), другой режим — снять; хук не прочитан — предупреждение в ответе.
+- `router_inventory` — все `WireguardN` (доступ/линк, онлайн, трафик, NAT, заворот, `.conf`-шаблон);
+  `backup_text` — бэкап одного доступа.
 
 ### 3.5. `OUTBOUND LIVENESS PROBES` — ядро outbound'ов и watchdog
 
@@ -302,7 +349,7 @@ fix_explain)`):
 
 ## 4. Реестр маршрутов
 
-87 декораторов `@app.route` на 86 функциях; все, кроме «без auth», под `requires_auth`. «Роутер»:
+91 декоратор `@app.route` на 90 функциях; все, кроме «без auth», под `requires_auth`. «Роутер»:
 `—` не трогает; `R` чтение по SSH; `W: …` запись (бэкап `.bak-<ts>`, если не оговорено); `⟳` явный
 `xkeen -restart`; `WD` — `keenetic_write_watchdog_config` (config + внеочередной `watchdog.sh`,
 который может перегенерировать routing и перезапустить xkeen, + авто-обновление `watchdog.sh`);
@@ -367,9 +414,13 @@ fix_explain)`):
 | `/api/xkeen/killswitch-remove` | POST | `api_xkeen_killswitch_remove` | снять всё | W |
 | `/api/xkeen/wg-interfaces` | GET | `api_wg_interfaces` | WG-интерфейсы, WAN, LAN-IP | R |
 | `/api/xkeen/wg-client-conf` | POST | `api_wg_client_conf` | текст `.conf` | R |
-| `/api/xkeen/wg-new-client` | POST | `api_wg_new_client` | ключи `wg.exe`, интерфейс + peer | ndm |
+| `/api/xkeen/wg-clients` | GET | `api_wg_clients` | выданные (реестр + где на роутере), свободный слот, пресеты | R |
+| `/api/xkeen/wg-issue` | POST | `api_wg_issue` | `name`, `exit`, `full`, `services`, `extra`, `s2s`, `remote_lan`, `create` → `.conf`, QR, серверный `.conf`, CLI | ndm, W: netfilter.d (подмена, заворот), crontab |
+| `/api/xkeen/wg-revoke` | POST | `api_wg_revoke` | `id` записи реестра | ndm, W: netfilter.d, crontab |
+| `/api/xkeen/wg-router` | GET | `api_wg_router` | инвентарь WG + `orphan_hooks` | R |
+| `/api/xkeen/wg-backup` | GET | `api_wg_backup` | `?iface=WireguardN` → текст-вложение | R |
 | `/api/xkeen/wg-connect`, `wg-disconnect`, `wg-cleanup-orphan` | POST | `api_wg_connect`, `api_wg_disconnect`, `api_wg_cleanup_orphan` | хук `zz_wg_xray_<iface>.sh` + cron self-heal | W: netfilter.d, crontab |
-| `/api/xkeen/wg-acl`, `wg-acl-apply` | GET; POST | `api_wg_acl_get`, `api_wg_acl_apply` | ACL интерфейса | R / ndm |
+| `/api/xkeen/wg-acl`, `wg-acl-apply` | GET; POST | `api_wg_acl_get`, `api_wg_acl_apply` | форма правил (`rules_form`); `iface_id`, `exit`, `full`, `services`, `extra` → access-list, NAT, подмена, заворот по итоговому режиму; линк — отказ | R / ndm, W: netfilter.d, crontab |
 | `/api/xkeen/policy-clients` | GET | `api_xkeen_policy_clients` | клиенты, политики, порты, `.lst` | R |
 | `/api/xkeen/set-client-policy` | POST | `api_xkeen_set_client_policy` | `mac`, `policy` | ndm |
 | `/api/xkeen/flush-conntrack` | POST | `api_xkeen_flush_conntrack` | `ip` | `conntrack -D` или ndm |
@@ -431,7 +482,7 @@ fix_explain)`):
 | `/opt/etc/xray/outbound_meta.json`, `subscription_meta.json`, `domain_notes.json` | панель (sidecar; xray не читает) | панель, уведомитель |
 | `/opt/etc/xray/dat/*.dat` | `xkeen -ug` (cron; обновляет `geoip_v2fly.dat`, не `geoip.dat`), auto-fix `install_extended_geoip` (`geoip.dat` → симлинк или скачанный файл) | xray, панель (`_list_remote_dat` дедуплицирует симлинки по `readlink -f`) |
 | `/opt/var/log/xray/watchdog.log`, `error.log` | watchdog, xray | `keenetic_tail_log(n=30)`, header-status |
-| `/opt/etc/ndm/netfilter.d/zz_xkeen_killswitch.sh`, `zz_wg_xray_<iface>.sh` | kill-switch, WG | Keenetic, снапшот (`zz_*.sh`) |
+| `/opt/etc/ndm/netfilter.d/zz_xkeen_killswitch.sh`, `zz_wg_xray_<iface>.sh`, `zz_wg_lan_masq.sh` | kill-switch, WG (заворот; подмена адреса WG → ЛВС, `MAP` внутри) | Keenetic, снапшот (`zz_*.sh`) |
 | `/opt/var/spool/cron/crontabs/root` | bootstrap, auto-fix, kill-switch, WG, restore | watchdog `*/1`, self-heal, `xkeen -ug` |
 | `/opt/etc/xkeen/port_proxying.lst`, `port_exclude.lst`, `ip_exclude.lst` | watchdog держит `53` в `port_exclude.lst` | policy-clients, `_ks_read_params` |
 | `/opt/etc/dropbear/authorized_keys` | restore | снапшот |
@@ -732,14 +783,14 @@ FAILOVER не форсирует failover. TG «переключаюсь на р
 
 `<head>`/`<style>` → шапка `<h1>🚦 XKeen` (индикатор xray, версия) → `#flash` → баннер приветствия
 (`is_first_run`) → баннер «структура отстала» (`syncStructure(this)`) → разделы `<h2 class="sec-…">` →
-скрипт WG-помощника (`initWgGen`) → «❓ Помощь» → главный `<script>` → `<footer>`.
+скрипт WG-раздела (`initWg`) → «❓ Помощь» → главный `<script>` → `<footer>`.
 
 | Раздел (класс) | Категория | Содержимое |
 |---|---|---|
 | 🎯 Основное и резервное подключение (`sec-routing`) | Каналы | баннер режима, PRIMARY/FAILOVER, подпункты `data-xk-sub` (🤖 AI, 📺 YouTube, 📱 Зарубежные сервисы, 🌐 Через IPv6, ↪️ Напрямую, ⛔ Блокировать, 👥 Клиенты), ⚡ Принудительно, 🩺 Сквозная проба, 📋 Лог watchdog |
 | ⛓️ Цепочка резерва (FAILOVER) (`sec-chain`) | Каналы | `failover-chain` (drag-n-drop) |
 | 📋 Все outbounds (`sec-list`), ➕ Добавить (`sec-add`), 📡 Обновить из подписки (`sec-sync`) | Каналы | группы, bulk, форма, preview/sync |
-| 💾 Бэкап и восстановление (`sec-backup`), 🔧 Подключение к роутеру (`sec-router`, `section-router-config`), 🛠 Управление XKeen (`sec-xkmgmt`), 🐉 Подключение клиентов WireGuard (`sec-router`) | Обслуживание | снапшоты, SSH и bootstrap, CLI и GeoFile, WG |
+| 💾 Бэкап и восстановление (`sec-backup`), 🔧 Подключение к роутеру (`sec-router`, `section-router-config`), 🛠 Управление XKeen (`sec-xkmgmt`), 🐉 Подключение клиентов WireGuard (`sec-router`) | Обслуживание | снапшоты, SSH и bootstrap, CLI и GeoFile, WG: подпункты сайдбара «➕ Выдать доступ», «📋 Выданные», «📡 На роутере…», «🧩 .conf вручную…» (`.card > details`) + диалог `wgRulesDlg` |
 | 🚨 Алерты при падении xray (`sec-xkmgmt`), 🚑 Восстановление и диагностика (`sec-rescue`), 🤖 Telegram-бот для алертов (`sec-tg`) | Диагностика | индикатор/toast, диагностика + auto-fix, TG |
 | 🛡 Kill-switch политики XKeen (`sec-killswitch`) | **Прочее** (не ловится `catFor`) | `ks-status` |
 | ❓ Помощь (`sec-help`) | Помощь | 21 тема `details.help-section` |
@@ -797,6 +848,11 @@ GeoIP-категории»: неизвестно / расширенная и с�
   `autoMatchPresets`, `injectSectionControls`.
 - Обслуживание: `xkeenCmd`, `runDiagnose`, `applyFixByIdx`, `installExtendedGeoip`, `ksRefresh`,
   `tgSave`, `tgTest`, `repairTgChannel`, `saveDeepProbeSettings`, `syncStructure`, `bootstrapApply`.
+- WG (отдельный `<script>` после раздела, IIFE `initWg`): `loadClients` (`wg-clients`), `issue`,
+  `revoke`, `loadRouter` (`wg-router`), `xrayToggle`, `renderOrphans`/`cleanupOrphan`, `openRules`/
+  `applyRules` (диалог `wgRulesDlg` переносится в `<body>`: базовая страница раздела скрыта, пока открыт
+  подпункт), ручной генератор `loadIfaces`/`gen`. Чтение роутера — только когда блок показан
+  (`onVisible`: `offsetParent !== null` + проверка по клику).
 - Шапка/UX: `refreshXrayHeaderStatus` (60 с), `refreshDashboardHealth` (15 с), `injectSelectorCounters`,
   `injectLatencyAndCards`, `_convertSelectorsToCards`, `_xkRemindAssignRole`.
 
@@ -929,6 +985,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
 | `test_killswitch.py` | генератор хука, разбор статуса/утечек |
 | `test_probe_tag.py` | `probe_tag`/`_probe_connected` из `.cur` в `sh` с подменным curl: таймаут при установленном TCP = жив, без соединения = мёртв (нет `sh` — SKIP) |
 | `test_template_ips.py` | `.cur`-template (версия, два IPv4-массива), синк IP эндпоинтов |
+| `test_wg_clients_offline.py` | выдача WG на имитации Keenetic (RCI, ACL, NAT, маршруты, save, хуки): режимы, ЛВС и подмена адреса, ручной путь, s2s, линки, отзыв (метка save, возврат NAT/маршрута, чужие пиры, заворот), гонка за индекс, откат, битый/занятый реестр, X25519 = RFC 7748, рендер `/xkeen` |
 | `test_v29_ui_offline.py` | цепочка «Зарубежных» (`allow_ru`/`use_common`), `watchdog-settings`, `fields`/`deep`, quick-fail ⊇ ключей, рендер обоими путями |
 
 Новая функциональность = новые проверки по тому же образцу (подмена `D.*` **до** создания `test_client`).
@@ -991,4 +1048,5 @@ git log -1 --format='%an <%ae>'       # под кем последний ком�
 |---|---|
 | 2026-10-03 | Создание. Описано рабочее дерево: панель на базе v1.1.3 с UI для watchdog v29/v30 (цепочка и «общая цепочка» «Зарубежных», сквозная проба ролей и её настройки, статус `geoip.dat` и его связь с `geoip_v2fly.dat`), `bootstrap/watchdog.sh.cur` v30, template v13; 87 маршрутов, 13 проверок диагностики, 6 офлайн-тестов. |
 | 2026-10-03 | Независимое ревью → watchdog v31 (поля `*_RES`, `*_MAIN`, `*_NOALT`, `DPRI_FSINCE`; §6.3, §7.6); SSH-слой: `stdin=DEVNULL` во всех запусках ssh/scp (§5.2); geoip: статус без скана файла, проверка telegram в фоне с кэшем по `(size, mtime)`, auto-fix делает `geoip.dat` симлинком на `geoip_v2fly.dat`, откат при падении xray, 2 бэкапа. |
+| 2026-10-10 | WG-доступы: модуль `wg_clients.py` — выдача в один клик через RCI, правила по режиму выхода, NAT, хук подмены адреса WG → ЛВС, отзыв, инвентарь (§3.4а); раздел UI переделан в 4 подпункта + диалог правил; маршрут `wg-new-client` и редактор permit-строк удалены, `wg-acl`/`wg-acl-apply` — новая логика, +5 маршрутов (91); тест `test_wg_clients_offline.py`, офлайн-тестов 8. Дополнительные проверки: метка save после снятия заворота, возврат заворота при сорванном удалении, решение о завороте по итоговому режиму, предзаполнение режима по хуку, отказ выдачи без адреса подключения, снятие подмены со старыми LANNET/LANIF, `SESSION_COOKIE_SAMESITE=Lax`, снятие заворота у выключенного интерфейса. |
 | 2026-10-09 | watchdog v32: `probe_tag` — таймаут curl при установленном TCP (`%{num_connects}`) больше не считается смертью узла (§6.6, помощник `_probe_connected`); тест `tests/test_probe_tag.py` (§10.3), офлайн-тестов 7. |

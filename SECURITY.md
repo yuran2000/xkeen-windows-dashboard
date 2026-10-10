@@ -32,6 +32,8 @@
 
 - **`@requires_auth`** на всех API endpoints (session-based, секрет SECRET_KEY в config_local.py)
 - **`SECRET_KEY`** генерируется случайно через `secrets.token_hex(32)` при `install.bat`
+- **Cookie сессии `SameSite=Lax`** — браузер не отправляет её с кросс-сайт POST, поэтому чужая страница не может выполнить изменяющий запрос от имени вошедшего пользователя
+- **WireGuard-доступы**: имя клиента — белый список символов, передаётся на роутер только через stdin (не в командной строке); приватные ключи в панели не хранятся; линки и интерфейсы с чужими пирами панель не изменяет и не удаляет
 - **`SUBSCRIPTION_TOKEN`** — отдельный токен только для read-only subscription URL, не даёт админ-доступ
 - **SSH-ключ** имеет ACL только `SYSTEM`/`Administrators` (через `install_service.ps1`)
 - **`XKEEN_COMMANDS`** dict — whitelist разрешённых shell-команд, нельзя выполнить произвольный bash через `/api/xkeen/cmd`

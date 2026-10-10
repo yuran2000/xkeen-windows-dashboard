@@ -216,6 +216,7 @@ import threading as _threading
 # отдельные модули без Flask, чтобы их можно было проверять офлайн.
 import xkeen_backup_paths
 import xkeen_killswitch
+import wg_clients
 import ssh_bin
 
 # ============== ВЕРСИЯ ПАНЕЛИ ==============
@@ -338,6 +339,9 @@ apply_runtime_overrides()
 app = Flask(__name__)
 app.config["SECRET_KEY"] = cfg.SECRET_KEY
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=getattr(cfg, "SESSION_DAYS", 30))
+# Явный Lax: cookie сессии не уходит с кросс-сайт POST в любом браузере (Chromium делает так и по
+# умолчанию, Firefox/Safari — нет). Ссылка на панель (GET верхнего уровня) вход сохраняет.
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 # Лог запросов подписки (in-memory, последние N)
 SUBS_LOG = []  # list of dicts: {time, ip, user_agent, app, app_version, platform, platform_version}
@@ -1415,6 +1419,34 @@ def _build_wg_xray_hook(kernel, subnet, lan_ip, dns_port, mss, lan_net=None, lan
     return "\n".join(lines)
 
 
+_WG_LAN_CACHE = {"ts": 0.0, "val": None}
+
+
+def _keenetic_lan_net():
+    """(LAN-подсеть, её интерфейс) роутера — по адресу cfg.KEENETIC_HOST в `ip addr` роутера (а не
+    хардкодом: на чужих роутерах и LAN, и bridge другие). Кэш 10 мин. Не прочиталось — (<адрес>/24,
+    br0) без кэша; адрес не IPv4 — (None, br0)."""
+    import ipaddress
+    now = _time_mod.time()
+    if _WG_LAN_CACHE["val"] and now - _WG_LAN_CACHE["ts"] < 600:
+        return _WG_LAN_CACHE["val"]
+    lan_ip = getattr(cfg, "KEENETIC_HOST", "") or ""
+    if not re.match(r"\d+\.\d+\.\d+\.\d+$", lan_ip):
+        return None, "br0"
+    r = keenetic_ssh(f"ip -o -4 addr show 2>/dev/null | awk -v ip={lan_ip} '{{split($4,a,\"/\"); if(a[1]==ip){{print $2, $4; exit}}}}'", timeout=8)
+    parts = (r.get("stdout") or "").strip().split()
+    try:
+        if len(parts) >= 2:
+            val = (str(ipaddress.ip_network(parts[1], strict=False)), parts[0])
+            _WG_LAN_CACHE.update(ts=now, val=val)
+            return val
+        if _WG_LAN_CACHE["val"]:                  # сбой чтения: последнее удачное определение лучше догадки
+            return _WG_LAN_CACHE["val"]
+        return str(ipaddress.ip_network(lan_ip + "/24", strict=False)), "br0"
+    except Exception:
+        return None, "br0"
+
+
 def _wg_resolve_params(iface_id):
     """Собрать параметры для хука. → (dict, None) или (None, error_str)."""
     import ipaddress
@@ -1438,20 +1470,8 @@ def _wg_resolve_params(iface_id):
     if not subnet:
         return None, f"у {kernel} нет адреса/подсети — подними интерфейс на роутере"
     lan_ip = info.get("router_lan_ip") or getattr(cfg, "KEENETIC_HOST", "")
-    # LAN-подсеть и её интерфейс для masquerade WG→LAN. Определяем ДИНАМИЧЕСКИ по адресу
-    # роутера в LAN (а не хардкодим подсеть/br0 — на чужих роутерах и LAN, и bridge другие).
-    lan_net, lan_if = None, "br0"
-    if lan_ip and re.match(r"\d+\.\d+\.\d+\.\d+$", lan_ip):
-        r2 = keenetic_ssh(f"ip -o -4 addr show 2>/dev/null | awk -v ip={lan_ip} '{{split($4,a,\"/\"); if(a[1]==ip){{print $2, $4; exit}}}}'", timeout=8)
-        parts = (r2.get("stdout") or "").strip().split()
-        try:
-            if len(parts) >= 2:
-                lan_if = parts[0]
-                lan_net = str(ipaddress.ip_network(parts[1], strict=False))
-            else:
-                lan_net = str(ipaddress.ip_network(lan_ip + "/24", strict=False))
-        except Exception:
-            lan_net = None
+    # LAN-подсеть и её интерфейс для masquerade WG→LAN — по адресу роутера в LAN (_keenetic_lan_net).
+    lan_net, lan_if = _keenetic_lan_net()
     dns_port = _keenetic_detect_dns_port()
     try:
         mss = max(1200, int(iface.get("mtu") or 1320) - 84)
@@ -1465,11 +1485,15 @@ def _wg_resolve_params(iface_id):
 @requires_auth
 def api_wg_connect():
     """Поставить роутерный хук: завернуть WG-интерфейс в анти-DPI (xray). Idempotent + cron self-heal."""
-    import base64
     data = request.get_json(silent=True) or request.form
-    p, err = _wg_resolve_params((data.get("iface_id") or "").strip())
+    return jsonify(wg_xray_connect((data.get("iface_id") or "").strip()))
+
+
+def wg_xray_connect(iface_id):
+    """Хук заворота интерфейса в xray (+ cron self-heal). -> {ok, connected, kernel, msg} | {ok:False, error}."""
+    p, err = _wg_resolve_params(iface_id)
     if err:
-        return jsonify({"ok": False, "error": err})
+        return {"ok": False, "error": err}
     kernel = p["kernel"]
     path = f"/opt/etc/ndm/netfilter.d/zz_wg_xray_{kernel}.sh"
     hook = _build_wg_xray_hook(kernel, p["subnet"], p["lan_ip"], p["dns_port"], p["mss"],
@@ -1485,12 +1509,12 @@ def api_wg_connect():
     r = keenetic_ssh(cmd, timeout=40)
     out = r.get("stdout") or ""
     if "WG_CONN_OK" in out:
-        return jsonify({"ok": True, "connected": True, "kernel": kernel,
-                        "msg": f"{kernel} подключён к анти-DPI (хук + cron self-heal)"})
+        return {"ok": True, "connected": True, "kernel": kernel,
+                "msg": f"{kernel} подключён к анти-DPI (хук + cron self-heal)"}
     if "WG_CONN_PENDING" in out:
-        return jsonify({"ok": True, "connected": False, "kernel": kernel,
-                        "msg": f"хук {kernel} поставлен, но правило ещё не встало (xray/цепочка xkeen не готова?) — cron досделает в течение минуты"})
-    return jsonify({"ok": False, "error": (r.get("stderr") or out or "ошибка установки хука")[:300]})
+        return {"ok": True, "connected": False, "kernel": kernel,
+                "msg": f"хук {kernel} поставлен, но правило ещё не встало (xray/цепочка xkeen не готова?) — cron досделает в течение минуты"}
+    return {"ok": False, "error": (r.get("stderr") or out or "ошибка установки хука")[:300]}
 
 
 @app.route("/api/xkeen/wg-disconnect", methods=["POST"])
@@ -1498,28 +1522,48 @@ def api_wg_connect():
 def api_wg_disconnect():
     """Снять роутерный хук WG-интерфейса (flush правил + rm хук + cron-строка)."""
     data = request.get_json(silent=True) or request.form
-    p, err = _wg_resolve_params((data.get("iface_id") or "").strip())
-    if err:
-        return jsonify({"ok": False, "error": err})
-    kernel = p["kernel"]; subnet = p["subnet"]
+    return jsonify(wg_xray_disconnect((data.get("iface_id") or "").strip()))
+
+
+def wg_xray_disconnect(iface_id):
+    """Снять хук заворота в xray. Подмену адреса в ЛВС (хук wg_clients.MASQ_HOOK) возвращает прогоном
+    её хука: снятие идёт по факту и убирает MASQUERADE подсети целиком. Подсеть — из самого хука
+    (SUBNET=), иначе из интерфейса: у выключенного интерфейса адреса нет, а снять заворот с него нужно
+    (отзыв), поэтому _wg_resolve_params (требует адрес) здесь не используется.
+    -> {ok, connected:False, kernel, msg} | {ok:False, error}."""
+    info = keenetic_get_wireguard_interfaces()
+    if not info.get("ok"):
+        return {"ok": False, "error": info.get("error") or "не удалось прочитать WG с роутера"}
+    iface = next((i for i in info["interfaces"] if i["id"] == iface_id), None)
+    if not iface:
+        return {"ok": False, "error": f"WG-интерфейс {iface_id} не найден"}
+    kernel = iface.get("kernel_name") or ""
+    if not re.fullmatch(r"nwg\d+", kernel):
+        return {"ok": False, "error": "не удалось определить kernel-имя интерфейса"}
+    fallback = iface.get("subnet_cidr") or ""
+    if not re.fullmatch(r"[0-9./]+", fallback):
+        fallback = ""
     path = f"/opt/etc/ndm/netfilter.d/zz_wg_xray_{kernel}.sh"
     # ВСЕ правила интерфейса снимаем по ФАКТУ (grep '-i {kernel} ' → -D), а не по
     # пересчитанным значениям dns-порта / MSS / lan_ip: они могли дрейфовать с момента
     # connect (сменился MTU/DNS-порт роутера) → value-specific -D промахнулся бы и оставил
     # осиротевшие правила. Тот же by-fact подход, что и в очистке осиротевших хуков.
     dels = [
+        f"SUBNET=$(sed -n 's/^SUBNET=//p' {path} 2>/dev/null | head -1)",
+        f"[ -n \"$SUBNET\" ] || SUBNET=\"{fallback}\"",
         f"rm -f {path}",
         f"crontab -l 2>/dev/null | grep -vF '{path}' | crontab -",
         f"for T in nat mangle; do iptables -w -t $T -S PREROUTING 2>/dev/null | grep -- '-i {kernel} ' | sed 's|^-A |-D |' | while read _r; do iptables -w -t $T $_r 2>/dev/null; done; done",
         f"iptables -w -t nat -S INPUT 2>/dev/null | grep -- '-i {kernel} ' | sed 's|^-A |-D |' | while read _r; do iptables -w -t nat $_r 2>/dev/null; done",
         # masquerade подсети — тоже по факту (lan_net/lan_if могли дрейфовать или не зарезолвиться).
-        f"iptables -w -t nat -S POSTROUTING 2>/dev/null | grep -- '-s {subnet} ' | grep -- '-j MASQUERADE' | sed 's|^-A |-D |' | while read _r; do iptables -w -t nat $_r 2>/dev/null; done",
+        "[ -n \"$SUBNET\" ] && iptables -w -t nat -S POSTROUTING 2>/dev/null | grep -F -- \"-s $SUBNET \" | grep -- '-j MASQUERADE' | sed 's|^-A |-D |' | while read _r; do iptables -w -t nat $_r 2>/dev/null; done",
+        f"[ -x {wg_clients.MASQ_HOOK} ] && sh {wg_clients.MASQ_HOOK}",
     ]
     cmd = "; ".join(dels) + f"; iptables -t nat -S PREROUTING | grep -q -- '-i {kernel} -p tcp -j xkeen' && echo WG_STILL || echo WG_GONE"
     r = keenetic_ssh(cmd, timeout=30)
     if "WG_GONE" in (r.get("stdout") or ""):
-        return jsonify({"ok": True, "connected": False, "kernel": kernel, "msg": f"{kernel} отключён от анти-DPI"})
-    return jsonify({"ok": False, "error": "catch-all всё ещё на месте — возможно интерфейс ведёт сторонний хук (напр. zz_wg_home_xkeen.sh). Проверь вручную."})
+        return {"ok": True, "connected": False, "kernel": kernel, "msg": f"{kernel} отключён от анти-DPI"}
+    return {"ok": False, "error": "catch-all всё ещё на месте — возможно интерфейс ведёт сторонний хук (напр. zz_wg_home_xkeen.sh). Проверь вручную."}
 
 
 @app.route("/api/xkeen/wg-cleanup-orphan", methods=["POST"])
@@ -1537,7 +1581,7 @@ def api_wg_cleanup_orphan():
     if not info.get("ok"):
         return jsonify({"ok": False, "error": info.get("error") or "не удалось прочитать WG с роутера"})
     if kernel in {i.get("kernel_name") for i in (info.get("interfaces") or [])}:
-        return jsonify({"ok": False, "error": f"{kernel} — ЖИВОЙ интерфейс. Для него используй «Отключить от анти-DPI», а не очистку осиротевших."})
+        return jsonify({"ok": False, "error": f"{kernel} — живой интерфейс: заворот снимается кнопкой «🔌 Снять анти-DPI» в «📡 На роутере», а не очисткой осиротевших."})
     if kernel not in (info.get("orphan_hooks") or []):
         return jsonify({"ok": False, "error": f"хук {kernel} не найден среди осиротевших (возможно уже убран)"})
     path = f"/opt/etc/ndm/netfilter.d/zz_wg_xray_{kernel}.sh"
@@ -1765,364 +1809,189 @@ def api_xkeen_killswitch_remove():
     return jsonify({"ok": False, "error": ((r.get("stderr") or out)[-300:]).strip() or "не удалось снять"})
 
 
-WG_EXE_PATHS = [r"C:\Program Files\WireGuard\wg.exe", r"C:\Program Files (x86)\WireGuard\wg.exe"]
+# ============== WG-ДОСТУПЫ (выдача в один клик, правила, отзыв) ==============
+# Логика — в wg_clients.py (без Flask): ключи, свободный слот, интерфейс через RCI, access-list и NAT
+# по режиму выхода, подмена адреса WG -> ЛВС (хук wg_clients.MASQ_HOOK), отзыв, реестр выданного
+# (<base>/wg_clients.json, приватные ключи не хранятся). Здесь: настройки из cfg + роутера, связь
+# через keenetic_ssh, маршруты. Заворот в xray — wg_xray_connect / wg_xray_disconnect выше.
+
+def _wg_ssh(cmd, stdin_data=None, timeout=25):
+    """Адаптер keenetic_ssh -> (rc, stdout, stderr) для wg_clients."""
+    r = keenetic_ssh(cmd, timeout=timeout, stdin_data=stdin_data)
+    rc = 0 if r.get("ok") else (r.get("code") or 255)
+    return rc, r.get("stdout") or "", r.get("stderr") or ""
 
 
-@app.route("/api/xkeen/wg-new-client", methods=["POST"])
+def _wg_settings():
+    """wg_clients.Settings из cfg.WG_* (см. config_local.example.py) + ЛВС роутера, если не задана."""
+    lan_net = getattr(cfg, "WG_LAN_SUBNET", "") or ""
+    lan_if = getattr(cfg, "WG_LAN_IF", "") or ""
+    if not lan_net or not lan_if:
+        dn, di = _keenetic_lan_net()
+        lan_net, lan_if = lan_net or dn or "192.168.1.0/24", lan_if or di or "br0"
+    return wg_clients.Settings(
+        lan_subnet=lan_net, lan_if=lan_if,
+        prefix=getattr(cfg, "WG_SUBNET_PREFIX", "172.173"),
+        subnet_start=int(getattr(cfg, "WG_SUBNET_START", 1)),
+        port_range=tuple(getattr(cfg, "WG_PORT_RANGE", (48001, 48099))),
+        max_ifaces=int(getattr(cfg, "WG_MAX_IFACES", 48)),
+        block_extra=list(getattr(cfg, "WG_BLOCK_EXTRA", []) or []),
+        dns=getattr(cfg, "WG_DNS", "9.9.9.9"),
+        endpoint_host=getattr(cfg, "WG_ENDPOINT_HOST", "") or "",
+        mtu=int(getattr(cfg, "WG_MTU", 1324)),
+        services=list(getattr(cfg, "WG_SERVICES", []) or []),
+        registry_path=os.path.join(_app_base_dir(), "wg_clients.json"),
+    )
+
+
+def _wg_prepare():
+    wg_clients.configure(_wg_ssh, _wg_settings())
+
+
+def _wg_xray_on(iface):
+    d = wg_xray_connect(iface)
+    return bool(d.get("ok")), d.get("msg") or d.get("error") or ""
+
+
+def _wg_xray_off(iface):
+    d = wg_xray_disconnect(iface)
+    return bool(d.get("ok")), d.get("msg") or d.get("error") or ""
+
+
+def _wg_bool(v):
+    return (v is True) or (str(v).lower() in ("1", "true", "on", "yes"))
+
+
+def _wg_list(v):
+    if isinstance(v, (list, tuple)):
+        return [str(x) for x in v]
+    return [x for x in re.split(r"[,\s]+", str(v or "")) if x]
+
+
+@app.route("/api/xkeen/wg-clients", methods=["GET"])
 @requires_auth
-def api_wg_new_client():
-    """Создать WG-клиента «с нуля»: генерит ОБЕ пары ключей (сервер+клиент), подбирает свободную
-    подсеть/порт, отдаёт серверный .conf (для «Загрузить из файла» в Keenetic) + клиентский .conf."""
-    import subprocess as _sp
-    data = request.get_json(silent=True) or request.form
-    name = (data.get("name") or "").strip() or "client"
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name)[:40].strip("_") or "client"
-    mode = (data.get("mode") or "full").strip()
-    selective = data.get("selective_cidrs") or ""
-    selective_cidrs = [c.strip() for c in re.split(r"[,\s]+", selective) if c.strip()] if isinstance(selective, str) else list(selective)
-    exclude = data.get("exclude_cidrs") or ""
-    exclude_cidrs = [c.strip() for c in re.split(r"[,\s]+", exclude) if c.strip()] if isinstance(exclude, str) else list(exclude)
-    v6 = data.get("v6_antileak")
-    v6 = (v6 is True) or (str(v6).lower() in ("1", "true", "on", "yes"))
-    wg = next((p for p in WG_EXE_PATHS if os.path.exists(p)), None)
-    if not wg:
-        return jsonify({"ok": False, "error": "wg.exe не найден (поставь WireGuard for Windows)"})
-
-    def _keypair():
-        pr = _sp.run([wg, "genkey"], capture_output=True, timeout=10).stdout.decode("ascii", "ignore").strip()
-        pb = _sp.run([wg, "pubkey"], input=pr.encode(), capture_output=True, timeout=10).stdout.decode("ascii", "ignore").strip()
-        return pr, pb
-    try:
-        s_priv, s_pub = _keypair()
-        c_priv, c_pub = _keypair()
-        if not (s_priv and s_pub and c_priv and c_pub):
-            return jsonify({"ok": False, "error": "wg.exe не вернул ключи"})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)[:200]})
-
-    info = keenetic_get_wireguard_interfaces()
-    if not info.get("ok"):
-        return jsonify({"ok": False, "error": info.get("error") or "не удалось прочитать WG с роутера"})
-    import ipaddress
-    ifaces = info.get("interfaces") or []
-    subnet_cidr, server_ip, client_ip, port = _wg_pick_free_subnet_and_port(ifaces)
-    prefix = 24
-    # Существующие WG-подсети и порты — чтобы ручной override не пересёкся с ними
-    # (иначе новый интерфейс конфликтует по адресации/порту и молча не поднимается).
-    _existing_nets = []
-    _used_ports = set()
-    for _i in ifaces:
-        _sc = _i.get("subnet_cidr")
-        if _sc:
-            try:
-                _existing_nets.append(ipaddress.ip_network(_sc, strict=False))
-            except Exception:
-                pass
-        try:
-            _lp = int(_i.get("listen_port") or 0)
-            if _lp:
-                _used_ports.add(_lp)
-        except Exception:
-            pass
-    ov_subnet = (data.get("subnet") or "").strip()
-    ov_port = str(data.get("listen_port") or "").strip()
-    if ov_subnet:
-        try:
-            net = ipaddress.ip_network(ov_subnet, strict=False)
-        except ValueError:
-            return jsonify({"ok": False, "error": f"неверная подсеть: {ov_subnet}"})
-        hosts = list(net.hosts())
-        if len(hosts) < 2:
-            return jsonify({"ok": False, "error": f"подсеть {ov_subnet} мала — нужно ≥2 адресов (сервер .1 + клиент .2)"})
-        _clash = next((str(e) for e in _existing_nets if net.overlaps(e)), None)
-        if _clash:
-            return jsonify({"ok": False, "error": f"подсеть {ov_subnet} пересекается с уже существующей WG-подсетью {_clash} — выбери другую."})
-        subnet_cidr, server_ip, client_ip, prefix = str(net), str(hosts[0]), str(hosts[1]), net.prefixlen
-    elif subnet_cidr is None:
-        return jsonify({"ok": False, "error": "не нашлось свободной /24-подсети (172.173.x / 10.10.x заняты) — задай подсеть вручную полем"})
-    if ov_port:
-        if not ov_port.isdigit() or not (1 <= int(ov_port) <= 65535):
-            return jsonify({"ok": False, "error": f"неверный порт: {ov_port} (нужно число 1–65535)"})
-        if int(ov_port) in _used_ports:
-            return jsonify({"ok": False, "error": f"порт {ov_port} уже занят другим WG-интерфейсом — выбери другой."})
-        port = int(ov_port)
-    endpoint_host = (data.get("endpoint_host") or "").strip() or info.get("wan_host") or "<endpoint-host>"
-    endpoint_warn = None
-    try:
-        eh = ipaddress.ip_address(endpoint_host)
-        if eh.is_private or eh.is_loopback or eh in ipaddress.ip_network("100.64.0.0/10"):
-            endpoint_warn = f"Endpoint {endpoint_host} — приватный/CGNAT-адрес, снаружи он недостижим. Укажи внешний WAN-IP или DDNS в поле Endpoint, иначе handshake не пройдёт."
-    except ValueError:
-        pass
-    # Проверка осиротевших хуков ПЕРЕД созданием: новый интерфейс может занять тот же nwgX и
-    # подхватить старый хук → «зеленеет, но не работает». Предупреждаем (не блокируем — хук может
-    # быть для другого номера; пользователь решает, убрать ли его сначала).
-    orphan_warn = None
-    if info.get("orphan_hooks"):
-        orphan_warn = ("На роутере есть осиротевшие анти-DPI хуки: " + ", ".join(info["orphan_hooks"]) +
-                       ". Новый интерфейс может получить тот же номер и подхватить старый хук → «зеленеет, но не работает». "
-                       "Лучше сначала убери их: «🔄 Прочитать с роутера» → кнопка «🧹 Убрать».")
-    dns_ip = info.get("router_lan_ip") or "<router-lan-ip>"
-    home_lan_cidr = None
-    if dns_ip and re.match(r"\d+\.\d+\.\d+\.\d+$", dns_ip):
-        try:
-            home_lan_cidr = str(ipaddress.ip_network(dns_ip + "/24", strict=False))
-        except Exception:
-            pass
-    # Режимы с доступом к домашней LAN: добавить LAN-подсеть в AllowedIPs серверного пира
-    # (авторизует forward WG→LAN на роутере). Masquerade ставит анти-DPI хук при «Подключить».
-    lan_cidrs = [home_lan_cidr] if (mode in ("full_lan", "lan") and home_lan_cidr) else None
-    server_conf = build_wg_server_conf(s_priv, f"{server_ip}/{prefix}", port, c_pub, client_ip, lan_cidrs=lan_cidrs)
-    fake_iface = {"public_key": s_pub, "listen_port": port, "subnet_cidr": subnet_cidr, "mtu": None}
-    try:
-        client_conf = build_wg_client_conf(fake_iface, endpoint_host, client_ip, mode, selective_cidrs,
-                                           dns_ip, home_lan_cidr, v6_antileak=v6, client_priv=c_priv,
-                                           exclude_cidrs=exclude_cidrs)
-    except ValueError as e:
-        return jsonify({"ok": False, "error": str(e)})
+def api_wg_clients():
+    """Выданные доступы (реестр + где они на роутере), свободный слот, настройки для формы."""
+    _wg_prepare()
+    state = wg_clients.scan_router(timeout=12)
+    clients, reg_err = wg_clients.clients_view(state)
+    slot = wg_clients.free_slot(state) if state.get("ok") else None
+    s = wg_clients.S
+    lan_warn = ""
+    if not (getattr(cfg, "WG_LAN_SUBNET", "") or "") and not _WG_LAN_CACHE["val"]:
+        lan_warn = (f"ЛВС роутера не определена автоматически — взята {s.lan_subnet}. Если это не так, "
+                    f"задайте WG_LAN_SUBNET в config_local.py (влияет на «полный доступ к ЛВС» и подмену адреса).")
     return jsonify({
-        "ok": True,
-        "server_conf": server_conf, "client_conf": client_conf,
-        "server_filename": f"WG_{safe}.conf", "client_filename": f"wg-client-{safe}.conf",
-        "subnet": subnet_cidr, "listen_port": port,
-        "server_ip": server_ip, "client_ip": client_ip,
-        "server_pub": s_pub, "client_pub": c_pub, "endpoint_host": endpoint_host,
-        "endpoint_warn": endpoint_warn,
-        "orphan_warn": orphan_warn,
+        "ok": bool(state.get("ok")), "error": state.get("err", ""), "clients": clients, "reg_err": reg_err,
+        "slot": slot, "prefix": s.prefix, "lan": s.lan_subnet, "services": s.services,
+        "endpoint_host": wg_clients.endpoint_host(), "endpoint_warn": wg_clients.endpoint_warning(),
+        "lan_warn": lan_warn, "exit_modes": wg_clients.EXIT_MODES,
     })
 
 
-# ── WG firewall (least-privilege access-list через RCI parse-массив) ──────────
-# RCI POST localhost:79/rci/ принимает массив {"parse":...} в ОДНОЙ сессии (держит config-контекст),
-# чем задаётся многоуровневый access-list (ndmc -c stateless так не умеет). ТЗ рабочей 2026-06-22.
-# ACL интерфейса = _WEBADMIN_Wireguard<N> (тот, что правит веб-UI «Межсетевой экран»).
-
-def _keenetic_rci_post(parse_cmds, timeout=20):
-    """POST массив parse-команд на localhost:79/rci/ (одна сессия, держит config-контекст).
-    parse_cmds: list[str]. Возвращает {ok, errors:[...], raw}."""
-    import json as _json, base64 as _b64
-    body = _json.dumps([{"parse": c} for c in parse_cmds])
-    b64 = _b64.b64encode(body.encode("utf-8")).decode("ascii")
-    cmd = f"echo {b64} | base64 -d | curl -s -X POST 'http://localhost:79/rci/' -H 'Content-Type: application/json' -d @-"
-    r = keenetic_ssh(cmd, timeout=timeout)
-    raw = r.get("stdout") or ""
-    errors = []
-    try:
-        parsed = _json.loads(raw)
-
-        def _walk(o):
-            if isinstance(o, list):
-                for x in o:
-                    _walk(x)
-            elif isinstance(o, dict):
-                st = o.get("status")
-                if isinstance(st, list):
-                    for s in st:
-                        if isinstance(s, dict) and s.get("status") == "error":
-                            errors.append(s.get("message") or "RCI error")
-                for v in o.values():
-                    _walk(v)
-        _walk(parsed)
-    except Exception:
-        # непарсимый ответ: пустое тело при curl-ok = НЕ успех (роутер ничего не выполнил/обрыв)
-        if not raw.strip():
-            errors.append("пустой ответ RCI (роутер не отдал результат — перезапуск/обрыв)")
-        elif not r.get("ok"):
-            errors.append((r.get("stderr") or "RCI POST failed")[:200])
-        else:
-            errors.append("неразборчивый ответ RCI: " + raw.strip()[:120])
-    return {"ok": bool(r.get("ok")) and not errors, "errors": errors, "raw": raw[:1500]}
-
-
-def _wg_dst_and_mask(dst):
-    """'10.0.0.5' → ('10.0.0.5','255.255.255.255'); '10.0.0.0/24' → (net,netmask);
-    'any'/'' → ('0.0.0.0','0.0.0.0'). Бросает ValueError на мусоре."""
-    import ipaddress
-    s = str(dst or "").strip().lower()
-    if s in ("", "any", "0.0.0.0", "*"):
-        return "0.0.0.0", "0.0.0.0"
-    s = str(dst).strip()
-    if "/" in s:
-        net = ipaddress.ip_network(s, strict=False)
-        return str(net.network_address), str(net.netmask)
-    ipaddress.ip_address(s)
-    return s, "255.255.255.255"
-
-
-def _wg_is_permit_all(proto, dst, port, port_to):
-    """Правило = permit-all (tcp/udp на ЛЮБОЙ адрес без порта)? Нормализует dst так же, как
-    генератор (через _wg_dst_and_mask) — чтобы '0.0.0.0/0' и '0.0.0.0' распознавались одинаково."""
-    if str(proto or "").strip().lower() not in ("tcp", "udp"):
-        return False
-    try:
-        d, m = _wg_dst_and_mask(dst)
-    except Exception:
-        return False
-    return d == "0.0.0.0" and m == "0.0.0.0" and port in (None, "", 0) and port_to in (None, "", 0)
-
-
-def wg_acl_permit_lines(rules):
-    """rules: list of {proto:'icmp'|'tcp'|'udp', dst:'any'|ip|cidr, port?, port_to?}
-    → Keenetic-native permit-строки. Бросает ValueError на невалидном вводе."""
-    def _vp(p):
-        p = int(p)
-        if not (1 <= p <= 65535):
-            raise ValueError(f"порт вне диапазона 1..65535: {p}")
-        return p
-    lines = []
-    for r in (rules or []):
-        proto = str(r.get("proto") or "").strip().lower()
-        if proto not in ("icmp", "tcp", "udp"):
-            raise ValueError(f"протокол должен быть icmp/tcp/udp, не '{proto}'")
-        d, m = _wg_dst_and_mask(r.get("dst"))
-        port, port_to = r.get("port"), r.get("port_to")
-        has_port = port not in (None, "", 0)
-        has_to = port_to not in (None, "", 0)
-        if proto == "icmp":
-            if has_port or has_to:
-                raise ValueError("у протокола icmp нет портов — убери порт из icmp-правила")
-            lines.append(f"permit icmp 0.0.0.0 0.0.0.0 {d} {m}")
-            continue
-        if has_to and not has_port:
-            raise ValueError("для диапазона портов нужны ОБА конца (нижний порт пуст)")
-        line = f"permit {proto} 0.0.0.0 0.0.0.0 {d} {m}"
-        if has_port and has_to:
-            line += f" port range {_vp(port)} {_vp(port_to)}"
-        elif has_port:
-            line += f" port eq {_vp(port)}"
-        lines.append(line)
-    return lines
-
-
-def _wg_acl_block(acl_name):
-    """permit/deny-строки блока access-list <acl_name> из running-config.
-    Возвращает list (может быть пустым = ACL без правил) ЛИБО None = СБОЙ чтения (≠ пустой ACL).
-    Различие критично для fail-open guard: сбой чтения нельзя принять за «ACL чист»."""
-    r = keenetic_ssh("ndmc -c 'show running-config' 2>/dev/null", timeout=15)
-    if not r.get("ok"):
-        return None
-    txt = r.get("stdout") or ""
-    out, grab = [], False
-    for ln in txt.splitlines():
-        s = ln.strip()
-        if s == f"access-list {acl_name}":
-            grab = True
-            continue
-        if grab:
-            if s.startswith("permit ") or s.startswith("deny ") or s == "auto-delete":
-                out.append(s)
-            else:
-                break
-    return out
-
-
-def _wg_block_has_permit_all(block):
-    """fail-open детект по уже прочитанному блоку: permit tcp/udp на dst any (0.0.0.0 0.0.0.0) БЕЗ порта."""
-    for s in (block or []):
-        p = s.split()
-        if len(p) >= 6 and p[0] == "permit" and p[1] in ("tcp", "udp"):
-            if p[4] == "0.0.0.0" and p[5] == "0.0.0.0" and "port" not in p:
-                return True
-    return False
-
-
-def _wg_parse_permit(s):
-    """permit-строка → {proto,dst,port?,port_to?} для UI-редактора."""
-    import ipaddress
-    p = s.split()
-    if len(p) < 6 or p[0] != "permit":
-        return None
-    if p[4] == "0.0.0.0":
-        dst = "any"
-    elif p[5] == "255.255.255.255":
-        dst = p[4]
-    else:
+@app.route("/api/xkeen/wg-issue", methods=["POST"])
+@requires_auth
+def api_wg_issue():
+    """Выдать доступ: ключи, слот, .conf + QR; при create — интерфейс, правила, NAT, save, заворот."""
+    data = request.get_json(silent=True) or request.form
+    _wg_prepare()
+    res = wg_clients.issue(
+        data.get("name"), exit_mode=(data.get("exit") or ""), full=_wg_bool(data.get("full")),
+        services=_wg_list(data.get("services")), extra=data.get("extra") or "",
+        s2s=_wg_bool(data.get("s2s")), remote_lan=data.get("remote_lan") or "",
+        create=_wg_bool(data.get("create")), xray_on=_wg_xray_on)
+    if res.get("ok") and not res.get("s2s"):
         try:
-            dst = str(ipaddress.ip_network(f"{p[4]}/{p[5]}", strict=False))
+            buf = io.BytesIO()
+            qrcode.make(res["conf"]).save(buf, format="PNG")
+            res["qr"] = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
         except Exception:
-            dst = p[4]
-    out = {"proto": p[1], "dst": dst}
-    if "port" in p:
-        i = p.index("port")
-        op = p[i + 1] if i + 1 < len(p) else ""
-        if op == "eq" and i + 2 < len(p):
-            out["port"] = p[i + 2]
-        elif op == "range" and i + 3 < len(p):
-            out["port"], out["port_to"] = p[i + 2], p[i + 3]
-    return out
+            res["qr"] = ""
+    return jsonify(res)
 
 
-def wg_apply_acl(iface_index, rules):
-    """Применение least-privilege ACL к Wireguard<index> через RCI (ТЗ рабочей 2026-06-22):
-    отвязать(tolerant) → удалить(tolerant) → создать+permits(strict) → привязать(strict)
-    → fail-open guard (перечитать ACL: сбой чтения / лишние правила / непрошеный permit-all → стоп)
-    → save(strict). Сбой посередине = fail-CLOSED (поправимо повтором), не дыра."""
-    acl = f"_WEBADMIN_Wireguard{iface_index}"
-    iface = f"Wireguard{iface_index}"
+@app.route("/api/xkeen/wg-revoke", methods=["POST"])
+@requires_auth
+def api_wg_revoke():
+    """Отозвать выданный доступ: заворот в xray -> NAT/маршрут -> интерфейс -> save."""
+    data = request.get_json(silent=True) or request.form
+    _wg_prepare()
+    ok, msg = wg_clients.revoke((data.get("id") or "").strip(), xray_off=_wg_xray_off, xray_on=_wg_xray_on)
+    return jsonify({"ok": ok, "msg": msg} if ok else {"ok": False, "error": msg})
+
+
+@app.route("/api/xkeen/wg-router", methods=["GET"])
+@requires_auth
+def api_wg_router():
+    """Все WG-интерфейсы роутера (доступы и линки), онлайн, трафик, NAT, заворот, осиротевшие хуки."""
+    _wg_prepare()
     try:
-        permits = wg_acl_permit_lines(rules)
-    except ValueError as e:
-        return {"ok": False, "error": str(e)}
-    if not permits:
-        return {"ok": False, "error": "нужно хотя бы одно правило permit"}
-    _keenetic_rci_post([f"interface {iface}", f"no ip access-group {acl} in"])    # 1 отвязать (tolerant)
-    _keenetic_rci_post([f"no access-list {acl}"])                                  # 2 удалить (tolerant)
-    r3 = _keenetic_rci_post([f"access-list {acl}"] + permits)                      # 3 создать (strict). auto-delete НЕ ставим: на непривязанном ACL даёт "cannot enable auto-deletion for unreferenced lists" (проверено на боевом 2026-06-22), и не нужен — фаза 2 (no access-list) сама чистит старый при пересоздании.
-    if not r3["ok"]:
-        return {"ok": False, "error": "создание ACL: " + "; ".join(r3["errors"] or ["?"])}
-    r4 = _keenetic_rci_post([f"interface {iface}", f"ip access-group {acl} in"])   # 4 привязать (strict)
-    if not r4["ok"]:
-        return {"ok": False, "error": "привязка ACL: " + "; ".join(r4["errors"] or ["?"])}
-    block = _wg_acl_block(acl)                                                     # 5 fail-open guard — перечитать ACL
-    if block is None:                                                              # сбой чтения ≠ «чисто» → fail-CLOSED
-        return {"ok": False, "error": "не удалось перечитать ACL для проверки безопасности — НЕ сохраняю (fail-closed); повтори"}
-    actual_permits = [s for s in block if s.startswith("permit ")]
-    if len(actual_permits) > len(permits):                                         # правил больше задано → старый ACL не удалился (ловит и при намеренном permit-all)
-        return {"ok": False, "error": f"в ACL правил больше ({len(actual_permits)}), чем задано ({len(permits)}) — старый ACL не удалился; НЕ сохраняю, повтори"}
-    expect_all = any(_wg_is_permit_all(r.get("proto"), r.get("dst"), r.get("port"), r.get("port_to"))
-                     for r in (rules or []))                                       # намеренный permit-all (VPN-выход), нормализованный
-    if not expect_all and _wg_block_has_permit_all(block):
-        return {"ok": False, "error": "в ACL виден permit-all (tcp/udp на любой адрес без порта), хотя в правилах его нет — НЕ сохраняю, повтори"}
-    r6 = _keenetic_rci_post(["system configuration save"])                         # 6 save (strict)
-    if not r6["ok"]:
-        return {"ok": False, "error": "сохранение: " + "; ".join(r6["errors"] or ["?"])}
-    return {"ok": True, "acl": acl, "rules": permits}
+        reg = wg_clients.registry_read()
+    except wg_clients.RegistryError:
+        reg = {}
+    inv = wg_clients.router_inventory(reg)
+    hooks = wg_clients.xray_hooks() if inv.get("ok") else None
+    live = {i.get("index") for i in inv.get("items", [])}
+    inv["orphan_hooks"] = sorted(f"nwg{k}" for k in (hooks or {}) if k not in live)
+    return jsonify(inv)
+
+
+@app.route("/api/xkeen/wg-backup", methods=["GET"])
+@requires_auth
+def api_wg_backup():
+    """Бэкап одного доступа (только чтение): параметры + .conf-шаблон + публичные ключи."""
+    iface = (request.args.get("iface") or "").strip()
+    if not re.fullmatch(r"Wireguard\d+", iface):
+        return Response("Некорректный интерфейс.", status=400)
+    _wg_prepare()
+    cfgj = wg_clients._rci_json(f"/rci/interface/{iface}")
+    stj = wg_clients._rci_json(f"/rci/show/interface/{iface}")
+    if not isinstance(cfgj, dict) or not isinstance(stj, dict):
+        return Response(f"{iface} не прочитан с роутера.", status=502)
+    text = wg_clients.backup_text(iface, cfgj, stj)
+    desc = re.sub(r"[^A-Za-z0-9_.-]+", "_", wg_clients._translit(cfgj.get("description", iface))).strip("_") or iface
+    resp = Response(text, mimetype="text/plain; charset=utf-8")
+    resp.headers["Content-Disposition"] = f'attachment; filename="wg-backup-{desc}.txt"'
+    return resp
 
 
 @app.route("/api/xkeen/wg-acl", methods=["GET"])
 @requires_auth
 def api_wg_acl_get():
-    """Текущие firewall-правила (permit) WG-интерфейса для редактора."""
-    iface_id = (request.args.get("iface_id") or "").strip()
-    m = re.search(r"(\d+)$", iface_id)
-    if not m:
-        return jsonify({"ok": False, "error": "не задан iface_id (напр. Wireguard5)"})
-    acl = f"_WEBADMIN_Wireguard{m.group(1)}"
-    block = _wg_acl_block(acl)
-    if block is None:
-        return jsonify({"ok": False, "error": "не удалось прочитать конфиг роутера"})
-    rules = [x for x in (_wg_parse_permit(s) for s in block) if x]
-    has_deny = any(s.startswith("deny ") for s in block)
-    return jsonify({"ok": True, "acl": acl, "rules": rules, "has_deny": has_deny})
+    """Правила интерфейса для формы: текущие (человекочитаемо) + предзаполнение режима и доступа."""
+    _wg_prepare()
+    res = wg_clients.rules_form((request.args.get("iface_id") or "").strip())
+    res.update({"services": wg_clients.S.services, "lan": wg_clients.S.lan_subnet,
+                "exit_modes": wg_clients.EXIT_MODES})
+    return jsonify(res)
 
 
 @app.route("/api/xkeen/wg-acl-apply", methods=["POST"])
 @requires_auth
 def api_wg_acl_apply():
-    """Применить least-privilege ACL к WG-интерфейсу (5-фазный RCI + fail-open guard + save)."""
+    """Правила по режиму выхода + доступ к ЛВС -> access-list, NAT, подмена адреса, save.
+    Режим xray включает заворот, другой режим — снимает его (иначе NAT/ЛВС не работали бы как задано)."""
     data = request.get_json(silent=True) or request.form
-    iface_id = (data.get("iface_id") or "").strip()
-    m = re.search(r"(\d+)$", iface_id)
-    if not m:
-        return jsonify({"ok": False, "error": "не задан iface_id"})
-    rules = data.get("rules") or []
-    if isinstance(rules, str):
-        import json as _j
-        try:
-            rules = _j.loads(rules)
-        except Exception:
-            rules = []
-    return jsonify(wg_apply_acl(m.group(1), rules))
+    iface = (data.get("iface_id") or "").strip()
+    exit_mode = data.get("exit")
+    _wg_prepare()
+    ok, msg, eff = wg_clients.apply_rules(iface, exit_mode, full=_wg_bool(data.get("full")),
+                                          services=_wg_list(data.get("services")), extra=data.get("extra") or "")
+    if not ok:
+        return jsonify({"ok": False, "error": msg})
+    # решение — по ИТОГОВОМУ режиму (site-to-site всегда "", даже если в запросе xray)
+    info = wg_clients.iface_info(iface)
+    hook = wg_clients.xray_hook_for(info["index"]) if info else None
+    if eff == "xray" and hook is not True:       # None — не проверилось: включение идемпотентно
+        xok, xmsg = _wg_xray_on(iface)
+        msg += (" Заворот в xray включён." if xok else f" ⚠ Заворот в xray не включён: {xmsg}")
+    elif eff != "xray" and hook:
+        xok, xmsg = _wg_xray_off(iface)
+        msg += (" Заворот в xray снят." if xok else f" ⚠ Заворот в xray не снят: {xmsg}")
+    elif eff != "xray" and hook is None:
+        msg += (" ⚠ Состояние заворота в xray не прочитано — проверьте в «📡 На роутере»; если заворот "
+                "включён, снимите его кнопкой «🔌 Снять анти-DPI», иначе трафик пойдёт в xray.")
+    return jsonify({"ok": True, "msg": msg})
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -13695,162 +13564,161 @@ Use this token to access the HTTP API:
 
 <!-- ===== РАЗДЕЛ «ПОМОЩЬ» — длинная документация для будущей памяти ===== -->
 <details class="section-collapsible">
-<summary><h2 class="sec-router">🐉 Подключение клиентов WireGuard <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— новые клиенты, .conf, доступ к LAN / анти-DPI</span></h2></summary>
+<summary><h2 class="sec-router">🐉 Подключение клиентов WireGuard <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— выдача доступов в один клик, правила, анти-DPI</span></h2></summary>
 <div class="card">
-  <p style="margin-top:0;">Панель читает параметры WireGuard прямо с роутера и собирает готовый клиентский <code>.conf</code>. Приватный ключ можно сгенерировать в помощнике «➕ Новый клиент» ниже (или вставить свой). Как настроить саму удалённую машину — см. <a href="#help-wg-client" onclick="openHelpAnchor('help-wg-client'); return false;">❓ Помощь → «Удалённый клиент через туннель»</a>.</p>
+  <p style="margin-top:0;">WireGuard-доступы на роутер: панель сама создаёт подключение на Keenetic, заливает правила межсетевого экрана и NAT по выбранному режиму, сохраняет конфигурацию роутера и отдаёт клиенту QR / <code>.conf</code>. Режим «через xray» сразу заворачивает трафик клиента в анти-DPI. Подпункты: <b>➕ Выдать доступ</b>, <b>📋 Выданные</b> (отзыв), <b>📡 На роутере</b> (все подключения, правила, анти-DPI), <b>🧩 .conf вручную</b>. Настройка удалённой машины — <a href="#help-wg-client" onclick="openHelpAnchor('help-wg-client'); return false;">❓ Помощь → «Удалённый клиент через туннель»</a>.</p>
+  <div style="margin:6px 0; padding:8px 10px; background:#fff8e1; border-left:3px solid #f0c200; font-size:0.9em;">⚠ Это <b>обычный WireGuard</b> (не анти-DPI транспорт) — для проводных и стабильных сетей. С мобильного интернета в РФ WireGuard иногда душит DPI оператора (подключается, но трафик не идёт) — тогда нужен VLESS-клиент, а не WireGuard.</div>
 
-  <details data-xk-keep-inline style="margin:8px 0; border:1px solid #cdd6df; border-radius:5px; padding:6px 10px; background:#fafcff;">
-    <summary style="cursor:pointer; font-weight:600;">➕ Новый клиент — помощник</summary>
+  <details style="margin:8px 0; border:1px solid #cdd6df; border-radius:5px; padding:6px 10px; background:#fafcff;">
+    <summary style="cursor:pointer; font-weight:600;">➕ Выдать доступ</summary>
     <div style="margin-top:8px;">
-      <p class="muted" style="margin-top:0;">Помощник создаёт клиента «с нуля»: генерит обе пары ключей, подбирает свободную подсеть/порт и отдаёт <b>два готовых файла</b> — серверный <code>.conf</code> (его в Keenetic: <b>Интернет → Другие подключения → WireGuard → «Загрузить из файла»</b> — интерфейс создастся сам) и клиентский <code>.conf</code> (на удалённую машину). Заводить интерфейс руками больше не нужно.</p>
       <div style="margin:6px 0;">
-        <label>Имя клиента (станет именем интерфейса в Keenetic):<br>
-          <input type="text" id="wgNcName" placeholder="напр. office-pc" style="width:280px;"></label>
+        <label>Имя (кому / какое устройство) — станет именем подключения в Keenetic:<br>
+          <input type="text" id="wgiName" maxlength="40" placeholder="например: Ноутбук бухгалтера" style="width:320px;"></label>
       </div>
-      <div style="margin:6px 0;">
-        <label>Режим:<br>
-          <select id="wgNcMode" style="min-width:320px;">
-            <option value="full">Весь трафик через анти-DPI — БЕЗ доступа к домашней LAN</option>
-            <option value="full_lan">Весь трафик через анти-DPI + 🏠 доступ к домашней LAN (RDP/файлы дома)</option>
-            <option value="selective">Выборочно (указанные подсети) — через анти-DPI</option>
-            <option value="lan">🏠 Только доступ к дому (LAN) — обычный клиент, без анти-DPI</option>
-          </select></label>
+      <div id="wgiExitBox" style="margin:8px 0;">
+        <div style="font-weight:600; margin-bottom:2px;">Выход в интернет:</div>
+        <label style="display:block;"><input type="radio" name="wgiExit" value="direct" checked> 🌐 <b>Напрямую через роутер</b> <span class="muted">— весь трафик клиента выходит с внешнего IP роутера <code id="wgiEp">…</code> (обход блокировок провайдера клиента)</span></label>
+        <label style="display:block;"><input type="radio" name="wgiExit" value="xray"> 🛡 <b>Через xray (анти-DPI)</b> <span class="muted">— трафик клиента идёт через XKeen по правилам маршрутизации; заворот включается сразу</span></label>
+        <label style="display:block;"><input type="radio" name="wgiExit" value=""> 🏠 <b>Только домашняя сеть</b> <span class="muted">— только разрешённое ниже, интернет у клиента свой</span></label>
       </div>
-      <div id="wgNcSelRow" style="display:none; margin:6px 0;">
-        <label>Подсети назначения (через запятую):<br>
-          <input type="text" id="wgNcSel" placeholder="напр. 203.0.113.0/24, 198.51.100.0/24" style="width:100%; max-width:520px;"></label>
+      <div style="margin:8px 0;">
+        <div style="font-weight:600; margin-bottom:2px;">Доступ к домашней сети <span class="muted" style="font-weight:400;">(при интернете — необязательно; по умолчанию ЛВС, роутер и другие туннели закрыты)</span>:</div>
+        <div id="wgiSvc"></div>
+        <label style="display:block; color:#b02a37;"><input type="checkbox" id="wgiFull"> 🔓 полный доступ к ЛВС <code id="wgiLan">…</code></label>
+        <label style="display:block; margin-top:4px;">Дополнительно вручную (по строке <code>IP[/маска][:порты]</code>; без портов — весь хост):<br>
+          <textarea id="wgiExtra" rows="2" placeholder="192.168.1.50:8080&#10;192.168.1.60" style="width:100%; max-width:520px; font-family:monospace; font-size:0.86em;"></textarea></label>
       </div>
-      <div id="wgNcExcRow" style="margin:6px 0;">
-        <label>Адреса-исключения — мимо туннеля (IPv4):<br>
-          <textarea id="wgNcExc" rows="2" placeholder="напр. 198.51.100.5/32" style="width:100%; max-width:520px; font-family:monospace; font-size:0.86em;"></textarea></label>
-        <div class="muted" style="font-size:0.84em;">Пойдут напрямую мимо туннеля (вырезаются из AllowedIPs). Один адрес можно без маски (<code>/32</code> подставится сам).</div>
+      <div style="margin:8px 0;">
+        <label><input type="checkbox" id="wgiS2s"> 🔗 <b>Site-to-site</b> (роутер ↔ роутер): другой Keenetic, вся его сеть получает доступ к отмеченному в нашей ЛВС</label>
+        <div id="wgiRlRow" style="display:none; margin:4px 0 0 22px;">
+          <label>Подсеть удалённой ЛВС (за тем роутером):<br><input type="text" id="wgiRl" placeholder="192.168.50.0/24" style="width:200px; font-family:monospace;"></label>
+          <div class="muted" style="font-size:0.86em;">При «Сразу создать» панель добавит маршрут к ней и правила (при ручном пути маршрут добавляется в Keenetic — строка <code>ip route … auto</code> в блоке CLI результата). Клиентский <code>.conf</code> загружается на удалённый Keenetic («Загрузить из файла»), там тоже настраивается межсетевой экран. Доступ к ЛВС выше — обязателен.</div>
+        </div>
       </div>
-      <div id="wgNcV6Row" style="margin:6px 0;">
-        <label><input type="checkbox" id="wgNcV6" checked> 🛡 Закрыть IPv6-утечку (заворачивать v6 в туннель, fail-closed)</label>
+      <div style="margin:8px 0;">
+        <label><input type="checkbox" id="wgiCreate" checked> 🚀 <b>Сразу создать на роутере</b> — подключение, правила и NAT по режиму, конфигурация роутера сохраняется. Останется отдать клиенту QR / <code>.conf</code>.</label>
+        <div id="wgiManual" style="display:none; margin:4px 0 0 22px; padding:6px 10px; background:#eef4fb; border-radius:4px; font-size:0.88em;">📋 Ручной путь: серверный <code>.conf</code> → в Keenetic <b>Интернет → Другие подключения → WireGuard → «Загрузить из файла»</b> → включить подключение → здесь в «📋 Выданные» нажать <b>«🔒 Правила»</b> (правила и NAT). Без этого шага интернета у клиента не будет, а ЛВС будет открыта полностью.</div>
       </div>
-      <div style="margin:6px 0;">
-        <label>Endpoint (внешний WAN-IP / DDNS — если авто-WAN серый/за CGNAT):<br>
-          <input type="text" id="wgNcEndpoint" placeholder="авто: WAN роутера" style="width:300px;"></label>
-      </div>
-      <button type="button" class="btn" id="wgNcBtn">🔑 Создать клиента (ключи + 2 conf)</button>
-      <div class="muted" style="font-size:0.84em; margin-top:4px;">Подсеть и порт подберутся автоматически из свободных на роутере.</div>
+      <button type="button" class="btn" id="wgiBtn">🔑 Выдать доступ</button>
+      <div id="wgiSlot" class="muted" style="margin-top:8px; font-size:0.88em;">Свободный слот на роутере: читаю…</div>
 
-      <div id="wgNcOut" style="display:none; margin-top:10px;">
-        <div id="wgNcInfo" class="muted" style="margin-bottom:8px;"></div>
-        <div style="margin:6px 0; padding:8px 10px; background:#fff8e1; border-left:3px solid #f0c200; font-size:0.9em;">
-          <b>Что делать с файлами:</b>
-          <ol style="margin:4px 0 0 18px; padding:0;">
-            <li><b>Серверный</b> .conf → в Keenetic <b>Интернет → Другие подключения → WireGuard → «Загрузить из файла»</b>. Интерфейс создастся с этим именем, портом и пиром.</li>
-            <li><b>Включи</b> интерфейс (тумблер) в списке подключений.</li>
-            <li>🔥 <b>Межсетевой экран</b> → вкладка нового интерфейса → <b>добавь правила «Разрешить»</b> (Keenetic их сам НЕ создаёт): <b>TCP и UDP обязательно</b>, <b>ICMP желательно</b>, источник/назначение «Любой». Без них handshake есть, а связи нет.</li>
-            <li><b>Клиентский</b> .conf → на удалённую машину (приватный ключ уже внутри).</li>
-            <li>Для анти-DPI клиента — потом <b>«🔄 Прочитать с роутера»</b> → выбери интерфейс → <b>«🔌 Подключить к анти-DPI»</b>. Для режима <b>«+ доступ к домашней LAN»</b> эта же кнопка ставит masquerade к домашним хостам — без неё крупные пакеты (RDP/файлы) к LAN не пойдут.</li>
-          </ol>
+      <div id="wgiOut" style="display:none; margin-top:12px;">
+        <div id="wgiRes" style="padding:8px 10px; border-radius:4px; font-size:0.92em;"></div>
+        <div style="margin:8px 0; padding:8px 10px; background:#fbe5e5; border-left:3px solid #c33; font-size:0.9em; color:#7a1f1f;">🔴 Приватный ключ клиента показывается <b>один раз</b> и в панели не хранится. Скачайте <code>.conf</code> или покажите QR сейчас. Потерян — выдайте доступ заново.</div>
+        <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start;">
+          <div style="flex:1 1 420px; min-width:0;">
+            <div style="font-weight:600;">📄 Клиентский .conf:</div>
+            <textarea id="wgiConf" readonly rows="12" style="width:100%; font-family:monospace; font-size:0.8em; white-space:pre; overflow-x:auto;"></textarea>
+            <div style="margin-top:4px; display:flex; gap:8px; flex-wrap:wrap;">
+              <button type="button" class="btn" id="wgiConfCopy">📋 Копировать</button>
+              <button type="button" class="btn" id="wgiConfDl">💾 Скачать</button>
+            </div>
+          </div>
+          <div id="wgiQrBox" style="flex:0 0 auto; text-align:center;">
+            <div style="font-weight:600;">📱 QR для приложения WireGuard:</div>
+            <img id="wgiQr" alt="QR" style="width:240px; max-width:100%; border:1px solid #ddd; margin-top:4px;">
+          </div>
         </div>
-        <div style="font-weight:600; margin-top:8px;">🖥 Серверный .conf (для Keenetic «Загрузить из файла»):</div>
-        <textarea id="wgNcServer" readonly rows="9" style="width:100%; font-family:monospace; font-size:0.8em; white-space:pre; overflow-x:auto;"></textarea>
-        <div style="margin-top:4px; display:flex; gap:8px; flex-wrap:wrap;">
-          <button type="button" class="btn" id="wgNcServerCopy">📋 Копировать</button>
-          <button type="button" class="btn" id="wgNcServerDl">💾 Скачать серверный</button>
-        </div>
-        <div style="font-weight:600; margin-top:10px;">📱 Клиентский .conf (на удалённую машину):</div>
-        <textarea id="wgNcClient" readonly rows="11" style="width:100%; font-family:monospace; font-size:0.8em; white-space:pre; overflow-x:auto;"></textarea>
-        <div style="margin-top:4px; display:flex; gap:8px; flex-wrap:wrap;">
-          <button type="button" class="btn" id="wgNcClientCopy">📋 Копировать</button>
-          <button type="button" class="btn" id="wgNcClientDl">💾 Скачать клиентский</button>
+        <button type="button" class="btn" id="wgiSrvToggle" style="margin-top:8px;">⚙ Серверный .conf и команды CLI</button>
+        <div id="wgiSrvBox" style="display:none; margin-top:6px;">
+          <div class="muted" style="font-size:0.88em;">Для ручного пути (если подключение не создано на роутере): серверный <code>.conf</code> → Keenetic «Загрузить из файла». Блок CLI — справочно.</div>
+          <textarea id="wgiSrv" readonly rows="9" style="width:100%; font-family:monospace; font-size:0.8em; white-space:pre; overflow-x:auto;"></textarea>
+          <button type="button" class="btn" id="wgiSrvDl">💾 Скачать серверный .conf</button>
+          <textarea id="wgiCli" readonly rows="10" style="width:100%; margin-top:6px; font-family:monospace; font-size:0.8em; white-space:pre; overflow-x:auto;"></textarea>
         </div>
       </div>
     </div>
   </details>
 
-  <div id="wgGenStatus" class="muted" style="margin:8px 0;">Нажми «🔄 Прочитать с роутера», чтобы загрузить WG-интерфейсы.</div>
-  <button type="button" class="btn" id="wgLoadBtn">🔄 Прочитать с роутера</button>
-
-  <div id="wgForm" style="display:none; margin-top:12px;">
-    <div id="wgConnList" style="margin:6px 0; padding:8px 10px; background:#eef6ee; border-radius:4px; font-size:0.92em;"></div>
-    <div id="wgOrphanBox" style="display:none; margin:6px 0; padding:10px 12px; background:#fff3cd; border:2px solid #e0a800; border-radius:6px; font-size:0.92em;"></div>
-    <div style="margin:6px 0;">
-      <label>WG-интерфейс роутера:<br><select id="wgIface" style="min-width:300px;"></select></label>
-    </div>
-    <div id="wgIfaceInfo" class="muted" style="margin:4px 0;"></div>
-    <div id="wgConnRow" style="display:none; margin:6px 0; padding:8px 10px; background:#f3f6fa; border-radius:4px;">
-      <span id="wgConnStatus" class="muted"></span>
-      <button type="button" class="btn" id="wgConnBtn" style="margin-left:10px;"></button>
-      <button type="button" class="btn" id="wgAclBtn" style="margin-left:6px;">🔥 Правила</button>
-      <div class="muted" style="margin-top:4px; font-size:0.86em;">«Подключить» ставит на роутер хук (заворот этого интерфейса в xray) + cron self-heal — это нужно, чтобы трафик клиента реально шёл через анти-DPI. «Правила» — firewall-доступ интерфейса (нужен новому: при импорте «Загрузить из файла» Keenetic правил не создаёт).</div>
-      <div style="margin-top:8px; padding:10px 12px; background:#ffe5e5; border:2px solid #d33; border-radius:6px; color:#a00; font-weight:700; font-size:0.92em;">
-        🔴 ВАЖНО: если интерфейс подключён к анти-DPI — <u>СНАЧАЛА нажми «🔌 Отключить от анти-DPI», и только ПОТОМ удаляй интерфейс в Keenetic!</u>
-        <div style="font-weight:400; font-size:0.92em; margin-top:4px;">Хук анти-DPI живёт отдельным файлом на роутере + строкой в cron, а не в самом интерфейсе. Если удалить интерфейс не отключив — хук осиротеет, cron продолжит держать его правила, и новый WG-интерфейс с тем же номером <code>nwgX</code> подхватит старый хук → «подключается, но не работает».</div>
-        <div style="font-weight:400; font-size:0.92em; margin-top:4px;">✅ <b>Если уже забыли отключить перед удалением</b> — ничего страшного: нажми <b>«🔄 Прочитать с роутера»</b>, панель сама найдёт осиротевший хук и покажет кнопку <b>«🧹 Убрать»</b>. Сделай это <b>ПЕРЕД созданием нового клиента</b>.</div>
+  <details style="margin:8px 0; border:1px solid #cdd6df; border-radius:5px; padding:6px 10px;">
+    <summary style="cursor:pointer; font-weight:600;">📋 Выданные</summary>
+    <div style="margin-top:8px;">
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <button type="button" class="btn" id="wgcLoad">🔄 Обновить</button>
+        <span id="wgcStatus" class="muted">Читаю…</span>
       </div>
-      <div id="wgAclBox" style="display:none; margin-top:8px; padding:8px 10px; background:#fff; border:1px solid #cdd6df; border-radius:4px;">
-        <div style="font-weight:600; margin-bottom:4px;">🔥 Firewall-правила интерфейса (least-privilege)</div>
-        <div class="muted" style="font-size:0.84em; margin-bottom:6px;">Одна строка = одно правило: <code>протокол назначение [порт | порт-порт]</code>. Протокол — <code>icmp</code>/<code>tcp</code>/<code>udp</code>; назначение — <code>any</code>, IP (<code>192.168.1.10</code>) или подсеть (<code>192.168.1.0/24</code>); порт необязателен. Пустой список = весь вход закрыт (security-level public). Применяется на роутере: пересоздаёт <code>_WEBADMIN_WireguardN</code> и сохраняет конфиг.</div>
-        <div style="margin-bottom:6px; display:flex; gap:6px; flex-wrap:wrap;">
-          <button type="button" class="btn" id="wgAclPreVpn">VPN-выход (любой)</button>
-          <button type="button" class="btn" id="wgAclPreRdp">+ RDP</button>
-          <button type="button" class="btn" id="wgAclPreWeb">+ Web</button>
-          <button type="button" class="btn" id="wgAclPreDns">+ DNS</button>
-          <button type="button" class="btn" id="wgAclClear">Очистить</button>
+      <div id="wgcRegErr" style="display:none; margin:8px 0; padding:8px 10px; background:#ffe5e5; border:2px solid #d33; border-radius:6px; color:#a00;"></div>
+      <div id="wgcList" style="margin-top:8px; overflow-x:auto;"></div>
+      <div class="muted" style="font-size:0.86em; margin-top:6px;">«Отозвать» удаляет подключение с роутера (сначала снимает заворот в xray), сохраняет конфигурацию; клиенту понадобится новый доступ. Реестр выданного хранится на этом компьютере (<code>wg_clients.json</code> в папке панели), приватных ключей в нём нет.</div>
+    </div>
+  </details>
+
+  <details style="margin:8px 0; border:1px solid #cdd6df; border-radius:5px; padding:6px 10px;">
+    <summary style="cursor:pointer; font-weight:600;">📡 На роутере — подключения, правила, анти-DPI</summary>
+    <div style="margin-top:8px;">
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <button type="button" class="btn" id="wgrLoad">🔄 Прочитать с роутера</button>
+        <span id="wgrStatus" class="muted">Читаю…</span>
+      </div>
+      <div id="wgrConn" style="display:none; margin:8px 0; padding:8px 10px; background:#eef6ee; border-radius:4px; font-size:0.92em;"></div>
+      <div id="wgrOrphan" style="display:none; margin:8px 0; padding:10px 12px; background:#fff3cd; border:2px solid #e0a800; border-radius:6px; font-size:0.92em;"></div>
+      <div id="wgrList" style="margin-top:8px; overflow-x:auto;"></div>
+      <div class="muted" style="font-size:0.86em; margin-top:6px;">🧑 <b>доступ</b> — роутер слушает, устройство подключается. 🔗 <b>линк</b> — туннель к другой сети (роутер сам дозванивается наружу или в разрешённых адресах пира чужая сеть); его панель не трогает. <b>🛡 Анти-DPI</b> — заворот трафика подключения в xray (хук на роутере + cron). <b>🔒 Правила</b> — режим выхода и доступ к ЛВС (заменяет текущие правила, сохраняется сразу). <b>💾 conf</b> — клиентский <code>.conf</code>-шаблон (приватный ключ вставить свой). <b>💾 бэкап</b> — перед удалением: параметры, шаблон и публичные ключи; полное восстановление с теми же ключами — только штатный бэкап конфигурации Keenetic.</div>
+    </div>
+  </details>
+
+  <details style="margin:8px 0; border:1px solid #cdd6df; border-radius:5px; padding:6px 10px;">
+    <summary style="cursor:pointer; font-weight:600;">🧩 .conf вручную для существующего подключения</summary>
+    <div style="margin-top:8px;">
+      <p class="muted" style="margin-top:0;">Для подключений, созданных не через «Выдать доступ»: панель читает параметры с роутера и собирает клиентский <code>.conf</code> с плейсхолдером приватного ключа. Здесь же — выборочные подсети, адреса-исключения и своя точка подключения (Endpoint).</p>
+      <div id="wgGenStatus" class="muted" style="margin:8px 0;">Нажмите «🔄 Прочитать с роутера», чтобы загрузить WG-интерфейсы.</div>
+      <button type="button" class="btn" id="wgLoadBtn">🔄 Прочитать с роутера</button>
+      <div id="wgForm" style="display:none; margin-top:12px;">
+        <div style="margin:6px 0;">
+          <label>WG-интерфейс роутера:<br><select id="wgIface" style="min-width:300px;"></select></label>
         </div>
-        <textarea id="wgAclText" rows="6" placeholder="icmp any&#10;tcp any 80&#10;tcp 192.168.1.10 3389&#10;udp 192.168.1.1 53" style="width:100%; font-family:monospace; font-size:0.85em;"></textarea>
-        <div style="margin-top:6px;">
-          <button type="button" class="btn" id="wgAclApplyBtn">💾 Применить правила к роутеру</button>
-          <span id="wgAclStatus" class="muted" style="margin-left:8px;"></span>
+        <div id="wgIfaceInfo" class="muted" style="margin:4px 0;"></div>
+        <div style="margin:6px 0;">
+          <label>Режим:<br>
+            <select id="wgMode" style="min-width:300px;">
+              <option value="full">Весь трафик через анти-DPI — БЕЗ доступа к домашней LAN</option>
+              <option value="full_lan">Весь трафик через анти-DPI + 🏠 доступ к домашней LAN</option>
+              <option value="selective">Выборочно (только указанные подсети) — через анти-DPI</option>
+              <option value="lan">🏠 Только доступ к дому (LAN) — обычный клиент, без анти-DPI</option>
+            </select>
+          </label>
+        </div>
+        <div id="wgSelectiveRow" style="display:none; margin:6px 0;">
+          <label>Подсети назначения (через запятую):<br>
+            <input type="text" id="wgSelectiveCidrs" placeholder="например: 160.79.104.0/23, 149.154.160.0/20" style="width:100%; max-width:520px;">
+          </label>
+        </div>
+        <div id="wgExcludeRow" style="display:none; margin:6px 0;">
+          <label>Адреса-исключения — мимо туннеля (IPv4):<br>
+            <textarea id="wgExcludeCidrs" rows="2" placeholder="например: 203.0.113.0/24, 198.51.100.5/32" style="width:100%; max-width:520px; font-family:monospace; font-size:0.86em;"></textarea>
+          </label>
+          <div class="muted" style="margin-top:2px; font-size:0.86em;">Эти адреса/подсети вырезаются из AllowedIPs (по одному в строке или через запятую) — трафик к ним у клиента пойдёт <b>напрямую мимо туннеля</b>. Нужно, когда сервис назначения отвергает внешний адрес туннеля. Один адрес можно без маски (<code>/32</code> подставится сам). Только IPv4.</div>
+        </div>
+        <div style="margin:6px 0; display:flex; gap:16px; flex-wrap:wrap;">
+          <label>IP клиента в туннеле:<br><input type="text" id="wgClientIp" placeholder="авто" style="width:200px;"></label>
+          <label>Endpoint (DDNS, если нужен):<br><input type="text" id="wgEndpoint" placeholder="авто (WAN)" style="width:240px;"></label>
+        </div>
+        <div id="wgV6Row" style="margin:8px 0;">
+          <label><input type="checkbox" id="wgV6" checked> 🛡 Закрыть IPv6-утечку (заворачивать v6 в туннель, fail-closed)</label>
+          <div class="muted" style="margin-top:2px; font-size:0.88em;">Рекомендуется для полного туннеля. Для выборочного режима обычно выключают.</div>
+        </div>
+        <div id="wgLanNote" style="display:none; margin:8px 0; padding:8px 10px; background:#eef6ee; border-radius:4px; font-size:0.9em;">🏠 Обычный клиент: видит домашнюю сеть (LAN + подсеть туннеля), интернет у него идёт напрямую. Заворот в анти-DPI для такого подключения не нужен.</div>
+        <button type="button" class="btn" id="wgGenBtn" style="margin-top:8px;">🧩 Сгенерировать .conf</button>
+        <div id="wgResult" style="display:none; margin-top:12px;">
+          <div style="background:#fbe5e5; border-left:3px solid #c33; padding:8px 11px; margin:8px 0; font-size:0.9em; color:#7a1f1f;">🔴 Перед использованием замените <code>PrivateKey = ВСТАВЬ_СВОЙ_ПРИВАТНЫЙ_КЛЮЧ</code> на приватный ключ устройства.</div>
+          <textarea id="wgConf" readonly rows="14" style="width:100%; font-family:monospace; font-size:0.82em; white-space:pre; overflow-x:auto;"></textarea>
+          <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
+            <button type="button" class="btn" id="wgCopyBtn">📋 Скопировать</button>
+            <button type="button" class="btn" id="wgDownloadBtn">💾 Скачать .conf</button>
+          </div>
         </div>
       </div>
     </div>
+  </details>
 
-    <div style="margin:6px 0;">
-      <label>Режим:<br>
-        <select id="wgMode" style="min-width:300px;">
-          <option value="full">Весь трафик через анти-DPI — БЕЗ доступа к домашней LAN</option>
-          <option value="full_lan">Весь трафик через анти-DPI + 🏠 доступ к домашней LAN</option>
-          <option value="selective">Выборочно (только указанные подсети) — через анти-DPI</option>
-          <option value="lan">🏠 Только доступ к дому (LAN) — обычный клиент, без анти-DPI</option>
-        </select>
-      </label>
-    </div>
-
-    <div id="wgSelectiveRow" style="display:none; margin:6px 0;">
-      <label>Подсети назначения (через запятую):<br>
-        <input type="text" id="wgSelectiveCidrs" placeholder="напр. 160.79.104.0/23, 149.154.160.0/20" style="width:100%; max-width:520px;">
-      </label>
-    </div>
-
-    <div id="wgExcludeRow" style="display:none; margin:6px 0;">
-      <label>Адреса-исключения — мимо туннеля (IPv4):<br>
-        <textarea id="wgExcludeCidrs" rows="2" placeholder="напр. 203.0.113.0/24, 198.51.100.5/32" style="width:100%; max-width:520px; font-family:monospace; font-size:0.86em;"></textarea>
-      </label>
-      <div class="muted" style="margin-top:2px; font-size:0.86em;" data-xk-keep-inline>
-        Эти адреса/подсети вырезаются из AllowedIPs (по одному в строке или через запятую) — в готовом .conf их не будет, и трафик к ним у клиента пойдёт <b>напрямую мимо туннеля</b> (через его локальный шлюз). Нужно, когда сервис назначения отвергает заграничный exit-IP туннеля и должен запрашиваться с локального адреса. Один адрес можно писать без маски (<code>/32</code> подставится сам). Только IPv4.
+  <div id="wgRulesDlg" style="display:none; position:fixed; inset:0; z-index:9999; background:rgba(0,0,0,0.35); overflow:auto;">
+    <div style="max-width:640px; margin:6vh auto; background:#fff; border-radius:8px; padding:14px 18px; box-shadow:0 6px 30px rgba(0,0,0,0.3);">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <b id="wgRTitle">🔒 Правила</b>
+        <button type="button" class="btn" id="wgRClose">✖</button>
       </div>
-    </div>
-
-    <div style="margin:6px 0; display:flex; gap:16px; flex-wrap:wrap;">
-      <label>IP клиента в туннеле:<br><input type="text" id="wgClientIp" placeholder="авто" style="width:200px;"></label>
-      <label>Endpoint (DDNS, если нужен):<br><input type="text" id="wgEndpoint" placeholder="авто (WAN)" style="width:240px;"></label>
-    </div>
-
-    <div id="wgV6Row" style="margin:8px 0;">
-      <label><input type="checkbox" id="wgV6" checked> 🛡 Закрыть IPv6-утечку (заворачивать v6 в туннель, fail-closed)</label>
-      <div class="muted" style="margin-top:2px; font-size:0.88em;">Рекомендуется для full-tunnel. Для выборочного режима обычно выключают. При включённом v6-only сайты с клиента недоступны.</div>
-    </div>
-    <div id="wgLanNote" style="display:none; margin:8px 0; padding:8px 10px; background:#eef6ee; border-radius:4px; font-size:0.9em;">
-      🏠 Обычный клиент: видит домашнюю сеть (LAN + подсеть туннеля), интернет у него идёт <b>напрямую</b>. Анти-DPI не нужен — кнопку «Подключить к анти-DPI» для этого интерфейса <b>не нажимай</b>. Сам WG-интерфейс создай родным мастером Keenetic, потом «🔄 Прочитать с роутера». <b>⚠ Крупные пакеты к LAN-хостам (RDP, файлы)</b> в этом режиме могут застревать: masquerade к локалке ставит только анти-DPI хук — для надёжного доступа к дому используй режим «<b>Весь трафик через анти-DPI + доступ к домашней LAN</b>».
-    </div>
-
-    <button type="button" class="btn" id="wgGenBtn" style="margin-top:8px;">🧩 Сгенерировать .conf</button>
-
-    <div id="wgResult" style="display:none; margin-top:12px;">
-      <div style="background:#fbe5e5; border-left:3px solid #c33; padding:8px 11px; margin:8px 0; font-size:0.9em; color:#7a1f1f;">
-        🔴 Перед использованием замени <code>PrivateKey = ВСТАВЬ_СВОЙ_ПРИВАТНЫЙ_КЛЮЧ</code> на свой приватный ключ (из приложения WireGuard).
-      </div>
-      <textarea id="wgConf" readonly rows="14" style="width:100%; font-family:monospace; font-size:0.82em; white-space:pre; overflow-x:auto;"></textarea>
-      <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
-        <button type="button" class="btn" id="wgCopyBtn">📋 Скопировать</button>
-        <button type="button" class="btn" id="wgDownloadBtn">💾 Скачать .conf</button>
-      </div>
+      <div id="wgRBody" style="margin-top:8px;"></div>
     </div>
   </div>
 </div>
@@ -13859,243 +13727,397 @@ Use this token to access the HTTP API:
 <script>
 (function(){
   function $(id){ return document.getElementById(id); }
+  function esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function postJson(url, body){
+    return fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(function(r){ return r.json(); });
+  }
+  function dlText(text, fname){
+    var blob = new Blob([text || ''], {type:'text/plain'});
+    var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fname || 'wg.conf';
+    document.body.appendChild(a); a.click();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); if(a.parentNode) a.parentNode.removeChild(a); }, 1000);
+  }
+  function copyText2(text, btn){
+    var done = function(){ if(btn){ var o = btn.textContent; btn.textContent = '✅'; setTimeout(function(){ btn.textContent = o; }, 1200); } };
+    if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text || '').then(done, done); }
+    else { try{ var ta = document.createElement('textarea'); ta.value = text || ''; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); done(); }catch(e){} }
+  }
+  /* Чтение с роутера — только когда блок показан (страница сайдбара открыта, details раскрыт):
+     offsetParent у скрытого display:none / закрытого details — null. Не по области окна: блок
+     может быть ниже края экрана. */
+  function onVisible(el, fn){
+    if(!el) return;
+    var done = false, t = null;
+    var check = function(){
+      if(done || el.offsetParent === null) return;
+      done = true; clearInterval(t); document.removeEventListener('click', later, true); fn();
+    };
+    var later = function(){ setTimeout(check, 0); };
+    document.addEventListener('click', later, true);   /* пункт сайдбара / раскрытие details */
+    t = setInterval(check, 700);
+    check();
+  }
+
+  var WG = {services: [], lan: '', exitModes: {}, issued: null, routerItems: []};
+
+  /* ---------- ➕ Выдать доступ ---------- */
+  function renderServices(box, list, checked, prefix){
+    if(!box) return;
+    var html = '';
+    (list || []).forEach(function(s, i){
+      var on = (checked || []).indexOf(s.id) >= 0;
+      html += '<label style="display:block;"><input type="checkbox" data-svc="' + esc(s.id) + '" id="' + prefix + i + '"' + (on ? ' checked' : '') + '> ' + esc(s.label)
+        + ' <span class="muted" style="font-family:monospace; font-size:0.86em;">' + esc((s.ips || []).join(', ')) + (s.ports ? ':' + esc(s.ports) : '') + '</span></label>';
+    });
+    box.innerHTML = html;
+  }
+  function checkedSvc(box){
+    var out = [];
+    if(!box) return out;
+    var cbs = box.querySelectorAll('input[data-svc]');
+    for(var i = 0; i < cbs.length; i++){ if(cbs[i].checked) out.push(cbs[i].getAttribute('data-svc')); }
+    return out;
+  }
+  function exitLabel(k){ return (WG.exitModes && WG.exitModes[k] != null) ? WG.exitModes[k] : k; }
+
+  function renderSlot(d){
+    var el = $('wgiSlot'); if(!el) return;
+    if(!d.ok){ el.innerHTML = '⚠ Роутер не прочитан — слот не вычислен: ' + esc(d.error || ''); return; }
+    var s = d.slot;
+    if(!s){ el.textContent = ''; return; }
+    if(s.full){ el.innerHTML = '<b style="color:#b02a37;">⛔ Кончились ' + esc(s.why) + '</b> (занято ' + s.used + ' из ' + s.max + ') — отзовите ненужный доступ.'; return; }
+    var t = 'Новому доступу достанется: подсеть <code>' + esc(d.prefix) + '.' + s.sub_x + '.0/24</code> (роутер .1, клиент .2), порт <code>' + s.port + '</code>, интерфейс <code>' + esc(s.iface) + '</code> · занято ' + s.used + ' из ' + s.max + '.';
+    if(d.endpoint_warn) t += '<br><b style="color:#b02a37;">⚠ ' + esc(d.endpoint_warn) + '</b>';
+    if(d.lan_warn) t += '<br><b style="color:#b26a00;">⚠ ' + esc(d.lan_warn) + '</b>';
+    el.innerHTML = t;
+  }
+
+  function loadClients(){
+    var st = $('wgcStatus'); if(st) st.textContent = 'Читаю…';
+    return fetch('/api/xkeen/wg-clients').then(function(r){ return r.json(); }).then(function(d){
+      WG.services = d.services || []; WG.lan = d.lan || ''; WG.exitModes = d.exit_modes || {};
+      if($('wgiEp')) $('wgiEp').textContent = d.endpoint_host || '?';
+      if($('wgiLan')) $('wgiLan').textContent = WG.lan || '?';
+      if($('wgiSvc') && !$('wgiSvc').getAttribute('data-filled')){ renderServices($('wgiSvc'), WG.services, [], 'wgiSvc'); $('wgiSvc').setAttribute('data-filled', '1'); }
+      renderSlot(d);
+      renderClients(d);
+    }).catch(function(e){ if(st) st.textContent = '⚠ ошибка: ' + e; });
+  }
+
+  function renderClients(d){
+    var st = $('wgcStatus'), box = $('wgcList'), re = $('wgcRegErr');
+    if(re){
+      if(d.reg_err){ re.style.display = ''; re.innerHTML = '❌ <b>Реестр выданного не читается</b> — выдача и отзыв остановлены, файл не тронут: <code>' + esc(d.reg_err) + '</code>. Рядом лежит копия <code>wg_clients.json.bak</code>.'; }
+      else { re.style.display = 'none'; }
+    }
+    var list = d.clients || [];
+    var active = list.filter(function(c){ return c.status !== 'revoked'; }).length;
+    if(st) st.textContent = (d.ok ? '' : '⚠ роутер не прочитан: ' + (d.error || '') + ' · ') + 'Выдано: ' + active + (list.length > active ? (' · отозвано: ' + (list.length - active)) : '');
+    if(!box) return;
+    if(!list.length){ box.innerHTML = '<div class="muted">Пока ничего не выдано.</div>'; return; }
+    var h = '<table style="width:100%; border-collapse:collapse; font-size:0.9em;"><thead><tr style="background:#f3f6fa; text-align:left;">'
+      + '<th style="padding:4px 6px;">Имя</th><th style="padding:4px 6px;">Режим</th><th style="padding:4px 6px;">Туннель</th><th style="padding:4px 6px;">Порт</th><th style="padding:4px 6px;">Создан</th><th style="padding:4px 6px;">На роутере</th><th></th></tr></thead><tbody>';
+    list.forEach(function(c){
+      var rev = c.status === 'revoked';
+      var mode = c.s2s ? ('🔗 ' + esc(c.remote_lan)) : esc(c.exit_label);
+      if(c.exit === 'xray' && !rev && c.router_iface){
+        mode += c.xray_on ? ' <span style="color:#1a7f37;">· заворот вкл</span>' : ' <span style="color:#b02a37;" title="без заворота у клиента нет интернета">· ⛔ заворот выкл</span>';
+      }
+      var where;
+      if(rev) where = '<span class="muted">отозван ' + esc(c.revoked_at || '') + '</span>';
+      else if(!d.ok) where = '<span class="muted">? роутер не прочитан</span>';
+      else if(c.router_iface) where = '<code>' + esc(c.router_iface) + '</code>' + (c.status !== 'active' ? ' <span style="color:#b26a00;" title="правила и NAT ещё не применены панелью">· правила?</span>' : '');
+      else where = '<span style="color:#b26a00;" title="на роутере подключения с этим ключом нет">⏳ не на роутере</span>';
+      var act = '';
+      if(!rev){
+        if(c.router_iface) act += '<button type="button" class="btn" data-rules="' + esc(c.router_iface) + '">🔒 Правила</button> ';
+        act += '<button type="button" class="btn" data-revoke="' + esc(c.id) + '" data-name="' + esc(c.name) + '"' + (d.reg_err ? ' disabled' : '') + '>🗑 Отозвать</button>';
+      }
+      h += '<tr style="border-top:1px solid #e3e8ee;' + (rev ? ' opacity:0.5;' : '') + '"><td style="padding:4px 6px;"><b>' + esc(c.name) + '</b></td><td style="padding:4px 6px;">' + mode + '</td>'
+        + '<td style="padding:4px 6px; font-family:monospace;">' + esc(c.subnet) + '</td><td style="padding:4px 6px; font-family:monospace;">' + esc(c.port) + '</td>'
+        + '<td style="padding:4px 6px;" class="muted">' + esc(c.created) + '</td><td style="padding:4px 6px;">' + where + '</td><td style="padding:4px 6px; white-space:nowrap; text-align:right;">' + act + '</td></tr>';
+    });
+    box.innerHTML = h + '</tbody></table>';
+    wireListButtons(box);
+  }
+
+  function wireListButtons(box){
+    var rb = box.querySelectorAll('button[data-rules]');
+    for(var i = 0; i < rb.length; i++){ rb[i].addEventListener('click', function(){ openRules(this.getAttribute('data-rules')); }); }
+    var vb = box.querySelectorAll('button[data-revoke]');
+    for(var j = 0; j < vb.length; j++){ vb[j].addEventListener('click', function(){ revoke(this.getAttribute('data-revoke'), this.getAttribute('data-name'), this); }); }
+  }
+
+  function revoke(id, name, btn){
+    if(!confirm('Отозвать доступ «' + name + '»? Подключение будет УДАЛЕНО с роутера (если оно там есть; заворот в xray снимется), конфигурация роутера сохранится. Клиенту понадобится новый доступ.')) return;
+    var ot = btn.textContent; btn.disabled = true; btn.textContent = '…';
+    postJson('/api/xkeen/wg-revoke', {id: id}).then(function(d){
+      btn.disabled = false; btn.textContent = ot;
+      flash(d.ok, esc(d.ok ? d.msg : d.error));
+      loadClients(); loadRouter();
+    }).catch(function(e){ btn.disabled = false; btn.textContent = ot; alert('Ошибка: ' + e); });
+  }
+
+  function issue(){
+    var name = (($('wgiName') && $('wgiName').value) || '').trim();
+    if(!name){ alert('Укажите имя доступа'); return; }
+    var ex = document.querySelector('input[name="wgiExit"]:checked');
+    var body = { name: name, exit: ex ? ex.value : 'direct', full: !!($('wgiFull') && $('wgiFull').checked),
+      services: checkedSvc($('wgiSvc')), extra: ($('wgiExtra') && $('wgiExtra').value) || '',
+      s2s: !!($('wgiS2s') && $('wgiS2s').checked), remote_lan: (($('wgiRl') && $('wgiRl').value) || '').trim(),
+      create: !!($('wgiCreate') && $('wgiCreate').checked) };
+    var b = $('wgiBtn'); var ot = b.textContent; b.disabled = true; b.textContent = '… создаю (до минуты)';
+    postJson('/api/xkeen/wg-issue', body).then(function(d){
+      b.disabled = false; b.textContent = ot;
+      if(!d.ok){ flash(false, esc(d.error || '?')); alert('Ошибка: ' + (d.error || '?')); return; }
+      WG.issued = d;
+      var res = $('wgiRes'), c = d.created, html, ok = true;
+      if(c){
+        ok = !!c.ok;
+        html = (c.ok ? '🚀 <b>Готово на роутере.</b> ' : '❌ <b>На роутере не получилось.</b> ') + esc(c.msg);
+        if(c.ok){
+          html += '<br>Режим: <b>' + (d.s2s ? ('🔗 site-to-site ' + esc(d.remote_lan)) : esc(d.exit_label)) + '</b>. Осталось отдать клиенту ' + (d.s2s ? '<code>.conf</code> (на удалённый Keenetic).' : 'QR или <code>.conf</code>.');
+          if(c.xray){ html += '<br>' + (c.xray.ok ? '🛡 Заворот в xray: ' + esc(c.xray.msg) : '<b style="color:#b02a37;">⚠ Заворот в xray не включён: ' + esc(c.xray.msg) + '</b> — включите в «📡 На роутере» кнопкой «🛡 Анти-DPI».'); }
+        } else if(c.left){
+          html += '<br>Интерфейс остался на роутере — <b>серверный файл не загружать</b> (будет дубль): в «📋 Выданные» нажмите «🔒 Правила» или «🗑 Отозвать».';
+        } else {
+          html += '<br>На роутере ничего не осталось. Повторите выдачу или пройдите ручным путём (серверный .conf ниже).';
+        }
+      } else {
+        html = '📋 <b>Доступ выдан без создания на роутере</b> (ручной путь): загрузите серверный <code>.conf</code> в Keenetic («Загрузить из файла»), включите подключение, затем в «📋 Выданные» нажмите «🔒 Правила».';
+        if(d.s2s) html += '<br>🔗 Маршрут к удалённой ЛВС <code>' + esc(d.remote_lan) + '</code> «🔒 Правила» не добавляют — добавьте его в Keenetic (строка <code>ip route … auto</code> в блоке CLI ниже).';
+      }
+      if(d.endpoint_warn) html += '<br><b style="color:#b02a37;">⚠ ' + esc(d.endpoint_warn) + '</b>';
+      if(d.s2s) html += '<br>🔗 Site-to-site: клиентский <code>.conf</code> — на удалённый Keenetic («Загрузить из файла»), там разрешить в межсетевом экране трафик из туннеля и маршрут к <code>' + esc(WG.lan) + '</code>.';
+      res.innerHTML = html;
+      res.style.background = ok ? '#e8f5e9' : '#ffe5e5';
+      $('wgiConf').value = d.conf || '';
+      $('wgiSrv').value = d.router_conf || '';
+      $('wgiCli').value = d.router_block || '';
+      if($('wgiQrBox')) $('wgiQrBox').style.display = d.qr ? '' : 'none';
+      if($('wgiQr')) $('wgiQr').src = d.qr || '';
+      $('wgiSrvBox').style.display = (c && (c.ok || c.left)) ? 'none' : '';
+      $('wgiOut').style.display = '';
+      if(c && c.ok && $('wgiName')) $('wgiName').value = '';
+      loadClients(); loadRouter();
+    }).catch(function(e){ b.disabled = false; b.textContent = ot; alert('Ошибка: ' + e); });
+  }
+
+  /* ---------- 📡 На роутере ---------- */
+  function loadRouter(){
+    var st = $('wgrStatus'); if(st) st.textContent = 'Читаю…';
+    return fetch('/api/xkeen/wg-router').then(function(r){ return r.json(); }).then(function(d){
+      if(!d.ok){ if(st) st.textContent = '⚠ ' + (d.err || 'роутер не прочитан'); return; }
+      WG.routerItems = d.items || [];
+      var items = WG.routerItems;
+      var links = items.filter(function(i){ return i.is_link; }).length;
+      var online = items.filter(function(i){ return i.online; }).length;
+      if(st) st.textContent = 'Всего: ' + items.length + ' · доступов: ' + (items.length - links) + ' · линков: ' + links + ' · онлайн: ' + online;
+      var conn = items.filter(function(i){ return i.xray; });
+      var cb = $('wgrConn');
+      if(cb){ cb.style.display = ''; cb.innerHTML = '<b>В анти-DPI заведено' + (conn.length ? ' (' + conn.length + '):</b> ' + conn.map(function(i){ return 'nwg' + esc(i.index) + ' · ' + esc(i.desc); }).join(', ') : ':</b> пока ничего'); }
+      renderOrphans(d.orphan_hooks || []);
+      renderRouter(items);
+    }).catch(function(e){ if(st) st.textContent = '⚠ ошибка: ' + e; });
+  }
+
+  function renderRouter(items){
+    var box = $('wgrList'); if(!box) return;
+    if(!items.length){ box.innerHTML = '<div class="muted">WG-интерфейсов на роутере нет.</div>'; return; }
+    var h = '<table style="width:100%; border-collapse:collapse; font-size:0.88em;"><thead><tr style="background:#f3f6fa; text-align:left;">'
+      + '<th style="padding:4px 6px;">Тип</th><th style="padding:4px 6px;">Имя</th><th style="padding:4px 6px;">Интерфейс</th><th style="padding:4px 6px;">Туннель</th><th style="padding:4px 6px;">Порт</th><th style="padding:4px 6px;">Статус</th><th style="padding:4px 6px;">Трафик ↓/↑</th><th></th></tr></thead><tbody>';
+    items.forEach(function(i, n){
+      var stx = !i.up ? '<span class="muted">выключен</span>' : (i.online ? '<span style="color:#1a7f37;">🟢 онлайн</span>' : '<span class="muted">офлайн</span>');
+      var badges = (i.nat ? ' <span class="muted" title="ip nat — выход в интернет через роутер">· NAT</span>' : '') + (i.xray ? ' <span style="color:#1a7f37;" title="заворот в xray">· 🛡 анти-DPI</span>' : '') + (i.issued ? ' <span class="muted" title="выдан через «Выдать доступ»">· выдан</span>' : '');
+      var act = '';
+      if(!i.is_link){
+        act += '<button type="button" class="btn" data-xray="' + n + '">' + (i.xray ? '🔌 Снять анти-DPI' : '🛡 Анти-DPI') + '</button> ';
+        act += '<button type="button" class="btn" data-rules="' + esc(i.iface) + '">🔒 Правила</button> ';
+      }
+      if(i.conf_tpl) act += '<button type="button" class="btn" data-conf="' + n + '">💾 conf</button> ';
+      act += '<a class="btn" href="/api/xkeen/wg-backup?iface=' + encodeURIComponent(i.iface) + '">💾 бэкап</a>';
+      h += '<tr style="border-top:1px solid #e3e8ee;' + (i.is_link ? ' background:#eef6fb;' : '') + '"><td style="padding:4px 6px; white-space:nowrap;">' + (i.is_link ? '🔗 линк' : '🧑 доступ') + '</td>'
+        + '<td style="padding:4px 6px;"><b>' + esc(i.desc) + '</b>' + badges + '</td><td style="padding:4px 6px; font-family:monospace;">' + esc(i.iface) + '</td>'
+        + '<td style="padding:4px 6px; font-family:monospace;">' + esc(i.subnet || i.addr || '—') + '</td><td style="padding:4px 6px; font-family:monospace;">' + esc(i.port || '—') + '</td>'
+        + '<td style="padding:4px 6px;">' + stx + (i.remote_ip ? '<br><span class="muted" style="font-size:0.9em;">' + esc(i.remote_ip) + '</span>' : '') + '</td>'
+        + '<td style="padding:4px 6px; font-family:monospace; white-space:nowrap;">' + esc(i.rx) + ' / ' + esc(i.tx) + '</td><td style="padding:4px 6px; white-space:nowrap; text-align:right;">' + act + '</td></tr>';
+    });
+    box.innerHTML = h + '</tbody></table>';
+    wireListButtons(box);
+    var xb = box.querySelectorAll('button[data-xray]');
+    for(var k = 0; k < xb.length; k++){ xb[k].addEventListener('click', function(){ xrayToggle(WG.routerItems[+this.getAttribute('data-xray')], this); }); }
+    var cfb = box.querySelectorAll('button[data-conf]');
+    for(var m = 0; m < cfb.length; m++){ cfb[m].addEventListener('click', function(){ var it = WG.routerItems[+this.getAttribute('data-conf')]; dlText(it.conf_tpl, it.fname); }); }
+  }
+
+  function xrayToggle(i, btn){
+    if(!i) return;
+    var on = !i.xray;
+    if(on && !confirm('Завернуть трафик подключения «' + i.desc + '» (nwg' + i.index + ') в xray (анти-DPI)? На роутер ставится хук (iptables, только для этого интерфейса) и строка cron для самовосстановления. Правила межсетевого экрана должны пропускать интернет — режим «через xray» в «🔒 Правила».')) return;
+    if(!on && !confirm('Снять заворот в xray с «' + i.desc + '» (nwg' + i.index + ')? Хук и строка cron будут удалены, правила хука сняты.')) return;
+    var ot = btn.textContent; btn.disabled = true; btn.textContent = '…';
+    postJson(on ? '/api/xkeen/wg-connect' : '/api/xkeen/wg-disconnect', {iface_id: i.iface}).then(function(d){
+      btn.disabled = false; btn.textContent = ot;
+      flash(d.ok, esc(d.ok ? d.msg : d.error));
+      loadRouter(); loadClients();
+    }).catch(function(e){ btn.disabled = false; btn.textContent = ot; alert('Ошибка: ' + e); });
+  }
+
+  function renderOrphans(list){
+    var el = $('wgrOrphan'); if(!el) return;
+    if(!list.length){ el.style.display = 'none'; el.innerHTML = ''; return; }
+    el.innerHTML = '<b>⚠ Найдены осиротевшие хуки анти-DPI</b> — интерфейс удалён без снятия заворота, его правила держит cron; новое подключение с тем же номером подхватит старый хук и не заработает. Уберите их:<br>'
+      + list.map(function(k){ return '🔴 <code>' + esc(k) + '</code> <button type="button" class="btn" data-orphan="' + esc(k) + '">🧹 Убрать ' + esc(k) + '</button>'; }).join('<br>');
+    el.style.display = '';
+    var btns = el.querySelectorAll('button[data-orphan]');
+    for(var i = 0; i < btns.length; i++){ btns[i].addEventListener('click', function(){ cleanupOrphan(this.getAttribute('data-orphan'), this); }); }
+  }
+  function cleanupOrphan(kernel, btn){
+    if(!confirm('Убрать осиротевший хук ' + kernel + '? (файл хука, строка cron и его правила на роутере)')) return;
+    btn.disabled = true; btn.textContent = '…';
+    postJson('/api/xkeen/wg-cleanup-orphan', {kernel: kernel}).then(function(d){
+      flash(d.ok, esc(d.ok ? d.msg : d.error)); loadRouter();
+    }).catch(function(e){ alert('Ошибка: ' + e); btn.disabled = false; });
+  }
+
+  /* ---------- 🔒 Правила (диалог) ---------- */
+  function openRules(iface){
+    var dlg = $('wgRulesDlg'), body = $('wgRBody');
+    /* диалог живёт в базовой странице раздела, а её сайдбар прячет, пока открыт подпункт */
+    if(dlg.parentNode !== document.body) document.body.appendChild(dlg);
+    $('wgRTitle').textContent = '🔒 Правила — ' + iface;
+    body.innerHTML = '<div class="muted">Читаю правила с роутера…</div>';
+    dlg.style.display = '';
+    fetch('/api/xkeen/wg-acl?iface_id=' + encodeURIComponent(iface)).then(function(r){ return r.json(); }).then(function(d){
+      if(!d.ok){ body.innerHTML = '<div style="color:#b02a37;">⚠ ' + esc(d.error || '?') + '</div>'; return; }
+      $('wgRTitle').textContent = '🔒 Правила — ' + d.desc + ' (' + iface + ')';
+      WG.exitModes = d.exit_modes || WG.exitModes;
+      var cur = d.current;
+      var h = '<div style="font-weight:600;">Сейчас на роутере:</div>';
+      if(cur === null || cur === undefined) h += '<div style="color:#b02a37;">⚠ правила не прочитаны</div>';
+      else if(!cur.length) h += '<div class="muted">правил нет</div>';
+      else h += '<ul style="margin:4px 0; font-family:monospace; font-size:0.85em; max-height:160px; overflow:auto;">' + cur.map(function(x){ return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>';
+      var pre = d.pre || {};
+      h += '<div class="muted" style="font-size:0.88em; margin-top:6px;">Применится только отмеченное, текущие правила заменятся.' + (pre.src ? ' Предзаполнено по данным ' + esc(pre.src) + '.' : '') + '</div>';
+      if(pre.exit === null && !d.s2s) h += '<div style="color:#b26a00; font-size:0.88em;">⚠ Текущий NAT/правила не прочитаны — режим не угадан, выберите сами.</div>';
+      if(d.s2s){
+        h += '<input type="hidden" name="wgRExit" value=""><div style="margin:6px 0;">🔗 Site-to-site: интернет не выдаётся, только доступ к ЛВС.</div>';
+      } else {
+        h += '<div style="font-weight:600; margin-top:8px;">Выход в интернет:</div>';
+        ['direct', 'xray', ''].forEach(function(k){
+          var hint = k === 'direct' ? ' <span class="muted">(включит <code>ip nat ' + esc(iface) + '</code>)</span>' : (k === 'xray' ? ' <span class="muted">(включит заворот в xray, выключит ip nat)</span>' : '');
+          h += '<label style="display:block;"><input type="radio" name="wgRExit" value="' + k + '"' + (pre.exit === k ? ' checked' : '') + '> ' + esc(exitLabel(k)) + hint + '</label>';
+        });
+      }
+      h += '<div style="font-weight:600; margin-top:8px;">Доступ к домашней сети:</div><div id="wgRSvc"></div>'
+        + '<label style="display:block; color:#b02a37;"><input type="checkbox" id="wgRFull"' + (pre.full ? ' checked' : '') + '> 🔓 полный доступ к ЛВС <code>' + esc(d.lan) + '</code></label>'
+        + '<label style="display:block; margin-top:4px;">Дополнительно вручную (<code>IP[/маска][:порты]</code>, по строке):<br><textarea id="wgRExtra" rows="2" style="width:100%; font-family:monospace; font-size:0.86em;"></textarea></label>'
+        + '<div style="margin:8px 0; padding:6px 10px; background:#fff8e1; border-left:3px solid #f0c200; font-size:0.88em;">⚠ Применяется на роутер и <b>сразу сохраняется</b>. Если устройство сейчас онлайн — возможен краткий разрыв.</div>'
+        + '<button type="button" class="btn" id="wgRApply">🔒 Применить и сохранить</button> <span id="wgRStatus" class="muted"></span>';
+      body.innerHTML = h;
+      renderServices($('wgRSvc'), d.services, pre.services || [], 'wgRSvc');
+      $('wgRExtra').value = pre.extra || '';
+      $('wgRApply').addEventListener('click', function(){ applyRules(iface, d.s2s, d.xray_on); });
+    }).catch(function(e){ body.innerHTML = '<div style="color:#b02a37;">⚠ ' + esc(e) + '</div>'; });
+  }
+
+  function applyRules(iface, s2s, xrayOn){
+    var ex = document.querySelector('input[name="wgRExit"]:checked') || document.querySelector('input[name="wgRExit"][type="hidden"]');
+    if(!ex){ alert('Выберите режим выхода в интернет'); return; }
+    var warnX = (xrayOn && ex.value !== 'xray') ? ' Заворот в xray у этого подключения будет СНЯТ.' : '';
+    if(!confirm('Применить правила к ' + iface + ' и сохранить конфигурацию роутера? Текущие правила будут заменены.' + warnX)) return;
+    var b = $('wgRApply'); b.disabled = true; $('wgRStatus').textContent = 'применяю…';
+    postJson('/api/xkeen/wg-acl-apply', { iface_id: iface, exit: ex.value, full: !!$('wgRFull').checked,
+      services: checkedSvc($('wgRSvc')), extra: $('wgRExtra').value || '' }).then(function(d){
+      b.disabled = false;
+      $('wgRStatus').textContent = d.ok ? ('✅ ' + d.msg) : ('⚠ ' + (d.error || '?'));
+      flash(d.ok, esc(d.ok ? d.msg : d.error));
+      if(d.ok){ loadRouter(); loadClients(); }
+    }).catch(function(e){ b.disabled = false; $('wgRStatus').textContent = '⚠ ' + e; });
+  }
+
+  /* ---------- 🧩 .conf вручную (существующее подключение) ---------- */
   var ifaces = [], wan = '', dns = '', fname = 'wg-client.conf';
-  function curIface(){ var id=$('wgIface') ? $('wgIface').value : ''; for(var k=0;k<ifaces.length;k++){ if(ifaces[k].id===id) return ifaces[k]; } return null; }
-  function setStatus(t){ var s=$('wgGenStatus'); if(s) s.textContent=t; }
+  function curIface(){ var id = $('wgIface') ? $('wgIface').value : ''; for(var k = 0; k < ifaces.length; k++){ if(ifaces[k].id === id) return ifaces[k]; } return null; }
+  function setStatus(t){ var s = $('wgGenStatus'); if(s) s.textContent = t; }
   function onIfaceChange(){
-    var i=curIface(); if(!i) return;
+    var i = curIface(); if(!i) return;
     if($('wgClientIp')) $('wgClientIp').placeholder = 'авто: ' + (i.suggested_client_ip || '?');
     if($('wgIfaceInfo')){
-      var info = 'Порт ' + (i.listen_port||'?') + ' · MTU ' + (i.mtu||'?') + ' · подсеть ' + (i.subnet_cidr||'?') + ' · пиров: ' + (i.peers_count!=null?i.peers_count:'?');
-      info += i.iface_up ? ' · 🟢 включён' : ' · 🔴 ВЫКЛЮЧЕН — включи тумблер интерфейса в Keenetic (Другие подключения), иначе клиент и правила не работают';
+      var info = 'Порт ' + (i.listen_port || '?') + ' · MTU ' + (i.mtu || '?') + ' · подсеть ' + (i.subnet_cidr || '?') + ' · пиров: ' + (i.peers_count != null ? i.peers_count : '?');
+      info += i.iface_up ? ' · 🟢 включён' : ' · 🔴 ВЫКЛЮЧЕН — включите подключение в Keenetic (Другие подключения)';
+      info += i.connected ? ' · 🛡 заведён в анти-DPI' : '';
       $('wgIfaceInfo').textContent = info;
       $('wgIfaceInfo').style.color = i.iface_up ? '' : '#c33';
-      $('wgIfaceInfo').style.fontWeight = i.iface_up ? '' : '600';
-    }
-    var cr=$('wgConnRow'), cs=$('wgConnStatus'), cb=$('wgConnBtn');
-    if(cr && cs && cb){
-      cr.style.display='';
-      if(i.connected && i.panel_managed){ cs.textContent='✅ Подключён к анти-DPI (хук панели)'; cb.textContent='🔌 Отключить'; cb.dataset.act='disconnect'; cb.style.display=''; }
-      else if(i.connected){ cs.textContent='✅ Подключён к анти-DPI (внешний хук — отключение в панели недоступно)'; cb.style.display='none'; }
-      else { cs.textContent='⛔ Не подключён к анти-DPI'; cb.textContent='🔌 Подключить к анти-DPI'; cb.dataset.act='connect'; cb.style.display=''; }
     }
   }
   function onModeChange(){
-    var m=$('wgMode')?$('wgMode').value:'full';
-    if($('wgSelectiveRow')) $('wgSelectiveRow').style.display=(m==='selective')?'':'none';
-    if($('wgExcludeRow')) $('wgExcludeRow').style.display=(m==='lan')?'none':'';
-    if($('wgV6Row')) $('wgV6Row').style.display=(m==='lan')?'none':'';
-    if($('wgLanNote')) $('wgLanNote').style.display=(m==='lan')?'':'none';
-  }
-  function renderConnList(){
-    var el=$('wgConnList'); if(!el) return;
-    var conn = ifaces.filter(function(x){ return x.connected; });
-    if(!conn.length){ el.innerHTML='<b>В анти-DPI заведено:</b> пока ничего'; return; }
-    var parts = conn.map(function(x){ return (x.kernel_name||'?') + (x.name?(' · '+x.name):'') + (x.panel_managed?'':' <span style="color:#888">(внешний хук)</span>'); });
-    el.innerHTML='<b>В анти-DPI заведено ('+conn.length+'):</b> ' + parts.join(', ');
-  }
-  function renderOrphans(list){
-    var el=$('wgOrphanBox'); if(!el) return;
-    list = list || [];
-    if(!list.length){ el.style.display='none'; el.innerHTML=''; return; }
-    var rows = list.map(function(k){
-      return '🔴 Осиротевший хук <code>'+k+'</code> — интерфейса уже нет, но его правила держит cron. '
-        + '<button type="button" class="btn" data-orphan="'+k+'" style="margin-left:6px;">🧹 Убрать '+k+'</button>';
-    });
-    el.innerHTML = '<b>⚠️ Найдены осиротевшие анти-DPI хуки</b> (интерфейс удалён без «🔌 Отключить» — их правила держит cron; новый клиент с тем же номером подхватит старый хук и не заработает). Убери их:<br>' + rows.join('<br>');
-    el.style.display='';
-    var btns = el.querySelectorAll('button[data-orphan]');
-    for(var i=0;i<btns.length;i++){ btns[i].addEventListener('click', function(){ cleanupOrphan(this.getAttribute('data-orphan'), this); }); }
-  }
-  function cleanupOrphan(kernel, btn){
-    if(!confirm('Убрать осиротевший хук '+kernel+'? (удалит файл хука + cron-строку + его правила на роутере)')) return;
-    if(btn){ btn.disabled=true; btn.textContent='…'; }
-    fetch('/api/xkeen/wg-cleanup-orphan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kernel:kernel})})
-      .then(function(r){return r.json();}).then(function(d){
-        if(!d.ok){ alert('Ошибка: '+(d.error||'?')); if(btn){btn.disabled=false; btn.textContent='🧹 Убрать '+kernel;} return; }
-        setStatus(d.msg||'осиротевший хук убран'); loadIfaces();
-      }).catch(function(e){ alert('Ошибка: '+e); if(btn){btn.disabled=false; btn.textContent='🧹 Убрать '+kernel;} });
+    var m = $('wgMode') ? $('wgMode').value : 'full';
+    if($('wgSelectiveRow')) $('wgSelectiveRow').style.display = (m === 'selective') ? '' : 'none';
+    if($('wgExcludeRow')) $('wgExcludeRow').style.display = (m === 'lan') ? 'none' : '';
+    if($('wgV6Row')) $('wgV6Row').style.display = (m === 'lan') ? 'none' : '';
+    if($('wgLanNote')) $('wgLanNote').style.display = (m === 'lan') ? '' : 'none';
   }
   function loadIfaces(){
     setStatus('Читаю WG-интерфейсы роутера…');
-    fetch('/api/xkeen/wg-interfaces').then(function(r){return r.json();}).then(function(d){
-      if(!d.ok){ setStatus('⚠ ' + (d.error||'не удалось прочитать роутер')); return; }
+    fetch('/api/xkeen/wg-interfaces').then(function(r){ return r.json(); }).then(function(d){
+      if(!d.ok){ setStatus('⚠ ' + (d.error || 'не удалось прочитать роутер')); return; }
       ifaces = d.interfaces || []; wan = d.wan_host || ''; dns = d.router_lan_ip || '';
-      var sel=$('wgIface');
-      if(sel){ sel.innerHTML='';
-        ifaces.forEach(function(i){ var o=document.createElement('option'); o.value=i.id;
-          o.textContent = i.id + (i.name?(' ('+i.name+')'):'') + (i.subnet_cidr?(' — '+i.subnet_cidr):''); sel.appendChild(o); }); }
-      if($('wgEndpoint')) $('wgEndpoint').placeholder = 'авто: ' + (wan||'—');
-      if($('wgForm')) $('wgForm').style.display='';
-      onIfaceChange(); onModeChange(); renderConnList(); renderOrphans(d.orphan_hooks);
-      setStatus('✅ Прочитано. WAN: ' + (wan||'—') + ' · DNS: ' + (dns||'—') + '. Выбери интерфейс и нажми «Сгенерировать».');
+      var sel = $('wgIface');
+      if(sel){ sel.innerHTML = '';
+        ifaces.forEach(function(i){ var o = document.createElement('option'); o.value = i.id;
+          o.textContent = i.id + (i.name ? (' (' + i.name + ')') : '') + (i.subnet_cidr ? (' — ' + i.subnet_cidr) : ''); sel.appendChild(o); }); }
+      if($('wgEndpoint')) $('wgEndpoint').placeholder = 'авто: ' + (wan || '—');
+      if($('wgForm')) $('wgForm').style.display = '';
+      onIfaceChange(); onModeChange();
+      setStatus('✅ Прочитано. WAN: ' + (wan || '—') + ' · DNS: ' + (dns || '—') + '. Выберите интерфейс и нажмите «Сгенерировать».');
     }).catch(function(e){ setStatus('⚠ ошибка: ' + e); });
   }
   function gen(){
-    var i=curIface(); if(!i){ alert('Сначала прочитай интерфейсы с роутера'); return; }
-    var body = { iface_id:i.id, mode:$('wgMode').value,
-      client_ip:($('wgClientIp').value||'').trim(),
-      endpoint_host:($('wgEndpoint').value||'').trim(),
-      selective_cidrs:($('wgSelectiveCidrs').value||'').trim(),
-      exclude_cidrs:(($('wgExcludeCidrs') && $('wgExcludeCidrs').value)||'').trim(),
-      v6_antileak: !!($('wgV6') && $('wgV6').checked),
-      client_priv: '' };  /* основная форма = conf с плейсхолдером ключа; авто-ключ — в помощнике «Новый клиент» */
-    var b=$('wgGenBtn'); var ot=b.textContent; b.disabled=true; b.textContent='…';
-    fetch('/api/xkeen/wg-client-conf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-      .then(function(r){return r.json();}).then(function(d){
-        b.disabled=false; b.textContent=ot;
-        if(!d.ok){ alert('Ошибка: ' + (d.error||'?')); return; }
-        if($('wgConf')) $('wgConf').value = d.conf;
-        if($('wgResult')) $('wgResult').style.display='';
-        fname = d.filename || 'wg-client.conf';
-      }).catch(function(e){ b.disabled=false; b.textContent=ot; alert('Ошибка: ' + e); });
+    var i = curIface(); if(!i){ alert('Сначала прочитайте интерфейсы с роутера'); return; }
+    var body = { iface_id: i.id, mode: $('wgMode').value, client_ip: ($('wgClientIp').value || '').trim(),
+      endpoint_host: ($('wgEndpoint').value || '').trim(), selective_cidrs: ($('wgSelectiveCidrs').value || '').trim(),
+      exclude_cidrs: (($('wgExcludeCidrs') && $('wgExcludeCidrs').value) || '').trim(),
+      v6_antileak: !!($('wgV6') && $('wgV6').checked), client_priv: '' };
+    var b = $('wgGenBtn'); var ot = b.textContent; b.disabled = true; b.textContent = '…';
+    postJson('/api/xkeen/wg-client-conf', body).then(function(d){
+      b.disabled = false; b.textContent = ot;
+      if(!d.ok){ alert('Ошибка: ' + (d.error || '?')); return; }
+      if($('wgConf')) $('wgConf').value = d.conf;
+      if($('wgResult')) $('wgResult').style.display = '';
+      fname = d.filename || 'wg-client.conf';
+    }).catch(function(e){ b.disabled = false; b.textContent = ot; alert('Ошибка: ' + e); });
   }
-  function copyConf(){
-    var ta=$('wgConf'); if(!ta) return; ta.focus(); ta.select();
-    var done=function(){ var b=$('wgCopyBtn'); if(b){ var o=b.textContent; b.textContent='✅ Скопировано'; setTimeout(function(){b.textContent=o;},1500);} };
-    if(navigator.clipboard && navigator.clipboard.writeText){
-      navigator.clipboard.writeText(ta.value).then(done, function(){ try{document.execCommand('copy'); done();}catch(e){} });
-    } else { try{document.execCommand('copy'); done();}catch(e){} }
-  }
-  function dl(){ var ta=$('wgConf'); if(ta) ncDl(ta.value, fname); }
-  function connToggle(){
-    var i=curIface(); if(!i){ return; }
-    var act=($('wgConnBtn').dataset.act)||'connect';
-    if(act==='connect' && !confirm('Поставить роутерный хук: завернуть '+i.kernel_name+' ('+(i.name||'')+') в анти-DPI? Правит iptables роутера (scoped по интерфейсу), idempotent, +cron self-heal.')) return;
-    if(act==='disconnect' && !confirm('Снять хук анти-DPI с '+i.kernel_name+'? (flush правил + удаление хука и cron-строки)')) return;
-    var url = (act==='disconnect') ? '/api/xkeen/wg-disconnect' : '/api/xkeen/wg-connect';
-    var b=$('wgConnBtn'); var ot=b.textContent; b.disabled=true; b.textContent='…';
-    fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({iface_id:i.id})})
-      .then(function(r){return r.json();}).then(function(d){
-        b.disabled=false; b.textContent=ot;
-        if(!d.ok){ alert('Ошибка: '+(d.error||'?')); return; }
-        i.connected = !!d.connected; i.panel_managed = (act==='connect') ? !!d.connected : false;
-        setStatus(d.msg||'готово'); onIfaceChange(); renderConnList();
-      }).catch(function(e){ b.disabled=false; b.textContent=ot; alert('Ошибка: '+e); });
-  }
-  function ncModeChange(){
-    var m=$('wgNcMode')?$('wgNcMode').value:'full';
-    if($('wgNcSelRow')) $('wgNcSelRow').style.display=(m==='selective')?'':'none';
-    if($('wgNcExcRow')) $('wgNcExcRow').style.display=(m==='lan')?'none':'';
-    if($('wgNcV6Row')) $('wgNcV6Row').style.display=(m==='lan')?'none':'';
-  }
-  function ncDl(text, fname){
-    var blob=new Blob([text||''],{type:'text/plain'});
-    var a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=fname||'wg.conf';
-    document.body.appendChild(a); a.click();
-    setTimeout(function(){ URL.revokeObjectURL(a.href); if(a.parentNode) a.parentNode.removeChild(a); },1000);
-  }
-  function ncCopy(text, btn){
-    var done=function(){ if(btn){ var o=btn.textContent; btn.textContent='✅'; setTimeout(function(){btn.textContent=o;},1200);} };
-    if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text||'').then(done, done); }
-    else { try{ var ta=document.createElement('textarea'); ta.value=text||''; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); done(); }catch(e){} }
-  }
-  function newClient(){
-    var b=$('wgNcBtn'); if(!b) return; var ot=b.textContent; b.disabled=true; b.textContent='…';
-    var body={ name:(($('wgNcName') && $('wgNcName').value)||'').trim(), mode:$('wgNcMode').value,
-      endpoint_host:(($('wgNcEndpoint') && $('wgNcEndpoint').value)||'').trim(),
-      selective_cidrs:(($('wgNcSel') && $('wgNcSel').value)||'').trim(),
-      exclude_cidrs:(($('wgNcExc') && $('wgNcExc').value)||'').trim(),
-      v6_antileak: !!($('wgNcV6') && $('wgNcV6').checked) };
-    fetch('/api/xkeen/wg-new-client',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-      .then(function(r){return r.json();}).then(function(d){
-        b.disabled=false; b.textContent=ot;
-        if(!d.ok){ alert('Ошибка: '+(d.error||'?')); return; }
-        window.__ncServer=d.server_conf||''; window.__ncClient=d.client_conf||'';
-        window.__ncSF=d.server_filename||'server.conf'; window.__ncCF=d.client_filename||'client.conf';
-        if($('wgNcServer')) $('wgNcServer').value=window.__ncServer;
-        if($('wgNcClient')) $('wgNcClient').value=window.__ncClient;
-        var nci='Подсеть '+d.subnet+' · порт '+d.listen_port+' · сервер '+d.server_ip+' · клиент '+d.client_ip+' · endpoint '+d.endpoint_host;
-        if(d.endpoint_warn) nci+='  ⚠️ '+d.endpoint_warn;
-        if(d.orphan_warn) nci+='  🔴 '+d.orphan_warn;
-        if($('wgNcInfo')) $('wgNcInfo').textContent=nci;
-        if($('wgNcOut')) $('wgNcOut').style.display='';
-        if(d.orphan_warn) alert('🔴 ВНИМАНИЕ — осиротевшие анти-DPI хуки на роутере:\n\n'+d.orphan_warn);
-      }).catch(function(e){ b.disabled=false; b.textContent=ot; alert('Ошибка: '+e); });
-  }
-  function aclRuleToLine(r){
-    var s=(r.proto||'')+' '+(r.dst||'any');
-    if(r.port && r.port_to) s+=' '+r.port+'-'+r.port_to;
-    else if(r.port) s+=' '+r.port;
-    return s;
-  }
-  function aclParse(text){
-    var rules=[];
-    (text||'').split('\n').forEach(function(ln){
-      var t=ln.trim(); if(!t || t.charAt(0)==='#') return;
-      var p=t.split(/\s+/);
-      var r={proto:(p[0]||'').toLowerCase(), dst:p[1]||'any'};
-      if(p[2]){ var pr=p[2].split('-'); if(pr.length===2){ r.port=pr[0]; r.port_to=pr[1]; } else { r.port=p[2]; } }
-      rules.push(r);
+
+  function initWg(){
+    if(!$('wgiBtn')) return;
+    $('wgiBtn').addEventListener('click', issue);
+    $('wgiS2s').addEventListener('change', function(){
+      $('wgiRlRow').style.display = this.checked ? '' : 'none';
+      $('wgiExitBox').style.display = this.checked ? 'none' : '';
     });
-    return rules;
-  }
-  function aclAppend(txt){
-    var ta=$('wgAclText'); if(!ta) return;
-    var cur=ta.value.replace(/\s+$/,'');
-    ta.value=(cur?cur+'\n':'')+txt;
-  }
-  function aclToggle(){
-    var i=curIface(); if(!i){ alert('Сначала выбери интерфейс'); return; }
-    var box=$('wgAclBox'); if(!box) return;
-    var open=(box.style.display==='none'||box.style.display==='');
-    box.style.display=open?'block':'none';
-    if(!open) return;
-    var ta=$('wgAclText');
-    if(ta && ta.value.trim() && window.__aclIface===i.id){ if($('wgAclStatus')) $('wgAclStatus').textContent='(несохранённые правки на месте; «Очистить» — перечитать с роутера)'; return; }
-    window.__aclIface=i.id;
-    if($('wgAclStatus')) $('wgAclStatus').textContent='читаю текущие правила…';
-    fetch('/api/xkeen/wg-acl?iface_id='+encodeURIComponent(i.id)).then(function(r){return r.json();}).then(function(d){
-      if(!d.ok){ if($('wgAclStatus')) $('wgAclStatus').textContent='⚠ '+(d.error||'?'); return; }
-      var st='ACL '+d.acl+' · правил: '+(d.rules?d.rules.length:0);
-      if(d.has_deny) st+=' · ⚠️ есть deny-правила — НЕ показаны, будут УДАЛЕНЫ при «Применить»';
-      if($('wgAclStatus')) $('wgAclStatus').textContent=st;
-      if(ta) ta.value=(d.rules||[]).map(aclRuleToLine).join('\n');
-    }).catch(function(e){ if($('wgAclStatus')) $('wgAclStatus').textContent='⚠ '+e; });
-  }
-  function aclApply(){
-    var i=curIface(); if(!i) return;
-    var rules=aclParse($('wgAclText')?$('wgAclText').value:'');
-    if(!rules.length){ if(!confirm('Правил нет — это ЗАКРОЕТ весь вход на интерфейс. Продолжить?')) return; }
-    else if(!confirm('Применить '+rules.length+' правил к '+i.id+'? Перезапишет _WEBADMIN_'+i.id+' на роутере и сохранит конфиг.')) return;
-    var b=$('wgAclApplyBtn'); var ot=b.textContent; b.disabled=true; b.textContent='…';
-    if($('wgAclStatus')) $('wgAclStatus').textContent='применяю…';
-    fetch('/api/xkeen/wg-acl-apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({iface_id:i.id, rules:rules})})
-      .then(function(r){return r.json();}).then(function(d){
-        b.disabled=false; b.textContent=ot;
-        if($('wgAclStatus')){
-          var msg=d.ok?('✅ применено: '+((d.rules&&d.rules.length)||0)+' правил, сохранено'):('⚠ '+(d.error||'?'));
-          if(d.ok && i && !i.iface_up) msg+=' · ⚠️ но интерфейс ВЫКЛЮЧЕН — включи тумблер в Keenetic, иначе не заработает!';
-          $('wgAclStatus').textContent=msg;
-        }
-        if(!d.ok) alert('Ошибка: '+(d.error||'?'));
-      }).catch(function(e){ b.disabled=false; b.textContent=ot; if($('wgAclStatus')) $('wgAclStatus').textContent='⚠ '+e; });
-  }
-  function initWgGen(){
-    if(!$('wgLoadBtn')) return;
+    $('wgiCreate').addEventListener('change', function(){ $('wgiManual').style.display = this.checked ? 'none' : ''; });
+    $('wgiConfCopy').addEventListener('click', function(){ copyText2($('wgiConf').value, this); });
+    $('wgiConfDl').addEventListener('click', function(){ dlText($('wgiConf').value, WG.issued ? WG.issued.conf_fname : 'wg.conf'); });
+    $('wgiSrvToggle').addEventListener('click', function(){ var x = $('wgiSrvBox'); x.style.display = (x.style.display === 'none') ? '' : 'none'; });
+    $('wgiSrvDl').addEventListener('click', function(){ dlText($('wgiSrv').value, WG.issued ? WG.issued.router_fname : 'server.conf'); });
+    $('wgcLoad').addEventListener('click', loadClients);
+    $('wgrLoad').addEventListener('click', loadRouter);
+    $('wgRClose').addEventListener('click', function(){ $('wgRulesDlg').style.display = 'none'; });
+    $('wgRulesDlg').addEventListener('click', function(e){ if(e.target === this) this.style.display = 'none'; });
     $('wgLoadBtn').addEventListener('click', loadIfaces);
-    if($('wgIface')) $('wgIface').addEventListener('change', onIfaceChange);
-    if($('wgMode')) $('wgMode').addEventListener('change', onModeChange);
-    if($('wgGenBtn')) $('wgGenBtn').addEventListener('click', gen);
-    if($('wgCopyBtn')) $('wgCopyBtn').addEventListener('click', copyConf);
-    if($('wgDownloadBtn')) $('wgDownloadBtn').addEventListener('click', dl);
-    if($('wgConnBtn')) $('wgConnBtn').addEventListener('click', connToggle);
-    if($('wgAclBtn')) $('wgAclBtn').addEventListener('click', aclToggle);
-    if($('wgAclApplyBtn')) $('wgAclApplyBtn').addEventListener('click', aclApply);
-    if($('wgAclPreVpn')) $('wgAclPreVpn').addEventListener('click', function(){ aclAppend('icmp any\ntcp any\nudp any'); });
-    if($('wgAclPreRdp')) $('wgAclPreRdp').addEventListener('click', function(){ aclAppend('tcp any 3389'); });
-    if($('wgAclPreWeb')) $('wgAclPreWeb').addEventListener('click', function(){ aclAppend('tcp any 80\ntcp any 443'); });
-    if($('wgAclPreDns')) $('wgAclPreDns').addEventListener('click', function(){ aclAppend('udp any 53\ntcp any 53'); });
-    if($('wgAclClear')) $('wgAclClear').addEventListener('click', function(){ if($('wgAclText')) $('wgAclText').value=''; window.__aclIface=null; });
-    if($('wgNcMode')) $('wgNcMode').addEventListener('change', ncModeChange);
-    if($('wgNcBtn')) $('wgNcBtn').addEventListener('click', newClient);
-    if($('wgNcServerCopy')) $('wgNcServerCopy').addEventListener('click', function(){ ncCopy(window.__ncServer, $('wgNcServerCopy')); });
-    if($('wgNcServerDl')) $('wgNcServerDl').addEventListener('click', function(){ ncDl(window.__ncServer, window.__ncSF); });
-    if($('wgNcClientCopy')) $('wgNcClientCopy').addEventListener('click', function(){ ncCopy(window.__ncClient, $('wgNcClientCopy')); });
-    if($('wgNcClientDl')) $('wgNcClientDl').addEventListener('click', function(){ ncDl(window.__ncClient, window.__ncCF); });
-    ncModeChange();
+    $('wgIface').addEventListener('change', onIfaceChange);
+    $('wgMode').addEventListener('change', onModeChange);
+    $('wgGenBtn').addEventListener('click', gen);
+    $('wgCopyBtn').addEventListener('click', function(){ copyText2($('wgConf').value, this); });
+    $('wgDownloadBtn').addEventListener('click', function(){ dlText($('wgConf').value, fname); });
+    var loadedC = false, loadedR = false;
+    var lc = function(){ if(!loadedC){ loadedC = true; loadClients(); } };
+    onVisible($('wgiSlot'), lc);
+    onVisible($('wgcList'), lc);
+    onVisible($('wgrList'), function(){ if(!loadedR){ loadedR = true; loadRouter(); } });
   }
-  if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded', initWgGen); } else { initWgGen(); }
+  if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', initWg); } else { initWg(); }
 })();
 </script>
 
@@ -15739,10 +15761,10 @@ xkeen -restart</pre>
     <div class="help-body">
       <p><strong>Что это.</strong> Настройка удалённой Windows-машины так, чтобы её трафик уходил в этот домашний роутер по WireGuard, а тут — в анти-DPI-выход (xray/XKeen → зарубежный сервер). Выбор выхода и обход DPI делает домашняя сторона; задача клиента — лишь доставить пакеты сюда.</p>
       <div style="background:#e7f5ff; border-left:3px solid #3498db; padding:8px 11px; margin:8px 0; font-size:0.92em;">
-        💡 Готовый <code>.conf</code> для клиента можно <strong>сгенерировать кнопкой</strong> — см. раздел «🐉 Подключение клиентов WireGuard». Эта справка — про то, что нужно донастроить на самой удалённой машине (IPv6, watchdog), и пояснения к каждому полю.
+        💡 Доступ проще всего выдать в разделе «🐉 Подключение клиентов WireGuard» → <strong>«➕ Выдать доступ»</strong>: панель сама создаст подключение на роутере, правила и NAT и отдаст готовый <code>.conf</code> / QR. Эта справка — про то, что нужно донастроить на самой удалённой машине (IPv6, watchdog), и пояснения к каждому полю.
       </div>
       <div style="background:#fff8e1; border-left:3px solid #f0c200; padding:8px 11px; margin:8px 0; font-size:0.92em; color:#6a4900;">
-        🔥 <strong>На роутере (один раз на каждый новый WG-интерфейс):</strong> Сетевые правила → <strong>Межсетевой экран</strong> → вкладка интерфейса → <strong>проверь</strong> правила <strong>«Разрешить»</strong> (если Keenetic не создал их сам): <strong>TCP и UDP — обязательно</strong>, ICMP — желательно, источник/назначение «Любой». Нужны для <strong>любого</strong> клиента (и LAN-доступ, и просто VPN-выход): без них входящий трафик режется файрволом — handshake есть, связи нет.
+        🔥 <strong>Подключение, созданное не через «Выдать доступ»</strong> (вручную в Keenetic или «Загрузить из файла»): Keenetic не создаёт для него правил Межсетевого экрана — handshake есть, связи нет. Правила задаются в «📡 На роутере» → <strong>«🔒 Правила»</strong> (режим выхода и доступ к ЛВС) либо в Keenetic: Сетевые правила → Межсетевой экран → вкладка интерфейса.
       </div>
 
       <p class="muted">Заполнители ниже: <code>&lt;endpoint-host&gt;</code> — публичный адрес/DDNS роутера; <code>&lt;endpoint-port&gt;</code> — порт WireGuard на роутере; <code>&lt;router-lan-ip&gt;</code> — LAN-IP роутера (он же DNS); <code>192.168.X.0/24</code> — домашняя LAN; <code>&lt;tunnel-subnet&gt;</code> — подсеть туннеля; <code>&lt;client-tunnel-ip&gt;</code> — адрес машины в туннеле.</p>
