@@ -5,6 +5,10 @@
 > (функция, маршрут, константа, `id`, маркер раздела `# ============== ИМЯ ==============`); номеров
 > строк нет — файл живой. Переход: `grep -n "def keenetic_ssh" dashboard.py`. Документ обновляется
 > **в том же коммите**, что и код (§12).
+>
+> Справочники вынесены в `docs/architecture/` (номера § те же): §4 маршруты — `04-routes.md`, §6 watchdog —
+> `06-watchdog.md`, §7 каналы и цепочки — `07-chains.md`, журнал изменений — `changelog.md`. Этот файл читать
+> целиком; справочник — когда задача его касается.
 
 Обозначения: `<install-dir>` — папка установки (обычно `C:\xray-dashboard`), `<router-ip>` — роутер
 Keenetic, `<vpn-domain>` — `cfg.EXTERNAL_DOMAIN`, `<home-domain>` — `cfg.HOME_DOMAIN`,
@@ -14,11 +18,11 @@ Keenetic, `<vpn-domain>` — `cfg.EXTERNAL_DOMAIN`, `<home-domain>` — `cfg.HOM
 
 | Задача | Где |
 |---|---|
-| Что делает кнопка UI | `onclick` → JS-функция главного `<script>` `XKEEN_TEMPLATE` → `fetch('/api/…')` → §4 |
-| Новый ключ `watchdog.config` | §6.2 + чек-лист §9.3 |
-| Показать поле `watchdog.state` | §6.3, §6.4 + чек-лист §9.2 |
+| Что делает кнопка UI | `onclick` → JS-функция главного `<script>` `XKEEN_TEMPLATE` → `fetch('/api/…')` → §4 (`architecture/04-routes.md`) |
+| Новый ключ `watchdog.config` | §6.2 (`architecture/06-watchdog.md`) + чек-лист §9.3 |
+| Показать поле `watchdog.state` | §6.3, §6.4 (`architecture/06-watchdog.md`) + чек-лист §9.2 |
 | Логика переключения каналов | `bootstrap/watchdog.sh.cur`, не Python (§6.6); поднять версию (§6.5) |
-| Новая роль / цепочка | §7.1, §7.4 |
+| Новая роль / цепочка | §7.1, §7.4 (`architecture/07-chains.md`) |
 | Новый блок или карточка на `/xkeen` | §8.6 |
 | Эндпоинт, пишущий на роутер | §5.2, §9 (fail-closed; бэкап → запись → откат) |
 | Проверка в «🚑 Диагностике» | `api_xkeen_diagnose` + `XKEEN_AUTO_FIXES` + ветка `api_xkeen_auto_fix` (§3.10) |
@@ -92,7 +96,7 @@ pythonw не сохраняется. Разработка: `start.bat` (конс
 | `release.ps1`, `release_notes_footer.md` | релиз (§11), футер release notes |
 | `portable/build.bat`, `portable/config.ini.template` | portable-exe (PyInstaller), шаблон `config.ini` |
 | `.github/workflows/release-archives.yml`, `.github/ISSUE_TEMPLATE/*` | архивы-ассеты к релизу, шаблоны issue |
-| `docs/*.png`, `docs/ARCHITECTURE.md` | скриншоты README; этот документ |
+| `docs/*.png`, `docs/ARCHITECTURE.md`, `docs/architecture/*.md` | скриншоты README; этот документ и его справочники (§4, §6, §7, журнал) |
 | `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `THIRD-PARTY-NOTICES.md`, `LICENSE` | публичная документация («Архитектура» в `CONTRIBUTING.md` устарела) |
 | `.gitattributes`, `.gitignore`, `icons8-favicon-64.png` | переводы строк (§9.5), исключения, иконка |
 
@@ -377,116 +381,15 @@ fix_explain)`):
 
 ---
 
-## 4. Реестр маршрутов
+## 4. Реестр маршрутов → [`docs/architecture/04-routes.md`](architecture/04-routes.md)
 
-91 декоратор `@app.route` на 90 функциях; все, кроме «без auth», под `requires_auth`. «Роутер»:
-`—` не трогает; `R` чтение по SSH; `W: …` запись (бэкап `.bak-<ts>`, если не оговорено); `⟳` явный
-`xkeen -restart`; `WD` — `keenetic_write_watchdog_config` (config + внеочередной `watchdog.sh`,
-который может перегенерировать routing и перезапустить xkeen, + авто-обновление `watchdog.sh`);
-`ndm` — `ndmc`/RCI + `system configuration save`.
-
-### 4.1. Страницы, служебные, состояние
-
-| Путь | Методы | Функция | Что делает | Роутер |
-|---|---|---|---|---|
-| `/login`, `/logout` | GET,POST; GET | `login`, `logout` | вход/выход (без auth) | — |
-| `/favicon.ico`, `/favicon.png` | GET | `favicon` | иконка (без auth) | — |
-| `/` | GET | `index` | мониторинг локального xray | — |
-| `/api/state` | GET | `api_state` | фрагмент `#dynamic` | — |
-| `/api/tail` | GET | `api_tail` | `?log=access/error&n=` | — |
-| `/sub/<token>` | GET | `subscription` | base64 от `cfg.PROFILES[*].url` + `Profile-*`/`Subscription-Userinfo`; токен = пароль (без auth) | — |
-| `/xkeen` | GET | `xkeen_page` | главный экран (§3.6) | R (~11 SSH) |
-| `/api/xkeen/state` | GET | `api_xkeen_state` | `{outbounds, routing, watchdog}` | R |
-| `/api/xkeen/debug` | GET | `api_xkeen_debug` | сырой/разобранный state и config | R |
-| `/api/xkeen/header-status` | GET | `api_xkeen_header_status` | индикатор шапки, кэш 30 с | R |
-| `/api/xkeen/probe-status` | GET,POST | `api_xkeen_probe_status` | handshake-проба, `?force=1` (по умолчанию) / `0` — кэш | R |
-| `/api/xkeen/dashboard-health` | GET | `api_xkeen_dashboard_health` | LISTEN на :5000 | — |
-| `/api/xkeen/restart-dashboard` | POST | `api_xkeen_restart_dashboard` | перезапуск задачи | — |
-
-### 4.2. Outbound'ы, подписки, мета (все POST, кроме GET `orphan-sub-meta`)
-
-| Путь | Функция | Параметры | Роутер |
-|---|---|---|---|
-| `/api/xkeen/add` | `api_xkeen_add` | `payload` (vless:// или JSON), `tag`, `overwrite`, `sub_url`, `note` | W: `04_outbounds.json` ⟳ откат, `outbound_meta.json`, IP в template |
-| `/api/xkeen/remove` | `api_xkeen_remove` | `tag` | то же |
-| `/api/xkeen/remove-bulk` | `api_xkeen_remove_bulk` | `tags` (одна транзакция, `skipped`) | то же |
-| `/api/xkeen/remove-subscription` | `api_xkeen_remove_subscription` | `key` (sub_url или pbk) | WD, W: `04_outbounds.json` ⟳, `subscription_meta.json` |
-| `/api/xkeen/subscription-preview` | `api_xkeen_subscription_preview` | `url` (ничего не пишет) | R + HTTP с ПК |
-| `/api/xkeen/subscription-sync` | `api_xkeen_subscription_sync` | `url`, `add_new`, `remove_orphans`, `update_expires`, `overwrite_expires`, `add_tags` | W: `04_outbounds.json` ⟳ откат, WD, обе meta |
-| `/api/xkeen/meta` | `api_xkeen_meta` | `tag` + имя/заметка | W: `outbound_meta.json` (без бэкапа) |
-| `/api/xkeen/sub-meta` | `api_xkeen_sub_meta` | `pbk` (историческое имя ключа группы), `name`, `note`, `expires_at`, `sub_url` | W: `subscription_meta.json` (без бэкапа) |
-| `/api/xkeen/orphan-sub-meta` | `api_xkeen_orphan_sub_meta` | — | R |
-| `/api/xkeen/remove-orphan-sub-meta` | `api_xkeen_remove_orphan_sub_meta` | — | W: `subscription_meta.json` |
-
-### 4.3. Роли, режим, домены, категории, цепочки (все POST, кроме GET `get-domain-notes`)
-
-| Путь | Функция | Параметры → ключ config | Роутер |
-|---|---|---|---|
-| `/api/xkeen/set-target/<role>` | `api_xkeen_set_target` | role primary/failover/ai/yt/foreign/ipv6, `tag` (пусто снимает ai/yt/foreign/ipv6) | WD |
-| `/api/xkeen/watchdog/<mode>` | `api_xkeen_watchdog` | primary/failover/auto → `FORCE_MODE` | WD |
-| `/api/xkeen/set-failover-chain` | `api_xkeen_set_failover_chain` | `tags` через запятую (≥ 1) → `FAILOVER_TAGS` | WD |
-| `/api/xkeen/set-channel-chain` | `api_xkeen_set_channel_chain` | `kind` ai/yt/foreign, `tags`, опц. `allow_ru`, `use_common` (foreign) | R + WD |
-| `/api/xkeen/set-{direct,block,ai,yt,foreign}-domains` | `api_xkeen_set_{direct,block,ai,yt,foreign}_domains` | `domains` → `*_DOMAINS` | WD |
-| `/api/xkeen/set-ipv6-domains` | `api_xkeen_set_ipv6_domains` | `domains` или `action=add/remove` + `domain` | WD + ndm (`ip host <d> 198.18.0.1`) |
-| `/api/xkeen/set-{ai,yt,foreign}-fail-block` | `api_xkeen_set_{ai,yt,foreign}_fail_block` | `enabled=1/0` → `*_FAIL_BLOCK` | WD |
-| `/api/xkeen/set-{ai,yt,foreign}-ext-categories` | `api_xkeen_set_{ai,yt,foreign}_ext_categories` | `categories` → `*_EXT_CATEGORIES` (проверка geosite) | R + WD |
-| `/api/xkeen/set-foreign-geoip-categories`, `set-yt-geoip-categories` (совместимость) | `api_xkeen_set_foreign_geoip_categories`, `api_xkeen_set_yt_geoip_categories` | `categories` → `*_GEOIP_CATEGORIES` (проверка geoip) | R + WD |
-| `/api/xkeen/set-ai-ip-ranges` | `api_xkeen_set_ai_ip_ranges` | `ranges` (CIDR) → `AI_IP_RANGES` | WD |
-| `/api/xkeen/get-domain-notes`, `set-domain-notes` | `api_xkeen_get_domain_notes`, `api_xkeen_set_domain_notes` | примечания к доменам по каналам | R / W: `domain_notes.json` |
-
-### 4.4. Kill-switch, WireGuard, клиенты политики
-
-| Путь | Методы | Функция | Что делает | Роутер |
-|---|---|---|---|---|
-| `/api/xkeen/killswitch-status` | GET | `api_xkeen_killswitch_status` | состояние, утечки; `?heal=1` | R (W при heal) |
-| `/api/xkeen/killswitch-preview` | GET | `api_xkeen_killswitch_preview` | текст хука | R |
-| `/api/xkeen/killswitch-apply` | POST | `api_xkeen_killswitch_apply` | `mode` protect/observe | W: хук + cron |
-| `/api/xkeen/killswitch-remove` | POST | `api_xkeen_killswitch_remove` | снять всё | W |
-| `/api/xkeen/wg-interfaces` | GET | `api_wg_interfaces` | WG-интерфейсы, WAN, LAN-IP | R |
-| `/api/xkeen/wg-client-conf` | POST | `api_wg_client_conf` | текст `.conf` | R |
-| `/api/xkeen/wg-clients` | GET | `api_wg_clients` | выданные (реестр + где на роутере), свободный слот, пресеты | R |
-| `/api/xkeen/wg-issue` | POST | `api_wg_issue` | `name`, `exit`, `full`, `services`, `extra`, `s2s`, `remote_lan`, `create` → `.conf`, QR, серверный `.conf`, CLI | ndm, W: netfilter.d (подмена, заворот), crontab |
-| `/api/xkeen/wg-revoke` | POST | `api_wg_revoke` | `id` записи реестра | ndm, W: netfilter.d, crontab |
-| `/api/xkeen/wg-router` | GET | `api_wg_router` | инвентарь WG + `orphan_hooks` | R |
-| `/api/xkeen/wg-backup` | GET | `api_wg_backup` | `?iface=WireguardN` → текст-вложение | R |
-| `/api/xkeen/wg-connect`, `wg-disconnect`, `wg-cleanup-orphan` | POST | `api_wg_connect`, `api_wg_disconnect`, `api_wg_cleanup_orphan` | хук `zz_wg_xray_<iface>.sh` + cron self-heal | W: netfilter.d, crontab |
-| `/api/xkeen/wg-acl`, `wg-acl-apply` | GET; POST | `api_wg_acl_get`, `api_wg_acl_apply` | форма правил (`rules_form`: `current`, `pre`, `warnings`); `iface_id`, `exit`, `full`, `services`, `extra` → access-list, NAT, подмена, заворот по итоговому режиму; линк — отказ | R / ndm, W: netfilter.d, crontab |
-| `/api/xkeen/policy-clients` | GET | `api_xkeen_policy_clients` | клиенты, политики, порты, `.lst` | R |
-| `/api/xkeen/set-client-policy` | POST | `api_xkeen_set_client_policy` | `mac`, `policy` | ndm |
-| `/api/xkeen/flush-conntrack` | POST | `api_xkeen_flush_conntrack` | `ip` | `conntrack -D` или ndm |
-| `/api/xkeen/install-conntrack-tools` | POST | `api_xkeen_install_conntrack_tools` | opkg | W |
-
-### 4.5. Template, структура, бэкапы, настройки, CLI, диагностика
-
-| Путь | Методы | Функция | Что делает | Роутер |
-|---|---|---|---|---|
-| `/api/xkeen/routing-template-rules` | GET | `api_xkeen_routing_template_rules` | базовые правила template | R |
-| `/api/xkeen/sync-template-ips` | POST | `api_xkeen_sync_template_ips` | preview; `apply=1`; `restart=1` | W: template; ⟳ при `restart=1` |
-| `/api/keenetic/sync-structure` | POST | `api_keenetic_sync_structure` | «⚙ Применить структуру» | W ⟳ откат |
-| `/api/keenetic/bootstrap-preview` | GET | `api_keenetic_bootstrap_preview` | план развёртывания | R |
-| `/api/keenetic/bootstrap-apply` | POST | `api_keenetic_bootstrap_apply` | `{keys, overwrite_existing}` | W, прогон watchdog, ⟳ |
-| `/api/xkeen/backup` | GET | `api_xkeen_backup` | снапшот v7 файлом | R |
-| `/api/xkeen/backup-to-disk` | POST | `api_xkeen_backup_to_disk` | снапшот в `<base>/backups/` | R |
-| `/api/xkeen/migration-backup` | POST | `api_xkeen_migration_backup` | tar `/opt` → `scp -O` | W: временный архив |
-| `/api/xkeen/restore` | POST | `api_xkeen_restore` | файл `snapshot` (v7/v6) | W ⟳ |
-| `/api/keenetic/settings` | GET,POST | `api_keenetic_settings` | override'ы (пусто = снять) | — |
-| `/api/keenetic/test-connection` | POST | `api_keenetic_test_connection` | SSH с переданными параметрами | R |
-| `/api/keenetic/tg-settings` | GET,POST | `api_keenetic_tg_settings` | `{token, chat_id}` | R / WD |
-| `/api/keenetic/watchdog-settings` | GET,POST | `api_keenetic_watchdog_settings` | сквозная проба (§7.6) | R / WD |
-| `/api/keenetic/tg-test` | POST | `api_keenetic_tg_test` | тест с роутера | R |
-| `/api/keenetic/repair-tg-channel` | POST | `api_keenetic_repair_tg_channel` | self-heal канала алертов | W ⟳ откат |
-| `/api/xkeen/cmd` | POST | `api_xkeen_cmd` | `cmd` ∈ `XKEEN_COMMANDS` | по команде |
-| `/api/xkeen/diagnose` | GET | `api_xkeen_diagnose` | 13 проверок | R |
-| `/api/xkeen/auto-fix` | POST | `api_xkeen_auto_fix` | `fix_id` ∈ `XKEEN_AUTO_FIXES` | по ветке |
-| `/api/diagnose/site` | GET | `api_diagnose_site` | `?url=` — проба с ПК | — |
-| `/api/xkeen/iphost` | GET,POST | `api_xkeen_iphost` | `ip host`; `domain`, `action` | ndm |
-| `/api/xkeen/test-socks` | GET,POST | `api_xkeen_test_socks` | статус; `action=remove` | W ⟳ при remove |
-| `/api/xkeen/dat-categories` | GET | `api_xkeen_dat_categories` | категории в routing, `.dat` | R |
-| `/api/xkeen/dat/lookup` | GET | `api_xkeen_dat_lookup` | поиск по `.dat` | R |
-| `/api/xkeen/dat/refresh-cache` | POST | `api_xkeen_dat_refresh` | перекачать кэш | R |
-| `/api/xkeen/dat/cache-status` | GET | `api_xkeen_dat_cache_status` | кэш vs роутер | R |
-
----
+Все `@app.route` (91) по группам: метод, функция, что делает, что трогает на роутере (`—` / `R` / `W` / `⟳` /
+`WD` / `ndm`). Подразделы:
+- 4.1. Страницы, служебные, состояние
+- 4.2. Outbound'ы, подписки, мета (все POST, кроме GET `orphan-sub-meta`)
+- 4.3. Роли, режим, домены, категории, цепочки (все POST, кроме GET `get-domain-notes`)
+- 4.4. Kill-switch, WireGuard, клиенты политики
+- 4.5. Template, структура, бэкапы, настройки, CLI, диагностика
 
 ## 5. Роутер: файлы, пути, SSH-слой
 
@@ -547,265 +450,28 @@ fix_explain)`):
 
 ---
 
-## 6. watchdog: панель ↔ watchdog.config ↔ watchdog.sh ↔ watchdog.state
+## 6. watchdog → [`docs/architecture/06-watchdog.md`](architecture/06-watchdog.md)
 
-Движок переключений живёт **на роутере** — `/opt/etc/xray/watchdog.sh` (эталон
-`bootstrap/watchdog.sh.cur`, BusyBox ash, cron раз в минуту). Панель пишет его конфиг, раскатывает
-версии и показывает состояние.
+Движок переключений живёт **на роутере** — `/opt/etc/xray/watchdog.sh` (эталон `bootstrap/watchdog.sh.cur`,
+BusyBox ash, cron раз в минуту); панель пишет его конфиг, раскатывает версии и показывает состояние.
+Подразделы:
+- 6.1. Связка
+- 6.2. Ключи watchdog.config, которыми управляет панель
+- 6.3. watchdog.state — полный перечень полей
+- 6.4. Как панель показывает состояние
+- 6.5. Автосинк watchdog.sh по номеру версии
+- 6.6. Тик watchdog.sh
 
-### 6.1. Связка
+## 7. Каналы и цепочки резерва → [`docs/architecture/07-chains.md`](architecture/07-chains.md)
 
-```
-UI → POST (§4.3, §4.5) → keenetic_write_watchdog_config(updates)
-  [_WATCHDOG_CFG_LOCK] keenetic_ensure_watchdog_current() → keenetic_read_watchdog_config() (None → отказ)
-                       → дефолты отсутствующих ключей → update → _build_watchdog_config()
-                       → cp .bak-<ts> → cat > watchdog.config
-  [вне лока]           ssh /opt/etc/xray/watchdog.sh (timeout 30) — внеочередной тик
-cron */1 → watchdog.sh: . watchdog.config → пробы → state-машина → generate_routing → проверки
-         → mv 05_routing.json → xkeen -restart → health_check → watchdog.state / .log / .aiprobe
-/xkeen → keenetic_get_watchdog_targets() → targets.*   keenetic_get_watchdog() → watchdog.*
-```
-
-Тики сериализует `/tmp/xkeen_watchdog.lock`, сохранения — `_WATCHDOG_CFG_LOCK`. Запись = внеочередной
-тик ~30 с → связанные изменения писать **одним** вызовом.
-
-### 6.2. Ключи watchdog.config, которыми управляет панель
-
-Файл — shell (`KEY="value"`, подключается `. "$CFG"`). `_build_watchdog_config` пишет все ключи
-`keys_order` в этом порядке (нет ключа → `KEY=""`), затем прочие ключи файла (не теряются; комментарии
-при «Сохранить» пропадают). «Дефолт» — значение `watchdog.sh` при пустом ключе; оно же в
-`DEFAULT_WATCHDOG_CONFIG` и в дефолтах записи, если не оговорено. «Явно» — запись ставит число, если пусто.
-
-| Ключи (порядок `keys_order`) | Дефолт / особенности | Кто пишет | `targets` |
-|---|---|---|---|
-| `PRIMARY_TAG` | пусто → routing берёт `direct`; запись без ключа — legacy `vless-reality` | set-target/primary | `primary_tag` |
-| `FAILOVER_TAGS` | `""`; запись без ключа — legacy `provider-a-nl` | set-target/primary, /failover, set-failover-chain, sync, remove-subscription | `failover_tags`, `failover_tag` |
-| `AI_TAG` | `""`; запись без ключа — `provider-a-nl` | set-target/ai | `ai_tag` |
-| `AI_DOMAINS`, `AI_EXT_CATEGORIES`, `AI_IP_RANGES` | bootstrap: домены с гео-сервисами для AI-пробы, CIDR AI-провайдеров | set-ai-domains, -ext-categories, -ip-ranges | `ai_domains`, `ai_ext_categories`, `ai_ip_ranges` |
-| `AI_FAIL_BLOCK` | `1`; записью не дефолтится | set-ai-fail-block | `ai_fail_block` (нет → True) |
-| `AI_FAILOVER_TAGS`, `AI_CHAIN_ALLOW_RU` | `""`, `0` явно | set-channel-chain kind=ai | `ai_failover_tags`, `ai_chain_allow_ru` |
-| `YT_TAG`, `YT_DOMAINS`, `YT_EXT_CATEGORIES` | `""`; bootstrap: домены YouTube | set-target/yt, set-yt-* | `yt_tag`, `yt_domains`, `yt_ext_categories` |
-| `YT_GEOIP_CATEGORIES` | watchdog очищает сам (v23), UI нет | set-yt-geoip-categories | `yt_geoip_categories` |
-| `YT_FAIL_BLOCK` | `0` | set-yt-fail-block | `yt_fail_block` (нет → **True**, §9.3) |
-| `YT_FAILOVER_TAGS`, `YT_CHAIN_ALLOW_RU` | `""`, `1` явно | set-channel-chain kind=yt | `yt_failover_tags`, `yt_chain_allow_ru` |
-| `FOREIGN_TAG`, `FOREIGN_DOMAINS`, `FOREIGN_EXT_CATEGORIES`, `FOREIGN_GEOIP_CATEGORIES` | `""` | set-target/foreign, set-foreign-* | `foreign_tag`, `foreign_domains`, `foreign_ext_categories`, `foreign_geoip_categories` |
-| `FOREIGN_FAIL_BLOCK` | `0` | set-foreign-fail-block | `foreign_fail_block` |
-| `FOREIGN_FAILOVER_TAGS`, `FOREIGN_CHAIN_ALLOW_RU`, `FOREIGN_CHAIN_USE_COMMON` | `""`, `0`, `0` (флаги явно) | set-channel-chain kind=foreign | `foreign_failover_tags`, `foreign_chain_allow_ru`, `foreign_chain_use_common` |
-| `IPV6_TAG`, `IPV6_DOMAINS` | `""` | set-target/ipv6, set-ipv6-domains | `ipv6_tag`, `ipv6_domains` |
-| `DIRECT_DOMAINS`, `BLOCK_DOMAINS` | `""` | set-direct-/set-block-domains | `direct_domains`, `block_domains` |
-| `PRIMARY_PROBE_URL` | пусто → TCP-проба; запись без ключа — `https://<vpn-domain>:8444/` | set-target/primary (для `vless-reality` URL, иначе пусто) | — |
-| `FAIL_THRESHOLD`, `PASS_THRESHOLD` | `2`, `3` (`_num`) | только вручную | — |
-| `DEEP_PROBE_ENABLE`, `DEEP_PROBE_INTERVAL`, `DEEP_PROBE_THRESHOLD`, `DEEP_RETURN_HOLD` | `1`, `180` с, `2`, `1800` с — все явно | watchdog-settings | `deep_probe_enable`, `deep_probe_interval`, `deep_probe_threshold`, `deep_return_hold` |
-| `TG_BOT_TOKEN`, `TG_CHAT_ID` | пусто → алерты выключены | tg-settings | — |
-| `FORCE_MODE` | `auto` | watchdog/&lt;mode&gt; | `force_mode` |
-
-В `targets` числа санитизируются (`_wd_int`), списки режутся по `[,\s]+`, у `*_CHAIN_ALLOW_RU` и
-`DEEP_PROBE_ENABLE` пусто = дефолт watchdog.
-
-**Только в watchdog.sh** (UI нет; добавленные руками сохраняются хвостом): `AI_PROBE_PORT` (10818),
-`AI_PROBE_INTERVAL` (600), `AI_PROBE_ALERT_COOLDOWN` (3600), `AI_PROBE_BAD_COUNTRIES`,
-`AI_DEAF_THRESHOLD` (3), `AI_DEAF_AUTORESTART` (1), `AI_RETURN_HOLD` (1800),
-`AI_/YT_/FOREIGN_CHAIN_ROUNDS` (2), `AI_/YT_/FOREIGN_CHAIN_SWITCH_COOLDOWN` (300),
-`DEEP_PROBE_PORT_PRI/YT/FGN` (10819–10821), `DEEP_PROBE_URL_PRI/YT/FGN` (cloudflare trace, youtube
-`generate_204`, `api.telegram.org`), `KILL_FAIL_THRESHOLD`/`KILL_PASS_THRESHOLD` (3/2), `RECVQ_THRESHOLD`,
-`RECVQ_HARD`, `STALL_FAIL_NEED`, `STALL_COOLDOWN`, `CONNTRACK_MIN`, `FD_DELTA_THRESHOLD`,
-`FD_STALL_COOLDOWN`.
-
-### 6.3. watchdog.state — полный перечень полей
-
-Одна строка, пишется в конце тика (`# ---------- Save state ----------`):
-
-```
-<state> <counter> <default_tag> EFFECTIVE_AI= EFFECTIVE_YT= EFFECTIVE_FOREIGN= LAST_FULL_PROBE= PREV_ALIVE=
-LAST_BAD_MD5= AI_BLOCKED= AI_KCTR= YT_BLOCKED= YT_KCTR= FOREIGN_BLOCKED= FOREIGN_KCTR= AI_EFF= DEEP_CTR= DEEP_TS=
-AI_CMISS= AI_SW_TS= AI_LEFT_TS= YT_EFF= YT_CMISS= YT_SW_TS= FGN_EFF= FGN_CMISS= FGN_SW_TS=
-DPRI_CTR= DPRI_TS= DPRI_DEAF= DPRI_LEFT= DPRI_TAG= DYT_CTR= DYT_TS= DYT_DEAF= DYT_LEFT= DYT_TAG=
-DFGN_CTR= DFGN_TS= DFGN_DEAF= DFGN_LEFT= DFGN_TAG=
-+ v31: D{PRI,YT,FGN}_RES= PRI_MAIN= YT_MAIN= FGN_MAIN= DPRI_FSINCE= PRI_NOALT= DYT_NOALT= DFGN_NOALT=
-```
-(точный порядок — строка `echo "$NEW_STATE …` в `.cur`).
-
-| Поле | Смысл |
-|---|---|
-| позиции 1–3 | `primary`/`failover` (`unknown` в панели без файла); подряд-проб к порогу; действующий default |
-| `EFFECTIVE_AI`/`_YT`/`_FOREIGN` | применённый тег канала: свой, резерв, `block` или пусто |
-| `LAST_FULL_PROBE`, `PREV_ALIVE` | обход FAILOVER раз в 300 с и число живых (алерт при ≤ 2) |
-| `LAST_BAD_MD5` | md5 кандидата routing, уже ронявшего сеть (анти-флап) |
-| `AI_/YT_/FOREIGN_BLOCKED`, `…_KCTR` | латч kill-switch канала и счётчик гистерезиса |
-| `AI_EFF`, `YT_EFF`, `FGN_EFF` | дубли `EFFECTIVE_*` под короткими именами |
-| `DEEP_CTR`, `DEEP_TS` | legacy v27, переносятся как есть |
-| `AI_/YT_/FGN_CMISS`, `…_SW_TS`, `AI_LEFT_TS` | пустые круги цепочки; время смены канала; уход AI по глухоте |
-| `D{PRI,YT,FGN}_CTR/_TS/_DEAF/_LEFT/_TAG` | сквозная проба роли: пустых подряд; время пробы; латч глухоты; время ухода по глухоте; тег замера |
-| `D{PRI,YT,FGN}_RES` (v31) | итог последнего замера: `ok` / `fail` / `none` (замера на этом теге не было, служебный тег, проба выключена) |
-| `PRI_MAIN`, `YT_MAIN`, `FGN_MAIN` (v31) | основной тег роли на прошлом тике: если в настройках сменили основной — карантин `D*_LEFT` обнуляется, лог «сменён в настройках (A → B)», без TG «вернулся» |
-| `PRI_NOALT`, `DYT_NOALT`, `DFGN_NOALT`, `DPRI_FSINCE` (v31) | «предупреждение о том, что уходить некуда, уже отправлено» (один TG за эпизод); с какого момента форсируется failover глухого основного (лог раз в 5 мин) |
-
-Имена не симметричны (kill-switch «Зарубежных» — `FOREIGN_*`, прочее — `FGN_*`/`DFGN_*`) — брать из
-строки записи в `.cur`. Разбор только по токенам (`split()` + `split("=", 1)`): `EFFECTIVE_AI=` и
-`AI_EFF=` — разные ключи. `watchdog.aiprobe` — `ts|country|last_alert|empty|stage`.
-
-Метки `watchdog.log`: `SWITCH`, `FAILOVER-HEALTH`, `AI-`/`YT-`/`FOREIGN-FAILOVER` (+ `-RETURN`),
-`…-KILL-SWITCH` (+ `-CLEAR`), `DEEP-PROBE` (`DEAF`, `RECOVER`), `XRAY-TEST FAIL`, `HEALTH FAIL`,
-`AUTO-ROLLBACK`, `SKIP (анти-флап)`, `UDP-STALL`, `FD-STALL`, `AUTO-FIX`, `WARN`, `ERROR`. Долгие
-состояния пишутся раз в 5 мин (`_log_every5`), иначе окно «последние 30 строк» забьётся.
-
-### 6.4. Как панель показывает состояние
-
-`keenetic_get_watchdog(deep_hold_sec)` — один SSH (`cat watchdog.state; echo '=AIPROBE='; cat
-watchdog.aiprobe`) + `keenetic_tail_log(…, n=30)` → `state`, `counter`, `current_default`,
-`effective_ai`, `effective_yt`, `effective_foreign`, `last_bad_md5`, `log`, `ai_probe` (`{ts, country,
-empty, stage, age_min}`/`None`), `fields` (все `KEY=VAL`), `deep` (`{pri, yt, fgn}`: `{ctr, ts, deaf,
-left, tag, age_min, hold_left_min}` или `None` у роли без полей — старый watchdog), `fgn_eff`, `yt_eff`,
-`ai_eff`. Те же ключи — в quick-fail литерале. В шаблоне: баннер режима (`.wd-state`), Jinja-статусы
-kill-switch, «📋 Лог watchdog», JS-константы (§8.4). `api_xkeen_state`/`api_xkeen_debug` отдают тот же
-словарь, но страница их не опрашивает — обновление только перезагрузкой.
-
-### 6.5. Автосинк watchdog.sh по номеру версии
-
-- Версия — первое совпадение `watchdog\s+v(\d+)` в первых **40** строках (`_parse_watchdog_version`).
-  Заголовок `.cur`: `# XKeen failover watchdog vNN (дата, суть)`, история ниже — **новую версию писать
-  в самый верх**. Template: `template\s+v(\d+)` в первых **5** строках (`_parse_template_version`).
-- `keenetic_ensure_watchdog_current()` — в начале **каждой** `keenetic_write_watchdog_config`, в
-  sync-structure и repair-tg-channel. Условие: на роутере **строго меньше**. Проверка — только `sh -n`.
-  Результат `current`/`upgraded`/`skip`/`failed`; при сбое старый watchdog не трогается.
-- Template автосинком **не** обновляется — только «⚙ Применить структуру». Баннер «структура отстала» —
-  `_structure_drift_status()` (`outdated` = remote > 0 и local > remote).
-
-> 🔴 **Правишь `bootstrap/watchdog.sh.cur` — поднимай версию** в первой строке заголовка и добавляй
-> историю сверху. Без новой версии правка не дойдёт ни до одного роутера; с новой — уйдёт при первом
-> «Сохранить» с боевой панели, поэтому поднимать после проверки (§10). Новые ключи / поля —
-> синхронно в §6.2/§6.3 и в Python (§9.2, §9.3).
-
-### 6.6. Тик watchdog.sh
-
-Порядок разделов `.cur`: lock → помощники (`_probe_connected`, `probe_tag`, `_num`, `is_ru_tag`, `killswitch_decide`,
-`_state_field`, `_log_every5`, `deep_probe_check`, `tg_alert`, `generate_routing`, `routing_changed`,
-`validate_routing_xray`, `health_check`) → досыл TG → UDP-залип (v19) → `53` в `port_exclude.lst` (v21)
-→ очистка `YT_GEOIP_CATEGORIES` (v23) → self-heal `socks-ai-check` (v24) → параметры v27/v29/v30 →
-self-heal `socks-deep-*` (v29) → fd-залип (v22) → AI-проба (v24/v25) → State → Force-mode → проба
-PRIMARY и state-машина (глухота `DPRI_DEAF` форсирует down) → AI → YT → FOREIGN (kill-switch +
-цепочки) → Apply (`generate_routing <default> <ai> <yt> <foreign> <ipv6>` → `routing_changed` →
-анти-флап → `validate_routing_xray` → `mv` → `xkeen -restart` → `health_check` → `.lastgood` или
-`AUTO-ROLLBACK`) → обход FAILOVER → Save state.
-
-**`probe_tag` (TCP-проба узла, v32).** curl на `https://host:port/` (или `PRIMARY_PROBE_URL`): код 7 →
-мёртв; код 28 (таймаут) → мёртв **только** при `%{num_connects}` = 0 (`_probe_connected`); прочие коды
-→ жив. Проба — не VLESS: Reality отдаёт её сайту-маскировке (`dest`), и сторонний `dest` может молчать
-при живом узле (до v32 это давало ложные уходы на резерв и лишние `xkeen -restart`). 🔴
-`%{time_connect}` как признак соединения не годится: при таймауте на этапе TLS curl пишет 0 и для
-установленного TCP. Тест — `tests/test_probe_tag.py`.
-
-Плейсхолдеры template: `__DEFAULT_TAG__`, `__BLOCK_RULE_BLOCK__`, `__DIRECT_RULE_BLOCK__`,
-`__AI_RULE_BLOCK__`, `__YT_RULE_BLOCK__`, `__YT_RULE_GEOIP__`, `__FOREIGN_RULE_BLOCK__`,
-`__FOREIGN_RULE_GEOIP__`, `__IPV6_RULE_BLOCK__` (пусто → правило не генерится). Правила для
-`socks-ai-check` и `socks-deep-*` watchdog вставляет сам.
-
----
-
-## 7. Каналы и цепочки резерва
-
-### 7.1. Роли
-
-| Роль | Ключи | Действующий тег | Kill-switch | Цепочка (RU по умолч.) | Сквозная проба | UI (`id`) |
-|---|---|---|---|---|---|---|
-| PRIMARY / FAILOVER | `PRIMARY_TAG`, `FAILOVER_TAGS`, `PRIMARY_PROBE_URL` | state поз. 3 | — | `FAILOVER_TAGS` | `DPRI_*` | `select-primary`, `info-primary`, `select-failover`, `info-failover`, `failover-active-label`, `deep-pri-note`, `failover-chain` |
-| AI | `AI_TAG`, `AI_DOMAINS`, `AI_EXT_CATEGORIES`, `AI_IP_RANGES` | `EFFECTIVE_AI` | `AI_FAIL_BLOCK` (1) | `AI_FAILOVER_TAGS` (нет) | AI-проба страны | `select-ai`, `info-ai`, `info-ai-active`, `ai-chain-*`, `ai-fail-block-toggle` |
-| YouTube | `YT_TAG`, `YT_DOMAINS`, `YT_EXT_CATEGORIES` | `EFFECTIVE_YT` | `YT_FAIL_BLOCK` (0) | `YT_FAILOVER_TAGS` (да) | `DYT_*` | `select-yt`, `info-yt`, `info-yt-active`, `yt-chain-*`, `yt-fail-block-toggle` |
-| Зарубежные сервисы | `FOREIGN_TAG`, `FOREIGN_DOMAINS`, `FOREIGN_EXT_CATEGORIES`, `FOREIGN_GEOIP_CATEGORIES` | `EFFECTIVE_FOREIGN` | `FOREIGN_FAIL_BLOCK` (0) | `FOREIGN_FAILOVER_TAGS` или общая (нет) | `DFGN_*` | `select-foreign`, `info-foreign`, `info-foreign-active`, `foreign-chain-*`, `foreign-chain-use-common`, `foreign-fail-block-toggle` |
-| Через IPv6 | `IPV6_TAG`, `IPV6_DOMAINS` | — | — | — | — | `select-ipv6` |
-| DIRECT / BLOCK | `DIRECT_DOMAINS`, `BLOCK_DOMAINS` | — | — | — | — | секции `ds-direct`, `ds-block` |
-
-- **IPv6**: домены получают fake-IPv4 `198.18.0.1` (`ndmc ip host`); узел обязан иметь IPv6-egress и
-  `routeOnly:false`; `direct` и RU-узлы не годятся.
-- **AI**: `AI_DOMAINS` намеренно содержит гео-сервисы — по ним watchdog проверяет страну выхода; UI
-  красит рискованные варианты (`ai_risk`), `setRole` спрашивает подтверждение.
-- **GeoIP-категории** (IP-only клиенты) — только у «Зарубежных»; нужен расширенный `geoip.dat` с
-  `telegram` (`geoip_status`, auto-fix `install_extended_geoip`). Категории `discord` нет ни в одной
-  geoip-базе — Discord идёт доменами.
-- **Базовые правила template** из панели не редактируются (read-only блок «📐 Базовые правила
-  маршрутизации»).
-
-### 7.2. Цепочки резерва каналов
-
-- Порядок = приоритет; перебор всегда сверху; возврат на более приоритетный — не чаще
-  `*_CHAIN_SWITCH_COOLDOWN` (аварийный уход — сразу). Основной тег проверяется раньше и в цепочку не
-  входит. `block` — последняя мера: вся цепочка молчит `*_CHAIN_ROUNDS` кругов и включён `*_FAIL_BLOCK`.
-  Пустая цепочка = прежнее поведение.
-- `direct`/`block` в цепочке запрещены; лимит `CHANNEL_CHAIN_MAX` = 8.
-- RU-фильтр: `is_ru_tag()` в watchdog ≡ `wd_is_ru_tag()` в панели (вплоть до асимметрии «`Ru_` есть,
-  `Ru-` нет»). `chain_tag_info[tag]`: `ru_wd` (как увидит watchdog), `ru_look` (эвристика панели),
-  `anti_dpi`, `group`.
-- `api_xkeen_set_channel_chain`: словарь `_KINDS` (`label`, `key_chain`, `key_ru`, `key_main`,
-  `t_allow_ru`); дедуп; `targets` с `strict=True`; основной тег убирается; теги сверяются с
-  `keenetic_get_outbounds()`; **не пришедшие `allow_ru`/`use_common` не затираются** (так работает
-  `removeFromChannelChain`).
-- Общая цепочка `FAILOVER_TAGS`: `api_xkeen_set_failover_chain` (`saveFailoverChain`,
-  `pingFailoverChain`, `removeDeadFromChain`, `removeFromFailoverChain`, `bulkAddToChain`) и set-target.
-
-### 7.3. «Общая цепочка» у «Зарубежных» (`FOREIGN_CHAIN_USE_COMMON`)
-
-`=1` → watchdog подставляет `FOREIGN_FAILOVER_TAGS="$FAILOVER_TAGS"`, RU-фильтр по
-`FOREIGN_CHAIN_ALLOW_RU` действует и тут; собственный список хранится, но не действует. Чекбокс
-`foreign-chain-use-common` только перерисовывает (`chainRender('foreign')` → `chainRenderCommonView`:
-`foreign-chain-editor` гаснет, read-only `foreign-chain-common-view` из `WATCHDOG_FAILOVER_TAGS`);
-пишет «Сохранить цепочку» (`saveChannelChain('foreign')` шлёт `use_common`). `chainPositionOf` и
-Jinja-статус kill-switch берут действующий список. Теги собственного списка защищены от удаления и при
-use_common=1 — иначе при выключении галочки «проснётся» тег-зомби.
-
-### 7.4. Где учитывается членство в цепочках (менять синхронно)
-
-Удалённый тег, оставшийся в `*_FAILOVER_TAGS`, — **тег-зомби**: в аварии цепочка молча укоротится.
-Новая роль или цепочка — пройти всё:
-1. `keenetic_get_watchdog_targets` + quick-fail `targets`; `keys_order`, дефолты записи,
-   `DEFAULT_WATCHDOG_CONFIG`.
-2. `keenetic_remove_outbound` (блокирует любое членство) и `keenetic_remove_outbounds_bulk`
-   (`*_chain_set`, причина в `skipped`).
-3. `_subscription_removal_plan` (`critical`, `*_chain_tail`) + `keenetic_remove_subscription` (одна
-   запись config, `removed_from_*_chain`); `api_xkeen_subscription_sync` (pre-check, автоочистка).
-4. `xkeen_page`: `in_*_chain`, `*_chain_position`, `is_inactive`, `any_active` групп.
-5. Jinja: бейджи в `failover-chain` и «📋 Все outbounds» (`has_current`, «резерв … №N» +
-   `removeFromChannelChain(kind, tag)`), статус kill-switch карточки, условные тексты блокировки.
-6. JS: `CHAIN_STATE[kind]`, `chainPositionOf` (маппинг `roleLabel`), `chainRender`,
-   `saveChannelChain`, `DOMContentLoaded`, `refresh*Info`, `applyStatusesToMeta`.
-7. Help (`help-channels`) и `tests/test_v29_ui_offline.py`.
-
-### 7.5. Три разных «жив»
-
-| Что | Где меряется | Значит | Показ |
-|---|---|---|---|
-| Handshake-проба | панель: `probe_outbounds` → curl с роутера до `host:port` | порт узла отвечает | `VLESS_META[tag].status_*` → `getChannelStatusNote`, `_latencyBadge`, `refreshStatuses`, `probeChannelFromInfo` |
-| Сквозная проба | watchdog: `deep_probe_check` через `socks-deep-*` по **действующему** каналу | трафик идёт насквозь | `WATCHDOG_DEEP` → `deepProbeNote`, `renderDeepProbeSummary` |
-| AI-проба | watchdog: `socks-ai-check` → страна выхода | туннель AI жив, выход не в запрещённой стране | `WATCHDOG_AI_PROBE` → `aiThroughProbeNote` |
-
-Порт отвечает ≠ трафик идёт. `ok: None` / `stale` / `kind: ssh_fail` — «не смог проверить», не «мёртв»;
-авто-действия обязаны это различать.
-
-### 7.6. Сквозная проба (DEEP_PROBE, watchdog v29+)
-
-Inbound'ы `socks-deep-pri`/`-yt`/`-fgn` watchdog заводит сам и маршрутизирует на действующий канал
-роли (у AI — своя проба с v25). Раз в `DEEP_PROBE_INTERVAL` — запрос к цели, успех = любой HTTP-код.
-`DEEP_PROBE_THRESHOLD` пустых подряд → латч `D*_DEAF=1` (до успешной пробы) → PRIMARY форсирует
-failover, YouTube и «Зарубежные» уходят по цепочке; реакция ≈ интервал × порог. Смена канала роли
-сбрасывает счётчики; после ухода — карантин `DEEP_RETURN_HOLD`. UI: «🩺 Сквозная проба каналов» в
-карточке «🎯 Основное…» — форма `deep-probe-form` (`deep-probe-enable`, `deep-probe-interval`,
-`deep-probe-threshold`, `deep-return-hold-min`) → `saveDeepProbeSettings` → `POST
-/api/keenetic/watchdog-settings` JSON `{deep_probe_enable, deep_probe_interval, deep_probe_threshold,
-deep_return_hold_min}` → `_validate_deep_probe_settings` (`DEEP_PROBE_LIMITS`: 60–900 с, 1–5,
-5–1440 мин; карантин ×60) → `keenetic_write_watchdog_config`. GET — значения + `limits` (503 без
-config). Watchdog ≤ v28 полей `D*` не пишет → `deep[role] = None` → «нет данных».
-
-Поведение v31 (важно для текстов UI): в `block` роль уходит только при смерти основного по TCP
-(`*_BLOCKED=1`); основной лишь глух и живого резерва нет → роль остаётся на основном, одно
-предупреждение за эпизод, без `xkeen -restart` (иначе «качели» block ↔ глухой узел). Глухой основной без
-FAILOVER не форсирует failover. TG «переключаюсь на резерв» — только если у роли есть резерв (иначе «резерв
-не настроен»). Бейдж `deepProbeNote` — «⚪ не измеряется», когда `res == 'none'` (у старого watchdog без
-`*_RES` — по `ts == 0`, служебному тегу или выключенной пробе); подсказка «сторож переключит на резерв» —
-только при `deepRoleHasReserve(role)`. POST `/api/keenetic/watchdog-settings`: тело не объект или
-пустое → 400; отсутствующее поле — ключ не трогается. Дефолты `DEEP_*` при записи config ставятся только
-если `keenetic_ensure_watchdog_current()` вернул `current`/`upgraded` (старому watchdog v27/v28 нельзя
-включать его нерабочую пробу через `socks-local`).
-
----
+Роли (каналы), их цепочки резерва, «общая цепочка» «Зарубежных», где членство в цепочках учитывается
+(менять синхронно), что значит «жив», сквозная проба. Подразделы:
+- 7.1. Роли
+- 7.2. Цепочки резерва каналов
+- 7.3. «Общая цепочка» у «Зарубежных» (`FOREIGN_CHAIN_USE_COMMON`)
+- 7.4. Где учитывается членство в цепочках (менять синхронно)
+- 7.5. Три разных «жив»
+- 7.6. Сквозная проба (DEEP_PROBE, watchdog v29+)
 
 ## 8. Фронтенд `/xkeen` (`XKEEN_TEMPLATE`)
 
@@ -1074,17 +740,11 @@ git log -1 --format='%an <%ae>'       # под кем последний ком�
 - Репозиторий публичный: никаких личных адресов, доменов, имён, путей личных машин, токенов, chat id.
 - Проверка: каждый идентификатор существует (`grep -n` по `dashboard.py`, `.py`, `.cur`); счётчики
   (маршруты, проверки, темы справки, переменные шаблона) пересчитаны.
-- Объём держать ≤ ~80 КБ: детали — в коде и docstring'ах, здесь — карта и правила.
+- Объём главного файла держать ≤ ~80 КБ (его читают первым целиком): детали — в коде и docstring'ах, здесь —
+  карта и правила. Справочник, который разросся, — отдельным файлом в `docs/architecture/` с тем же номером §
+  и заглушкой здесь (заголовок, суть в 2–3 строки, ссылка, список подразделов); заглушку обновлять вместе с ним.
+- Строку в журнал — в `docs/architecture/changelog.md`.
 
-### Журнал изменений документа
+### Журнал изменений документа → [`docs/architecture/changelog.md`](architecture/changelog.md)
 
-| Дата | Изменение |
-|---|---|
-| 2026-10-03 | Создание. Описано рабочее дерево: панель на базе v1.1.3 с UI для watchdog v29/v30 (цепочка и «общая цепочка» «Зарубежных», сквозная проба ролей и её настройки, статус `geoip.dat` и его связь с `geoip_v2fly.dat`), `bootstrap/watchdog.sh.cur` v30, template v13; 87 маршрутов, 13 проверок диагностики, 6 офлайн-тестов. |
-| 2026-10-03 | Независимое ревью → watchdog v31 (поля `*_RES`, `*_MAIN`, `*_NOALT`, `DPRI_FSINCE`; §6.3, §7.6); SSH-слой: `stdin=DEVNULL` во всех запусках ssh/scp (§5.2); geoip: статус без скана файла, проверка telegram в фоне с кэшем по `(size, mtime)`, auto-fix делает `geoip.dat` симлинком на `geoip_v2fly.dat`, откат при падении xray, 2 бэкапа. |
-| 2026-10-10 | WG: форма «🔒 Правила» для доступа, созданного вручную, предзаполняется из текущих правил роутера (`prefill_from_acl`, `_rule_ports`, `_rule_net`; свой .1 в режиме xray не переносится), что модель панели не выражает — в `warnings` и блок «⚠ При применении» в `openRules`; в тесте 143 проверки. |
-| 2026-10-10 | WG: «Выданные» показывают и созданные вручную доступы (`manual_view`, поле `manual`); отозванные в списке не показываются (запись остаётся в реестре). |
-| 2026-10-10 | WG: кнопка выдачи неактивна, пока роутер не прочитан; автоповтор чтения (`setIssueReady`, `WG.retry`). |
-| 2026-10-10 | CSRF: `_csrf_origin_guard` (`before_request`) — изменяющие запросы с чужим `Origin`/`Referer` → 403, `cfg.TRUSTED_ORIGINS`; тест `test_csrf_offline.py`, офлайн-тестов 9. |
-| 2026-10-10 | WG-доступы: модуль `wg_clients.py` — выдача в один клик через RCI, правила по режиму выхода, NAT, хук подмены адреса WG → ЛВС, отзыв, инвентарь (§3.4а); раздел UI переделан в 4 подпункта + диалог правил; маршрут `wg-new-client` и редактор permit-строк удалены, `wg-acl`/`wg-acl-apply` — новая логика, +5 маршрутов (91); тест `test_wg_clients_offline.py`, офлайн-тестов 8. Дополнительные проверки: метка save после снятия заворота, возврат заворота при сорванном удалении, решение о завороте по итоговому режиму, предзаполнение режима по хуку, отказ выдачи без адреса подключения, снятие подмены со старыми LANNET/LANIF, `SESSION_COOKIE_SAMESITE=Lax`, снятие заворота у выключенного интерфейса. Проверка граничных случаев: хук подмены не создавался на роутере без хука (`echo END` в конце чтения), SSH-порт панели закрыт на своём .1, ЛВС при туннельном `KEENETIC_HOST` — с `br0`, кнопка бэкапа запросом; повторная проверка: ЛВС только с моста `brN`, без ЛВС запись останавливается, `wg_xray_connect` не выдаёт «поставлен» при незаписанном хуке; показ по догадке при неподтверждённой ЛВС; в тесте 115 проверок. |
-| 2026-10-09 | watchdog v32: `probe_tag` — таймаут curl при установленном TCP (`%{num_connects}`) больше не считается смертью узла (§6.6, помощник `_probe_connected`); тест `tests/test_probe_tag.py` (§10.3), офлайн-тестов 7. |
+Строка на каждую правку документа (дата, что изменилось) — таблица там.
