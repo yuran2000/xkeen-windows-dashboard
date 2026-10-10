@@ -1347,6 +1347,127 @@ def _reg_for_iface(info):
     return None, None
 
 
+def _rule_ports(r):
+    """Порт(ы) назначения правила RCI -> токен для «вручную» ('3389', '1560-1591') или '' (все порты)."""
+    port = str(r.get("destination-port", "") or "")
+    if not port:
+        return ""
+    end = str(r.get("destination-end-port", "") or "")
+    if r.get("dst-port-operator") == "range" and end and "-" not in port:
+        return f"{port}-{end}"
+    return port
+
+
+def _rule_net(r):
+    """Сеть назначения правила RCI -> ip_network (0.0.0.0 — «любой»). Не разобрана -> ValueError."""
+    dst = r.get("destination") or "0.0.0.0"
+    if dst == "0.0.0.0":
+        return ipaddress.ip_network("0.0.0.0/0")
+    bits = _mask2cidr(r.get("destination-mask", "")) if r.get("destination-mask") else 32
+    return ipaddress.ip_network(f"{dst}/{32 if bits is None else bits}", strict=False)
+
+
+def _port_key(tok):
+    return int(tok.split("-", 1)[0]) if tok.split("-", 1)[0].isdigit() else 0
+
+
+def prefill_from_acl(raw, exit_mode, own_ip=None):
+    """Доступ к ЛВС из ТЕКУЩИХ правил интерфейса (для подключений не из реестра) -> (services, full, extra,
+    warnings). Разрешения к хостам/сетям -> пресеты WG_SERVICES (точное совпадение хоста и портов) и строки
+    «IP[/маска][:порты]»; то, что модель панели не выражает, — в предупреждения (при применении заменится).
+    own_ip — адрес роутера в туннеле: в режиме xray разрешение к нему ставит сама панель (с закрытыми портами
+    управления), в «вручную» его переносить нельзя — встало бы выше запретов и открыло управление роутером."""
+    warnings = []
+    off = [r for r in raw if r.get("disable")]
+    if off:
+        warnings.append(f"выключенных правил: {len(off)} — при применении они будут удалены (панель включение/выключение "
+                        f"правил не переносит)")
+    lan = _lan()
+    try:
+        own = ipaddress.ip_network(f"{ipaddress.ip_interface(own_ip).ip}/32") if own_ip else None
+    except ValueError:
+        own = None
+    per = {}                     # сеть -> {"tcp": set(портов|''), "udp": set(...)}
+    wide, denies, after = [], [], {}          # after: запрет -> сети разрешений НИЖЕ него
+    for r in raw:
+        if r.get("disable") or r.get("action") not in ("permit", "deny"):
+            continue
+        proto = (r.get("protocol") or "ip").lower()
+        try:
+            net = _rule_net(r)
+        except ValueError:
+            warnings.append(f"правило к «{r.get('destination')}» не разобрано — будет заменено")
+            continue
+        if r.get("action") == "deny":
+            denies.append(net)
+            after.setdefault(net, set())
+            continue
+        if net.prefixlen == 0:
+            # «любой» в режиме с интернетом — часть выхода (его ставит панель после запретов частных сетей);
+            # без режима или ДО любых запретов он пускал и в ЛВС, и к роутеру — панель так не умеет
+            if proto in ("tcp", "udp", "ip") and (not exit_mode or not denies):
+                wide.append(proto.upper())
+            continue
+        if proto == "icmp":
+            continue                              # пинг к открытому хосту панель добавляет сама
+        if exit_mode == "xray" and own is not None and net == own:
+            continue                              # свой .1 в режиме xray открывает сама панель
+        if proto not in ("tcp", "udp", "ip"):
+            warnings.append(f"правило {proto} → {net} панель не выражает — будет удалено")
+            continue
+        for dn in denies:
+            after[dn].add(net)
+        d = per.setdefault(net, {"tcp": set(), "udp": set()})
+        for pr in (("tcp", "udp") if proto == "ip" else (proto,)):
+            d[pr].add(_rule_ports(r))
+    if wide:
+        warnings.append(f"правило «{'/'.join(sorted(set(wide)))} → любой» шире, чем умеет панель (пускает и к роутеру, и в "
+                        f"другие сети) — будет заменено отмеченным доступом")
+    # Запрет теряется, если он сужал разрешение (пересекается с открытой сетью НИЖЕ него — срабатывает первое
+    # совпадение) или, в режиме с интернетом, закрывал то, чего нет в запретах панели (частные сети, туннели, роутер).
+    blocked = None
+    for net in after:
+        if net.prefixlen == 0:
+            continue
+        lost = any(net.overlaps(n) for n in after[net])
+        if not lost and exit_mode:
+            if blocked is None:
+                blocked = [ipaddress.ip_network(n, strict=False) for n in _block_nets()]
+            lost = not any(net.subnet_of(b) for b in blocked)
+        if lost:
+            host = str(net.network_address) if net.prefixlen == 32 else str(net)
+            warnings.append(f"запрет к {host} панель не переносит — при применении он пропадёт")
+    full = False
+    if lan in per and "" in per[lan]["tcp"] and "" in per[lan]["udp"]:
+        full = True
+        del per[lan]
+    services = []
+    for s in (S.services or []):
+        want = {tok for tok in re.split(r"[,\s]+", s.get("ports", "") or "") if tok}
+        try:
+            ips = [ipaddress.ip_network(i, strict=False) for i in s.get("ips", [])]
+        except ValueError:
+            continue
+        if want and ips and all(n in per and want <= per[n]["tcp"] for n in ips):
+            services.append(s.get("id"))
+            for n in ips:
+                per[n]["tcp"] -= want
+    lines = []
+    for net, d in sorted(per.items(), key=lambda x: (int(x[0].network_address), x[0].prefixlen)):
+        host = str(net.network_address) if net.prefixlen == 32 else str(net)
+        if "" in d["tcp"]:
+            lines.append(host)                    # без портов «вручную» = хост целиком, TCP и UDP
+            if "" not in d["udp"]:
+                warnings.append(f"«TCP → {host}» без UDP — панель откроет хост целиком (TCP и UDP)")
+            continue
+        ports = sorted((x for x in d["tcp"] if x), key=_port_key)
+        if ports:
+            lines.append(f"{host}:{','.join(ports)}")
+        if d["udp"]:
+            warnings.append(f"UDP-правила к {host} панель отдельно не выражает — при применении они пропадут")
+    return services, full, "\n".join(lines), warnings
+
+
 def rules_form(iface):
     """Данные для формы правил интерфейса: текущие правила, предзаполнение, признаки. -> dict."""
     if not re.fullmatch(r"Wireguard\d+", iface or ""):
@@ -1360,6 +1481,7 @@ def rules_form(iface):
     cid, rec = _reg_for_iface(info)
     current = iface_acl_rules(iface)
     hook = xray_hook_for(info["index"])
+    warnings = []
     # Фактический выход определяет хук: при нём TCP/UDP интерфейса идут в xray независимо от ip nat
     # (и от режима в реестре — заворот могли включить кнопкой «🛡 Анти-DPI»).
     if rec:
@@ -1368,13 +1490,17 @@ def rules_form(iface):
                "full": rec.get("full", False), "extra": rec.get("extra", ""), "src": "реестра панели"}
     else:
         nat = nat_ifaces()
-        if nat is None or current is None or hook is None:
+        raw = _acl_raw_rules(f"_WEBADMIN_{iface}")
+        if nat is None or current is None or hook is None or raw is None:
             pre = {"exit": None, "services": [], "full": False, "extra": "", "src": ""}
         else:
-            pre = {"exit": "xray" if hook else ("direct" if iface in nat else ""),
-                   "services": [], "full": False, "extra": "", "src": "роутера"}
+            ex = "xray" if hook else ("direct" if iface in nat else "")
+            services, full, extra, warns = prefill_from_acl(raw, ex, info["addr"] or None)
+            pre = {"exit": ex, "services": services, "full": full, "extra": extra, "src": "текущих правил роутера"}
+            warnings = warns
     return {"ok": True, "iface": iface, "desc": info["desc"], "current": current, "pre": pre,
-            "s2s": bool(rec and rec.get("remote_lan")), "issued": bool(rec), "xray_on": bool(hook)}
+            "s2s": bool(rec and rec.get("remote_lan")), "issued": bool(rec), "xray_on": bool(hook),
+            "warnings": warnings}
 
 
 def apply_rules(iface, exit_mode, full=False, services=None, extra=""):

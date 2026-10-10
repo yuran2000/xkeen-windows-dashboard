@@ -14117,6 +14117,8 @@ Use this token to access the HTTP API:
       var pre = d.pre || {};
       h += '<div class="muted" style="font-size:0.88em; margin-top:6px;">Применится только отмеченное, текущие правила заменятся.' + (pre.src ? ' Предзаполнено по данным ' + esc(pre.src) + '.' : '') + '</div>';
       if(pre.exit === null && !d.s2s) h += '<div style="color:#b26a00; font-size:0.88em;">⚠ Текущий NAT/правила не прочитаны — режим не угадан, выберите сами.</div>';
+      if(d.warnings && d.warnings.length) h += '<div style="margin:6px 0; padding:6px 10px; background:#fff3cd; border-left:3px solid #e0a800; font-size:0.88em;"><b>⚠ При применении:</b><ul style="margin:2px 0 0 18px; padding:0;">'
+        + d.warnings.map(function(w){ return '<li>' + esc(w) + '</li>'; }).join('') + '</ul></div>';
       if(d.s2s){
         h += '<input type="hidden" name="wgRExit" value=""><div style="margin:6px 0;">🔗 Site-to-site: интернет не выдаётся, только доступ к ЛВС.</div>';
       } else {

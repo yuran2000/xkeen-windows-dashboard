@@ -523,8 +523,122 @@ check("15b реестр: режим обновлён", any(x["name"] == "Phone X
 # 15c. чужой доступ (не из реестра) с хуком: форма угадывает xray
 R.hooks.add(2)
 f = c.get("/api/xkeen/wg-acl?iface_id=Wireguard2").get_json()
-check("15c форма для подключения не из реестра: xray по хуку", f.get("ok") and f["pre"]["exit"] == "xray" and f["pre"]["src"] == "роутера", f)
+check("15c форма для подключения не из реестра: xray по хуку", f.get("ok") and f["pre"]["exit"] == "xray" and f["pre"]["src"] == "текущих правил роутера", f)
 R.hooks.discard(2)
+
+# 15d. Подключение, созданное вручную: форма восстанавливает доступ из ТЕКУЩИХ правил (prefill_from_acl)
+D._wg_prepare()
+
+
+def rci(line):
+    """CLI-строка access-list -> запись /rci/access-list (как в имитации; диапазон — одной строкой)."""
+    m = re.fullmatch(r"(permit|deny) (\w+) 0\.0\.0\.0 0\.0\.0\.0 (\S+) (\S+)(?: port (eq|range) (\d+)(?: (\d+))?)?", line)
+    r = {"action": m.group(1), "protocol": m.group(2), "destination": m.group(3), "destination-mask": m.group(4)}
+    if m.group(5):
+        r["dst-port-operator"] = m.group(5)
+        r["destination-port"] = m.group(6) + (("-" + m.group(7)) if m.group(7) else "")
+    return r
+
+
+def rr(*lines, off=()):
+    out = [rci(x) for x in lines]
+    for i in off:
+        out[i]["disable"] = True
+    return out
+
+
+H10 = "192.168.1.10 255.255.255.255"
+HANDMADE = rr("permit tcp 0.0.0.0 0.0.0.0 0.0.0.0 0.0.0.0", f"permit tcp 0.0.0.0 0.0.0.0 {H10} port eq 3389",
+           f"permit tcp 0.0.0.0 0.0.0.0 {H10} port eq 1541", f"permit tcp 0.0.0.0 0.0.0.0 {H10} port range 1560 1591",
+           off=(2, 3))
+sv, fl, ex, wn = W.prefill_from_acl(HANDMADE, "")
+check("15d ручное подключение: пресет RDP, вручную пусто", sv == ["rdp_pc"] and not fl and ex == "", (sv, fl, ex))
+check("15d предупреждения: 2 выключенных + «TCP → любой»", len(wn) == 2 and "выключенных правил: 2" in wn[0]
+      and "TCP → любой" in wn[1], wn)
+# диапазон портов в обоих форматах RCI
+r1 = rr("permit tcp 0.0.0.0 0.0.0.0 192.168.1.20 255.255.255.255 port range 1560 1591")
+r2 = [{"action": "permit", "protocol": "tcp", "destination": "192.168.1.20", "destination-mask": "255.255.255.255",
+       "dst-port-operator": "range", "destination-port": 1560, "destination-end-port": 1591}]
+check("15d диапазон «1560-1591» одной строкой", W.prefill_from_acl(r1, "")[2] == "192.168.1.20:1560-1591")
+check("15d диапазон destination-port + destination-end-port", W.prefill_from_acl(r2, "")[2] == "192.168.1.20:1560-1591",
+      W.prefill_from_acl(r2, ""))
+# вся ЛВС: tcp+udp без портов (или ip) -> «вся ЛВС», не строка вручную
+for nm, raw in (("tcp+udp", rr("permit tcp 0.0.0.0 0.0.0.0 192.168.1.0 255.255.255.0", "permit udp 0.0.0.0 0.0.0.0 192.168.1.0 255.255.255.0")),
+                ("ip", rr("permit ip 0.0.0.0 0.0.0.0 192.168.1.0 255.255.255.0"))):
+    sv, fl, ex, wn = W.prefill_from_acl(raw, "")
+    check(f"15d вся ЛВС ({nm}) -> full", fl and not sv and ex == "" and not wn, (sv, fl, ex, wn))
+# пресет — только при точном совпадении хоста и ВСЕХ портов; остаток — вручную, порты по возрастанию
+sv, fl, ex, wn = W.prefill_from_acl(rr(f"permit tcp 0.0.0.0 0.0.0.0 {H10} port eq 445"), "")
+check("15d неполный пресет SMB -> вручную", sv == [] and ex == "192.168.1.10:445", (sv, ex))
+sv, fl, ex, wn = W.prefill_from_acl(rr(*(f"permit tcp 0.0.0.0 0.0.0.0 {H10} port eq {p}" for p in (445, 3389, 139, 8080))), "")
+check("15d два пресета + остаток", sv == ["rdp_pc", "smb_pc"] and ex == "192.168.1.10:8080" and not wn, (sv, ex, wn))
+sv, fl, ex, wn = W.prefill_from_acl(rr(*(f"permit tcp 0.0.0.0 0.0.0.0 192.168.1.30 255.255.255.255 port eq {p}" for p in (3389, 445, 139))), "")
+check("15d порты вручную — по возрастанию", ex == "192.168.1.30:139,445,3389", ex)
+# TCP к хосту без портов и без UDP -> хост целиком + предупреждение; UDP отдельно -> предупреждение, не в «вручную»
+sv, fl, ex, wn = W.prefill_from_acl(rr("permit tcp 0.0.0.0 0.0.0.0 192.168.1.40 255.255.255.255"), "")
+check("15d TCP без UDP -> хост целиком + предупреждение", ex == "192.168.1.40" and len(wn) == 1 and "без UDP" in wn[0], (ex, wn))
+sv, fl, ex, wn = W.prefill_from_acl(rr("permit udp 0.0.0.0 0.0.0.0 192.168.1.50 255.255.255.255 port eq 53",
+                                       "permit tcp 0.0.0.0 0.0.0.0 192.168.1.50 255.255.255.255 port eq 80"), "")
+check("15d UDP с портом -> предупреждение, TCP-порт вручную", ex == "192.168.1.50:80" and len(wn) == 1 and "UDP-правила" in wn[0], (ex, wn))
+sv, fl, ex, wn = W.prefill_from_acl(rr("permit udp 0.0.0.0 0.0.0.0 192.168.1.51 255.255.255.255"), "")
+check("15d только UDP -> предупреждение, вручную пусто", ex == "" and len(wn) == 1 and "UDP-правила" in wn[0], (ex, wn))
+# «любой»: в режиме с интернетом после запретов — норма; без запретов перед ним — шире модели
+ANY = "permit tcp 0.0.0.0 0.0.0.0 0.0.0.0 0.0.0.0"
+check("15d direct: «любой» после запретов — без предупреждения",
+      W.prefill_from_acl(rr("deny tcp 0.0.0.0 0.0.0.0 192.168.0.0 255.255.0.0", ANY), "direct")[3] == [])
+wn = W.prefill_from_acl(rr(ANY), "direct")[3]
+check("15d direct: «любой» без запретов перед ним — предупреждение", len(wn) == 1 and "TCP → любой" in wn[0], wn)
+# запреты: сужающий открытое и (в режиме с интернетом) вне запретов панели — пропадут; частная сеть — норма
+wn = W.prefill_from_acl(rr(f"deny tcp 0.0.0.0 0.0.0.0 {H10} port eq 445",
+                           "permit tcp 0.0.0.0 0.0.0.0 192.168.1.0 255.255.255.0", "permit udp 0.0.0.0 0.0.0.0 192.168.1.0 255.255.255.0"), "")[3]
+check("15d запрет внутри открытой ЛВС — предупреждение", len(wn) == 1 and "запрет к 192.168.1.10" in wn[0], wn)
+wn = W.prefill_from_acl(rr("deny tcp 0.0.0.0 0.0.0.0 8.8.8.8 255.255.255.255", "deny tcp 0.0.0.0 0.0.0.0 10.0.0.0 255.0.0.0", ANY), "direct")[3]
+check("15d direct: запрет публичного адреса пропадёт, частной сети — нет", len(wn) == 1 and "8.8.8.8" in wn[0], wn)
+# обратимость: правила, которые ставит сама панель, восстанавливаются без потерь и предупреждений во всех режимах
+OWN = "172.173.30.1"
+for mode, ids, full_, extra in (("", ["rdp_pc"], False, "192.168.1.60:1560-1591"), ("direct", ["smb_pc"], False, ""),
+                                ("xray", ["rdp_pc"], False, "192.168.1.70"), ("direct", [], True, "")):
+    g, _ = W.collect_grants(ids, full_, extra)
+    raw = [rci(x) for x in W.acl_lines(g, mode, OWN)]
+    got = W.prefill_from_acl(raw, mode, OWN)
+    check(f"15d обратимость режима «{mode or 'только ЛВС'}» {ids or ('вся ЛВС' if full_ else '')}",
+          got == (ids, full_, extra, []), got)
+# 🔴 xray: открытый панелью свой .1 НЕ попадает во «вручную» (иначе встал бы выше запретов портов управления)
+g, _ = W.collect_grants([], False, "")
+XR = [rci(x) for x in W.acl_lines(g, "xray", OWN)]
+got = W.prefill_from_acl(XR, "xray", OWN)
+check("15d xray: свой .1 не переносится во «вручную»", got[2] == "" and got[3] == [], got)
+check("15d тот же список без own_ip перенёс бы .1 (страховка теста)", OWN in W.prefill_from_acl(XR, "xray")[2])
+
+# сквозь маршруты: ручное подключение с такими правилами -> форма -> применить -> форма снова
+R.add("Wireguard30", "Manual-X", OWN, 48030, peers={"MANPUB=": None})
+R.acls["_WEBADMIN_Wireguard30"] = {"rules": [dict(x) for x in HANDMADE], "auto": True}
+R.ifaces["Wireguard30"]["acl_in"] = "_WEBADMIN_Wireguard30"
+R.save()
+f = c.get("/api/xkeen/wg-acl?iface_id=Wireguard30").get_json()
+check("15d форма ручного: галочка RDP, режим «только ЛВС», 2 предупреждения",
+      f.get("ok") and not f["issued"] and f["pre"]["exit"] == "" and f["pre"]["services"] == ["rdp_pc"]
+      and f["pre"]["extra"] == "" and f["pre"]["src"] == "текущих правил роутера" and len(f.get("warnings") or []) == 2
+      and len(f["current"]) == 4 and f["current"][2].endswith("(выкл)"), f)
+reg_before = json.dumps(reg(), sort_keys=True)
+d = post("/api/xkeen/wg-acl-apply", {"iface_id": "Wireguard30", "exit": f["pre"]["exit"],
+                                     "services": f["pre"]["services"], "extra": f["pre"]["extra"]})
+rules = R.acls["_WEBADMIN_Wireguard30"]["rules"]
+check("15d применено: RDP + пинг, «любой» и выключенные убраны", d.get("ok") and len(rules) == 2
+      and rules[0].get("destination-port") == "3389" and not any(r.get("disable") for r in rules)
+      and not any(r["destination"] == "0.0.0.0" for r in rules), (d, rules))
+f2 = c.get("/api/xkeen/wg-acl?iface_id=Wireguard30").get_json()
+check("15d после применения форма та же, без предупреждений", f2["pre"]["services"] == ["rdp_pc"] and f2["warnings"] == [], f2)
+check("15d реестр не тронут (подключение не панели)", json.dumps(reg(), sort_keys=True) == reg_before)
+f = c.get(f"/api/xkeen/wg-acl?iface_id={kx}").get_json()
+check("15d выданное панелью: предзаполнение из реестра, предупреждений нет", f["pre"]["src"] == "реестра панели" and f["warnings"] == [], f)
+# уборка: имитация как до 15d (интерфейс, его список, его строка в хуке подмены)
+del R.ifaces["Wireguard30"]
+R.acls.pop("_WEBADMIN_Wireguard30", None)
+mp = W._parse_map(R.masq or "")
+mp.pop("Wireguard30", None)
+R.masq = " ".join(f"{k}={','.join(v)}" for k, v in sorted(mp.items())) or None
+R.save()
 
 # 17. выдан панелью, потом руками добавлена чужая сеть -> линк, отзыв не удаляет
 d = post("/api/xkeen/wg-issue", {"name": "Branch office", "exit": "direct", "create": True})

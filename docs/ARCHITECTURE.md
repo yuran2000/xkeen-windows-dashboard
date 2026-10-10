@@ -219,6 +219,20 @@ Windows-клиент включает свой kill-switch), `build_wg_client_co
   предупреждения в подтверждении. `apply_rules` → `(ok, msg, итоговый режим)`: для site-to-site режим
   всегда `""`. `api_wg_acl_apply` решает по итоговому режиму: `xray` — включить заворот (и если хук не
   прочитан: включение идемпотентно), другой режим — снять; хук не прочитан — предупреждение в ответе.
+- Доступ не из реестра (создан вручную) — галочки предзаполняет `prefill_from_acl(raw, exit_mode, own_ip)`
+  из **текущих** правил (`_acl_raw_rules`; режим — по хуку и `ip nat`), `pre.src` = «текущих правил
+  роутера»: разрешения TCP к хосту, покрывающие все порты пресета `WG_SERVICES`, — галочка пресета
+  (порты — `_rule_ports`: диапазон RCI бывает и строкой `1560-1591`, и парой `destination-port` +
+  `destination-end-port`); TCP+UDP (или `ip`) ко всей ЛВС без портов — «полный доступ»; остальное — строки
+  «вручную» `IP[/маска][:порты]`; ICMP и «любой» после запретов в режиме с интернетом пропускаются (их ставит
+  панель). 🔴 В режиме xray разрешение к своему .1 (`own_ip`) во «вручную» не переносится: строка «вручную»
+  встала бы выше запретов портов управления и открыла бы клиенту управление роутером. Что модель панели не
+  выражает — не предзаполняется, а уходит в `warnings` (блок «⚠ При применении» в диалоге): выключенные
+  правила (будут удалены), «TCP/UDP → любой» без режима или до любого запрета (шире модели), TCP без UDP
+  (хост откроется целиком), UDP отдельно (пропадёт), запрет, сужающий разрешение ниже него или (в режиме с
+  интернетом) вне `_block_nets`, — пропадёт; правила не TCP/UDP/ICMP. У выданного панелью предзаполнение —
+  из реестра, `warnings` пуст. Правила, поставленные самой панелью, восстанавливаются без потерь и
+  предупреждений во всех режимах (проверка «обратимость» в тесте).
 - `manual_view` — доступы роутера, выданные не панелью и не линки: поле `manual` в `wg-clients`, серые строки
   «создано вручную» в «📋 Выданные» (правила — да, отзыв — нет).
 - `router_inventory` — все `WireguardN` (доступ/линк, онлайн, трафик, NAT, заворот, `.conf`-шаблон);
@@ -436,7 +450,7 @@ fix_explain)`):
 | `/api/xkeen/wg-router` | GET | `api_wg_router` | инвентарь WG + `orphan_hooks` | R |
 | `/api/xkeen/wg-backup` | GET | `api_wg_backup` | `?iface=WireguardN` → текст-вложение | R |
 | `/api/xkeen/wg-connect`, `wg-disconnect`, `wg-cleanup-orphan` | POST | `api_wg_connect`, `api_wg_disconnect`, `api_wg_cleanup_orphan` | хук `zz_wg_xray_<iface>.sh` + cron self-heal | W: netfilter.d, crontab |
-| `/api/xkeen/wg-acl`, `wg-acl-apply` | GET; POST | `api_wg_acl_get`, `api_wg_acl_apply` | форма правил (`rules_form`); `iface_id`, `exit`, `full`, `services`, `extra` → access-list, NAT, подмена, заворот по итоговому режиму; линк — отказ | R / ndm, W: netfilter.d, crontab |
+| `/api/xkeen/wg-acl`, `wg-acl-apply` | GET; POST | `api_wg_acl_get`, `api_wg_acl_apply` | форма правил (`rules_form`: `current`, `pre`, `warnings`); `iface_id`, `exit`, `full`, `services`, `extra` → access-list, NAT, подмена, заворот по итоговому режиму; линк — отказ | R / ndm, W: netfilter.d, crontab |
 | `/api/xkeen/policy-clients` | GET | `api_xkeen_policy_clients` | клиенты, политики, порты, `.lst` | R |
 | `/api/xkeen/set-client-policy` | POST | `api_xkeen_set_client_policy` | `mac`, `policy` | ndm |
 | `/api/xkeen/flush-conntrack` | POST | `api_xkeen_flush_conntrack` | `ip` | `conntrack -D` или ndm |
@@ -867,7 +881,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
 - WG (отдельный `<script>` после раздела, IIFE `initWg`): `loadClients` (`wg-clients`), `issue`,
   `revoke`, `loadRouter` (`wg-router`), `xrayToggle`, `renderOrphans`/`cleanupOrphan`, `openRules`/
   `applyRules` (диалог `wgRulesDlg` переносится в `<body>`: базовая страница раздела скрыта, пока открыт
-  подпункт), `backupDl` (бэкап запросом: ошибка — во `flash`, а не уход со страницы с показанным `.conf`),
+  подпункт; `warnings` формы — блок «⚠ При применении»), `backupDl` (бэкап запросом: ошибка — во `flash`, а не уход со страницы с показанным `.conf`),
   ручной генератор `loadIfaces`/`gen`. Чтение роутера — только когда блок показан
   (`onVisible`: `offsetParent !== null` + проверка по клику). «Выдать доступ» активна только при вычисленном
   слоте и известной ЛВС (`setIssueReady`); не прочитался роутер — `loadClients` сам повторяет 2 раза через 4 с
@@ -1004,7 +1018,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
 | `test_killswitch.py` | генератор хука, разбор статуса/утечек |
 | `test_probe_tag.py` | `probe_tag`/`_probe_connected` из `.cur` в `sh` с подменным curl: таймаут при установленном TCP = жив, без соединения = мёртв (нет `sh` — SKIP) |
 | `test_template_ips.py` | `.cur`-template (версия, два IPv4-массива), синк IP эндпоинтов |
-| `test_wg_clients_offline.py` | выдача WG на имитации Keenetic (RCI, ACL, NAT, маршруты, save, хуки): режимы, ЛВС и подмена адреса, ручной путь, s2s, линки, отзыв (метка save, возврат NAT/маршрута, чужие пиры, заворот), гонка за индекс, откат, битый/занятый реестр, X25519 = RFC 7748, рендер `/xkeen` |
+| `test_wg_clients_offline.py` | выдача WG на имитации Keenetic (RCI, ACL, NAT, маршруты, save, хуки): режимы, ЛВС и подмена адреса, ручной путь, s2s, линки, отзыв (метка save, возврат NAT/маршрута, чужие пиры, заворот), форма правил созданного вручную (`prefill_from_acl`: пресеты, диапазоны в обоих форматах RCI, предупреждения, свой .1 в xray, обратимость), гонка за индекс, откат, битый/занятый реестр, X25519 = RFC 7748, рендер `/xkeen` |
 | `test_csrf_offline.py` | `_csrf_origin_guard`: чужой Origin/Referer/`null`/другой порт → 403 до обработчика, свой хост, без заголовков и GET — проходят, `TRUSTED_ORIGINS`, `SameSite=Lax` |
 | `test_v29_ui_offline.py` | цепочка «Зарубежных» (`allow_ru`/`use_common`), `watchdog-settings`, `fields`/`deep`, quick-fail ⊇ ключей, рендер обоими путями |
 
@@ -1068,6 +1082,7 @@ git log -1 --format='%an <%ae>'       # под кем последний ком�
 |---|---|
 | 2026-10-03 | Создание. Описано рабочее дерево: панель на базе v1.1.3 с UI для watchdog v29/v30 (цепочка и «общая цепочка» «Зарубежных», сквозная проба ролей и её настройки, статус `geoip.dat` и его связь с `geoip_v2fly.dat`), `bootstrap/watchdog.sh.cur` v30, template v13; 87 маршрутов, 13 проверок диагностики, 6 офлайн-тестов. |
 | 2026-10-03 | Независимое ревью → watchdog v31 (поля `*_RES`, `*_MAIN`, `*_NOALT`, `DPRI_FSINCE`; §6.3, §7.6); SSH-слой: `stdin=DEVNULL` во всех запусках ssh/scp (§5.2); geoip: статус без скана файла, проверка telegram в фоне с кэшем по `(size, mtime)`, auto-fix делает `geoip.dat` симлинком на `geoip_v2fly.dat`, откат при падении xray, 2 бэкапа. |
+| 2026-10-10 | WG: форма «🔒 Правила» для доступа, созданного вручную, предзаполняется из текущих правил роутера (`prefill_from_acl`, `_rule_ports`, `_rule_net`; свой .1 в режиме xray не переносится), что модель панели не выражает — в `warnings` и блок «⚠ При применении» в `openRules`; в тесте 143 проверки. |
 | 2026-10-10 | WG: «Выданные» показывают и созданные вручную доступы (`manual_view`, поле `manual`); отозванные в списке не показываются (запись остаётся в реестре). |
 | 2026-10-10 | WG: кнопка выдачи неактивна, пока роутер не прочитан; автоповтор чтения (`setIssueReady`, `WG.retry`). |
 | 2026-10-10 | CSRF: `_csrf_origin_guard` (`before_request`) — изменяющие запросы с чужим `Origin`/`Referer` → 403, `cfg.TRUSTED_ORIGINS`; тест `test_csrf_offline.py`, офлайн-тестов 9. |
