@@ -2840,9 +2840,12 @@ def keenetic_get_watchdog(deep_hold_sec=None):
             continue
         ts = _f_int(pfx + "TS")
         left = _f_int(pfx + "LEFT")
+        # watchdog v33: растущий карантин — действующий срок роли в state (D*_HOLD); старый сторож
+        # его не пишет → срок из config.
+        role_hold = _f_int(pfx + "HOLD") or _hold
         hold_left = None
         if left > 0:
-            hold_left = max(0, int((_hold - (_now - left)) // 60))
+            hold_left = max(0, int((role_hold - (_now - left)) // 60))
         deep[role_key] = {
             "ctr": _f_int(pfx + "CTR"),
             "ts": ts,
@@ -2855,6 +2858,10 @@ def keenetic_get_watchdog(deep_hold_sec=None):
             # этом узле ещё не было, канал служебный или проба выключена). Старый сторож — None.
             "res": ((fields.get(pfx + "RES") or "").strip()
                     if (fields.get(pfx + "RES") or "").strip() in ("ok", "fail", "none") else None),
+            # watchdog v33: уходов с основного по глухоте подряд (растущий карантин) и «вернулись
+            # после карантина, идёт сквозная проверка». Старый сторож — 0 / False.
+            "qn": _f_int(pfx + "QN"),
+            "chk": (fields.get(pfx + "CHK") or "0").strip() == "1",
         }
     log_lines = keenetic_tail_log(cfg.KEENETIC_WATCHDOG_LOG, n=30)
     # Сквозная AI-проба watchdog (файл watchdog.aiprobe: ts|country|last_alert|empty|stage).
@@ -16457,7 +16464,7 @@ const WATCHDOG_EFFECTIVE_YT = {{ watchdog.effective_yt|tojson }};
 const AI_FAIL_BLOCK = {{ targets.ai_fail_block|tojson }};
 const YT_FAIL_BLOCK = {{ targets.yt_fail_block|tojson }};
 // watchdog v29/v30: канал «Зарубежные сервисы» + сквозные пробы ролей.
-// WATCHDOG_DEEP = {pri:{ctr,ts,deaf,left,tag,age_min,hold_left_min}|null, yt:…, fgn:…} либо null
+// WATCHDOG_DEEP = {pri:{ctr,ts,deaf,left,tag,age_min,hold_left_min,res,qn,chk}|null, yt:…, fgn:…} либо null
 // (роутер недоступен / старый watchdog без полей D{PRI,YT,FGN}_*).
 const WATCHDOG_EFFECTIVE_FOREIGN = {{ watchdog.effective_foreign|tojson }};
 const FOREIGN_FAIL_BLOCK = {{ targets.foreign_fail_block|tojson }};
@@ -16735,7 +16742,13 @@ function deepProbeNote(roleKey) {
   if (d.hold_left_min > 0) {
     out += ' <span style="background:#eee; color:#555; padding:1px 6px; border-radius:3px;"' +
            ' title="Роль ушла с узла по глухоте. Пока карантин не истечёт, сторож не вернёт трафик на этот узел, даже если он оживёт.">' +
-           '⏸ карантин возврата: ещё ' + d.hold_left_min + ' мин</span>';
+           '⏸ карантин возврата: ещё ' + d.hold_left_min + ' мин' +
+           (d.qn > 1 ? ' (уход подряд №' + d.qn + ', срок удвоен)' : '') + '</span>';
+  }
+  if (d.chk) {
+    out += ' <span style="background:#e7f0fb; color:#1f4e79; padding:1px 6px; border-radius:3px;"' +
+           ' title="Роль вернулась на основной узел после карантина. Сквозная проба идёт раз в минуту, пока не подтвердит, что трафик проходит.">' +
+           '🔎 проверка после карантина</span>';
   }
   return out;
 }

@@ -43,8 +43,8 @@ def extract(src, name):
 
 
 src = open(CUR, encoding="utf-8", newline="").read()
-check(re.search(r"watchdog\s+v(\d+)", "\n".join(src.splitlines()[:40])).group(1) == "32",
-      "заголовок .cur — watchdog v32")
+check(int(re.search(r"watchdog\s+v(\d+)", "\n".join(src.splitlines()[:40])).group(1)) >= 32,
+      "заголовок .cur — watchdog v32 или новее")
 fn_conn = extract(src, "_probe_connected")
 fn_probe = extract(src, "probe_tag")
 check(fn_conn is not None and fn_probe is not None, "в .cur есть _probe_connected и probe_tag")

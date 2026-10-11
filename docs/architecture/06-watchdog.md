@@ -61,7 +61,7 @@ cron */1 → watchdog.sh: . watchdog.config → пробы → state-машин�
 `AI_PROBE_INTERVAL` (600), `AI_PROBE_ALERT_COOLDOWN` (3600), `AI_PROBE_BAD_COUNTRIES`,
 `AI_DEAF_THRESHOLD` (3), `AI_DEAF_AUTORESTART` (1), `AI_RETURN_HOLD` (1800),
 `AI_/YT_/FOREIGN_CHAIN_ROUNDS` (2), `AI_/YT_/FOREIGN_CHAIN_SWITCH_COOLDOWN` (300),
-`DEEP_PROBE_PORT_PRI/YT/FGN` (10819–10821), `DEEP_PROBE_URL_PRI/YT/FGN` (cloudflare trace, youtube
+`DEEP_RETURN_HOLD_MAX` (86400, потолок растущего карантина, v33), `DEEP_PROBE_PORT_PRI/YT/FGN` (10819–10821), `DEEP_PROBE_URL_PRI/YT/FGN` (cloudflare trace, youtube
 `generate_204`, `api.telegram.org`), `KILL_FAIL_THRESHOLD`/`KILL_PASS_THRESHOLD` (3/2), `RECVQ_THRESHOLD`,
 `RECVQ_HARD`, `STALL_FAIL_NEED`, `STALL_COOLDOWN`, `CONNTRACK_MIN`, `FD_DELTA_THRESHOLD`,
 `FD_STALL_COOLDOWN`.
@@ -77,6 +77,7 @@ AI_CMISS= AI_SW_TS= AI_LEFT_TS= YT_EFF= YT_CMISS= YT_SW_TS= FGN_EFF= FGN_CMISS= 
 DPRI_CTR= DPRI_TS= DPRI_DEAF= DPRI_LEFT= DPRI_TAG= DYT_CTR= DYT_TS= DYT_DEAF= DYT_LEFT= DYT_TAG=
 DFGN_CTR= DFGN_TS= DFGN_DEAF= DFGN_LEFT= DFGN_TAG=
 + v31: D{PRI,YT,FGN}_RES= PRI_MAIN= YT_MAIN= FGN_MAIN= DPRI_FSINCE= PRI_NOALT= DYT_NOALT= DFGN_NOALT=
++ v33: D{PRI,YT,FGN}_QN= D{PRI,YT,FGN}_CHK= D{PRI,YT,FGN}_HOLD=
 ```
 (точный порядок — строка `echo "$NEW_STATE …` в `.cur`).
 
@@ -93,6 +94,9 @@ DFGN_CTR= DFGN_TS= DFGN_DEAF= DFGN_LEFT= DFGN_TAG=
 | `D{PRI,YT,FGN}_CTR/_TS/_DEAF/_LEFT/_TAG` | сквозная проба роли: пустых подряд; время пробы; латч глухоты; время ухода по глухоте; тег замера |
 | `D{PRI,YT,FGN}_RES` (v31) | итог последнего замера: `ok` / `fail` / `none` (замера на этом теге не было, служебный тег, проба выключена) |
 | `PRI_MAIN`, `YT_MAIN`, `FGN_MAIN` (v31) | основной тег роли на прошлом тике: если в настройках сменили основной — карантин `D*_LEFT` обнуляется, лог «сменён в настройках (A → B)», без TG «вернулся» |
+| `D{PRI,YT,FGN}_QN` (v33) | уходов с основного по глухоте подряд без успешной сквозной пробы на нём между ними; растит карантин (`_deep_hold`); сбрасывается успешной пробой на основном и сменой основного в настройках |
+| `D{PRI,YT,FGN}_CHK` (v33) | `1` — роль вернулась на основной после такого ухода и ждёт сквозной проверки: замеры раз в минуту, а не раз в `DEEP_PROBE_INTERVAL`; снимается первым успехом («✅ … проверен») или признанием глухоты |
+| `D{PRI,YT,FGN}_HOLD` (v33) | действующий срок карантина роли, с: `DEEP_RETURN_HOLD`, ×2 за каждый повторный уход, потолок `DEEP_RETURN_HOLD_MAX`; только для панели |
 | `PRI_NOALT`, `DYT_NOALT`, `DFGN_NOALT`, `DPRI_FSINCE` (v31) | «предупреждение о том, что уходить некуда, уже отправлено» (один TG за эпизод); с какого момента форсируется failover глухого основного (лог раз в 5 мин) |
 
 Имена не симметричны (kill-switch «Зарубежных» — `FOREIGN_*`, прочее — `FGN_*`/`DFGN_*`) — брать из
@@ -110,7 +114,8 @@ DFGN_CTR= DFGN_TS= DFGN_DEAF= DFGN_LEFT= DFGN_TAG=
 watchdog.aiprobe`) + `keenetic_tail_log(…, n=30)` → `state`, `counter`, `current_default`,
 `effective_ai`, `effective_yt`, `effective_foreign`, `last_bad_md5`, `log`, `ai_probe` (`{ts, country,
 empty, stage, age_min}`/`None`), `fields` (все `KEY=VAL`), `deep` (`{pri, yt, fgn}`: `{ctr, ts, deaf,
-left, tag, age_min, hold_left_min}` или `None` у роли без полей — старый watchdog), `fgn_eff`, `yt_eff`,
+left, tag, age_min, hold_left_min, res, qn, chk}` или `None` у роли без полей — старый watchdog;
+`hold_left_min` считается от `D*_HOLD`, у сторожа до v33 — от `deep_hold_sec`), `fgn_eff`, `yt_eff`,
 `ai_eff`. Те же ключи — в quick-fail литерале. В шаблоне: баннер режима (`.wd-state`), Jinja-статусы
 kill-switch, «📋 Лог watchdog», JS-константы (§8.4). `api_xkeen_state`/`api_xkeen_debug` отдают тот же
 словарь, но страница их не опрашивает — обновление только перезагрузкой.
@@ -142,6 +147,14 @@ PRIMARY и state-машина (глухота `DPRI_DEAF` форсирует dow
 цепочки) → Apply (`generate_routing <default> <ai> <yt> <foreign> <ipv6>` → `routing_changed` →
 анти-флап → `validate_routing_xray` → `mv` → `xkeen -restart` → `health_check` → `.lastgood` или
 `AUTO-ROLLBACK`) → обход FAILOVER → Save state.
+
+**Карантин возврата (v29, растущий — v33).** Ушли с основного роли по глухоте (`D*_DEAF`) — `D*_LEFT` = время
+ухода, `D*_QN` += 1; пока не истёк срок `_deep_hold(D*_QN)` (`DEEP_RETURN_HOLD`, ×2 за каждый повторный
+уход, потолок `DEEP_RETURN_HOLD_MAX`), роль на основной не возвращается, даже если он отвечает по TCP.
+После возврата `deep_probe_check` (7-й аргумент — основной тег роли) ставит `D*_CHK=1` и меряет через
+минуту, пустые пробы тоже повторяет через минуту: глухой узел признаётся за ~2 мин. Алерт возврата
+после карантина — «↩️ … проверяю насквозь», «✅ … проверен» шлёт проба; успех на основном обнуляет
+`D*_QN`. Тест — `tests/test_deep_quarantine.py`.
 
 **`probe_tag` (TCP-проба узла, v32).** curl на `https://host:port/` (или `PRIMARY_PROBE_URL`): код 7 →
 мёртв; код 28 (таймаут) → мёртв **только** при `%{num_connects}` = 0 (`_probe_connected`); прочие коды
