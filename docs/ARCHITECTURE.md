@@ -66,8 +66,9 @@ pythonw не сохраняется. Разработка: `start.bat` (конс
 при первом «Сохранить» в UI, **даже незакоммиченный** (§6.5).
 
 **Как прод подхватывает изменения:** кнопка в UI → `POST /api/xkeen/restart-dashboard` →
-`api_xkeen_restart_dashboard` (одноразовая задача `XrayDashboardRestarter` от SYSTEM:
-`schtasks /End /TN XrayDashboard` → 3 с → `/Run` → самоудаление; имя `XrayDashboard` захардкожено);
+`api_xkeen_restart_dashboard` (одноразовая задача `XrayDashboardRestarter[-<port>]` от SYSTEM:
+`schtasks /End` → 3 с → `/Run` своей задачи `_dashboard_task_name()` — правило install_service: порт 5000 →
+`XrayDashboard`, иначе `XrayDashboard-<port>` → самоудаление);
 `Restart-Clean.bat` (UAC, порт из конфига); `update.bat` → `update.ps1` (`git pull` с авто-stash, стоп
 задачи, `pip install` при изменении `requirements.txt`, старт). Проверка — `/api/xkeen/dashboard-health`
 (ровно один LISTEN) и версия в шапке.
@@ -296,7 +297,7 @@ Windows-клиент включает свой kill-switch), `build_wg_client_co
 
 `api_xkeen_header_status` — одна команда с маркерами `===STATUS===`/`===ERROR===`/`===STATE===`, кэш
 `_HEADER_STATUS_CACHE` 30 с; **`watchdog.state` здесь разбирается отдельно** (3-й токен).
-`api_xkeen_dashboard_health` — LISTEN на **5000 (захардкожено)**. Подписки: `_fetch_subscription`
+`api_xkeen_dashboard_health` — LISTEN на порту экземпляра (`_dashboard_port()` = `cfg.DASHBOARD_PORT`). Подписки: `_fetch_subscription`
 (HTTP с ПК под видом мобильного клиента; заголовки — идентификатор «устройства» у провайдера, **их
 правка плодит устройства и съедает лимит**), `_parse_happ_multiprofile_json`, `_parse_sub_userinfo`,
 `_parse_profile_title`, `_normalize_outbound_tag` (`_SHELL_UNSAFE_RE` → `_`), `_uniquify_parsed_tags`
@@ -491,7 +492,7 @@ BusyBox ash, cron раз в минуту); панель пишет его кон
 | 📋 Все outbounds (`sec-list`), ➕ Добавить (`sec-add`), 📡 Обновить из подписки (`sec-sync`) | Каналы | группы, bulk, форма, preview/sync |
 | 💾 Бэкап и восстановление (`sec-backup`), 🔧 Подключение к роутеру (`sec-router`, `section-router-config`), 🛠 Управление XKeen (`sec-xkmgmt`), 🐉 Подключение клиентов WireGuard (`sec-router`) | Обслуживание | снапшоты, SSH и bootstrap, CLI и GeoFile, WG: подпункты сайдбара «➕ Выдать доступ», «📋 Выданные», «📡 На роутере…», «🧩 .conf вручную…» (`.card > details`) + диалог `wgRulesDlg` |
 | 🚨 Алерты при падении xray (`sec-xkmgmt`), 🚑 Восстановление и диагностика (`sec-rescue`), 🤖 Telegram-бот для алертов (`sec-tg`) | Диагностика | индикатор/toast, диагностика + auto-fix, TG |
-| 🛡 Kill-switch политики XKeen (`sec-killswitch`) | **Прочее** (не ловится `catFor`) | `ks-status` |
+| 🛡 Kill-switch политики XKeen (`sec-killswitch`) | Обслуживание (`catFor`: `kill-switch`) | `ks-status` |
 | ❓ Помощь (`sec-help`) | Помощь | 22 темы `details.help-section` |
 
 ### 8.2. Сайдбар (`buildKeeneticSidebar`)
@@ -625,8 +626,8 @@ GeoIP-категории»: неизвестно / расширенная и с�
 - **Числа — только числом** (`X="2"`): пустое или комментарий в кавычках → `[ "$X" -ge … ]` в ash →
   «bad number», тик ломается. Флаги (`*_CHAIN_ALLOW_RU`, `FOREIGN_CHAIN_USE_COMMON`, `DEEP_PROBE_*`)
   писать явно `"0"`/`"1"`: пустое watchdog трактует как свой дефолт, и галочка UI разъедется.
-  Известные расхождения: `targets.yt_fail_block` без ключа `True` при дефолте watchdog `0`;
-  `AI_FAIL_BLOCK=""` UI покажет выключенным, watchdog применит `1`.
+  Галки `targets.*_fail_block` читаются как в watchdog (`${X:-дефолт}`): пусто = нет ключа = дефолт сторожа
+  (AI `1`, YT и FOREIGN `0`) — расхождения UI и сторожа устранены 11.10.
 - Запись — только `keenetic_write_watchdog_config`, одним вызовом; fail-closed не обходить; значения
   экранирует `_esc` — строки config руками не собирать.
 - Теги без пробелов и shell-метасимволов (`_normalize_outbound_tag`): цепочки — «теги через пробел».
@@ -655,8 +656,8 @@ GeoIP-категории»: неизвестно / расширенная и с�
   — **CRLF**. Шелл-скрипт с CRLF на роутере не запустится.
 - **`.ps1` — только ASCII** (PowerShell 5.1 читает в ANSI-кодировке); кириллица — во внешних UTF-8
   файлах (как `release_notes_footer.md`). `.bat` — тоже ASCII.
-- Правка в боевой папке = правка прода (§1, §6.5). `api_xkeen_dashboard_health` (порт 5000) и
-  `api_xkeen_restart_dashboard` (задача `XrayDashboard`) захардкожены. Спутники не видят
+- Правка в боевой папке = правка прода (§1, §6.5). `api_xkeen_dashboard_health` и
+  `api_xkeen_restart_dashboard` берут порт и задачу своего экземпляра (`_dashboard_port`, `_dashboard_task_name`). Спутники не видят
   `runtime_settings.json`. Свой argv ssh — только с `ssh_bin.ssh_exe()`/`ssh_bin.null_known_hosts()`.
 
 ---
@@ -689,6 +690,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
 | `test_geoip_status.py` | `keenetic_geoip_dat_status` (+ фоновая проверка `telegram`), все состояния секции GeoIP, auto-fix `install_extended_geoip` (симлинк, скачивание, авто-откат, ротация бэкапов), категории в диагностике |
 | `test_killswitch.py` | генератор хука, разбор статуса/утечек |
 | `test_deep_quarantine.py` | карантин возврата из `.cur` в `sh` с подменными curl/date (v33): `_deep_hold` (удвоение, потолок), `deep_probe_check` — проверка основного через минуту после возврата, сброс `D*_QN` успехом только на основном, глухота после двух пустых проверок, state v32 без новых полей (нет `sh` — SKIP) |
+| `test_panel_misc_offline.py` | порт и задача экземпляра (рестарт, здоровье), галки `*_fail_block` как в watchdog, kill-switch в «Обслуживании» |
 | `test_probe_tag.py` | `probe_tag`/`_probe_connected` из `.cur` в `sh` с подменным curl: таймаут при установленном TCP = жив, без соединения = мёртв (нет `sh` — SKIP) |
 | `test_wg_disconnect_offline.py` | снятие заворота WG и очистка осиротевшего хука: успех только при удалённых правилах, файле хука и строке cron; живой интерфейс очисткой не снимается |
 | `test_template_ips.py` | `.cur`-template (версия, два IPv4-массива), синк IP эндпоинтов |

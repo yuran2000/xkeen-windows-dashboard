@@ -3010,21 +3010,22 @@ def keenetic_get_watchdog_targets(strict=False):
         "ai_domains":   ai_domains_list,
         "ai_ext_categories": cfg_d.get("AI_EXT_CATEGORIES", "").strip(),
         "ai_ip_ranges": cfg_d.get("AI_IP_RANGES", "").strip(),
-        "ai_fail_block": cfg_d.get("AI_FAIL_BLOCK", "1") == "1",
+        # Как watchdog (${X:-дефолт}): пусто и нет ключа — одно и то же, дефолт сторожа.
+        "ai_fail_block": ((cfg_d.get("AI_FAIL_BLOCK") or "").strip() or "1") == "1",
         "ai_failover_tags": ai_chain_list,
         "ai_chain_allow_ru": (_ai_ru_raw == "1") if _ai_ru_raw else False,
         "yt_tag":       cfg_d.get("YT_TAG"),
         "yt_domains":   yt_domains_list,
         "yt_ext_categories": cfg_d.get("YT_EXT_CATEGORIES", "").strip(),
         "yt_geoip_categories": cfg_d.get("YT_GEOIP_CATEGORIES", "").strip(),
-        "yt_fail_block": cfg_d.get("YT_FAIL_BLOCK", "1") == "1",
+        "yt_fail_block": ((cfg_d.get("YT_FAIL_BLOCK") or "").strip() or "0") == "1",
         "yt_failover_tags": yt_chain_list,
         "yt_chain_allow_ru": (_yt_ru_raw == "1") if _yt_ru_raw else True,
         "foreign_tag":       cfg_d.get("FOREIGN_TAG"),
         "foreign_domains":   foreign_domains_list,
         "foreign_ext_categories": cfg_d.get("FOREIGN_EXT_CATEGORIES", "").strip(),
         "foreign_geoip_categories": cfg_d.get("FOREIGN_GEOIP_CATEGORIES", "").strip(),
-        "foreign_fail_block": cfg_d.get("FOREIGN_FAIL_BLOCK", "0") == "1",
+        "foreign_fail_block": ((cfg_d.get("FOREIGN_FAIL_BLOCK") or "").strip() or "0") == "1",
         "foreign_failover_tags": foreign_chain_list,
         "foreign_chain_allow_ru": (_fg_ru_raw == "1") if _fg_ru_raw else False,
         "foreign_chain_use_common": (_fg_common_raw == "1"),
@@ -5096,20 +5097,36 @@ def api_xkeen_header_status():
     return jsonify(result)
 
 
+def _dashboard_port():
+    """Порт этого экземпляра панели (cfg.DASHBOARD_PORT, по умолчанию 5000)."""
+    try:
+        return int(getattr(cfg, "DASHBOARD_PORT", 5000) or 5000)
+    except (TypeError, ValueError):
+        return 5000
+
+
+def _dashboard_task_name():
+    """Имя задачи Планировщика этого экземпляра — то же правило, что в install_service.ps1:
+    порт 5000 → XrayDashboard, иначе XrayDashboard-<порт>."""
+    port = _dashboard_port()
+    return "XrayDashboard" if port == 5000 else f"XrayDashboard-{port}"
+
+
 @app.route("/api/xkeen/dashboard-health", methods=["GET"])
 @requires_auth
 def api_xkeen_dashboard_health():
-    """Самодиагностика панели: сколько pythonw-процессов слушают :5000.
+    """Самодиагностика панели: сколько процессов слушают порт этого экземпляра (_dashboard_port).
     Нормально = ровно 1. На Windows venv pythonw.exe — это launcher,
     он запускает реальный интерпретатор как ребёнка; считать «pythonw count > 1»
     как проблему нельзя — это всегда 2 процесса (launcher + interpreter).
     А вот listening на одном порту может быть только один — это надёжный критерий."""
     my_pid = os.getpid()
+    port = _dashboard_port()
     listeners = []
     for c in psutil.net_connections(kind="tcp"):
         if c.status != psutil.CONN_LISTEN:
             continue
-        if c.laddr.port != 5000:
+        if c.laddr.port != port:
             continue
         if not c.pid:
             continue
@@ -5124,12 +5141,12 @@ def api_xkeen_dashboard_health():
             listeners.append({"pid": c.pid, "name": "?", "is_me": c.pid == my_pid})
     count = len(listeners)
     if count == 1:
-        status, msg = "ok", "Панель здорова — 1 listener на :5000"
+        status, msg = "ok", f"Панель здорова — 1 listener на :{port}"
     elif count == 0:
         # Если этот endpoint отвечает, listener'ов точно ≥1. Возможен race в psutil.
-        status, msg = "warn", "Listener на :5000 не виден (race?)"
+        status, msg = "warn", f"Listener на :{port} не виден (race?)"
     else:
-        status, msg = "bad", f"На :5000 слушают {count} процессов — реальный дубликат, нужен чистый рестарт"
+        status, msg = "bad", f"На :{port} слушают {count} процессов — реальный дубликат, нужен чистый рестарт"
     return jsonify({"ok": True, "status": status, "msg": msg, "count": count, "listeners": listeners})
 
 
@@ -5148,23 +5165,25 @@ def api_xkeen_restart_dashboard():
 
     Раньше создавали .bat в %TEMP% — оставался мусор. Раньше использовали PowerShell +
     DETACHED_PROCESS — залипало (родитель умирал от schtasks /End до запуска ребёнка)."""
+    task = _dashboard_task_name()
+    restarter = task.replace("XrayDashboard", "XrayDashboardRestarter", 1)
     try:
         # Inline-команда задачи. cmd.exe /c "..." нужен потому что schtasks /TR
         # не понимает && / timeout / piping напрямую — только одну исполняемую строку.
         tr = (
             'cmd.exe /c "'
-            'schtasks /End /TN XrayDashboard'
+            f'schtasks /End /TN {task}'
             ' && timeout /t 3 /nobreak > nul'
-            ' && schtasks /Run /TN XrayDashboard'
+            f' && schtasks /Run /TN {task}'
             ' && timeout /t 1 /nobreak > nul'
-            ' && schtasks /Delete /TN XrayDashboardRestarter /F'
+            f' && schtasks /Delete /TN {restarter} /F'
             '"'
         )
         # Создание/перезапись (/F) задачи. /SC ONCE /ST = триггерное время, не используется
         # т.к. запустим вручную через /Run. /RU SYSTEM = от системного пользователя
         # (нужны права на /End XrayDashboard). /RL HIGHEST = с админ-привилегиями.
         result = subprocess.run(
-            ["schtasks", "/Create", "/TN", "XrayDashboardRestarter",
+            ["schtasks", "/Create", "/TN", restarter,
              "/TR", tr, "/SC", "ONCE", "/ST", "23:59",
              "/RU", "SYSTEM", "/RL", "HIGHEST", "/F"],
             capture_output=True, text=True, timeout=10,
@@ -5174,7 +5193,7 @@ def api_xkeen_restart_dashboard():
             return jsonify({"ok": False, "stderr": f"schtasks /Create failed: {result.stderr or result.stdout}"})
         # Запускаем задачу немедленно (не ждём триггера 23:59)
         subprocess.Popen(
-            ["schtasks", "/Run", "/TN", "XrayDashboardRestarter"],
+            ["schtasks", "/Run", "/TN", restarter],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
             close_fds=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -21479,7 +21498,7 @@ async function makeSiteReachable(btn) {
     const catFor = (title) => {
       const t = title.toLowerCase();
       if (/основн|резерв|цепочк|failover|outbound|подписк|добав/.test(t)) return 'Каналы';
-      if (/бэкап|роутер|управление xkeen|удал[её]нн|wireguard/.test(t)) return 'Обслуживание';
+      if (/бэкап|роутер|управление xkeen|удал[её]нн|wireguard|kill-switch/.test(t)) return 'Обслуживание';
       if (/алерт|восстановлен|диагност|telegram/.test(t)) return 'Диагностика';
       if (/помощь/.test(t)) return 'Помощь';
       return 'Прочее';
