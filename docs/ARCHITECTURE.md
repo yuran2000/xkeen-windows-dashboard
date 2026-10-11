@@ -162,6 +162,8 @@ Windows-клиент включает свой kill-switch), `build_wg_client_co
 догадка `<адрес>/24, br0`, при `guess=False` — `(None, br0)`. `_keenetic_lan_net_ex` отдаёт ещё признак
 `known` (прочитано, а не догадка) — по нему `_wg_settings` ставит `Settings.lan_known`. `wg_xray_connect`: запись
 хука — условие для остального (`… || { …; echo WG_CONN_WRITEFAIL; exit 1; }`), не записался — `ok:False`.
+`wg_xray_disconnect` и `wg-cleanup-orphan`: успех — только если удалены и файл хука, и строка cron (маркеры
+`WG_FILE_LEFT`/`WG_CRON_LEFT`/`WG_ORPHAN_CRON`): иначе self-heal cron вернул бы заворот через минуту.
 
 ### 3.4. `KILL-SWITCH ПОЛИТИКИ XKEEN (v1.1.0)` и соседи
 
@@ -685,6 +687,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
 | `test_killswitch.py` | генератор хука, разбор статуса/утечек |
 | `test_deep_quarantine.py` | карантин возврата из `.cur` в `sh` с подменными curl/date (v33): `_deep_hold` (удвоение, потолок), `deep_probe_check` — проверка основного через минуту после возврата, сброс `D*_QN` успехом только на основном, глухота после двух пустых проверок, state v32 без новых полей (нет `sh` — SKIP) |
 | `test_probe_tag.py` | `probe_tag`/`_probe_connected` из `.cur` в `sh` с подменным curl: таймаут при установленном TCP = жив, без соединения = мёртв (нет `sh` — SKIP) |
+| `test_wg_disconnect_offline.py` | снятие заворота WG и очистка осиротевшего хука: успех только при удалённых правилах, файле хука и строке cron; живой интерфейс очисткой не снимается |
 | `test_template_ips.py` | `.cur`-template (версия, два IPv4-массива), синк IP эндпоинтов |
 | `test_wg_clients_offline.py` | выдача WG на имитации Keenetic (RCI, ACL, NAT, маршруты, save, хуки): режимы, ЛВС и подмена адреса, ручной путь, s2s, линки, отзыв (метка save, возврат NAT/маршрута, чужие пиры, заворот), форма правил созданного вручную (`prefill_from_acl`: пресеты, диапазоны в обоих форматах RCI, предупреждения, свой .1 в xray, обратимость), гонка за индекс, откат, битый/занятый реестр, X25519 = RFC 7748, рендер `/xkeen` |
 | `test_csrf_offline.py` | `_csrf_origin_guard`: чужой Origin/Referer/`null`/другой порт → 403 до обработчика, свой хост, без заголовков и GET — проходят, `TRUSTED_ORIGINS`, `SameSite=Lax` |

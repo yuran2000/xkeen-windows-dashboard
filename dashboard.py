@@ -1608,10 +1608,23 @@ def wg_xray_disconnect(iface_id):
         "[ -n \"$SUBNET\" ] && iptables -w -t nat -S POSTROUTING 2>/dev/null | grep -F -- \"-s $SUBNET \" | grep -- '-j MASQUERADE' | sed 's|^-A |-D |' | while read _r; do iptables -w -t nat $_r 2>/dev/null; done",
         f"[ -x {wg_clients.MASQ_HOOK} ] && sh {wg_clients.MASQ_HOOK}",
     ]
-    cmd = "; ".join(dels) + f"; iptables -t nat -S PREROUTING | grep -q -- '-i {kernel} -p tcp -j xkeen' && echo WG_STILL || echo WG_GONE"
+    # Успех — только когда сняты и правила, и то, что их вернёт: файл хука и строка cron (self-heal
+    # раз в минуту). rm/crontab на роутере могут не пройти молча (раздел /opt только для чтения) —
+    # без этой проверки ответ «отключён» сменялся бы возвратом заворота через минуту.
+    cmd = "; ".join(dels) + (
+        f"; [ -e {path} ] && echo WG_FILE_LEFT; "
+        f"crontab -l 2>/dev/null | grep -qF '{path}' && echo WG_CRON_LEFT; "
+        f"iptables -t nat -S PREROUTING | grep -q -- '-i {kernel} -p tcp -j xkeen' && echo WG_STILL || echo WG_GONE")
     r = keenetic_ssh(cmd, timeout=30)
-    if "WG_GONE" in (r.get("stdout") or ""):
+    out = r.get("stdout") or ""
+    left = [label for marker, label in (("WG_FILE_LEFT", f"файл {path}"), ("WG_CRON_LEFT", "строка cron"))
+            if marker in out]
+    if "WG_GONE" in out and not left:
         return {"ok": True, "connected": False, "kernel": kernel, "msg": f"{kernel} отключён от анти-DPI"}
+    if "WG_GONE" in out:
+        return {"ok": False, "error": f"правила {kernel} сняты, но на роутере не удалились: {', '.join(left)} — "
+                                      "cron вернёт заворот в течение минуты. Вероятно, раздел /opt недоступен "
+                                      "для записи; проверить вручную."}
     return {"ok": False, "error": "catch-all всё ещё на месте — возможно интерфейс ведёт сторонний хук (напр. zz_wg_home_xkeen.sh). Проверить вручную."}
 
 
@@ -1641,9 +1654,12 @@ def api_wg_cleanup_orphan():
         f"for T in nat mangle; do iptables -t $T -S PREROUTING 2>/dev/null | grep -- '-i {kernel} ' | sed 's|^-A |-D |' | while read r; do iptables -w -t $T $r 2>/dev/null; done; done; "
         f"iptables -t nat -S INPUT 2>/dev/null | grep -- '-i {kernel} ' | sed 's|^-A |-D |' | while read r; do iptables -w -t nat $r 2>/dev/null; done; "
         f"[ -n \"$SUBNET\" ] && iptables -t nat -S POSTROUTING 2>/dev/null | grep -F -- \"-s $SUBNET \" | grep MASQUERADE | sed 's|^-A |-D |' | while read r; do iptables -w -t nat $r 2>/dev/null; done; "
+        f"crontab -l 2>/dev/null | grep -qF '{path}' && echo WG_ORPHAN_CRON; "
         f"[ -f {path} ] && echo WG_ORPHAN_STILL || echo WG_ORPHAN_GONE"
     )
     r = keenetic_ssh(cmd, timeout=25)
+    if "WG_ORPHAN_CRON" in (r.get("stdout") or ""):
+        return jsonify({"ok": False, "error": f"строка cron хука {kernel} не удалилась — проверить crontab на роутере вручную"})
     if "WG_ORPHAN_GONE" in (r.get("stdout") or ""):
         return jsonify({"ok": True, "kernel": kernel, "msg": f"осиротевший хук {kernel} убран (файл + cron + правила + masquerade)"})
     return jsonify({"ok": False, "error": (r.get("stderr") or r.get("stdout") or "не удалось убрать хук")[:200]})

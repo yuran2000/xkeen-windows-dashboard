@@ -72,7 +72,7 @@ cron */1 → watchdog.sh: . watchdog.config → пробы → state-машин�
 
 ```
 <state> <counter> <default_tag> EFFECTIVE_AI= EFFECTIVE_YT= EFFECTIVE_FOREIGN= LAST_FULL_PROBE= PREV_ALIVE=
-LAST_BAD_MD5= AI_BLOCKED= AI_KCTR= YT_BLOCKED= YT_KCTR= FOREIGN_BLOCKED= FOREIGN_KCTR= AI_EFF= DEEP_CTR= DEEP_TS=
+LAST_BAD_MD5= AI_BLOCKED= AI_KCTR= YT_BLOCKED= YT_KCTR= FOREIGN_BLOCKED= FOREIGN_KCTR= AI_EFF=
 AI_CMISS= AI_SW_TS= AI_LEFT_TS= YT_EFF= YT_CMISS= YT_SW_TS= FGN_EFF= FGN_CMISS= FGN_SW_TS=
 DPRI_CTR= DPRI_TS= DPRI_DEAF= DPRI_LEFT= DPRI_TAG= DYT_CTR= DYT_TS= DYT_DEAF= DYT_LEFT= DYT_TAG=
 DFGN_CTR= DFGN_TS= DFGN_DEAF= DFGN_LEFT= DFGN_TAG=
@@ -89,7 +89,7 @@ DFGN_CTR= DFGN_TS= DFGN_DEAF= DFGN_LEFT= DFGN_TAG=
 | `LAST_BAD_MD5` | md5 кандидата routing, уже ронявшего сеть (анти-флап) |
 | `AI_/YT_/FOREIGN_BLOCKED`, `…_KCTR` | латч kill-switch канала и счётчик гистерезиса |
 | `AI_EFF`, `YT_EFF`, `FGN_EFF` | дубли `EFFECTIVE_*` под короткими именами |
-| `DEEP_CTR`, `DEEP_TS` | legacy v27, переносятся как есть |
+| `DEEP_CTR`, `DEEP_TS` | legacy v27; ✅ с v34 не пишутся (никто не читал) |
 | `AI_/YT_/FGN_CMISS`, `…_SW_TS`, `AI_LEFT_TS` | пустые круги цепочки; время смены канала; уход AI по глухоте |
 | `D{PRI,YT,FGN}_CTR/_TS/_DEAF/_LEFT/_TAG` | сквозная проба роли: пустых подряд; время пробы; латч глухоты; время ухода по глухоте; тег замера |
 | `D{PRI,YT,FGN}_RES` (v31) | итог последнего замера: `ok` / `fail` / `none` (замера на этом теге не было, служебный тег, проба выключена) |

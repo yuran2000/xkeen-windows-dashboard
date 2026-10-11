@@ -1,4 +1,9 @@
 #!/bin/sh
+# XKeen failover watchdog v34 (2026-10-11, чистка state):
+#   • Убраны поля DEEP_CTR / DEEP_TS (сквозная проба v27, заменена в v29 на D{PRI,YT,FGN}_*): их
+#     никто не читал, сторож лишь переносил их из тика в тик. Старые значения в state просто
+#     перестают записываться.
+#
 # XKeen failover watchdog v33 (2026-10-11, карантин возврата после глухоты — быстрее и честнее):
 #   • Вернулись на основной канал роли (PRIMARY / YouTube / «Зарубежные») после ухода по глухоте —
 #     сквозная проба через минуту, а не через DEEP_PROBE_INTERVAL; пока идёт проверка, пустая проба
@@ -2445,15 +2450,6 @@ fi
 
 # ---------- Save state ----------
 # Формат: "<state> <counter> <default_tag> EFFECTIVE_AI=<tag> EFFECTIVE_YT=<tag> LAST_FULL_PROBE=<epoch> PREV_ALIVE=<n>"
-# v27: DEEP_CTR/DEEP_TS могли не выставиться в этом тике (глубокая проба выключена, не auto-mode
-# или не наступил интервал) — переносим прежние значения, иначе счётчик глухоты сбрасывался бы
-# каждый тик и порог никогда бы не набрался.
-if [ -z "$DEEP_CTR" ]; then
-  DEEP_CTR=$(grep -o 'DEEP_CTR=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$DEEP_CTR" ] && DEEP_CTR=0
-fi
-if [ -z "$DEEP_TS" ]; then
-  DEEP_TS=$(grep -o 'DEEP_TS=[0-9]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2); [ -z "$DEEP_TS" ] && DEEP_TS=0
-fi
 # То же для счётчиков/таймстампов цепочек AI и YT: ветка могла не выполниться (канал жив,
 # цепочка не задана, блок неактивен) — переносим прежние значения из state, иначе счётчик
 # кругов и cooldown обнулялись бы каждый тик.
@@ -2495,4 +2491,4 @@ DPRI_HOLD=$(_deep_hold "$DPRI_QN"); DYT_HOLD=$(_deep_hold "$DYT_QN"); DFGN_HOLD=
 # PRI_MAIN/YT_MAIN/FGN_MAIN выставляются каждый тик (до блоков ролей) — переносить не нужно.
 # AI_EFF — что РЕАЛЬНО применено для AI в этом тике (основной / резерв цепочки / block).
 # Нужен, чтобы (а) не спамить алертами о переключении, (б) AI-probe отличал blackhole от резерва.
-echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR AI_EFF=$EFFECTIVE_AI_TAG DEEP_CTR=$DEEP_CTR DEEP_TS=$DEEP_TS AI_CMISS=$AI_CMISS AI_SW_TS=$AI_SW_TS AI_LEFT_TS=$AI_LEFT_TS YT_EFF=$EFFECTIVE_YT_TAG YT_CMISS=$YT_CMISS YT_SW_TS=$YT_SW_TS FGN_EFF=$EFFECTIVE_FOREIGN_TAG FGN_CMISS=$FGN_CMISS FGN_SW_TS=$FGN_SW_TS DPRI_CTR=$DPRI_CTR DPRI_TS=$DPRI_TS DPRI_DEAF=$DPRI_DEAF DPRI_LEFT=$DPRI_LEFT DPRI_TAG=$DPRI_TAG DYT_CTR=$DYT_CTR DYT_TS=$DYT_TS DYT_DEAF=$DYT_DEAF DYT_LEFT=$DYT_LEFT DYT_TAG=$DYT_TAG DFGN_CTR=$DFGN_CTR DFGN_TS=$DFGN_TS DFGN_DEAF=$DFGN_DEAF DFGN_LEFT=$DFGN_LEFT DFGN_TAG=$DFGN_TAG PRI_MAIN=$PRI_MAIN YT_MAIN=$YT_MAIN FGN_MAIN=$FGN_MAIN DPRI_RES=$DPRI_RES DYT_RES=$DYT_RES DFGN_RES=$DFGN_RES PRI_NOALT=$PRI_NOALT DPRI_FSINCE=$DPRI_FSINCE DYT_NOALT=$DYT_NOALT DFGN_NOALT=$DFGN_NOALT DPRI_QN=$DPRI_QN DPRI_CHK=$DPRI_CHK DPRI_HOLD=$DPRI_HOLD DYT_QN=$DYT_QN DYT_CHK=$DYT_CHK DYT_HOLD=$DYT_HOLD DFGN_QN=$DFGN_QN DFGN_CHK=$DFGN_CHK DFGN_HOLD=$DFGN_HOLD" > "$STATE_FILE"
+echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR AI_EFF=$EFFECTIVE_AI_TAG AI_CMISS=$AI_CMISS AI_SW_TS=$AI_SW_TS AI_LEFT_TS=$AI_LEFT_TS YT_EFF=$EFFECTIVE_YT_TAG YT_CMISS=$YT_CMISS YT_SW_TS=$YT_SW_TS FGN_EFF=$EFFECTIVE_FOREIGN_TAG FGN_CMISS=$FGN_CMISS FGN_SW_TS=$FGN_SW_TS DPRI_CTR=$DPRI_CTR DPRI_TS=$DPRI_TS DPRI_DEAF=$DPRI_DEAF DPRI_LEFT=$DPRI_LEFT DPRI_TAG=$DPRI_TAG DYT_CTR=$DYT_CTR DYT_TS=$DYT_TS DYT_DEAF=$DYT_DEAF DYT_LEFT=$DYT_LEFT DYT_TAG=$DYT_TAG DFGN_CTR=$DFGN_CTR DFGN_TS=$DFGN_TS DFGN_DEAF=$DFGN_DEAF DFGN_LEFT=$DFGN_LEFT DFGN_TAG=$DFGN_TAG PRI_MAIN=$PRI_MAIN YT_MAIN=$YT_MAIN FGN_MAIN=$FGN_MAIN DPRI_RES=$DPRI_RES DYT_RES=$DYT_RES DFGN_RES=$DFGN_RES PRI_NOALT=$PRI_NOALT DPRI_FSINCE=$DPRI_FSINCE DYT_NOALT=$DYT_NOALT DFGN_NOALT=$DFGN_NOALT DPRI_QN=$DPRI_QN DPRI_CHK=$DPRI_CHK DPRI_HOLD=$DPRI_HOLD DYT_QN=$DYT_QN DYT_CHK=$DYT_CHK DYT_HOLD=$DYT_HOLD DFGN_QN=$DFGN_QN DFGN_CHK=$DFGN_CHK DFGN_HOLD=$DFGN_HOLD" > "$STATE_FILE"
