@@ -12391,7 +12391,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 
   <!-- v1.7.6 — Клиенты в политике XKeen (read-only) -->
   <div class="domain-section ds-clients" data-xk-sub="👥 Клиенты">
-    <h3 class="domain-section-header">👥 Клиенты в политике XKeen <span class="subsec-hint">(менять политику прямо в таблице через dropdown)</span></h3>
+    <h3 class="domain-section-header">👥 Клиенты в политике XKeen <span class="subsec-hint">(менять политику прямо в таблице через dropdown)</span> <a href="#help-policy-clients" onclick="openHelpAnchor('help-policy-clients'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; font-weight: normal;" title="Открыть тему справки «👥 Клиенты в политике XKeen»">❓ помощь</a></h3>
     <div class="domain-section-body">
       <p class="subtitle">
         В Keenetic-политике <code>XKeen</code> хранится список клиентов LAN, чей трафик помечается fwmark'ом и попадает в XKeen-iptables (а оттуда — в xray).
@@ -12553,6 +12553,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 <h2 class="sec-list">📋 Все outbounds <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— {{ outbounds|length }} шт., сгруппированы по провайдерам</span>
 </h2>
 <div class="card">
+  <div style="text-align: right; margin: -6px 0 4px;"><a href="#help-subscriptions" onclick="openHelpAnchor('help-subscriptions'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; font-weight: normal;" title="Открыть тему справки «📦 Подписки, группы и бейджи»">❓ помощь</a></div>
   <p class="subtitle" style="margin-top: 0; margin-bottom: 12px;">
     Outbound'ы сгруппированы по <strong>publicKey + SNI</strong> (Reality identity) — это значит «одна подписка от одного провайдера». Имя группы берётся из meta-поля «Провайдер» (если задано) или из общего префикса tag (например, provider-a-de1, provider-a-nl → группа «Provider A»). Сворачивать неинтересные группы ▶ чтобы не загромождать.<br>
     <strong>Проверить связь</strong> — кнопка «🏓 Пинг» внутри каждой группы: TCP+TLS-probe до каждого сервера группы с дашборда, бейджи появляются в колонке «статус». Один probe покрывает все группы (кэш 60&nbsp;сек).
@@ -12780,6 +12781,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 <details class="section-collapsible">
 <summary><h2 class="sec-add">➕ Добавить новый outbound <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— vless:// URL или JSON-конфиг</span></h2></summary>
 <div class="card">
+  <div style="text-align: right; margin: -6px 0 4px;"><a href="#help-add-outbound" onclick="openHelpAnchor('help-add-outbound'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; font-weight: normal;" title="Открыть тему справки «➕ Добавление outbound'ов»">❓ помощь</a></div>
   <div class="form-row">
     <label>vless:// URL или JSON-конфиг от провайдера</label>
     <textarea id="payload" placeholder='vless://uuid@host:port?type=...&security=reality&...#tag
@@ -12817,6 +12819,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 <details class="section-collapsible">
 <summary><h2 class="sec-sync">📡 Обновить из подписки <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— provider sync</span></h2></summary>
 <div class="card">
+  <div style="text-align: right; margin: -6px 0 4px;"><a href="#help-add-outbound" onclick="openHelpAnchor('help-add-outbound'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; font-weight: normal;" title="Открыть тему справки «➕ Добавление outbound'ов (sync с подписки)»">❓ помощь</a></div>
   <p class="subtitle" style="margin-top: 0;">
     Если провайдер обновил параметры (UUID, ключи, host, порт) — ввести URL подписки сюда,
     дашборд скачает свежий список vless URLs и обновит существующие outbound'ы
@@ -12878,6 +12881,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 <!-- ===== БЭКАП / ВОССТАНОВЛЕНИЕ ===== -->
 <h2 class="sec-backup">💾 Бэкап и восстановление <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— все настройки XKeen одним файлом</span></h2>
 <div class="card">
+  <div style="text-align: right; margin: -6px 0 4px;"><a href="#help-backup" onclick="openHelpAnchor('help-backup'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; font-weight: normal;" title="Открыть тему справки «💾 Бэкап и восстановление»">❓ помощь</a></div>
   <p class="subtitle" style="margin-top: 0;">
     Сохраняет/восстанавливает <strong>ВСЕ настройки XKeen</strong> одним файлом — конфиги xray, watchdog, sidecar-файлы панели и хуки netfilter.d:
     <details style="display: inline; margin-left: 4px;" data-xk-keep-inline>
@@ -13073,7 +13077,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 
   <!-- ====== BOOTSTRAP CLEAN XKEEN ====== -->
   <div style="margin-top: 22px; padding-top: 14px; border-top: 1px dashed #ccc;">
-    <h4 style="margin: 0 0 8px; color: #36a;">🚀 Развернуть на чистом XKeen</h4>
+    <h4 style="margin: 0 0 8px; color: #36a;">🚀 Развернуть на чистом XKeen <a href="#help-install-xkeen" onclick="openHelpAnchor('help-install-xkeen'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; font-weight: normal;" title="Открыть тему справки «🛠️ Установка XKeen с нуля»">❓ помощь</a></h4>
     <p style="margin: 0 0 10px; font-size: 0.92em; color: #555; line-height: 1.5;">
       Если на роутере уже стоит XKeen но он <strong>пустой</strong> (только что после <code>xkeen -i</code>) —
       эта кнопка дольёт всё что нужно для управления через панель:
@@ -13423,6 +13427,7 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
 <details class="section-collapsible">
 <summary><h2 class="sec-killswitch">🛡 Kill-switch политики XKeen <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— в окне перезапуска XKeen трафик не уходит напрямую</span></h2></summary>
 <div class="card">
+  <div style="text-align: right; margin: -6px 0 4px;"><a href="#help-killswitch" onclick="openHelpAnchor('help-killswitch'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; font-weight: normal;" title="Открыть тему справки «🛡 Kill-switch политики XKeen»">❓ помощь</a></div>
   <p class="subtitle" style="margin-top: 0;">
     При <code>xkeen -restart</code> (его делает и watchdog при переключении каналов) XKeen сначала снимает перехват, потом перезапускает xray —
     несколько секунд устройства из политики XKeen ходят в интернет <strong>напрямую, с домашним IP</strong>. AI-сервисы запоминают это как вход из другой страны.
@@ -13938,7 +13943,7 @@ Use this token to access the HTTP API:
       var where;
       if(rev) where = '<span class="muted">отозван ' + esc(c.revoked_at || '') + '</span>';
       else if(!d.ok) where = '<span class="muted">? роутер не прочитан</span>';
-      else if(c.router_iface) where = '<code>' + esc(c.router_iface) + '</code>' + (c.status !== 'active' ? ' <span style="color:#b26a00;" title="правила и NAT ещё не применены панелью">· правила?</span>' : '');
+      else if(c.router_iface) where = '<code>' + esc(c.router_iface) + '</code>' + (c.router_up === false ? ' <span style="color:#b02a37;" title="подключение выключено на роутере (веб-интерфейс Keenetic → Другие подключения): клиент не подключится, пока его не включат">· ⏸ выключено</span>' : '') + (c.status !== 'active' ? ' <span style="color:#b26a00;" title="правила и NAT ещё не применены панелью">· правила?</span>' : '');
       else where = '<span style="color:#b26a00;" title="на роутере подключения с этим ключом нет">⏳ не на роутере</span>';
       var act = '';
       if(!rev){
@@ -13954,7 +13959,7 @@ Use this token to access the HTTP API:
       h += '<tr style="border-top:1px solid #e3e8ee; color:#666; background:#fafafa;"><td style="padding:4px 6px;"><b>' + esc(m.desc) + '</b></td>'
         + '<td style="padding:4px 6px;">' + (m.xray_on ? '🛡 через xray · ' : '') + '<span class="muted" title="создано не через «Выдать доступ»: панель его не удаляет">создано вручную</span></td>'
         + '<td style="padding:4px 6px; font-family:monospace;">' + esc(m.subnet || '—') + '</td><td style="padding:4px 6px; font-family:monospace;">' + esc(m.port || '—') + '</td>'
-        + '<td style="padding:4px 6px;" class="muted">—</td><td style="padding:4px 6px;"><code>' + esc(m.iface) + '</code></td>'
+        + '<td style="padding:4px 6px;" class="muted">—</td><td style="padding:4px 6px;"><code>' + esc(m.iface) + '</code>' + (m.up === false ? ' <span style="color:#b02a37;" title="подключение выключено на роутере (веб-интерфейс Keenetic → Другие подключения): клиент не подключится, пока его не включат">· ⏸ выключено</span>' : '') + '</td>'
         + '<td style="padding:4px 6px; white-space:nowrap; text-align:right;"><button type="button" class="btn" data-rules="' + esc(m.iface) + '">🔒 Правила</button></td></tr>';
     });
     box.innerHTML = h + '</tbody></table>';
@@ -14459,7 +14464,7 @@ Use this token to access the HTTP API:
     </div>
   </details>
 
-  <details class="help-section">
+  <details class="help-section" id="help-update-panel">
     <summary>🔄 Обновление панели и синхронизация структуры с роутером</summary>
     <div class="help-body">
       <h4>Как обновлять панель</h4>
@@ -15067,7 +15072,7 @@ another-server.io   # ✏️</pre>
     </div>
   </details>
 
-  <details class="help-section">
+  <details class="help-section" id="help-subscriptions">
     <summary>📦 Подписки, группы и бейджи (🛡️ Обход / 📺 Ютуб)</summary>
     <div class="help-body">
       <h4>Что такое «подписка»</h4>
@@ -15092,7 +15097,7 @@ another-server.io   # ✏️</pre>
     </div>
   </details>
 
-  <details class="help-section">
+  <details class="help-section" id="help-add-outbound">
     <summary>➕ Добавление outbound'ов (vless URL, JSON, sync с подписки)</summary>
     <div class="help-body">
       <h4>Один outbound — vless URL</h4>
@@ -15433,7 +15438,7 @@ DASHBOARD_PORT = 5000  # опционально, если порт 5000 заня
     </div>
   </details>
 
-  <details class="help-section">
+  <details class="help-section" id="help-install-xkeen">
     <summary>🛠️ Установка XKeen с нуля на новый роутер</summary>
     <div class="help-body">
       <p>Эта инструкция — для случая, когда есть <strong>новый чистый Keenetic</strong>, на нём ничего нет,
@@ -15831,7 +15836,20 @@ xkeen -restart</pre>
     </div>
   </details>
 
-  <details class="help-section">
+  <details class="help-section" id="help-policy-clients">
+    <summary>👥 Клиенты в политике XKeen — кого перехватывает xray</summary>
+    <div class="help-body">
+      <p>XKeen перехватывает трафик <strong>только тех устройств, которые привязаны к политике доступа XKeen</strong> в Keenetic. Остальные устройства домашней сети ходят в интернет напрямую через провайдера — каналы, домены и kill-switch на них не действуют.</p>
+      <ul>
+        <li>Таблица «👥 Клиенты в политике XKeen» показывает устройства роутера и их политику; dropdown в колонке «Политика» переносит устройство в XKeen, в другую политику или «напрямую» без перезагрузки устройства.</li>
+        <li>Новое устройство (телефон, ТВ, приставка) по умолчанию в политику не попадает — его нужно добавить, иначе VPN на нём не работает.</li>
+        <li>Каждый клиент в политике добавляет нагрузку на процессор роутера (перехват TPROXY): устройствам, которым VPN не нужен, лучше оставить прямой доступ.</li>
+        <li>Проверка: на устройстве из политики сайт определения IP показывает адрес VPN-выхода, на устройстве вне политики — адрес провайдера.</li>
+      </ul>
+      <p class="muted">Сама политика создаётся в веб-интерфейсе Keenetic (шаг 8 темы «🛠️ Установка XKeen с нуля на новый роутер»); имя — ровно <code>XKeen</code>.</p>
+    </div>
+  </details>
+  <details class="help-section" id="help-backup">
     <summary>💾 Бэкап и восстановление</summary>
     <div class="help-body">
       <h4>Snapshot одним файлом</h4>

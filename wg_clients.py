@@ -442,6 +442,8 @@ def scan_router(timeout=20):
             "desc": (v.get("description", "") or "").strip(), "addr": addr, "subnet": sub, "port": port,
             "peers": [p.get("public-key", "") for p in (wg.get("peer") or [])],
             "is_link": _is_link(cprs, addr, s2s),
+            # включён ли интерфейс на роутере (выключенный в веб-интерфейсе Keenetic — "down")
+            "up": v.get("state") == "up",
         })
     for idx, subnet in hooks.items():           # подсети под хуками xray — тоже заняты
         sub = _octet3(subnet.split("/")[0]) if subnet else None
@@ -1566,7 +1568,7 @@ def manual_view(state):
         addr = f.get("addr") or ""
         out.append({"iface": f["name"], "desc": f.get("desc") or f["name"], "port": f.get("port"),
                     "subnet": str(ipaddress.ip_interface(f"{addr}/24").network) if addr else "",
-                    "xray_on": f.get("index") in state.get("hooks", {})})
+                    "xray_on": f.get("index") in state.get("hooks", {}), "up": f.get("up")})
     out.sort(key=lambda x: x["iface"])
     return out
 
@@ -1588,6 +1590,7 @@ def clients_view(state):
             "port": c.get("port"), "created": c.get("created", ""), "status": c.get("status", ""),
             "revoked_at": c.get("revoked_at", ""), "router_iface": f["name"] if f else "",
             "xray_on": bool(f) and f.get("index") in state.get("hooks", {}),
+            "router_up": f.get("up") if f else None,
         })
     clients.sort(key=lambda c: (c["status"] == "revoked", c["created"]))
     return clients, reg_err

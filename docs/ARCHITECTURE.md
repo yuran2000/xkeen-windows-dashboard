@@ -240,7 +240,8 @@ Windows-клиент включает свой kill-switch), `build_wg_client_co
   из реестра, `warnings` пуст. Правила, поставленные самой панелью, восстанавливаются без потерь и
   предупреждений во всех режимах (проверка «обратимость» в тесте).
 - `manual_view` — доступы роутера, выданные не панелью и не линки: поле `manual` в `wg-clients`, серые строки
-  «создано вручную» в «📋 Выданные» (правила — да, отзыв — нет).
+  «создано вручную» в «📋 Выданные» (правила — да, отзыв — нет). `scan_router` отдаёт у интерфейса `up` (`state` из
+  `/rci/show/interface`); выключенный в Keenetic доступ — пометка «⏸ выключено» (`router_up` у выданных, `up` у ручных).
 - `router_inventory` — все `WireguardN` (доступ/линк, онлайн, трафик, NAT, заворот, `.conf`-шаблон);
   `backup_text` — бэкап одного доступа.
 
@@ -491,7 +492,7 @@ BusyBox ash, cron раз в минуту); панель пишет его кон
 | 💾 Бэкап и восстановление (`sec-backup`), 🔧 Подключение к роутеру (`sec-router`, `section-router-config`), 🛠 Управление XKeen (`sec-xkmgmt`), 🐉 Подключение клиентов WireGuard (`sec-router`) | Обслуживание | снапшоты, SSH и bootstrap, CLI и GeoFile, WG: подпункты сайдбара «➕ Выдать доступ», «📋 Выданные», «📡 На роутере…», «🧩 .conf вручную…» (`.card > details`) + диалог `wgRulesDlg` |
 | 🚨 Алерты при падении xray (`sec-xkmgmt`), 🚑 Восстановление и диагностика (`sec-rescue`), 🤖 Telegram-бот для алертов (`sec-tg`) | Диагностика | индикатор/toast, диагностика + auto-fix, TG |
 | 🛡 Kill-switch политики XKeen (`sec-killswitch`) | **Прочее** (не ловится `catFor`) | `ks-status` |
-| ❓ Помощь (`sec-help`) | Помощь | 21 тема `details.help-section` |
+| ❓ Помощь (`sec-help`) | Помощь | 22 темы `details.help-section` |
 
 ### 8.2. Сайдбар (`buildKeeneticSidebar`)
 
@@ -562,10 +563,12 @@ GeoIP-категории»: неизвестно / расширенная и с�
 индикаторы. `CHAIN_STATE` объявлен `const` ниже читающих его функций — до инициализации ReferenceError
 (TDZ), поэтому в `chainPositionOf`/`chainUseCommon` стоит `try/catch`.
 
-**Справка**: `details.help-section` (21 тема). Якоря — `id` на `<details>`: `help-channels`,
+**Справка**: `details.help-section` (22 темы). Якоря — `id` на `<details>`: `help-channels`,
 `help-watchdog`, `help-tg-alerts`, `help-scenarios` (внутри `help-yt-recaptcha`), `help-v2fly-geoip`,
 `help-ipv6-leak`, `help-dns-block`, `help-foreign`, `help-killswitch` (kill-switch **политики**),
-`help-wg-client`. Ссылаться через `openHelpAnchor('help-x')` можно только на тему с `id`.
+`help-wg-client`, `help-update-panel`, `help-subscriptions`, `help-add-outbound`, `help-install-xkeen`,
+`help-policy-clients`, `help-backup`. Ссылка «❓ помощь» у раздела с `h2` — первой строкой карточки, не в
+заголовке (`catFor` определяет категорию по тексту заголовка). Ссылаться через `openHelpAnchor('help-x')` можно только на тему с `id`.
 
 ### 8.6. Как добавить новый блок или карточку
 
