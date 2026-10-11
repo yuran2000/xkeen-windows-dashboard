@@ -147,8 +147,8 @@ try:
 except ImportError:
     sys.stderr.write(
         "\nERROR: config_local.py не найден.\n"
-        "  - В portable-режиме положи config.ini рядом с exe (template создаётся автоматически).\n"
-        "  - В dev-режиме скопируй config_local.example.py -> config_local.py и заполни.\n\n"
+        "  - В portable-режиме положить config.ini рядом с exe (template создаётся автоматически).\n"
+        "  - В dev-режиме скопировать config_local.example.py -> config_local.py и заполнить.\n\n"
     )
     sys.exit(1)
 
@@ -553,7 +553,7 @@ def parse_active_per_port(access_log_path, window_sec=30, lines_limit=10000):
         ip = m.group(2)
         tag = m.group(3)
         # Skip только сам Keenetic (его connectivity-checks) и loopback.
-        # LAN-клиентов НЕ фильтруем — это твой телефон/ноут на Wi-Fi.
+        # LAN-клиентов НЕ фильтруем — это свои телефоны/ноутбуки на Wi-Fi.
         if ip == cfg.KEENETIC_HOST or ip.startswith("127."):
             continue
         port = tag_to_port.get(tag)
@@ -872,7 +872,7 @@ def keenetic_ssh(cmd, timeout=15, stdin_data=None):
                 partial_err = (e.stderr.decode("utf-8", errors="replace") if isinstance(e.stderr, bytes) else str(e.stderr))[-2000:]
         except Exception:
             pass
-        hint = f"⏱ timeout {timeout}s — команда могла фактически выполниться, проверь статус кнопкой '📊 Статус'."
+        hint = f"⏱ timeout {timeout}s — команда могла фактически выполниться, проверить статус кнопкой '📊 Статус'."
         return {
             "ok": False,
             "stdout": partial_out,
@@ -1249,7 +1249,7 @@ def build_wg_client_conf(iface, endpoint_host, client_ip, mode, selective_cidrs,
         if excl:
             inet = _wg_subtract_cidrs(inet, excl)
             if not inet:
-                raise ValueError("адреса-исключения покрыли весь интернет-набор — full-tunnel остался бы без выхода; убери слишком широкие CIDR (напр. 0.0.0.0/0)")
+                raise ValueError("адреса-исключения покрыли весь интернет-набор — full-tunnel остался бы без выхода; убрать слишком широкие CIDR (напр. 0.0.0.0/0)")
         allowed = ", ".join(inet + extras)
     elif mode == "lan":
         # обычный клиент: доступ только к домашней LAN + подсети туннеля (интернет у клиента напрямую, без анти-DPI)
@@ -1269,8 +1269,8 @@ def build_wg_client_conf(iface, endpoint_host, client_ip, mode, selective_cidrs,
         iface_head = ["[Interface]", f"PrivateKey = {client_priv}"]
     else:
         iface_head = ["[Interface]",
-                      "# PrivateKey: вставь свой приватный ключ (создаётся в приложении WireGuard -> Add empty tunnel)",
-                      "PrivateKey = ВСТАВЬ_СВОЙ_ПРИВАТНЫЙ_КЛЮЧ"]
+                      "# PrivateKey: вставить свой приватный ключ (создаётся в приложении WireGuard -> Add empty tunnel)",
+                      "PrivateKey = ВСТАВИТЬ_СВОЙ_ПРИВАТНЫЙ_КЛЮЧ"]
     lines = iface_head + [
         f"Address = {address}",
         f"DNS = {dns_ip}",
@@ -1514,7 +1514,7 @@ def _wg_resolve_params(iface_id):
         except Exception:
             subnet = None
     if not subnet:
-        return None, f"у {kernel} нет адреса/подсети — подними интерфейс на роутере"
+        return None, f"у {kernel} нет адреса/подсети — поднять интерфейс на роутере"
     lan_ip = info.get("router_lan_ip") or getattr(cfg, "KEENETIC_HOST", "")
     # LAN-подсеть и её интерфейс для masquerade WG→LAN — по адресу роутера в LAN (_keenetic_lan_net).
     lan_net, lan_if = _keenetic_lan_net()
@@ -1612,7 +1612,7 @@ def wg_xray_disconnect(iface_id):
     r = keenetic_ssh(cmd, timeout=30)
     if "WG_GONE" in (r.get("stdout") or ""):
         return {"ok": True, "connected": False, "kernel": kernel, "msg": f"{kernel} отключён от анти-DPI"}
-    return {"ok": False, "error": "catch-all всё ещё на месте — возможно интерфейс ведёт сторонний хук (напр. zz_wg_home_xkeen.sh). Проверь вручную."}
+    return {"ok": False, "error": "catch-all всё ещё на месте — возможно интерфейс ведёт сторонний хук (напр. zz_wg_home_xkeen.sh). Проверить вручную."}
 
 
 @app.route("/api/xkeen/wg-cleanup-orphan", methods=["POST"])
@@ -1900,7 +1900,7 @@ def _wg_settings():
 
 
 _WG_LAN_UNKNOWN = ("ЛВС роутера не определена (не прочитана с роутера) — изменения на роутере остановлены, "
-                   "чтобы не записать чужую сеть. Повторите позже или задайте WG_LAN_SUBNET в config_local.py.")
+                   "чтобы не записать чужую сеть. Повторить позже или задать WG_LAN_SUBNET в config_local.py.")
 
 
 def _wg_prepare(write=False):
@@ -2060,8 +2060,8 @@ def api_wg_acl_apply():
         xok, xmsg = _wg_xray_off(iface)
         msg += (" Заворот в xray снят." if xok else f" ⚠ Заворот в xray не снят: {xmsg}")
     elif eff != "xray" and hook is None:
-        msg += (" ⚠ Состояние заворота в xray не прочитано — проверьте в «📡 На роутере»; если заворот "
-                "включён, снимите его кнопкой «🔌 Снять анти-DPI», иначе трафик пойдёт в xray.")
+        msg += (" ⚠ Состояние заворота в xray не прочитано — проверить в «📡 На роутере»; если заворот "
+                "включён, снять его кнопкой «🔌 Снять анти-DPI», иначе трафик пойдёт в xray.")
     return jsonify({"ok": True, "msg": msg})
 
 
@@ -3165,7 +3165,7 @@ def keenetic_write_watchdog_config(updates):
         if cur is None:
             # Fail-closed: сбой чтения ≠ пустой конфиг. Продолжить = записать
             # дефолты+updates и потерять домены каналов / TG-токен / пороги.
-            return {"ok": False, "stderr": "watchdog.config не прочитался с роутера (SSH-сбой/таймаут) — запись отменена, чтобы не затереть текущие настройки. Повтори позже."}
+            return {"ok": False, "stderr": "watchdog.config не прочитался с роутера (SSH-сбой/таймаут) — запись отменена, чтобы не затереть текущие настройки. Повторить позже."}
         # Defaults если первый раз
         if "PRIMARY_TAG" not in cur: cur["PRIMARY_TAG"] = "vless-reality"
         if "FAILOVER_TAGS" not in cur: cur["FAILOVER_TAGS"] = "provider-a-nl"
@@ -3270,13 +3270,13 @@ def keenetic_set_watchdog_target(role, new_tag):
         return {"ok": False, "stderr": "не передан целевой outbound"}
     _obs = keenetic_get_outbounds()
     if _obs is None:
-        return {"ok": False, "stderr": "не удалось прочитать outbound'ы с роутера — смена роли отменена. Повтори позже."}
+        return {"ok": False, "stderr": "не удалось прочитать outbound'ы с роутера — смена роли отменена. Повторить позже."}
     _valid = {o.get("tag") for o in _obs}
     if new_tag not in _valid:
-        return {"ok": False, "stderr": f"outbound '{new_tag}' не найден среди серверов на роутере — обнови страницу (возможно список устарел) и выбери существующий."}
+        return {"ok": False, "stderr": f"outbound '{new_tag}' не найден среди серверов на роутере — обновить страницу (возможно список устарел) и выбрать существующий."}
     cur = keenetic_read_watchdog_config()
     if cur is None:
-        return {"ok": False, "stderr": "watchdog.config не прочитался с роутера — смена роли отменена (иначе можно потерять текущую резервную цепочку). Повтори позже."}
+        return {"ok": False, "stderr": "watchdog.config не прочитался с роутера — смена роли отменена (иначе можно потерять текущую резервную цепочку). Повторить позже."}
     failover_str = cur.get("FAILOVER_TAGS", "")
     failover_list = [t.strip() for t in re.split(r"[,\s]+", failover_str) if t.strip()]
 
@@ -3335,30 +3335,30 @@ def keenetic_remove_outbound(tag):
     # «ролей нет» — иначе удаление активного PRIMARY прошло бы без блокировки (fail-open).
     targets = keenetic_get_watchdog_targets(strict=True)
     if targets is None:
-        return {"ok": False, "stderr": "не удалось прочитать watchdog.config — удаление отменено (защита активных ролей, fail-closed). Повтори позже."}
+        return {"ok": False, "stderr": "не удалось прочитать watchdog.config — удаление отменено (защита активных ролей, fail-closed). Повторить позже."}
     if tag == targets.get("primary_tag"):
-        return {"ok": False, "stderr": f"tag '{tag}' сейчас PRIMARY. Сначала смени PRIMARY на другой outbound."}
+        return {"ok": False, "stderr": f"tag '{tag}' сейчас PRIMARY. Сначала сменить PRIMARY на другой outbound."}
     if tag == targets.get("ai_tag"):
-        return {"ok": False, "stderr": f"tag '{tag}' сейчас AI-sticky. Сначала смени AI на другой outbound."}
+        return {"ok": False, "stderr": f"tag '{tag}' сейчас AI-sticky. Сначала сменить AI на другой outbound."}
     if tag == targets.get("yt_tag"):
-        return {"ok": False, "stderr": f"tag '{tag}' сейчас YouTube-sticky. Сначала смени YouTube на другой outbound."}
+        return {"ok": False, "stderr": f"tag '{tag}' сейчас YouTube-sticky. Сначала сменить YouTube на другой outbound."}
     if tag == targets.get("foreign_tag"):
-        return {"ok": False, "stderr": f"tag '{tag}' сейчас канал «Зарубежные сервисы». Сначала смени его на другой outbound."}
+        return {"ok": False, "stderr": f"tag '{tag}' сейчас канал «Зарубежные сервисы». Сначала сменить его на другой outbound."}
     if tag == targets.get("ipv6_tag"):
-        return {"ok": False, "stderr": f"tag '{tag}' сейчас канал «Через IPv6». Сначала смени его на другой outbound."}
+        return {"ok": False, "stderr": f"tag '{tag}' сейчас канал «Через IPv6». Сначала сменить его на другой outbound."}
     if tag in (targets.get("failover_tags") or []):
-        return {"ok": False, "stderr": f"tag '{tag}' в списке FAILOVER. Сначала убери его оттуда (смени FAILOVER на другой)."}
+        return {"ok": False, "stderr": f"tag '{tag}' в списке FAILOVER. Сначала убрать его оттуда (сменить FAILOVER на другой)."}
     # v1.0.99: цепочки резерва AI/YouTube — та же защита, что и у FAILOVER-цепочки.
     # Удалить outbound, на который watchdog переключится при падении AI/YT-канала, значит
     # тихо оставить в watchdog.config тег-зомби (в аварии цепочка молча укоротится).
     if tag in (targets.get("ai_failover_tags") or []):
-        return {"ok": False, "stderr": f"tag '{tag}' в цепочке резерва AI-канала. Сначала убери его из цепочки (карточка «🤖 AI» → «⛓️ Цепочка резерва»)."}
+        return {"ok": False, "stderr": f"tag '{tag}' в цепочке резерва AI-канала. Сначала убрать его из цепочки (карточка «🤖 AI» → «⛓️ Цепочка резерва»)."}
     if tag in (targets.get("yt_failover_tags") or []):
-        return {"ok": False, "stderr": f"tag '{tag}' в цепочке резерва YouTube-канала. Сначала убери его из цепочки (карточка «📺 YouTube» → «⛓️ Цепочка резерва»)."}
+        return {"ok": False, "stderr": f"tag '{tag}' в цепочке резерва YouTube-канала. Сначала убрать его из цепочки (карточка «📺 YouTube» → «⛓️ Цепочка резерва»)."}
     # Собственную цепочку FOREIGN защищаем и при включённой «общей цепочке»: список в config
     # остаётся, и при выключении галочки тег-зомби проснулся бы.
     if tag in (targets.get("foreign_failover_tags") or []):
-        return {"ok": False, "stderr": f"tag '{tag}' в цепочке резерва канала «Зарубежные сервисы». Сначала убери его из цепочки (карточка «📱 Зарубежные сервисы» → «⛓️ Цепочка резерва»)."}
+        return {"ok": False, "stderr": f"tag '{tag}' в цепочке резерва канала «Зарубежные сервисы». Сначала убрать его из цепочки (карточка «📱 Зарубежные сервисы» → «⛓️ Цепочка резерва»)."}
     raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
     if not raw:
         return {"ok": False, "stderr": "не смог прочитать 04_outbounds.json"}
@@ -3400,7 +3400,7 @@ def keenetic_remove_outbounds_bulk(tags):
         return {"ok": False, "stderr": "пустой список tags"}
     targets = keenetic_get_watchdog_targets(strict=True)
     if targets is None:
-        return {"ok": False, "stderr": "не удалось прочитать watchdog.config — удаление отменено (защита активных ролей, fail-closed). Повтори позже."}
+        return {"ok": False, "stderr": "не удалось прочитать watchdog.config — удаление отменено (защита активных ролей, fail-closed). Повторить позже."}
     primary = targets.get("primary_tag")
     ai = targets.get("ai_tag")
     yt = targets.get("yt_tag")
@@ -3564,13 +3564,13 @@ def keenetic_remove_subscription(key, dry_run=False):
         return {"ok": False, "stderr": "не удалось прочитать outbound'ы с роутера"}
     targets = keenetic_get_watchdog_targets(strict=True)
     if targets is None:
-        return {"ok": False, "stderr": "не удалось прочитать watchdog.config — удаление подписки отменено (защита активных ролей, fail-closed). Повтори позже."}
+        return {"ok": False, "stderr": "не удалось прочитать watchdog.config — удаление подписки отменено (защита активных ролей, fail-closed). Повторить позже."}
     subs = keenetic_read_sub_meta() or {}
     plan = _subscription_removal_plan(key, outbounds, targets, subs)
     if plan["critical"]:
         return {"ok": False, "blocked": True, "protected": plan["critical"],
                 "member_count": len(plan["member_tags"]),
-                "stderr": "В подписке есть узел в активной роли (PRIMARY/AI/YouTube/Зарубежные/IPv6/голова резерва) — сначала переназначьте роль на другой канал, затем повторите."}
+                "stderr": "В подписке есть узел в активной роли (PRIMARY/AI/YouTube/Зарубежные/IPv6/голова резерва) — сначала переназначить роль на другой канал, затем повторить."}
     if dry_run:
         return {"ok": True, "dry_run": True, **plan}
     member_tags = plan["member_tags"]
@@ -3768,7 +3768,7 @@ def keenetic_add_outbound(payload, tag_override=None, overwrite=False):
     # 4. Дедуп по tag
     has_dup = any(o.get("tag") == tag for o in obs)
     if has_dup and not overwrite:
-        return {"ok": False, "stderr": f"outbound с tag '{tag}' уже есть. Поставь «Перезаписать если такой tag уже есть» или задай другой Tag."}
+        return {"ok": False, "stderr": f"outbound с tag '{tag}' уже есть. Поставить «Перезаписать если такой tag уже есть» или задать другой Tag."}
     if has_dup:
         obs = [o for o in obs if o.get("tag") != tag]
 
@@ -3807,9 +3807,9 @@ def keenetic_add_outbound(payload, tag_override=None, overwrite=False):
             break
     if not xray_up:
         keenetic_ssh(f"cp {ob_path}.bak-{ts} {ob_path} && /opt/sbin/xkeen -restart", timeout=120)
-        return {"ok": False, "stderr": "xray не поднялся после добавления — откатил 04_outbounds.json к бэкапу. Открой «🚑 Восстановление и диагностика» (частая причина — сломан curl/libnghttp2)."}
+        return {"ok": False, "stderr": "xray не поднялся после добавления — откатил 04_outbounds.json к бэкапу. Открыть «🚑 Восстановление и диагностика» (частая причина — сломан curl/libnghttp2)."}
     host = (new_ob.get("settings", {}).get("vnext") or [{}])[0].get("address", "?")
-    return {"ok": True, "tag": tag, "stdout": f"✅ Добавлен outbound '{tag}' ({host}). Бэкап: 04_outbounds.json.bak-{ts}. Чтобы пустить через него трафик — назначь роль (PRIMARY/FAILOVER/AI/…) в разделе каналов."}
+    return {"ok": True, "tag": tag, "stdout": f"✅ Добавлен outbound '{tag}' ({host}). Бэкап: 04_outbounds.json.bak-{ts}. Чтобы пустить через него трафик — назначить роль (PRIMARY/FAILOVER/AI/…) в разделе каналов."}
 
 
 SOCKS_LOCAL_TAG  = "socks-local"
@@ -3879,7 +3879,7 @@ def keenetic_ensure_socks_local():
         keenetic_ssh(f"cp {path}.bak-{ts} {path} && /opt/sbin/xkeen -restart", timeout=120)
         return {"ok": False, "action": "failed",
                 "detail": "xray не поднялся после добавления socks-local — откатил 03_inbounds.json к бэкапу. "
-                          "Открой «🚑 Восстановление и диагностика»."}
+                          "Открыть «🚑 Восстановление и диагностика»."}
     return {"ok": True, "action": "added",
             "detail": f"socks-local inbound поднят на 127.0.0.1:{SOCKS_LOCAL_PORT}. Бэкап: 03_inbounds.json.bak-{ts}"}
 
@@ -3924,7 +3924,7 @@ def keenetic_sync_structure():
     """Применить актуальную СТРУКТУРУ на роутер (watchdog.sh + routing template), сохранив
     кастомные IP, с ПОЛНЫМ авто-откатом если сеть после применения сломалась.
     Переиспользует keenetic_ensure_watchdog_current (watchdog) и _auto_sync_template_ips_silent
-    (вернуть твои IP после overwrite свежей структурой template). Возврат:
+    (вернуть свои IP после overwrite свежей структурой template). Возврат:
       {ok, steps:[...], rolled_back: bool, summary}."""
     steps = []
     def _rec(name, ok, detail=""):
@@ -3961,7 +3961,7 @@ def keenetic_sync_structure():
         _rec("watchdog → актуальный", wd.get("action") in ("current", "upgraded"),
              f"{wd.get('action')} v{wd.get('from','')}→v{wd.get('to','')}".strip())
 
-    # 3. template → свежая СТРУКТУРА + пересинк твоих IP из outbounds
+    # 3. template → свежая СТРУКТУРА + пересинк своих IP из outbounds
     if drift["template"]["outdated"]:
         local_tmpl = _bootstrap_find("05_routing.template.json.cur")
         if not local_tmpl or not os.path.exists(local_tmpl):
@@ -3973,10 +3973,10 @@ def keenetic_sync_structure():
             _rec("template → свежая структура", w.get("ok"), w.get("stderr", "")[:200])
             try:
                 ip_sync = _auto_sync_template_ips_silent()
-                _rec("template → вернуть твои IP из outbounds", True,
+                _rec("template → вернуть IP из outbounds", True,
                      (str(ip_sync) if isinstance(ip_sync, str) else "ок"))
             except Exception as ex:
-                _rec("template → вернуть твои IP из outbounds", False, str(ex))
+                _rec("template → вернуть IP из outbounds", False, str(ex))
 
     # 4. прогон watchdog → перегенерить routing из новых watchdog/template
     keenetic_ssh(f"sh {WATCHDOG_REMOTE_PATH} 2>&1 | tail -3", timeout=120)
@@ -4042,10 +4042,10 @@ def keenetic_sync_structure():
             pass
         return {"ok": False, "steps": steps, "rolled_back": True,
                 "summary": ("⏮ Применение структуры сломало сеть — выполнен АВТО-ОТКАТ к рабочей версии. "
-                            + ("Сеть восстановлена." if ok2 else "⚠ xray не поднялся — проверь роутер вручную."))}
+                            + ("Сеть восстановлена." if ok2 else "⚠ xray не поднялся — проверить роутер вручную."))}
 
     return {"ok": True, "steps": steps, "rolled_back": False,
-            "summary": "✅ Структура применена, сеть здорова (xray работает, DNS резолвится). Твои IP сохранены."}
+            "summary": "✅ Структура применена, сеть здорова (xray работает, DNS резолвится). Свои IP сохранены."}
 
 
 # ============== ROUTES ==============
@@ -4119,7 +4119,7 @@ def _xkeen_error_handler(ex):
         return f"""<!doctype html><html><head><meta charset="utf-8"><title>Ошибка</title></head><body style="font-family: -apple-system, Segoe UI, sans-serif; padding: 20px; max-width: 1000px;">
 <h2>❌ Ошибка при рендеринге /xkeen</h2>
 <p><strong>Что произошло:</strong> {str(ex).replace('<','&lt;')}</p>
-<p>Скопируй traceback ниже и пришли в чат:</p>
+<p>Скопировать traceback ниже и прислать в чат:</p>
 <pre style="background:#1e1e1e; color:#ddd; padding:14px; border-radius:6px; overflow-x:auto; font-size:0.85em; line-height:1.4;">{tb.replace('<','&lt;')}</pre>
 <p><a href="/login">← на login</a> · <a href="/xkeen">обновить</a></p>
 </body></html>""", 500
@@ -5060,7 +5060,7 @@ def api_xkeen_header_status():
         result = {
             "ok": True, "state": "warn",
             "label": f"xray {mode} · {active_tag}" if active_tag else f"xray {mode}",
-            "tooltip": f"PRIMARY: {active_tag or '(не определён)'}\nРежим не распознан ({mode}). xray запущен — глянь «📊 Статус».",
+            "tooltip": f"PRIMARY: {active_tag or '(не определён)'}\nРежим не распознан ({mode}). xray запущен — посмотреть «📊 Статус».",
         }
 
     result.update({
@@ -5158,7 +5158,7 @@ def api_xkeen_restart_dashboard():
         )
         return jsonify({
             "ok": True,
-            "stdout": "Рестарт через одноразовую Task Scheduler задачу (без файлов на диске). Жди ~5 сек → обнови страницу.",
+            "stdout": "Рестарт через одноразовую Task Scheduler задачу (без файлов на диске). Подождать ~5 сек → обновить страницу.",
         })
     except subprocess.TimeoutExpired:
         return jsonify({"ok": False, "stderr": "schtasks /Create timeout (>10 сек)"})
@@ -5523,13 +5523,13 @@ def api_xkeen_subscription_preview():
 
     # Helpers для роль-бейджей в matches и orphans_local. Один источник истины,
     # чтобы UI всегда показывал согласованную картинку: одно и то же распределение
-    # ролей в строках «Будут обновлены» и в строках «У тебя, но НЕ в подписке».
+    # ролей в строках «Будут обновлены» и в строках «На роутере, но НЕ в подписке».
     _targets_preview = keenetic_get_watchdog_targets() or {}
     _failover_list = list(_targets_preview.get("failover_tags") or [])
     _failover_pos = {t: i + 1 for i, t in enumerate(_failover_list)}
     # 6 «уникальных» ролей — у каждой ровно один tag через dropdown в секции
     # «🎯 Основное и резервное подключение». В matches (обновление) бейдж
-    # 🎯 — информационный («это твой PRIMARY/AI/...», обновление НЕ ломает роль).
+    # 🎯 — информационный («это текущий PRIMARY/AI/...», обновление НЕ ломает роль).
     # В orphans_local (удаление) тот же tag → бейдж ⛔ — блокирующий (sync отменит).
     _critical_roles = {
         _targets_preview.get("primary_tag"):  "PRIMARY",
@@ -5751,7 +5751,7 @@ def api_xkeen_subscription_sync():
     """Скачать subscription URL → распарсить → синхронизировать с outbound'ами на роутере.
     Body:
       url=<subscription URL>
-      add_new=1  — добавить outbound'ы которые есть в подписке но нет у тебя
+      add_new=1  — добавить outbound'ы, которые есть в подписке, но нет на роутере
       remove_orphans=1 — удалить outbound'ы которые ПРИНАДЛЕЖАТ ЭТОЙ ПОДПИСКЕ
                          (meta.sub_url == sub_url) но НЕТ в свежескачанной выгрузке.
                          Outbound'ы соседних подписок и legacy без meta.sub_url НЕ трогаются.
@@ -5855,7 +5855,7 @@ def api_xkeen_subscription_sync():
                 "stderr": (
                     "⛔ Удаление отменено: эти outbound'ы выбраны в УНИКАЛЬНЫХ dropdown'ах "
                     "секции «🎯 Основное и резервное подключение». Sync вообще не выполнен — "
-                    "сначала смени роль через соответствующий dropdown:\n\n"
+                    "сначала сменить роль через соответствующий dropdown:\n\n"
                     + "\n".join(roles_msg) +
                     "\n\nПотом снова запустить sync.\n\n"
                     "💡 Подсказка: outbound'ы которые ТОЛЬКО в хвосте FAILOVER-цепочки "
@@ -6099,7 +6099,7 @@ def api_xkeen_subscription_sync():
                 f"⚠️ FAILOVER-цепочка watchdog: попытался убрать {len(removed_from_failover)} tag'ов "
                 f"({', '.join(removed_from_failover)}), но запись watchdog.config упала: "
                 f"{failover_cleanup_error}. Outbound'ы уже удалены, но tag-зомби остались в "
-                f"FAILOVER_TAGS — watchdog может ошибаться. Поправь вручную через UI."
+                f"FAILOVER_TAGS — watchdog может ошибаться. Поправить вручную через UI."
             )
         else:
             parts.append(f"🔗 Также убраны из FAILOVER-цепочки watchdog ({len(removed_from_failover)}): {', '.join(removed_from_failover)}")
@@ -6112,7 +6112,7 @@ def api_xkeen_subscription_sync():
         elif u["action"] == "name":
             parts.append(f"🏷 Название подписки из Profile-Title: «{u['new']}»")
         elif u["action"] == "skip":
-            parts.append(f"⚠️ У подписки {u['pbk_short']} стояла дата {u['old']}, в URL — {u['new']}. Оставил твою (включи 'Обновить дату истечения' чтобы перетереть)")
+            parts.append(f"⚠️ У подписки {u['pbk_short']} стояла дата {u['old']}, в URL — {u['new']}. Оставлена текущая (включить 'Обновить дату истечения', чтобы перетереть)")
         elif u["action"] == "synced_to_pbks":
             parts.append(f"📅 Дата истечения также подтянута в {u['new']} pbk-записях этой подписки")
     response_payload = {
@@ -6220,7 +6220,7 @@ def api_xkeen_migration_backup():
     except FileNotFoundError:
         return jsonify({
             "ok": False, "stage": "scp_check",
-            "error": "Команда scp не найдена в PATH. Установи OpenSSH Client: Settings → Apps → Optional Features → Add 'OpenSSH Client'. Или поставь Git for Windows."
+            "error": "Команда scp не найдена в PATH. Установить OpenSSH Client: Settings → Apps → Optional Features → Add 'OpenSSH Client'. Или поставить Git for Windows."
         }), 500
     except Exception:
         pass  # ignore — попробуем напрямую
@@ -6292,7 +6292,7 @@ def api_xkeen_migration_backup():
             resp["fix_label"] = "📥 Установить Entware GNU tar"
             resp["fix_explain"] = (
                 "Системный BusyBox tar отказывается архивировать с --exclude= / -X "
-                "(в твоей сборке эти флаги отключены compile-time). Решение — поставить "
+                "(в этой сборке эти флаги отключены compile-time). Решение — поставить "
                 "полноценный Entware-пакет tar через opkg install. После этого "
                 "/opt/bin/tar становится настоящим GNU tar и миграция работает по "
                 "XKeen-документации."
@@ -6340,8 +6340,8 @@ def api_xkeen_migration_backup():
                 "stderr": stderr}
         if "sftp-server" in stderr.lower():
             resp["fix_explain"] = (
-                "scp -O должен работать без sftp-server. Если ошибка снова — возможно у тебя "
-                "старый OpenSSH-клиент без -O. Проверь: `ssh -V` (нужна 8.0+). "
+                "scp -O должен работать без sftp-server. Если ошибка снова — возможно, на ПК "
+                "старый OpenSSH-клиент без -O. Проверить: `ssh -V` (нужна 8.0+). "
                 "Альтернатива — поставить sftp-server на роутер: `opkg install openssh-sftp-server`."
             )
         return jsonify(resp), 500
@@ -6714,7 +6714,7 @@ def _cat_missing_msg(missing, kind="geoip"):
     if kind == "geosite":
         return (
             "❌ В geosite_v2fly.dat нет v2fly-категорий: " + ", ".join(missing) + ".\n"
-            "Скорее всего опечатка или это не v2fly-категория. Проверь имя на "
+            "Скорее всего опечатка или это не v2fly-категория. Проверить имя на "
             "github.com/v2fly/domain-list-community. Можно вместо категории задать домены вручную в поле выше.\n"
             "Сохранение отменено — роутер не тронут, xray работает."
         )
@@ -6818,7 +6818,7 @@ def api_xkeen_set_ipv6_domains():
     Возвращаем текущий IPV6_TAG — фронт предупредит, если узел канала ещё не выбран."""
     cur = keenetic_read_watchdog_config()
     if cur is None:
-        return jsonify({"ok": False, "stderr": "watchdog.config не прочитался с роутера — изменения канала «Через IPv6» отменены. Повтори позже."})
+        return jsonify({"ok": False, "stderr": "watchdog.config не прочитался с роутера — изменения канала «Через IPv6» отменены. Повторить позже."})
     old_domains = [d.strip() for d in re.split(r"[\s,]+", cur.get("IPV6_DOMAINS", "")) if d.strip()]
     action = (request.form.get("action") or "").strip()
     force_remove = set()
@@ -6951,13 +6951,13 @@ def api_xkeen_set_channel_chain():
         return jsonify({"ok": False, "stderr":
                         "В цепочку нельзя ставить служебные каналы (" + ", ".join(service) +
                         "): watchdog считает их всегда живыми, и трафик ушёл бы напрямую "
-                        "с IP роутера. Для «пусть идёт как обычно, если всё упало» — сними "
+                        "с IP роутера. Для «пусть идёт как обычно, если всё упало» — снять "
                         "галочку блокировки ниже."})
 
     # Роли из watchdog.config: strict — сбой чтения не должен молча превратиться в «ролей нет».
     targets = keenetic_get_watchdog_targets(strict=True)
     if targets is None:
-        return jsonify({"ok": False, "stderr": "watchdog.config не прочитался с роутера (SSH-сбой) — цепочка не сохранена. Повтори позже."})
+        return jsonify({"ok": False, "stderr": "watchdog.config не прочитался с роутера (SSH-сбой) — цепочка не сохранена. Повторить позже."})
     main_tag = targets.get(key_main)
     if main_tag and main_tag in tags:
         tags = [t for t in tags if t != main_tag]
@@ -6966,13 +6966,13 @@ def api_xkeen_set_channel_chain():
     # Тег должен существовать в 04_outbounds.json, иначе цепочка тихо укоротится в аварии.
     outbounds = keenetic_get_outbounds()
     if outbounds is None:
-        return jsonify({"ok": False, "stderr": "не удалось прочитать 04_outbounds.json с роутера — цепочка не сохранена (нечем проверить теги). Повтори позже."})
+        return jsonify({"ok": False, "stderr": "не удалось прочитать 04_outbounds.json с роутера — цепочка не сохранена (нечем проверить теги). Повторить позже."})
     known = {o.get("tag") for o in outbounds}
     unknown = [t for t in tags if t not in known]
     if unknown:
         return jsonify({"ok": False, "stderr":
                         "Нет таких outbound'ов: " + ", ".join(unknown) +
-                        ". Обнови страницу — список каналов мог измениться."})
+                        ". Обновить страницу — список каналов мог измениться."})
 
     if len(tags) > CHANNEL_CHAIN_MAX:
         return jsonify({"ok": False, "stderr":
@@ -7393,7 +7393,7 @@ def api_xkeen_routing_template_rules():
                     "type": "ip-list",
                     "ips": ips,
                     "outbound": outbound,
-                    "description": "Жёстко прописанные IP в template (вероятно ваши VPN-эндпоинты которые нельзя через xray роутить — иначе loop)",
+                    "description": "Жёстко прописанные IP в template (вероятно, VPN-эндпоинты которые нельзя через xray роутить — иначе loop)",
                 })
             if geoips:
                 parsed.append({
@@ -7650,7 +7650,7 @@ def api_xkeen_sync_template_ips():
             result["restart_skipped_reason"] = (
                 "Не запускаю xkeen -restart — curl сломан (отсутствует библиотека). "
                 "Template УЖЕ записан, watchdog подхватит за ≤1 мин. "
-                "Чтобы починить restart — открой «🚑 Восстановление и диагностика», запусти проверку и нажми «🔧 Переустановить libnghttp2»."
+                "Чтобы починить restart — открыть «🚑 Восстановление и диагностика», запустить проверку и нажать «🔧 Переустановить libnghttp2»."
             )
             return jsonify(result)
         restart_r = keenetic_ssh("xkeen -restart 2>&1 | tail -20", timeout=90)
@@ -7659,7 +7659,7 @@ def api_xkeen_sync_template_ips():
         result["restart_output"] = ansi_re.sub('', restart_r.get("stdout") or "")[:1500]
     else:
         result["restart_skipped"] = True
-        result["restart_skipped_reason"] = "Template записан. Watchdog подхватит за ≤1 мин (без рестарта xkeen). Чтобы применить немедленно — пометь чекбокс «С рестартом xkeen» и попробуй снова."
+        result["restart_skipped_reason"] = "Template записан. Watchdog подхватит за ≤1 мин (без рестарта xkeen). Чтобы применить немедленно — пометь чекбокс «С рестартом xkeen» и попробовать снова."
     return jsonify(result)
 
 
@@ -7851,7 +7851,7 @@ def api_xkeen_flush_conntrack():
     can_auto_install = False
     if has_error and used_method == "ndmc CLI":
         hint = ("conntrack-tools не установлен на роутере, и нативной CLI-команды "
-                "сброса conntrack по фильтру у KeeneticOS нет. Поставь conntrack-tools "
+                "сброса conntrack по фильтру у KeeneticOS нет. Поставить conntrack-tools "
                 "(~50KB + зависимости) — после этого кнопка 🔄 заработает.")
         can_auto_install = True
 
@@ -7913,13 +7913,13 @@ def api_xkeen_install_conntrack_tools():
     hint = ""
     if not (already_installed or installed_now):
         if "wget" in stderr.lower() or "could not resolve" in stdout.lower() or "no route" in stdout.lower():
-            hint = "Роутер не достучался до opkg-репозитория. Проверь интернет на роутере: ndmc -c \"show interface\""
+            hint = "Роутер не достучался до opkg-репозитория. Проверить интернет на роутере: ndmc -c \"show interface\""
         elif "no space left" in stdout.lower():
-            hint = "На /opt не хватает места. Освободи и попробуй снова."
+            hint = "На /opt не хватает места. Освободить и попробовать снова."
         elif "unknown package" in stdout.lower():
-            hint = "Пакет conntrack не найден в репозитории Entware. Проверь источники: opkg list | grep conntrack"
+            hint = "Пакет conntrack не найден в репозитории Entware. Проверить источники: opkg list | grep conntrack"
         elif failed:
-            hint = "opkg отработал, но /opt/sbin/conntrack не появился. Проверь: which conntrack"
+            hint = "opkg отработал, но /opt/sbin/conntrack не появился. Проверить: which conntrack"
 
     return jsonify({
         "ok": already_installed or installed_now,
@@ -8023,9 +8023,9 @@ def api_keenetic_test_connection():
         # отдельно классифицируем самые частые ошибки SSH чтобы юзеру было понятно
         err_low = (stderr or "").lower()
         if "permission denied" in err_low:
-            stage, hint = "auth", "Ключ есть, но роутер его не принимает. Проверьте что публичная часть лежит в /opt/etc/dropbear/authorized_keys на роутере."
+            stage, hint = "auth", "Ключ есть, но роутер его не принимает. Проверить что публичная часть лежит в /opt/etc/dropbear/authorized_keys на роутере."
         elif "connection refused" in err_low:
-            stage, hint = "tcp", f"TCP-порт {port} закрыт. Проверьте что SSH-сервер на роутере работает."
+            stage, hint = "tcp", f"TCP-порт {port} закрыт. Проверить что SSH-сервер на роутере работает."
         elif "no route to host" in err_low or "network is unreachable" in err_low:
             stage, hint = "net", f"IP {host} недоступен по сети."
         elif "could not resolve" in err_low or "name or service not known" in err_low:
@@ -8223,7 +8223,7 @@ def _bootstrap_collect_state():
     else:
         state["pre_checks"].append({
             "ok": True,
-            "msg": "ℹ Freedom-outbound (direct) НЕ найден в 04_outbounds.json. Виртуальная опция «🌐 Напрямую без VPN» не появится. Это нестандартно — обычно XKeen-инсталлятор создаёт direct автоматически. Если нужно — добавь outbound с tag=\"direct\" и protocol=\"freedom\" вручную.",
+            "msg": "ℹ Freedom-outbound (direct) НЕ найден в 04_outbounds.json. Виртуальная опция «🌐 Напрямую без VPN» не появится. Это нестандартно — обычно XKeen-инсталлятор создаёт direct автоматически. Если нужно — добавить outbound с tag=\"direct\" и protocol=\"freedom\" вручную.",
         })
 
     # ---- Items ----
@@ -8685,7 +8685,7 @@ def api_keenetic_tg_test():
         f"🛰 роутер {_router}\n"
         f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} МСК\n\n"
         "🧪 Тестовое сообщение от xray-dashboard\n"
-        "Если ты это видишь — TG-алерты watchdog'а будут работать."
+        "Это сообщение дошло — значит, TG-алерты watchdog'а будут работать."
     )
     # Запрос через роутер + ОБЯЗАТЕЛЬНО через SOCKS5-inbound xray (127.0.0.1:10808) — так же как
     # watchdog'овский tg_alert. Прямой curl с роутера к api.telegram.org заблокирован для RU-IP
@@ -8703,7 +8703,7 @@ def api_keenetic_tg_test():
         err = (r["stderr"] or r["stdout"] or "")[:300]
         if "10808" in err or "Failed to connect to 127.0.0.1" in err:
             err += (" — 💡 SOCKS5-inbound xray (127.0.0.1:10808) на этом роутере не поднят → канал "
-                    "для TG-алертов ещё не настроен. Нажми «🔧 Починить канал TG-алертов» ниже — панель "
+                    "для TG-алертов ещё не настроен. Нажать «🔧 Починить канал TG-алертов» ниже — панель "
                     "сама поднимет socks-local inbound и пропишет маршрут через зарубежный канал. Без "
                     "этого канала watchdog тоже не сможет слать алерты с этого роутера.")
             return jsonify({"ok": False, "error": "curl на роутере не сработал: " + err, "need_socks_repair": True})
@@ -8720,11 +8720,11 @@ def api_keenetic_tg_test():
     # типичные ошибки
     hint = ""
     if "chat not found" in err.lower():
-        hint = "💡 Чтобы chat_id заработал — сначала напиши боту /start, потом проверь URL https://api.telegram.org/bot<TOKEN>/getUpdates"
+        hint = "💡 Чтобы chat_id заработал — сначала написать боту /start, потом проверить URL https://api.telegram.org/bot<TOKEN>/getUpdates"
     elif "unauthorized" in err.lower():
         hint = "💡 Токен неверный или бот удалён в BotFather."
     elif "bot was blocked" in err.lower():
-        hint = "💡 Ты заблокировал бота — разблокируй и напиши ему /start."
+        hint = "💡 Бот заблокирован в Telegram — разблокировать и написать ему /start."
     return jsonify({"ok": False, "error": f"Telegram API: {err} (code {code})", "hint": hint})
 
 
@@ -8792,22 +8792,22 @@ def api_keenetic_repair_tg_channel():
         except Exception:
             test_sent = False
         _rec("Тестовое сообщение в Telegram",
-             {"detail": "доставлено" if test_sent else "не ушло (проверь токен/Chat ID)"}, ok=test_sent)
+             {"detail": "доставлено" if test_sent else "не ушло (проверить токен/Chat ID)"}, ok=test_sent)
 
     if not foreign_ok:
         summary = ("✅ socks-local поднят, НО на этом роутере нет ни одного канала для Telegram "
                    "(FOREIGN/YT/PRIMARY/AI/резерв — все direct или пусто). Алерт пойдёт мимо VPN и не "
-                   "дойдёт. Добавь канал, через который у тебя ходит Telegram (RU-канал для YouTube/"
-                   "Instagram/Telegram годится так же, как загран FOREIGN/AI), назначь ему роль — и нажми "
+                   "дойдёт. Добавить канал, через который ходит Telegram (RU-канал для YouTube/"
+                   "Instagram/Telegram годится так же, как загран FOREIGN/AI), назначить ему роль — и нажать "
                    "«Починить» ещё раз.")
     elif test_sent is True:
         summary = "✅ Готово! socks-local поднят, тестовое сообщение доставлено в Telegram. Алерты watchdog заработают."
     elif test_sent is False:
         summary = ("✅ socks-local поднят и маршрут есть, но тест не ушёл — скорее всего токен/Chat ID. "
-                   "Проверь их и нажми «📨 Отправить тестовое сообщение».")
+                   "Проверить их и нажать «📨 Отправить тестовое сообщение».")
     else:
-        summary = ("✅ socks-local поднят и маршрут готов. Заполни Bot Token и Chat ID выше, "
-                   "затем нажми «📨 Отправить тестовое сообщение».")
+        summary = ("✅ socks-local поднят и маршрут готов. Заполнить Bot Token и Chat ID выше, "
+                   "затем нажать «📨 Отправить тестовое сообщение».")
 
     return jsonify({"ok": True, "steps": steps, "foreign_ok": foreign_ok, "test_sent": test_sent, "summary": summary})
 
@@ -9228,7 +9228,7 @@ def api_xkeen_diagnose():
         _wd_detail,
         fix_id=None, fix_label=None,
         fix_explain=(None if _wd_ok else
-                     "Нажми любое «Сохранить» (например PRIMARY в «Основном») — авто-синк (v1.0.50+) сам поднимет watchdog до актуальной версии перед применением."),
+                     "Нажать любое «Сохранить» (например PRIMARY в «Основном») — авто-синк (v1.0.50+) сам поднимет watchdog до актуальной версии перед применением."),
     )
 
     # ---- 4. watchdog.config: PRIMARY_TAG не пустой ----
@@ -9703,7 +9703,7 @@ def api_diagnose_site():
     if request.args.get("via"):
         proxy_url, via_tag = _test_socks_proxy_url()
         if not proxy_url:
-            out["via_error"] = "Тест-узел не настроен — нажми «⚙ Подготовить узел»."
+            out["via_error"] = "Тест-узел не настроен — нажать «⚙ Подготовить узел»."
         else:
             out["via_outbound"] = via_tag
             try:
@@ -9802,7 +9802,7 @@ def api_xkeen_test_socks():
     # 🚫 Фича «Сравнить через outbound» УДАЛЕНА 2026-05-23: провижининг socks-test ронял
     # household-VPN (рвал tproxy при xkeen -restart — 3 инцидента 22-23 мая). Провижининг
     # отключён наглухо. action=remove (выше) оставлен как safety-очистка забытого узла.
-    return jsonify({"ok": False, "error": "Фича «Сравнить через outbound» отключена — она роняла роутерный VPN. Используй «🔎 Проверить» (диагностика с ПК)."}), 410
+    return jsonify({"ok": False, "error": "Фича «Сравнить через outbound» отключена — она роняла роутерный VPN. Использовать «🔎 Проверить» (диагностика с ПК)."}), 410
 
     target = (request.form.get("outbound") or "").strip()
     if not target:
@@ -10243,7 +10243,7 @@ def api_xkeen_auto_fix():
         if curl_ok_now:
             log_lines.append("✅ curl восстановлен. xkeen-installer теперь сможет проверить политику через RCI.")
         else:
-            log_lines.append("⚠ curl всё ещё не работает — возможно сломаны ещё библиотеки (libcurl, libssl). Попробуй вручную: opkg install curl --force-reinstall")
+            log_lines.append("⚠ curl всё ещё не работает — возможно сломаны ещё библиотеки (libcurl, libssl). Попробовать вручную: opkg install curl --force-reinstall")
         ok = curl_ok_now
 
     elif fix_id == "install_entware_tar":
@@ -10260,7 +10260,7 @@ def api_xkeen_auto_fix():
         if tar_ok:
             log_lines.append("✅ Entware GNU tar установлен. Кнопка миграции теперь будет использовать его.")
         else:
-            log_lines.append("⚠ /opt/bin/tar не появился. Проверь вывод opkg выше — возможно нет интернета на роутере.")
+            log_lines.append("⚠ /opt/bin/tar не появился. Проверить вывод opkg выше — возможно нет интернета на роутере.")
         ok = tar_ok
 
     else:
@@ -10730,7 +10730,7 @@ DYNAMIC_TEMPLATE = r"""
 
 <!-- ==================== ПОРТЫ И КЛИЕНТЫ ==================== -->
 <h2>🔌 Активные порты и подключения</h2>
-<p class="dim" style="margin-top:0">⚠️ Keenetic делает source-NAT — все внешние клиенты приходят как <span class="mono">{{ keenetic_host }}</span>. Реальные external IP смотри в блоке «Недавние клиенты» ниже (из логов xray).</p>
+<p class="dim" style="margin-top:0">⚠️ Keenetic делает source-NAT — все внешние клиенты приходят как <span class="mono">{{ keenetic_host }}</span>. Реальные external IP — в блоке «Недавние клиенты» ниже (из логов xray).</p>
 
 {% for owner, plist in ports_by_owner.items() %}
 <h3 style="margin-top:20px;margin-bottom:6px">
@@ -10851,7 +10851,7 @@ DYNAMIC_TEMPLATE = r"""
   {% endfor %}
 </table>
 {% else %}
-<p class="dim">Никто ещё не подписался. Используй subscription URL — см. блок «Профили подключения» ниже.</p>
+<p class="dim">Никто ещё не подписался. Использовать subscription URL — см. блок «Профили подключения» ниже.</p>
 {% endif %}
 """
 
@@ -10971,13 +10971,13 @@ TEMPLATE = r"""<!doctype html>
 <!-- ==================== SUBSCRIPTION URL ==================== -->
 <h2>📦 Subscription URL <span class="dim" style="font-size:0.7em">(одна ссылка = все 4 профиля сразу + автосинк в Happ)</span></h2>
 <div class="card">
-  <p style="margin-top:0">Импортируй эту ссылку в Happ как <strong>Subscription</strong> (а не как обычный профиль). Happ скачает все 4 vless-конфига сразу и будет периодически их обновлять.</p>
+  <p style="margin-top:0">Импортировать эту ссылку в Happ как <strong>Subscription</strong> (а не как обычный профиль). Happ скачает все 4 vless-конфига сразу и будет периодически их обновлять.</p>
   <div style="display:flex; gap:16px; align-items:flex-start">
     <img class="qr" src="{{ sub_qr }}" alt="QR">
     <div style="flex:1">
       <div class="url-box" id="sub-url">{{ subscription_url }}</div>
       <button class="copy-btn" onclick="copyText('sub-url')">📋 Скопировать</button>
-      <p class="dim" style="font-size:0.85em;margin-top:12px">⚠️ Не делись этой ссылкой публично — кто её получит, тот получит твои конфиги. Сменить токен можно в <span class="mono">config_local.py</span> → <span class="mono">SUBSCRIPTION_TOKEN</span>.</p>
+      <p class="dim" style="font-size:0.85em;margin-top:12px">⚠️ Не делиться этой ссылкой публично — кто её получит, тот получит все конфиги. Сменить токен можно в <span class="mono">config_local.py</span> → <span class="mono">SUBSCRIPTION_TOKEN</span>.</p>
     </div>
   </div>
 </div>
@@ -11072,9 +11072,9 @@ function fallbackCopy(text, flash) {
   ta.select();
   try {
     const ok = document.execCommand("copy");
-    flash(ok ? "✓ скопировано" : "выдели и Ctrl+C");
+    flash(ok ? "✓ скопировано" : "выделить и Ctrl+C");
   } catch (e) {
-    flash("выдели и Ctrl+C");
+    flash("выделить и Ctrl+C");
   }
   document.body.removeChild(ta);
 }
@@ -11573,8 +11573,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     <a href="javascript:restartDashboard()" class="tb-link" title="Перезапустить панель прямо отсюда — запрос на /api/xkeen/restart-dashboard, ~8 сек и обновление страницы. Если не сработает — откроется help с альтернативами.">🔄 рестарт</a>
     <span id="xray-status-badge" class="health-badge xs-pending" title="Состояние xray на роутере — обновляется каждые 60 сек. Клик → секция 📊 Статус XKeen.">⏳ xray ...</span>
     <span id="dashboard-health-badge" class="health-badge health-pending" title="Проверка процесса панели — каждые 15 сек">⏳ проверка...</span>
-    {% if is_first_run %}<a href="#section-router-config" class="health-badge" style="background:#fde8c8; color:#7a5500; border:1px solid #e0c878; text-decoration:none; cursor:pointer; animation: blink 1.8s infinite;" title="Роутер не подключён — настрой SSH в разделе внизу страницы">⚠ роутер не подключён</a>{% endif %}
-    <a href="https://github.com/yuran2000/xkeen-windows-dashboard/releases/latest" target="_blank" class="health-badge" style="background:#f0e6ff; color:#5a3a99; border:1px solid #c9b3e0; text-decoration:none;" title="Версия панели. Клик → последний релиз на GitHub. Сравни с тем что у тебя — если есть свежее, обнови через update.bat.">v{{ dashboard_version }}</a>
+    {% if is_first_run %}<a href="#section-router-config" class="health-badge" style="background:#fde8c8; color:#7a5500; border:1px solid #e0c878; text-decoration:none; cursor:pointer; animation: blink 1.8s infinite;" title="Роутер не подключён — настроить SSH в разделе внизу страницы">⚠ роутер не подключён</a>{% endif %}
+    <a href="https://github.com/yuran2000/xkeen-windows-dashboard/releases/latest" target="_blank" class="health-badge" style="background:#f0e6ff; color:#5a3a99; border:1px solid #c9b3e0; text-decoration:none;" title="Версия панели. Клик → последний релиз на GitHub. Сравнить с установленной — если есть свежее, обновить через update.bat.">v{{ dashboard_version }}</a>
     <a href="/logout" class="tb-link" title="Выход из аккаунта {{ username }}">⎋ выход</a>
   </span>
 </div>
@@ -11584,21 +11584,21 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 {% if is_first_run %}
 <!-- ===== WELCOME BANNER (роутер не подключён) ===== -->
 <div style="margin: 20px 0; padding: 20px 24px; background: linear-gradient(135deg, #fff8e7 0%, #fef3d5 100%); border: 2px solid #e80; border-radius: 10px; box-shadow: 0 2px 8px rgba(232, 136, 0, 0.15);">
-  <h3 style="margin: 0 0 10px; color: #7a5500; font-size: 1.3em;">👋 Добро пожаловать! Настрой подключение к роутеру</h3>
+  <h3 style="margin: 0 0 10px; color: #7a5500; font-size: 1.3em;">👋 Добро пожаловать! Настроить подключение к роутеру</h3>
   <p style="margin: 0 0 12px; line-height: 1.55; color: #5a4500;">
     Эта панель управляет <strong>XKeen</strong> (xray на роутере Keenetic) через SSH. Сейчас связи с роутером нет —
     поэтому все секции ниже пустые с предупреждениями «нет данных для tag=». Это <strong>не ошибка</strong>, просто нужно настроить подключение.
   </p>
   <ol style="margin: 8px 0 14px 22px; line-height: 1.7; color: #5a4500;">
-    <li>Кликни кнопку ниже — проскроллит к разделу <strong>«🔧 Подключение к роутеру»</strong> в самом низу страницы (там уже будет развёрнута форма).</li>
-    <li>Впиши <strong>IP роутера</strong> (обычно <code>192.168.1.1</code> для Keenetic), <strong>SSH-порт</strong> (стандарт XKeen — <code>222</code>), <strong>путь к SSH-ключу</strong> (если ключа ещё нет — там же раскрой свёрнутый блок «❓ Как получить SSH-ключ» с пошаговой инструкцией).</li>
-    <li>Нажми <strong>«🔌 Проверить связь»</strong> → если зелёный ✅ → <strong>«💾 Сохранить»</strong>.</li>
-    <li>Перезагрузи страницу (F5) — этот баннер пропадёт, появятся твои каналы и outbound'ы.</li>
+    <li>Кликнуть кнопку ниже — проскроллит к разделу <strong>«🔧 Подключение к роутеру»</strong> в самом низу страницы (там уже будет развёрнута форма).</li>
+    <li>Вписать <strong>IP роутера</strong> (обычно <code>192.168.1.1</code> для Keenetic), <strong>SSH-порт</strong> (стандарт XKeen — <code>222</code>), <strong>путь к SSH-ключу</strong> (если ключа ещё нет — там же раскрыть свёрнутый блок «❓ Как получить SSH-ключ» с пошаговой инструкцией).</li>
+    <li>Нажать <strong>«🔌 Проверить связь»</strong> → если зелёный ✅ → <strong>«💾 Сохранить»</strong>.</li>
+    <li>Перезагрузить страницу (F5) — этот баннер пропадёт, появятся каналы и outbound'ы.</li>
     <li>Если на роутере уже XKeen установлен но <strong>пустой</strong> (например, только что после <code>xkeen -i</code>) — в том же разделе есть кнопка <strong>«🚀 Развернуть на чистом XKeen»</strong> которая дольёт watchdog + cron + routing-шаблон.</li>
-    <li>Если XKeen <strong>ещё не установлен</strong> на роутере — открой раздел Помощи «🛠️ Установка XKeen с нуля» (между «Бэкап» и «Подключение к роутеру»).</li>
+    <li>Если XKeen <strong>ещё не установлен</strong> на роутере — открыть раздел Помощи «🛠️ Установка XKeen с нуля» (между «Бэкап» и «Подключение к роутеру»).</li>
   </ol>
   <a href="#section-router-config" style="display: inline-block; background: #e80; color: #fff; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-weight: 700; font-size: 1em;">👇 Перейти к настройке роутера</a>
-  <span style="margin-left: 14px; color: #999; font-size: 0.9em;">или просто проскролль страницу в самый низ</span>
+  <span style="margin-left: 14px; color: #999; font-size: 0.9em;">или просто прокрутить страницу в самый низ</span>
 </div>
 {% endif %}
 
@@ -11610,7 +11610,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     <div style="margin-top:6px; font-size:0.92em; color:#6a5200;">
       {% if structure.watchdog.outdated %}🛡 watchdog: на роутере <strong>v{{ structure.watchdog.remote }}</strong> → в панели <strong>v{{ structure.watchdog.local }}</strong><br>{% endif %}
       {% if structure.template.outdated %}🧭 routing-шаблон: на роутере <strong>v{{ structure.template.remote }}</strong> → в панели <strong>v{{ structure.template.local }}</strong><br>{% endif %}
-      <span style="color:#888;">«Применить структуру» — твои кастомные IP сохранятся; при поломке сети — авто-откат к рабочей версии.</span>
+      <span style="color:#888;">«Применить структуру» — кастомные IP сохранятся; при поломке сети — авто-откат к рабочей версии.</span>
     </div>
   </div>
   <div style="flex:0 0 auto;">
@@ -11641,9 +11641,9 @@ XKEEN_TEMPLATE = r"""<!doctype html>
       {% if watchdog.state == 'failover' %}
       <span class="subtitle" style="margin-left: 8px; color: #e80;">⚠️ работаем через резерв, PRIMARY ({{ targets.primary_tag }}) недоступен</span>
       {% elif watchdog.last_bad_md5 %}
-      <span class="subtitle" style="margin-left: 8px; color: #c33;">🛡 авто-откат: PRIMARY ({{ targets.primary_tag }}) не прошёл проверку связи — watchdog держит рабочий {{ watchdog.current_default }}. Смени настройки (или почини PRIMARY), чтобы применить заново.</span>
+      <span class="subtitle" style="margin-left: 8px; color: #c33;">🛡 авто-откат: PRIMARY ({{ targets.primary_tag }}) не прошёл проверку связи — watchdog держит рабочий {{ watchdog.current_default }}. Сменить настройки (или починить PRIMARY), чтобы применить заново.</span>
       {% else %}
-      <span class="subtitle" style="margin-left: 8px; color: #888;">🔄 PRIMARY ({{ targets.primary_tag }}) только что изменён — watchdog ещё применяет переключение (сейчас активен {{ watchdog.current_default }}; обнови страницу через ~30 c)</span>
+      <span class="subtitle" style="margin-left: 8px; color: #888;">🔄 PRIMARY ({{ targets.primary_tag }}) только что изменён — watchdog ещё применяет переключение (сейчас активен {{ watchdog.current_default }}; обновить страницу через ~30 c)</span>
       {% endif %}
     {% endif %}
   </div>
@@ -11842,14 +11842,14 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           <details style="margin-top: 14px; border-top: 1px dashed #ccc; padding-top: 10px;" {% if targets.ai_ip_ranges %}open{% endif %}>
             <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">📡 IP-диапазоны (CIDR) <span style="color: #888; font-weight: 400; font-size: 0.88em;">— для приложений, которые ходят по IP без домена</span></summary>
             <div style="margin-top: 8px;">
-              <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">Часть клиентов AI-сервисов подключается к своему провайдеру <strong>по чистому IP</strong>, без SNI/домена в запросе — доменные правила выше такие соединения не видят, и они уходят через основной канал (PRIMARY). Впиши сюда IP-диапазоны провайдера — и они пойдут через AI-канал вместе с доменами. Kill-switch AI действует и на них.</p>
+              <p class="subtitle" style="font-size: 0.85em; margin: 0 0 8px;">Часть клиентов AI-сервисов подключается к своему провайдеру <strong>по чистому IP</strong>, без SNI/домена в запросе — доменные правила выше такие соединения не видят, и они уходят через основной канал (PRIMARY). Вписать сюда IP-диапазоны провайдера — и они пойдут через AI-канал вместе с доменами. Kill-switch AI действует и на них.</p>
               <div style="margin-bottom: 6px;">
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addAIIpRange('160.79.104.0/23'); addAIIpRange('2607:6bc0::/48')" title="Добавить IP-диапазоны Anthropic (Claude): 160.79.104.0/23 (IPv4, весь inbound-блок AS399358) + 2607:6bc0::/48 (IPv6). Приложения Claude часто бьют в эти адреса напрямую, без домена в SNI.">🟣 Anthropic (Claude)</button>
                 <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearAIIpRanges()" title="Очистить IP-диапазоны. Домены и категории выше не трогаются.">🗑 Очистить</button>
               </div>
               <input id="ai-ip-ranges" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.ai_ip_ranges or '' }}" placeholder="через пробел: 160.79.104.0/23 2607:6bc0::/48" />
               <button class="btn" style="margin-top: 6px; background: #6a3;" onclick="saveAIIpRanges()" title="Записать IP-диапазоны в watchdog.config. Watchdog подхватит при следующем тике (≤1 мин).">💾 Сохранить IP-диапазоны</button>
-              <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Формат: CIDR (<code>160.79.104.0/23</code>) или одиночный IP. IPv6 тоже можно. Чей диапазон — смотри в whois или в выводе «🔎 Проверить» ниже.</p>
+              <p style="font-size: 0.82em; color: #888; margin: 6px 0 0;">Формат: CIDR (<code>160.79.104.0/23</code>) или одиночный IP. IPv6 тоже можно. Чей диапазон — см. whois или в выводе «🔎 Проверить» ниже.</p>
             </div>
           </details>
         </div>
@@ -11857,7 +11857,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     </div>
     <div class="col" data-xk-sub="📺 YouTube">
       <div class="channel-card cc-yt">
-        <label class="col-header col-yt">📺 YouTube-sticky outbound <a href="#help-yt-recaptcha" onclick="openHelpAnchor('help-yt-recaptcha'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Если YouTube показывает reCAPTCHA «подозрительный трафик» — открой Сценарий 2 в Помощи. Там полный комплекс настроек: 🇷🇺 Рецепт A для RU-канала + 🇳🇱 Рецепт B для EU/US-канала.">❓ помощь</a></label>
+        <label class="col-header col-yt">📺 YouTube-sticky outbound <a href="#help-yt-recaptcha" onclick="openHelpAnchor('help-yt-recaptcha'); return false;" style="font-size: 0.75em; color: #468; text-decoration: none; margin-left: 6px; font-weight: normal;" title="Если YouTube показывает reCAPTCHA «подозрительный трафик» — открыть Сценарий 2 в Помощи. Там полный комплекс настроек: 🇷🇺 Рецепт A для RU-канала + 🇳🇱 Рецепт B для EU/US-канала.">❓ помощь</a></label>
         <div class="channel-card-body">
           <select id="select-yt" style="width: 100%; padding: 7px; font-size: 0.95em; border: 1px solid #ccc; border-radius: 4px;">
             {% for grp in vless_option_groups %}
@@ -11873,7 +11873,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           <p class="subtitle">Через какой канал идёт трафик к YouTube.</p>
           <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 11px; margin: 8px 0; font-size: 0.85em; color: #1a5276; border-radius: 4px;">
             <strong>❓ Почему YouTube — отдельный канал, а не вместе с «📱 Зарубежными сервисами»?</strong><br>
-            YouTube в РФ <strong>не блокируют</strong> — только <strong>замедляют</strong>. Это лечится <strong>российским выходом</strong>: RU-сервер с хорошим пирингом до Google убирает троттлинг. Бонус — с РФ-IP YouTube крутит <strong>меньше рекламы</strong> (рекламная выдача гео-таргетится, google_ads на РФ-адрес почти не идёт). Поэтому сюда ставь <strong>🇷🇺 RU-выход</strong> (тег вида <code>..._YouTube</code>) — и быстро, и без рекламы.<br><br>
+            YouTube в РФ <strong>не блокируют</strong> — только <strong>замедляют</strong>. Это лечится <strong>российским выходом</strong>: RU-сервер с хорошим пирингом до Google убирает троттлинг. Бонус — с РФ-IP YouTube крутит <strong>меньше рекламы</strong> (рекламная выдача гео-таргетится, google_ads на РФ-адрес почти не идёт). Поэтому сюда ставить <strong>🇷🇺 RU-выход</strong> (тег вида <code>..._YouTube</code>) — и быстро, и без рекламы.<br><br>
             А <strong>Instagram/Meta, Telegram, Twitter/X, Discord</strong> — наоборот, <strong>требуют зарубежного выхода</strong>: через российский они не работают (DPI режет TLS-handshake). Поэтому они вынесены в отдельный канал <strong>«📱 Зарубежные сервисы»</strong> с <strong>зарубежным</strong> выходом и собственными настройками (домены, пресеты, GeoIP для Telegram Desktop, свой kill-switch).
           </div>
           <div class="failover-active-label">🎯 Сейчас в роутинге для YouTube:</div>
@@ -11983,12 +11983,12 @@ XKEEN_TEMPLATE = r"""<!doctype html>
               <p style="margin: 0 0 6px;">Если YT-tag покрывает только узкие youtube-домены — <strong>остальные Google-запросы идут через PRIMARY</strong> → Google видит один сессионный токен с двух разных IP → <strong>reCAPTCHA «подозрительный трафик»</strong>.</p>
               <p style="margin: 0 0 6px;"><strong>Как починить:</strong></p>
               <ul style="margin: 0 0 8px 18px; padding: 0;">
-                <li><strong>YT-канал = EU/US</strong> (Нидерланды, Германия, США): добавь v2fly категорию <strong>🌐 google</strong> ниже — покрывает все Google-домены включая Gmail/Drive. Они тоже пойдут через EU/US — это OK.</li>
-                <li><strong>YT-канал = RU</strong> (Россия_YouTube, СПб_YouTube — для DPI-обхода рекламы): <strong>НЕ добавляй <code>google</code></strong> — Gmail/Drive через РФ-IP может пометить аккаунт как подозрительный регион. Вместо этого допиши в YT-домены (textarea выше) <strong>4 точечных домена</strong>:<br>
+                <li><strong>YT-канал = EU/US</strong> (Нидерланды, Германия, США): добавить v2fly категорию <strong>🌐 google</strong> ниже — покрывает все Google-домены включая Gmail/Drive. Они тоже пойдут через EU/US — это OK.</li>
+                <li><strong>YT-канал = RU</strong> (Россия_YouTube, СПб_YouTube — для DPI-обхода рекламы): <strong>НЕ добавлять <code>google</code></strong> — Gmail/Drive через РФ-IP может пометить аккаунт как подозрительный регион. Вместо этого дописать в YT-домены (textarea выше) <strong>4 точечных домена</strong>:<br>
                 <code style="background: #fff; padding: 2px 6px; border: 1px solid #d0a000;">1e100.net&nbsp; googleusercontent.com&nbsp; gstatic.com&nbsp; googleapis.com</code><br>
                 Это узко — без Gmail (<code>mail.google.com</code>) и Drive (<code>drive.google.com</code>), которые не под <code>googleapis.com</code>.</li>
               </ul>
-              <p style="margin: 0;">Диагностика: открой Chrome DevTools (F12) → Network → отсортируй по Domain → увидишь от скольких доменов YouTube тянет ресурсы. Сравни какие из них в твоём YT-tag.</p>
+              <p style="margin: 0;">Диагностика: открыть Chrome DevTools (F12) → Network → отсортировать по Domain → видно, от скольких доменов YouTube тянет ресурсы. Сравнить, какие из них в YT-tag.</p>
               <p style="margin: 8px 0 0;"><a href="#help-yt-recaptcha" onclick="openHelpAnchor('help-yt-recaptcha'); return false;" style="font-weight: 600; color: #6a4900;">📖 Подробнее в Помощи: Сценарий 2 «YouTube reCAPTCHA — полный комплекс» →</a></p>
             </div>
           </details>
@@ -12003,8 +12003,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
               </div>
               <div style="margin-bottom: 6px;">
                 <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('youtube')" title="Добавить категорию youtube (все домены YouTube из geosite_v2fly.dat). Безопасно через любой канал. Автоподхват новых поддоменов после xkeen -ug.">📺 youtube</button>
-                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('google')" title="🌐 Добавить категорию google — ВСЕ Google-домены (gstatic.com, googleapis.com, googleusercontent.com, 1e100.net, gmail.com, drive.google.com, и т.д.). ⚠ ВНИМАНИЕ: ВКЛЮЧАЕТ Gmail/Drive/Photos/Search/Maps — все они пойдут через YT-канал. Используй ТОЛЬКО если YT-канал = EU/US (Нидерланды, Германия и т.п.). На RU-канале (Россия_YouTube) — Google может пометить твой аккаунт как 'подозрительный регион' для Gmail/Drive. КОГДА НУЖНО: если YouTube показывает reCAPTCHA «Мы зарегистрировали подозрительный трафик» с двумя разными IP — это значит YT-страница использует gstatic/googleapis/googleusercontent (не покрытые категорией youtube) → они идут через PRIMARY вместо YT-канала → Google видит mismatch. Альтернатива для RU-канала: вместо google добавь в YT-домены руками: 1e100.net, googleusercontent.com, gstatic.com, googleapis.com (узко, без Gmail/Drive).">🌐 google</button>
-                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('tiktok')" title="Добавить категорию tiktok (все домены TikTok). На RU-канале TikTok не открывается (блокирован в РФ) — используй только если YT-канал = EU/US. Для RU-сценария TikTok лучше через «📱 Зарубежные сервисы» (тоже EU/US).">🎵 tiktok</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('google')" title="🌐 Добавить категорию google — ВСЕ Google-домены (gstatic.com, googleapis.com, googleusercontent.com, 1e100.net, gmail.com, drive.google.com, и т.д.). ⚠ ВНИМАНИЕ: ВКЛЮЧАЕТ Gmail/Drive/Photos/Search/Maps — все они пойдут через YT-канал. Использовать ТОЛЬКО если YT-канал = EU/US (Нидерланды, Германия и т.п.). На RU-канале (Россия_YouTube) — Google может пометить аккаунт как 'подозрительный регион' для Gmail/Drive. КОГДА НУЖНО: если YouTube показывает reCAPTCHA «Мы зарегистрировали подозрительный трафик» с двумя разными IP — это значит YT-страница использует gstatic/googleapis/googleusercontent (не покрытые категорией youtube) → они идут через PRIMARY вместо YT-канала → Google видит mismatch. Альтернатива для RU-канала: вместо google добавить в YT-домены руками: 1e100.net, googleusercontent.com, gstatic.com, googleapis.com (узко, без Gmail/Drive).">🌐 google</button>
+                <button type="button" class="btn btn-sm" style="margin: 2px;" onclick="addYTExtCat('tiktok')" title="Добавить категорию tiktok (все домены TikTok). На RU-канале TikTok не открывается (блокирован в РФ) — использовать только если YT-канал = EU/US. Для RU-сценария TikTok лучше через «📱 Зарубежные сервисы» (тоже EU/US).">🎵 tiktok</button>
                 <button type="button" class="btn btn-sm btn-secondary" style="margin: 2px;" onclick="clearYTExtCats()" title="Очистить все v2fly-категории YT. Ручные домены в textarea выше не трогаются.">🗑 Очистить</button>
               </div>
               <input id="yt-ext-categories" type="text" style="width: 100%; font-family: Consolas, monospace; font-size: 13px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;" value="{{ targets.yt_ext_categories or '' }}" placeholder="через пробел: youtube tiktok instagram" />
@@ -12041,7 +12041,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           </select>
           <button class="btn btn-sm" style="margin-top: 6px; background: #8e44ad;" onclick="setTarget('foreign')">Сохранить outbound</button>
           <div id="info-foreign" class="outbound-info"></div>
-          <p class="subtitle">Канал для <strong>зарубежных сервисов</strong> (Meta/IG, Telegram, Twitter/X, Discord), которым нужен заграничный выход. ⚠️ Выбирай <strong>ЗАРУБЕЖНЫЙ</strong> выход (🇳🇱 Нидерланды и т.п.) — российский для них <strong>не подходит</strong>.</p>
+          <p class="subtitle">Канал для <strong>зарубежных сервисов</strong> (Meta/IG, Telegram, Twitter/X, Discord), которым нужен заграничный выход. ⚠️ Выбирать <strong>ЗАРУБЕЖНЫЙ</strong> выход (🇳🇱 Нидерланды и т.п.) — российский для них <strong>не подходит</strong>.</p>
           <div class="failover-active-label">🎯 Сейчас в роутинге:</div>
           <div id="info-foreign-active" class="outbound-info"></div>
 
@@ -12132,7 +12132,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             <strong style="font-size: 0.85em; color: #555;">Готовые пресеты:</strong><br>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('instagram')">📷 Instagram</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('facebook')">📘 Facebook</button>
-            <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('whatsapp')" title="WhatsApp домены (web + клиент + Meta MQTT backend + wa.me ссылки). Для первичного связывания нового устройства (QR) клиент может ходить на доп. Edge-серверы по IP — временно поставь PRIMARY=VPN, свяжи, верни обратно.">💚 WhatsApp</button>
+            <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('whatsapp')" title="WhatsApp домены (web + клиент + Meta MQTT backend + wa.me ссылки). Для первичного связывания нового устройства (QR) клиент может ходить на доп. Edge-серверы по IP — временно поставить PRIMARY=VPN, связать, вернуть обратно.">💚 WhatsApp</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('threads')">🧵 Threads</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('telegram')">💌 Telegram</button>
             <button type="button" class="btn btn-sm" style="margin: 2px; background: #8e44ad;" onclick="addForeignPreset('twitter')">🐦 Twitter/X</button>
@@ -12253,7 +12253,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 10px; margin: 6px 0 0; font-size: 0.85em; color: #1a5276;">
             ⚠️ Узел обязан уметь <strong>IPv6-выход</strong> (egress IPv6) и восстанавливать домен из fake-IP (sniffing <code>routeOnly:false</code>). Надёжнее всего — <strong>свой VPS</strong>. Сторонние RU-узлы и «Напрямую» здесь не сработают.
           </div>
-          <button class="btn btn-sm" style="margin-top: 8px; background: #16a085;" onclick="checkIpv6Node()" title="Проверить по реальному маршруту с этого ПК, открывает ли выбранный узел IPv6-only сайт (ntc.party или домены из списка ниже). Запускай ПОСЛЕ «Сохранить outbound» и «Сохранить домены» (≤1 мин на применение).">🔎 Проверить, открывает ли узел IPv6</button>
+          <button class="btn btn-sm" style="margin-top: 8px; background: #16a085;" onclick="checkIpv6Node()" title="Проверить по реальному маршруту с этого ПК, открывает ли выбранный узел IPv6-only сайт (ntc.party или домены из списка ниже). Запускать ПОСЛЕ «Сохранить outbound» и «Сохранить домены» (≤1 мин на применение).">🔎 Проверить, открывает ли узел IPv6</button>
           <div id="ipv6-check-result" style="margin-top: 4px;"></div>
         </div>
       </div>
@@ -12285,7 +12285,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     <h3 class="domain-section-header">↪️ Сайты НАПРЯМУЮ без VPN <span class="subsec-hint">(DIRECT — пойдут через провайдера, без VPN)</span> <a href="#help-scenarios" onclick="openHelpAnchor('help-scenarios'); return false;" style="font-size: 0.7em; color: #468; text-decoration: none; margin-left: 8px; font-weight: normal;" title="Открыть «🎯 Готовые сценарии» — там объяснение когда нужны DIRECT-домены (банки, Госуслуги, российские сервисы которые блокируют не-RU IP)">❓ помощь</a></h3>
     <div class="domain-section-body">
       <p class="subtitle">
-        Эти домены пойдут через твоего обычного провайдера (без VPN). Полезно: банки/Госуслуги (требуют RU IP),
+        Эти домены пойдут через обычного провайдера (без VPN). Полезно: банки/Госуслуги (требуют RU IP),
         российские стримминги (Okko/Кинопоиск), почта (Mail.ru) — для скорости и совместимости.<br>
         <strong>⚠️ Уже работает автоматически</strong> через базовые правила в шаблоне: <code>regex *.ru / *.su / *.рф</code>
         + <code>geosite</code> (yandex, vk, category-gov-ru, steam, private) + <code>geoip:ru</code>.
@@ -12329,7 +12329,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         <strong>отключения Windows Update / Telemetry</strong> (Microsoft не сможет тянуть обновления и слать данные),
         <strong>блокировки Adobe Genuine</strong> (если использовался крякнутый Photoshop — без блока он выдаст «non-genuine» и заблокирует фичи),
         <strong>отрезки рекламных трекеров</strong> на уровне роутера (вместо AdGuard на каждом устройстве).
-        <br>⚠️ Используй <strong>аккуратно</strong> — заблокированный сайт перестанет работать на ВСЕХ устройствах в твоей LAN.
+        <br>⚠️ Использовать <strong>аккуратно</strong> — заблокированный сайт перестанет работать на ВСЕХ устройствах в LAN.
       </p>
       <div style="margin-bottom: 8px;">
         <strong style="font-size: 0.9em; color: #555;">Готовые пресеты:</strong><br>
@@ -12353,14 +12353,14 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 
   <!-- v1.7.18 — Базовые правила маршрутизации из template (read-only, свёрнуто) -->
   <details class="domain-section ds-template-rules" style="margin: 16px 0; padding: 0; border-radius: 4px;">
-    <summary style="cursor: pointer; padding: 10px 14px; background: #6c757d; color: #fff; border-radius: 4px; font-weight: 700;">📐 Базовые правила маршрутизации (зашиты в template, read-only) <span style="font-weight: 400; opacity: 0.85; font-size: 0.88em;">— что захардкожено в 05_routing.template.json помимо твоих DIRECT/BLOCK/AI/YT доменов</span></summary>
+    <summary style="cursor: pointer; padding: 10px 14px; background: #6c757d; color: #fff; border-radius: 4px; font-weight: 700;">📐 Базовые правила маршрутизации (зашиты в template, read-only) <span style="font-weight: 400; opacity: 0.85; font-size: 0.88em;">— что захардкожено в 05_routing.template.json помимо пользовательских DIRECT/BLOCK/AI/YT доменов</span></summary>
     <div style="padding: 12px 16px; background: #fafafa; border: 1px solid #ddd; border-top: 0; border-radius: 0 0 4px 4px;">
       <p class="subtitle" style="margin-top: 0;">
-        Это правила которые применяются <strong>ко всем клиентам в политике XKeen</strong> — независимо от того, что ты добавляешь в DIRECT/BLOCK секции. Например, <code>regexp:^*.ru$</code> отправляет ВСЕ .ru домены через провайдера (мимо VPN), даже если тебя нет в DIRECT-списке. Эти правила <strong>невозможно поменять через дашборд</strong> — они в template на роутере (<code>/opt/etc/xray/configs.bak/05_routing.template.json</code>), редактировать нужно через SSH.
+        Это правила которые применяются <strong>ко всем клиентам в политике XKeen</strong> — независимо от того, что добавлено в DIRECT/BLOCK секции. Например, <code>regexp:^*.ru$</code> отправляет ВСЕ .ru домены через провайдера (мимо VPN), даже если домена нет в DIRECT-списке. Эти правила <strong>невозможно поменять через дашборд</strong> — они в template на роутере (<code>/opt/etc/xray/configs.bak/05_routing.template.json</code>), редактировать нужно через SSH.
       </p>
       <button class="btn btn-sm" style="background:#6c757d; color:#fff;" onclick="loadRoutingTemplateRules()">🔄 Загрузить правила</button>
       <div id="routing-template-rules-output" style="margin-top: 12px;">
-        <p class="subtitle" style="color:#888;">Нажми «Загрузить правила» чтобы прочитать актуальный template с роутера.</p>
+        <p class="subtitle" style="color:#888;">Нажать «Загрузить правила» чтобы прочитать актуальный template с роутера.</p>
       </div>
       <p class="subtitle" style="margin: 10px 0 0; color:#888;">🔁 Синхронизация IP-списка с подпиской переехала в <strong>«🚑 Восстановление и диагностика» → подменю «🔁 Синхронизация IP»</strong> (она для починки и активна только при расхождении).</p>
     </div>
@@ -12368,18 +12368,18 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 
   <!-- v1.7.6 — Клиенты в политике XKeen (read-only) -->
   <div class="domain-section ds-clients" data-xk-sub="👥 Клиенты">
-    <h3 class="domain-section-header">👥 Клиенты в политике XKeen <span class="subsec-hint">(меняй политику прямо в таблице через dropdown)</span></h3>
+    <h3 class="domain-section-header">👥 Клиенты в политике XKeen <span class="subsec-hint">(менять политику прямо в таблице через dropdown)</span></h3>
     <div class="domain-section-body">
       <p class="subtitle">
         В Keenetic-политике <code>XKeen</code> хранится список клиентов LAN, чей трафик помечается fwmark'ом и попадает в XKeen-iptables (а оттуда — в xray).
         <strong>Клиенты вне политики идут напрямую через провайдера</strong>, минуя xray. CPU роутера грузит именно содержимое этого списка — чем больше клиентов, тем выше нагрузка.
-        <br><strong>Как менять</strong>: dropdown в колонке «Политика» — выбери XKeen / другую политику / «напрямую» → команда уйдёт по SSH через ndmc и автоматически сохранится через <code>system configuration save</code>. Альтернативно — через Keenetic Web UI: «Сетевые правила» → «Приоритеты подключений» → вкладка «Применение политик».
-        <br><strong>Кнопка 🔄 рядом с dropdown</strong>: сбрасывает <code>conntrack</code>-записи клиента — все его существующие TCP/UDP-соединения переоткроются и новая политика применится мгновенно (без переподключения устройства). Полезно если только что сменил политику и хочешь увидеть результат сразу.
+        <br><strong>Как менять</strong>: dropdown в колонке «Политика» — выбрать XKeen / другую политику / «напрямую» → команда уйдёт по SSH через ndmc и автоматически сохранится через <code>system configuration save</code>. Альтернативно — через Keenetic Web UI: «Сетевые правила» → «Приоритеты подключений» → вкладка «Применение политик».
+        <br><strong>Кнопка 🔄 рядом с dropdown</strong>: сбрасывает <code>conntrack</code>-записи клиента — все его существующие TCP/UDP-соединения переоткроются и новая политика применится мгновенно (без переподключения устройства). Полезно, если политика только что сменилась и результат нужен сразу.
       </p>
       <button class="btn btn-sm" style="background:#4a7bbf; color:#fff;" onclick="loadPolicyClients()">🔄 Обновить список</button>
       <a href="http://{{ keenetic_settings.current.host or '192.168.1.1' }}/" target="_blank" class="btn btn-sm btn-secondary" style="margin-left:6px;">🌐 Открыть Keenetic Web UI</a>
       <div id="policy-clients-output" style="margin-top:10px;">
-        <p class="subtitle" style="color:#888;">Нажми «Обновить список» чтобы спросить роутер какие клиенты сейчас в политике XKeen.</p>
+        <p class="subtitle" style="color:#888;">Нажать «Обновить список» чтобы спросить роутер какие клиенты сейчас в политике XKeen.</p>
       </div>
     </div>
   </div>
@@ -12400,7 +12400,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         </div>
         <div class="force-mode-cell">
           <button class="btn btn-warn" onclick="forceMode('failover')">🟡 FAILOVER</button>
-          <p class="subtitle">Жёстко переключиться на <strong>первый живой</strong> из цепочки резерва. PRIMARY обратно <strong>не вернётся</strong>, пока не нажмёшь AUTO.</p>
+          <p class="subtitle">Жёстко переключиться на <strong>первый живой</strong> из цепочки резерва. PRIMARY обратно <strong>не вернётся</strong>, пока не нажата AUTO.</p>
         </div>
         <div class="force-mode-cell">
           <button class="btn btn-secondary" onclick="forceMode('auto')">🔄 AUTO</button>
@@ -12460,7 +12460,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <p class="subtitle" style="margin-top: 0;">
     Watchdog при падении PRIMARY пробует резервные каналы <strong>сверху вниз по этой таблице</strong>
     и переключается на <strong>первый живой</strong>. Если он тоже упадёт — перейдёт на следующий.
-    Сними галку чтобы исключить outbound из каскада (тогда его можно будет удалить через таблицу «Все outbounds» ниже).
+    Снять галку чтобы исключить outbound из каскада (тогда его можно будет удалить через таблицу «Все outbounds» ниже).
     <br><strong>Цветовая полоска слева</strong> и <strong>колонка «Подписка»</strong> — показывают к какому провайдеру принадлежит каждый сервер
     (группировка по Reality publicKey+SNI). Так проще выбрать какие включать в каскад: например,
     чтобы при падении Provider A не переключаться на платную Provider B, а только на резервные Provider A.
@@ -12504,7 +12504,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
       </tr>
     {% else %}
       <tr class="draggable grp-{{ o.group_color_idx or 0 }}" draggable="true" data-tag="{{ o.tag }}">
-        <td><span class="drag-handle" title="Перетащи чтобы изменить порядок">⋮⋮</span></td>
+        <td><span class="drag-handle" title="Перетащить чтобы изменить порядок">⋮⋮</span></td>
         <td><input type="number" min="0" max="99" value="{{ order_in_chain }}" style="width: 60px;" class="fc-order" data-tag="{{ o.tag }}"></td>
         <td style="text-align:center"><input type="checkbox" {% if o.in_failover_chain %}checked{% endif %} class="fc-check" data-tag="{{ o.tag }}" style="transform: scale(1.3);"></td>
         <td class="mono"><strong>{{ o.tag }}</strong>{% if o.note %}<br><span style="font-style:italic; font-size:0.8em; color:#3a6;">📝 {{ o.note }}</span>{% endif %}</td>
@@ -12518,8 +12518,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <div style="margin-top: 12px;">
     <button class="btn" onclick="saveFailoverChain()">💾 Сохранить цепочку</button>
     <span class="subtitle" style="margin-left: 10px;">
-      <strong>Перетащи строки</strong> за ⋮⋮ слева чтобы изменить порядок (или редактируй № вручную).
-      Сними галку чтобы исключить из каскада. После сохранения unchecked станут «не задействован» → появится кнопка 🗑 Удалить.
+      <strong>Перетащить строки</strong> за ⋮⋮ слева чтобы изменить порядок (или редактировать № вручную).
+      Снять галку чтобы исключить из каскада. После сохранения unchecked станут «не задействован» → появится кнопка 🗑 Удалить.
     </span>
   </div>
 </div>
@@ -12531,7 +12531,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 </h2>
 <div class="card">
   <p class="subtitle" style="margin-top: 0; margin-bottom: 12px;">
-    Outbound'ы сгруппированы по <strong>publicKey + SNI</strong> (Reality identity) — это значит «одна подписка от одного провайдера». Имя группы берётся из meta-поля «Провайдер» (если задано) или из общего префикса tag (например, provider-a-de1, provider-a-nl → группа «Provider A»). Сворачивай неинтересные группы ▶ чтобы не загромождать.<br>
+    Outbound'ы сгруппированы по <strong>publicKey + SNI</strong> (Reality identity) — это значит «одна подписка от одного провайдера». Имя группы берётся из meta-поля «Провайдер» (если задано) или из общего префикса tag (например, provider-a-de1, provider-a-nl → группа «Provider A»). Сворачивать неинтересные группы ▶ чтобы не загромождать.<br>
     <strong>Проверить связь</strong> — кнопка «🏓 Пинг» внутри каждой группы: TCP+TLS-probe до каждого сервера группы с дашборда, бейджи появляются в колонке «статус». Один probe покрывает все группы (кэш 60&nbsp;сек).
   </p>
   <div id="orphan-sub-meta-box" style="display:none;"></div>
@@ -12668,7 +12668,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             <span class="badge" style="background:#ffe0e0; color:#a33;" title="TCP+TLS handshake — очень медленно"><strong>🔴 {{ o.status_ms }} ms</strong></span>
           {% endif %}
         {% elif o.status_ok is none %}
-          <span class="badge badge-dim" title="статус не проверялся — нажми «🏓 Пинг» в шапке этой группы">⚪ —</span>
+          <span class="badge badge-dim" title="статус не проверялся — нажать «🏓 Пинг» в шапке этой группы">⚪ —</span>
         {% else %}
           <span class="badge" style="background:#333; color:#fff;" title="TCP+TLS handshake не прошёл — {% if o.status_kind == 'noaddr' %}нет адреса{% else %}порт закрыт / таймаут / сервер мёртв{% endif %}"><strong>⛔ не отвечает</strong></span>
         {% endif %}
@@ -12730,7 +12730,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         {% else %}
           <button class="btn btn-sm" style="background:#2a7d2a; color:#fff;" onclick="prepareUpdateOutbound('{{ o.tag }}')" title="Обновить параметры (новый vless URL / новый ключ)">🔄 Обновить</button>
           {% if o.is_primary or o.is_failover or o.is_ai or o.in_failover_chain %}
-            <span class="badge badge-dim" title="используется watchdog'ом — сначала убери из роли">🔒 активен</span>
+            <span class="badge badge-dim" title="используется watchdog'ом — сначала убрать из роли">🔒 активен</span>
           {% else %}
             <button class="btn btn-sm btn-danger" onclick="removeOutbound('{{ o.tag }}')">🗑 Удалить</button>
           {% endif %}
@@ -12742,7 +12742,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   </details>
   {% endfor %}
   <p class="subtitle" style="margin-top: 10px;">
-    <strong>⚪ Статус</strong> — нажми <strong>«🏓 Пинг»</strong> в нужной группе → дашборд через SSH запустит на роутере параллельный HTTPS-`curl` к host:port каждого outbound'а и покажет **TCP+TLS handshake** (как в Happ "via Proxy"): 🟢 быстро (&lt;300ms) · 🟡 норм (300-500) · 🟠 медленно (500-800) · 🔴 очень медленно (&gt;800) · <span style="background:#dfe8ff; color:#1a55cc; padding:1px 4px;">🔌 TCP</span> порт открыт (Reality без фолбэка — TLS не прошёл, но VPN работает) · ⛔ <strong style="background:#333; color:#fff; padding:1px 4px;">не отвечает</strong> (порт закрыт — сервер мёртв). Числа будут меньше чем в Happ примерно в 1.5-2 раза (Happ делает 3-5 RTT через VLESS-туннель + запрос на gstatic.com; мы 2 RTT до Reality-fallback'а), но порядки сходятся. Результат кэшируется 60 сек. Probe идёт **с роутера**, потому что XKeen перехватывает TCP-трафик с PC через redirect+tproxy и handshake завершается локально за ~1ms.
+    <strong>⚪ Статус</strong> — нажать <strong>«🏓 Пинг»</strong> в нужной группе → дашборд через SSH запустит на роутере параллельный HTTPS-`curl` к host:port каждого outbound'а и покажет **TCP+TLS handshake** (как в Happ "via Proxy"): 🟢 быстро (&lt;300ms) · 🟡 норм (300-500) · 🟠 медленно (500-800) · 🔴 очень медленно (&gt;800) · <span style="background:#dfe8ff; color:#1a55cc; padding:1px 4px;">🔌 TCP</span> порт открыт (Reality без фолбэка — TLS не прошёл, но VPN работает) · ⛔ <strong style="background:#333; color:#fff; padding:1px 4px;">не отвечает</strong> (порт закрыт — сервер мёртв). Числа будут меньше чем в Happ примерно в 1.5-2 раза (Happ делает 3-5 RTT через VLESS-туннель + запрос на gstatic.com; мы 2 RTT до Reality-fallback'а), но порядки сходятся. Результат кэшируется 60 сек. Probe идёт **с роутера**, потому что XKeen перехватывает TCP-трафик с PC через redirect+tproxy и handshake завершается локально за ~1ms.
     <strong>⚡ default</strong> — через какой outbound идёт основной трафик прямо сейчас (читается из watchdog.state).
     <strong>🟢 primary</strong> — основной канал watchdog.
     <strong>🟡 failover</strong> — первый резервный (watchdog переключится сюда при падении PRIMARY).
@@ -12765,16 +12765,16 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   </div>
   <div class="form-row">
     <label>Tag (опционально — переопределить имя)</label>
-    <input type="text" id="tag" placeholder="оставь пустым → возьмётся из URL fragment (после #)"/>
+    <input type="text" id="tag" placeholder="оставить пустым → возьмётся из URL fragment (после #)"/>
     <div style="font-size:0.82em; color:#666; margin-top:4px; padding:6px 8px; background:#f9f9f4; border-left:3px solid #ccc; border-radius:3px;">
-      <strong style="color:#a55a18;">⚠️ Менять нежелательно</strong> если хочешь, чтобы серверы одной подписки собирались в общую группу с красивым именем (например, «Provider A»).
+      <strong style="color:#a55a18;">⚠️ Менять нежелательно</strong>, если нужно, чтобы серверы одной подписки собирались в общую группу с красивым именем (например, «Provider A»).
       Имя группы выводится из общего префикса tag'ов (до <code>-</code>): <code>provider-a-de1</code>, <code>provider-a-nl</code> → группа <strong>Provider A</strong>.
       Если у одного tag префикс другой — группа всё равно соберётся <em>(по pbk Reality)</em>, но имя станет <code>Reality &lt;pbk&gt;…</code> вместо красивого.<br>
-      <strong>Менять полезно</strong>, если провайдер выдал безликие имена типа <code>#Germany</code> / <code>#USA</code> — тогда добавь префикс провайдера: <code>brava-de</code>, <code>brava-us</code>. Это и красиво, и защищает от collision с другим провайдером у которого тоже могут быть `#Germany`.
+      <strong>Менять полезно</strong>, если провайдер выдал безликие имена типа <code>#Germany</code> / <code>#USA</code> — тогда добавить префикс провайдера: <code>brava-de</code>, <code>brava-us</code>. Это и красиво, и защищает от collision с другим провайдером у которого тоже могут быть `#Germany`.
     </div>
   </div>
   <div class="form-row">
-    <label>Примечание (опц.) — твоя заметка про этот outbound</label>
+    <label>Примечание (опц.) — заметка про этот outbound</label>
     <input type="text" id="add-note" placeholder="например: купил в марте, истекает в августе"/>
     <div style="font-size:0.82em; color:#888; margin-top:2px;">
       После добавления можно отредактировать через ✏️ в таблице — там же есть поле Subscription URL (для dropdown «Сохранённый URL» в форме sync, если понадобится).
@@ -12795,7 +12795,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 <summary><h2 class="sec-sync">📡 Обновить из подписки <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— provider sync</span></h2></summary>
 <div class="card">
   <p class="subtitle" style="margin-top: 0;">
-    Если провайдер обновил параметры (UUID, ключи, host, порт) — введи URL подписки сюда,
+    Если провайдер обновил параметры (UUID, ключи, host, порт) — ввести URL подписки сюда,
     дашборд скачает свежий список vless URLs и обновит существующие outbound'ы
     <strong>по совпадению tag</strong> (имя после <code>#</code> в URL).
     Опционально (через чекбоксы ниже): можно <strong>добавлять новые</strong> outbound'ы
@@ -12803,7 +12803,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   </p>
   <p class="subtitle" style="margin-top: 0;">
     ⚠️ Не все провайдеры разрешают прямой fetch подписки — Provider A, например, требует Happ-клиент.
-    Для них работай через <code>Import-Provider ABatch.ps1</code> или ручную копию URL'ов.
+    Для них — через <code>Import-Provider ABatch.ps1</code> или ручную копию URL'ов.
   </p>
   {% if saved_sub_urls %}
   <div style="margin-top: 6px; padding: 6px 10px; background:#f0f5f8; border-left: 3px solid #2a7; border-radius: 3px; font-size: 0.88em;">
@@ -12826,7 +12826,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   </div>
   <div style="margin-top: 10px; padding: 8px 12px; background: #f9f9f4; border-radius: 4px; font-size: 0.9em;">
     <label style="display: block; margin-bottom: 4px; cursor: pointer;">
-      <input type="checkbox" id="sub-add-new" checked> ➕ <strong>Добавить новые</strong> outbound'ы которые есть в подписке но нет у тебя
+      <input type="checkbox" id="sub-add-new" checked> ➕ <strong>Добавить новые</strong> outbound'ы, которые есть в подписке, но нет на роутере
       <span class="subtitle" style="color:#888;">— безопасно, по умолчанию включено</span>
     </label>
     <label style="display: block; cursor: pointer; margin-bottom: 4px;">
@@ -12845,7 +12845,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     ⚠️ <strong>Имена должны совпадать!</strong> Provider A часто даёт <code>#Netherlands</code> а не <code>#provider-a-nl</code> —
     тогда выгоднее использовать «🔄 Обновить» в таблице ниже на каждом outbound отдельно
     (или <code>Import-Provider ABatch.ps1</code> с переименованием).<br>
-    💡 Жми «Предпросмотр» сначала — увидишь что найдено и что совпадёт.
+    💡 Сначала «Предпросмотр» — он покажет, что найдено и что совпадёт.
   </p>
 </div>
 
@@ -12868,7 +12868,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         Системное: <code>crontab</code> · <code>dropbear authorized_keys</code>
       </div>
     </details>
-    Используй перед экспериментами или для переезда на другой роутер.
+    Использовать перед экспериментами или для переезда на другой роутер.
   </p>
   <div style="margin-top: 12px;">
     <button class="btn" onclick="saveSnapshotToDisk()">💾 Сохранить snapshot на диск</button>
@@ -12911,30 +12911,30 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         <ul>
           <li>Entware (<code>/opt/sbin/</code>, <code>/opt/bin/</code>, <code>/opt/lib/</code>, <code>/opt/etc/</code>)</li>
           <li>xkeen (<code>/opt/sbin/xkeen</code>, <code>/opt/sbin/.xkeen/</code>)</li>
-          <li>xray бинарь и конфиги (<code>/opt/etc/xray/</code>) — outbounds с твоей подпиской, watchdog, 05_routing.template.json</li>
+          <li>xray бинарь и конфиги (<code>/opt/etc/xray/</code>) — outbounds с подпиской, watchdog, 05_routing.template.json</li>
           <li>GeoIP-базы (<code>/opt/etc/xray/dat/</code>) — Loyalsoldier 18MB</li>
           <li>XKeen-конфиги (<code>/opt/etc/xkeen/</code>) — порты, ip_exclude</li>
           <li>Кэш opkg-пакетов</li>
         </ul>
         <p><strong>Как использовать для миграции на новый роутер</strong>:</p>
         <ol>
-          <li>Создай этот архив кнопкой выше → файл в <code>C:\xray-dashboard\backups\</code></li>
-          <li>Подготовь USB-флешку (формат ext4 через MiniTool Partition Wizard или аналог)</li>
-          <li>Создай на USB папку <code>install/</code></li>
-          <li>В <code>install/</code> положи <strong>2 файла</strong>:
+          <li>Создать этот архив кнопкой выше → файл в <code>C:\xray-dashboard\backups\</code></li>
+          <li>Подготовить USB-флешку (формат ext4 через MiniTool Partition Wizard или аналог)</li>
+          <li>Создать на USB папку <code>install/</code></li>
+          <li>В <code>install/</code> положить <strong>2 файла</strong>:
             <ul>
               <li><code>mipsel-installer.tar.gz</code> — стандартный Entware-инсталлятор от Corvus-Malus (взять из <a href="https://github.com/Corvus-Malus/XKeen" target="_blank">репо XKeen</a>)</li>
-              <li><code>entware_backup.tar.gz</code> — этот архив (переименуй из <code>entware_backup_YYYYMMDD-HHMMSS.tar.gz</code> просто в <code>entware_backup.tar.gz</code>)</li>
+              <li><code>entware_backup.tar.gz</code> — этот архив (переименовать из <code>entware_backup_YYYYMMDD-HHMMSS.tar.gz</code> просто в <code>entware_backup.tar.gz</code>)</li>
             </ul>
           </li>
-          <li>Вставь USB в новый Keenetic</li>
-          <li>В Web UI Keenetic → <strong>«Управление» → «Файлы» → выбери <code>mipsel-installer.tar.gz</code> на USB → «Установить компонент»</strong></li>
+          <li>Вставить USB в новый Keenetic</li>
+          <li>В Web UI Keenetic → <strong>«Управление» → «Файлы» → выбрать <code>mipsel-installer.tar.gz</code> на USB → «Установить компонент»</strong></li>
           <li>Keenetic распакует Entware + автоматически развернёт <code>entware_backup.tar.gz</code> в <code>/opt/</code></li>
-          <li>После reboot — настрой <strong>политику XKeen</strong> в Keenetic Web UI (Шаг 8) + <strong>привяжи клиентов</strong> к политике через «Применение политик»</li>
-          <li>Подключи этот дашборд к новому роутеру (поменяй <code>KEENETIC_HOST</code> в <code>config_local.py</code>) → готово, все настройки на месте</li>
+          <li>После reboot — настроить <strong>политику XKeen</strong> в Keenetic Web UI (Шаг 8) + <strong>привязать клиентов</strong> к политике через «Применение политик»</li>
+          <li>Подключить этот дашборд к новому роутеру (поменять <code>KEENETIC_HOST</code> в <code>config_local.py</code>) → готово, все настройки на месте</li>
         </ol>
         <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin-top: 8px; font-size: 0.92em;">
-          ⚠ Архив содержит твою подписку (UUID/publicKey VLESS), SSH-ключ роутера и другие чувствительные данные. <strong>Не теряй флешку</strong>, не публикуй архив, форматируй USB после миграции.
+          ⚠ Архив содержит подписку (UUID/publicKey VLESS), SSH-ключ роутера и другие чувствительные данные. <strong>Не терять флешку</strong>, не публиковать архив, форматировать USB после миграции.
         </div>
       </div>
     </details>
@@ -13098,14 +13098,14 @@ XKEEN_TEMPLATE = r"""<!doctype html>
       <details open style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">🪟 Шаг 1. Сгенерировать пару ключей на компьютере</summary>
         <div style="margin-top: 8px;">
-          <p>Открой PowerShell и выполни (путь и комментарий можно поменять):</p>
+          <p>Открыть PowerShell и выполнить (путь и комментарий можно поменять):</p>
           <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">ssh-keygen -t ed25519 -f C:\Users\<username>\.ssh\id_ed25519 -C "my-pc-$(Get-Date -Format yyyy-MM-dd)" -N '""'</pre>
           <p>Что получится:</p>
           <ul style="margin: 6px 0 6px 22px;">
-            <li><code>C:\Users\<username>\.ssh\id_ed25519</code> — <strong>приватный</strong> ключ (его адрес впиши в форму выше, в поле «Путь к SSH-ключу»). Никому не отдавать!</li>
+            <li><code>C:\Users\<username>\.ssh\id_ed25519</code> — <strong>приватный</strong> ключ (его адрес вписать в форму выше, в поле «Путь к SSH-ключу»). Никому не отдавать!</li>
             <li><code>C:\Users\<username>\.ssh\id_ed25519.pub</code> — <strong>публичный</strong> ключ (одна строка, начинается с <code>ssh-ed25519 AAAA…</code>). Его надо положить на роутер.</li>
           </ul>
-          <p class="muted">⚠ Если в имени файла каталоги ещё не существуют (<code>C:\Users\&lt;username&gt;\.ssh\</code>) — сначала создай папку: <code>mkdir C:\Users\&lt;username&gt;\.ssh</code>.</p>
+          <p class="muted">⚠ Если в имени файла каталоги ещё не существуют (<code>C:\Users\&lt;username&gt;\.ssh\</code>) — сначала создать папку: <code>mkdir C:\Users\&lt;username&gt;\.ssh</code>.</p>
           <p class="muted">⚠ Windows-грабля: на приватный ключ должны быть restrictive ACL, иначе ssh будет ругаться <code>UNPROTECTED PRIVATE KEY FILE</code>. Лечится:
           <pre style="background:#1e1e1e; color:#ddd; padding:8px 10px; border-radius:4px; font-size:0.82em; overflow-x:auto;">icacls C:\Users\<username>\.ssh\id_ed25519 /inheritance:r /grant:r "$($env:USERNAME):(R)"</pre>
           </p>
@@ -13116,7 +13116,7 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">📋 Шаг 2. Скопировать публичную часть в буфер</summary>
         <div style="margin-top: 8px;">
           <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">Get-Content C:\Users\<username>\.ssh\id_ed25519.pub | Set-Clipboard</pre>
-          <p>Теперь у тебя в буфере одна строка вида:
+          <p>Теперь в буфере одна строка вида:
           <code style="display:block; margin-top:4px; padding:6px 8px; background:#f0f0f0; border-radius:4px; font-size:0.85em; word-break:break-all;">ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI… my-pc-2026-05-17</code></p>
         </div>
       </details>
@@ -13127,15 +13127,15 @@ XKEEN_TEMPLATE = r"""<!doctype html>
           <p>Для первого захода нужен пароль admin-пользователя роутера (тот же что от web-морды).
           В PowerShell:</p>
           <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_settings.current.port or 222 }}</pre>
-          <p>После ввода пароля попадёшь в shell роутера. Там выполни <strong>одной командой</strong>
-          (вместо <code>ssh-ed25519 AAAA…</code> вставь свою публичную часть из шага 2):</p>
+          <p>После ввода пароля откроется shell роутера. Там выполнить <strong>одной командой</strong>
+          (вместо <code>ssh-ed25519 AAAA…</code> вставить свою публичную часть из шага 2):</p>
           <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">mkdir -p /opt/etc/dropbear &amp;&amp; \
 echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI… my-pc-2026-05-17" \
   &gt;&gt; /opt/etc/dropbear/authorized_keys &amp;&amp; \
 chmod 600 /opt/etc/dropbear/authorized_keys &amp;&amp; \
 chmod 700 /opt/etc/dropbear &amp;&amp; \
 echo OK</pre>
-          <p>Если вывелось <code>OK</code> — выйди (<code>exit</code>) и переходи к шагу 4.</p>
+          <p>Если вывелось <code>OK</code> — выйти (<code>exit</code>) и переходить к шагу 4.</p>
           <p class="muted">💡 Почему именно <code>/opt/etc/dropbear/authorized_keys</code>? Keenetic использует
           dropbear SSH-сервер из пакета Entware (OPKG), а не системный OpenSSH. Стандартный путь
           <code>/root/.ssh/authorized_keys</code> на Keenetic не работает — dropbear туда не смотрит.</p>
@@ -13146,10 +13146,10 @@ echo OK</pre>
         <summary style="cursor: pointer; font-weight: 700; color: #1f4d2c;">✅ Шаг 4. Проверить связь и сохранить</summary>
         <div style="margin-top: 8px;">
           <ol style="margin: 6px 0 6px 22px;">
-            <li>В форме выше впиши путь к <strong>приватному</strong> ключу (например <code>C:\Users\<username>\.ssh\id_ed25519</code>) в поле «Путь к SSH-ключу».</li>
-            <li>Заполни IP/порт/пользователя если они отличаются от значений по умолчанию.</li>
-            <li>Нажми <strong>«🔌 Проверить связь»</strong> — должно вывести информацию о роутере: <code>Linux … mips GNU/Linux</code>, версию XKeen и список конфигов.</li>
-            <li>Если всё хорошо — нажми <strong>«💾 Сохранить»</strong>. Настройки запишутся в <code>runtime_settings.json</code> и сразу применятся (рестарт панели не нужен).</li>
+            <li>В форме выше вписать путь к <strong>приватному</strong> ключу (например <code>C:\Users\<username>\.ssh\id_ed25519</code>) в поле «Путь к SSH-ключу».</li>
+            <li>Заполнить IP/порт/пользователя если они отличаются от значений по умолчанию.</li>
+            <li>Нажать <strong>«🔌 Проверить связь»</strong> — должно вывести информацию о роутере: <code>Linux … mips GNU/Linux</code>, версию XKeen и список конфигов.</li>
+            <li>Если всё хорошо — нажать <strong>«💾 Сохранить»</strong>. Настройки запишутся в <code>runtime_settings.json</code> и сразу применятся (рестарт панели не нужен).</li>
           </ol>
         </div>
       </details>
@@ -13157,12 +13157,12 @@ echo OK</pre>
       <details style="margin: 12px 0; padding: 10px 14px; background: #fff8e7; border-left: 4px solid #e80; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #7a5500;">🛠 Если SSH по паролю отключён на роутере</summary>
         <div style="margin-top: 8px;">
-          <p>Тогда нужен альтернативный канал — выбери любой:</p>
+          <p>Тогда нужен альтернативный канал — выбрать любой:</p>
           <ul style="margin: 6px 0 6px 22px;">
             <li><strong>Telnet</strong> на тот же IP, порт 23, логин <code>admin</code> + пароль admin'а. После входа:
               <code>system configuration save</code> ничего не делает,
-              нужно через <code>opkg</code>-shell: набери <code>exec sh</code>, и оттуда уже та же команда из шага 3.</li>
-            <li><strong>Web-морда роутера</strong> (<a href="http://{{ keenetic_settings.current.host or '192.168.1.1' }}" target="_blank">http://{{ keenetic_settings.current.host or '192.168.1.1' }}</a>) → System → Components → убедись что включён OPKG + Dropbear, перезапусти OPKG. SSH-по-ключу обычно работает out-of-the-box, но если выключен — включи галку «Разрешить вход по SSH» в настройках OPKG.</li>
+              нужно через <code>opkg</code>-shell: набрать <code>exec sh</code>, и оттуда уже та же команда из шага 3.</li>
+            <li><strong>Web-морда роутера</strong> (<a href="http://{{ keenetic_settings.current.host or '192.168.1.1' }}" target="_blank">http://{{ keenetic_settings.current.host or '192.168.1.1' }}</a>) → System → Components → убедиться что включён OPKG + Dropbear, перезапустить OPKG. SSH-по-ключу обычно работает out-of-the-box, но если выключен — включить галку «Разрешить вход по SSH» в настройках OPKG.</li>
             <li><strong>MobaXterm</strong> (Windows GUI SSH-клиент) — умеет принять самоподписанный host-key и работает там где встроенный PowerShell-ssh ругается.</li>
             <li><strong>Физический ресет</strong> — крайняя мера. Кнопка Reset на 10+ секунд, потом полная переинициализация.</li>
           </ul>
@@ -13172,8 +13172,8 @@ echo OK</pre>
       <details style="margin: 12px 0; padding: 10px 14px; background: #f0f4f8; border-left: 4px solid #468; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #1f3050;">📂 Альтернатива — использовать уже существующий ключ</summary>
         <div style="margin-top: 8px;">
-          <p>Если у тебя уже есть SSH-ключ (например для GitHub или другого сервера) — можно использовать его же,
-          не генерируя новый. Просто впиши путь к приватной части в поле «Путь к SSH-ключу» и выполни <strong>только шаги 2–3</strong>
+          <p>Если SSH-ключ уже есть (например для GitHub или другого сервера) — можно использовать его же,
+          не генерируя новый. Просто вписать путь к приватной части в поле «Путь к SSH-ключу» и выполнить <strong>только шаги 2–3</strong>
           (добавить публичную часть на роутер).</p>
           <p>Стандартные места где люди хранят ключи:</p>
           <ul style="margin: 6px 0 6px 22px; font-family: Consolas, monospace; font-size: 0.85em;">
@@ -13188,11 +13188,11 @@ echo OK</pre>
         <summary style="cursor: pointer; font-weight: 700; color: #6a1a1a;">🆘 Если «🔌 Проверить связь» возвращает Permission denied</summary>
         <div style="margin-top: 8px;">
           <ul style="margin: 6px 0 6px 22px;">
-            <li>Убедись что на роутер положена именно <strong>публичная</strong> часть (<code>.pub</code>), а не приватный ключ.</li>
-            <li>Проверь права: <code>ls -la /opt/etc/dropbear/authorized_keys</code> — должно быть <code>-rw-------</code> (600). Если нет — <code>chmod 600 /opt/etc/dropbear/authorized_keys</code>.</li>
-            <li>Проверь что путь к приватному ключу в форме указан правильно и файл существует.</li>
-            <li>Проверь права на приватный ключ (см. предупреждение в шаге 1 про <code>icacls</code>).</li>
-            <li>Зайди на роутер по паролю и посмотри лог: <code>logread | grep dropbear | tail -20</code> — там будет причина отказа.</li>
+            <li>Убедиться что на роутер положена именно <strong>публичная</strong> часть (<code>.pub</code>), а не приватный ключ.</li>
+            <li>Проверить права: <code>ls -la /opt/etc/dropbear/authorized_keys</code> — должно быть <code>-rw-------</code> (600). Если нет — <code>chmod 600 /opt/etc/dropbear/authorized_keys</code>.</li>
+            <li>Проверить что путь к приватному ключу в форме указан правильно и файл существует.</li>
+            <li>Проверить права на приватный ключ (см. предупреждение в шаге 1 про <code>icacls</code>).</li>
+            <li>Зайти на роутер по паролю и посмотреть лог: <code>logread | grep dropbear | tail -20</code> — там будет причина отказа.</li>
           </ul>
         </div>
       </details>
@@ -13223,7 +13223,7 @@ echo OK</pre>
   </div>
   <p style="font-size: 0.85em; color: #888; margin: 0;">
     Кнопки update-* запускают <code>xkeen -ux / -ug / -uk</code> через SSH с автоматическим выбором первой (latest) версии из списка релизов.
-    Для Xray это может быть pre-release (бета) — если хочешь именно stable, используй TTY-SSH с ручным выбором номера (см. пояснение ниже).
+    Для Xray это может быть pre-release (бета) — если нужен именно stable, использовать TTY-SSH с ручным выбором номера (см. пояснение ниже).
   </p>
 
   <details style="margin-top: 8px;" data-xk-keep-inline>
@@ -13270,13 +13270,13 @@ echo OK</pre>
         </tr></thead>
         <tbody>
           <tr style="background:#e8f5e8; border-bottom:1px solid #eee;"><td style="padding:5px 10px;">🌐 GeoFile</td><td style="padding:5px 10px;">Раз в 1-2 недели</td><td style="padding:5px 10px;">✅ <strong>Самое полезное.</strong> Свежие списки доменов (новые AI-сайты, реклама, трекеры). Минимальный риск — только списки, не бинарь.</td></tr>
-          <tr style="border-bottom:1px solid #eee;"><td style="padding:5px 10px;">🔄 Xray</td><td style="padding:5px 10px;">Раз в 1-3 месяца</td><td style="padding:5px 10px;">⚠️ Реже. Баг-фиксы и новые фичи xray. Если стабильно работает — «работает = не трогай».</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:5px 10px;">🔄 Xray</td><td style="padding:5px 10px;">Раз в 1-3 месяца</td><td style="padding:5px 10px;">⚠️ Реже. Баг-фиксы и новые фичи xray. Если стабильно работает — «работает = не трогать».</td></tr>
           <tr><td style="padding:5px 10px;">🔄 XKeen</td><td style="padding:5px 10px;">Раз в полгода</td><td style="padding:5px 10px;">⚪ Редко нужно. Обновляет сам bash-менеджер. Только если что-то в командах xkeen-CLI поломалось.</td></tr>
         </tbody>
       </table>
 
       <p style="margin: 10px 0; color: #666; font-size: 0.92em;">
-        💡 <strong>Если решил что-то обновить — начни с GeoFile</strong>. Минимальный риск, максимальная польза. Команды update-* интерактивные — нажми кнопку, появится готовая SSH-команда для запуска в терминале.
+        💡 <strong>Если решил что-то обновить — начать с GeoFile</strong>. Минимальный риск, максимальная польза. Команды update-* интерактивные — нажать кнопку, появится готовая SSH-команда для запуска в терминале.
       </p>
 
     </div>
@@ -13290,11 +13290,11 @@ echo OK</pre>
   <!-- ====== ГДЕ ПРИМЕНЯЮТСЯ GEOFILE-БАЗЫ ====== -->
   <details id="dat-categories-section" open style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 14px;">
     <summary style="cursor: pointer; font-weight: 700; color: #2e7d32; font-size: 1.05em;">
-      📍 Где применяются GeoFile-базы (категории geosite/geoip в твоих правилах)
+      📍 Где применяются GeoFile-базы (категории geosite/geoip в правилах)
     </summary>
     <div style="margin-top: 14px; line-height: 1.55;">
       <p style="margin: 0 0 8px;">GeoFile — это базы доменов и IP в файлах <code>/opt/etc/xray/dat/*.dat</code> от community-проекта <a href="https://github.com/v2fly/domain-list-community/tree/master/data" target="_blank">v2fly</a>. Они <strong>не применяются автоматически</strong> — Xray использует их только если в правиле есть ссылка <code>ext:geosite_v2fly.dat:&lt;категория&gt;</code>.</p>
-      <p style="margin: 0 0 10px;">Кнопка ниже покажет — какие категории у тебя <strong>сейчас задействованы</strong> в <code>05_routing.json</code>, в какое правило и куда направляется трафик (BLOCK / DIRECT / VPN-канал):</p>
+      <p style="margin: 0 0 10px;">Кнопка ниже покажет — какие категории <strong>сейчас задействованы</strong> в <code>05_routing.json</code>, в какое правило и куда направляется трафик (BLOCK / DIRECT / VPN-канал):</p>
       <button type="button" class="btn-primary" style="background:#2e7d32; color:#fff; margin: 8px 0;" onclick="scanDatCategories()">🩻 Просканировать — где применяются GeoFile-базы</button>
       <div id="dat-categories-output" style="margin-top: 12px;"></div>
 
@@ -13302,7 +13302,7 @@ echo OK</pre>
       <div style="margin-top: 24px; border-top: 1px dashed #e6e6e6; padding-top: 16px;">
         <h3 style="margin: 0 0 6px; font-size: 1.02em; color: #2e7d32;">🔍 Найти домен или IP в GeoFile-базах</h3>
         <p style="margin: 0 0 10px; font-size: 0.9em; color: #555;">
-          Введите домен (например <code>example.com</code>) или IP (<code>8.8.8.8</code>) — панель покажет, в каких категориях он есть. Поиск идёт по локальному кэшу; при первом запросе базы скачиваются с роутера (geoip-файлы крупные, до 30 секунд).
+          Ввести домен (например <code>example.com</code>) или IP (<code>8.8.8.8</code>) — панель покажет, в каких категориях он есть. Поиск идёт по локальному кэшу; при первом запросе базы скачиваются с роутера (geoip-файлы крупные, до 30 секунд).
         </p>
         <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
           <input type="text" id="dat-lookup-input" placeholder="example.com или 8.8.8.8"
@@ -13328,7 +13328,7 @@ echo OK</pre>
 <summary><h2 class="sec-xkmgmt">🚨 Алерты при падении xray <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— индикатор в шапке + browser-алерты + Windows toast</span></h2></summary>
 <div class="card">
   <p class="subtitle" style="margin-top: 0;">
-    Дашборд раз в минуту опрашивает <code>xkeen -status</code> на роутере и отображает состояние xray в шапке. При падении xray срабатывают визуальные и звуковые алерты — разные сценарии в зависимости от того где ты в этот момент.
+    Дашборд раз в минуту опрашивает <code>xkeen -status</code> на роутере и отображает состояние xray в шапке. При падении xray срабатывают визуальные и звуковые алерты — разные сценарии в зависимости от того, где находится пользователь в этот момент.
   </p>
 
   <h4 style="margin-top: 16px;">🟢 Индикатор xray-status в шапке (v1.7.19)</h4>
@@ -13341,7 +13341,7 @@ echo OK</pre>
     </tr></thead>
     <tbody>
       <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟢 зелёный</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>ok</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray запущен в рабочем режиме (<strong>TPROXY / Hybrid / Mixed / Redirect</strong> — все валидны), error.log чистый. <em>Hybrid</em> (XKeen 2.0; в 1.x назывался <em>Mixed</em>) = TCP через redirect + UDP через tproxy — штатный режим XKeen, не хуже остальных.</td></tr>
-      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟡 жёлтый</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>warn</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray запущен, но режим не распознан / статус прочитать не удалось. VPN скорее всего работает — глянь «📊 Статус».</td></tr>
+      <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟡 жёлтый</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>warn</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray запущен, но режим не распознан / статус прочитать не удалось. VPN скорее всего работает — посмотреть «📊 Статус».</td></tr>
       <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🟠 оранжевый (мигает)</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>error</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray запущен, но в error.log есть <code>failed to load</code> / <code>cannot find</code> / <code>panic</code> / <code>fatal</code> — что-то поломалось в конфиге.</td></tr>
       <tr><td style="border:1px solid #ccc; padding: 6px 10px;">🔴 красный (мигает)</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>stopped</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">xray НЕ запущен — VPN не работает совсем.</td></tr>
       <tr><td style="border:1px solid #ccc; padding: 6px 10px;">⚪ серый</td><td style="border:1px solid #ccc; padding: 6px 10px;"><code>unreachable</code></td><td style="border:1px solid #ccc; padding: 6px 10px;">SSH-таймаут к роутеру — сам роутер недоступен (нет связи).</td></tr>
@@ -13353,16 +13353,16 @@ echo OK</pre>
   <h4 style="margin-top: 18px;">🔔 Browser-алерты когда дашборд открыт (v1.7.19-1.7.20)</h4>
   <p>При <strong>переходе</strong> состояния из <code>ok</code>/<code>warn</code> в <code>error</code>/<code>stopped</code> — три сигнала одновременно:</p>
   <ul>
-    <li><strong>🔊 Beep</strong> через Web Audio API (2 коротких писка 880Hz + 1100Hz по 200ms). Работает только если ты <strong>уже кликал по странице</strong> хотя бы раз (browser autoplay policy блокирует AudioContext до первого user-interaction).</li>
-    <li><strong>📛 Title-мигание</strong>: каждые 800ms <code>document.title</code> переключается между «🔴 xray НЕ запущен» и оригиналом. Видно если ты в другой вкладке.</li>
+    <li><strong>🔊 Beep</strong> через Web Audio API (2 коротких писка 880Hz + 1100Hz по 200ms). Работает, только если по странице <strong>уже был клик</strong> хотя бы раз (browser autoplay policy блокирует AudioContext до первого user-interaction).</li>
+    <li><strong>📛 Title-мигание</strong>: каждые 800ms <code>document.title</code> переключается между «🔴 xray НЕ запущен» и оригиналом. Видно, если открыта другая вкладка.</li>
     <li><strong>🎨 Favicon-swap</strong>: favicon страницы меняется на иконку с красной кляксой и восклицательным знаком в углу. Видно даже в <strong>закреплённой (pinned) вкладке Chrome</strong> где title скрыт.</li>
   </ul>
   <p>При остающемся плохом состоянии — beep <strong>повторяется каждые 3 минуты</strong> (не спам). При восстановлении в <code>ok</code>/<code>warn</code> — все алерты снимаются.</p>
 
   <h4 style="margin-top: 18px;">🍞 Windows Toast когда дашборд закрыт (v1.7.21)</h4>
-  <p>Browser-алерты работают только если <strong>вкладка дашборда открыта</strong> в браузере. Если ты закрыл вкладку или браузер вообще — JS не выполняется, никаких алертов. Для таких случаев — отдельный daemon-скрипт <code>xkeen_toast_daemon.py</code>:</p>
+  <p>Browser-алерты работают только если <strong>вкладка дашборда открыта</strong> в браузере. Если вкладка или браузер закрыты — JS не выполняется, никаких алертов. Для таких случаев — отдельный daemon-скрипт <code>xkeen_toast_daemon.py</code>:</p>
   <ul>
-    <li>Бежит в фоне как Task Scheduler-задача <code>XrayToastAlerts</code> под твоим юзером (<code>/IT</code> = interactive — Windows toast виден только из interactive-сессии, поэтому НЕ под SYSTEM)</li>
+    <li>Бежит в фоне как Task Scheduler-задача <code>XrayToastAlerts</code> под текущим пользователем (<code>/IT</code> = interactive — Windows toast виден только из interactive-сессии, поэтому НЕ под SYSTEM)</li>
     <li>Раз в 60 сек HTTP GET <code>/api/xkeen/header-status</code> на локальный дашборд (cookie-auth через PASSWORD из <code>config_local.py</code>)</li>
     <li>При падении xray → Windows toast «🔴 Xray упал!» в правом нижнем углу</li>
     <li>Повтор каждые 10 минут пока xray валяется</li>
@@ -13387,7 +13387,7 @@ echo OK</pre>
   <p><strong>Не используется Telegram-алерт</strong> для падения xray — потому что Telegram-бот шлёт через локальный SOCKS5 (<code>127.0.0.1:10808</code>) который идёт через xray. Если xray упал — Telegram-алерт не уйдёт по определению. Поэтому только Windows toast (локальный, не зависит от VPN).</p>
 
   <div style="background:#eefbe5; border-left: 4px solid #2a7; padding: 8px 12px; margin: 12px 0; font-size: 0.92em;">
-    💡 <strong>Тест что toast реально работает</strong>: временно положи xray на роутере → подожди ~90 сек (60s polling + 30s server-cache) → должен прийти toast «🔴 Xray упал!». Потом подними обратно — через минуту придёт «✅ Xray восстановлен».
+    💡 <strong>Тест что toast реально работает</strong>: временно положить xray на роутере → подождать ~90 сек (60s polling + 30s server-cache) → должен прийти toast «🔴 Xray упал!». Потом поднять обратно — через минуту придёт «✅ Xray восстановлен».
     <pre style="background:#1e1e1e; color:#ddd; padding:6px 10px; border-radius:3px; font-size:0.82em; overflow-x:auto; margin-top:6px;">ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_settings.current.port or 222 }} "xkeen -stop"
 # жди toast, потом:
 ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_settings.current.port or 222 }} "xkeen -start"</pre>
@@ -13469,7 +13469,7 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
   <div data-xk-sub="🔁 Синхронизация IP" style="margin-top: 22px; border-top: 1px dashed #ccc; padding-top: 16px;">
     <h3 style="margin: 0 0 6px; font-size: 1.05em; color: #6a1a1a;">🔁 Синхронизация IP template с подпиской</h3>
     <p class="subtitle" style="margin: 0 0 10px;">
-      В базовом template есть жёсткий список IP <strong>твоих VPN-серверов</strong> — трафик роутера к ним должен идти <strong>напрямую</strong> (мимо xray), иначе петля и канал не работает. Когда подписка обновляется и IP серверов меняются, список может разойтись: новый сервер «не оживает», старые IP — мусор.<br>
+      В базовом template есть жёсткий список IP <strong>VPN-серверов</strong> — трафик роутера к ним должен идти <strong>напрямую</strong> (мимо xray), иначе петля и канал не работает. Когда подписка обновляется и IP серверов меняются, список может разойтись: новый сервер «не оживает», старые IP — мусор.<br>
       <strong>Обычно это происходит автоматически</strong> — после «🔄 Обновить из подписки» и добавления/удаления outbound. Кнопка ниже — ручная починка, она <strong>активна только когда есть расхождение</strong>.
     </p>
     <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
@@ -13490,7 +13490,7 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
         </tr></thead>
         <tbody>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>xray binary</code></td><td style="padding: 5px 10px;">Бинарь /opt/sbin/xray даёт SIGSEGV (Go runtime crash) — обычно <strong>неправильная архитектура</strong> (mips32 BE вместо mips32le на MT7621). Auto-fix НЕТ — нужно вручную скачать <code>Xray-linux-mips32le.zip</code> с XTLS/Xray-core releases (см. Help-секция).</td></tr>
-          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>xkeen запущен</code></td><td style="padding: 5px 10px;">xray-процесс не запущен. Auto-fix: <strong>🔄 Запустить xkeen</strong> (xkeen -restart). Если после рестарта снова «не запущен» — проблема в конфигах, проверяй следующие пункты.</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>xkeen запущен</code></td><td style="padding: 5px 10px;">xray-процесс не запущен. Auto-fix: <strong>🔄 Запустить xkeen</strong> (xkeen -restart). Если после рестарта снова «не запущен» — проблема в конфигах, проверять следующие пункты.</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>configs валидны</code></td><td style="padding: 5px 10px;"><code>xray test</code> показывает ошибки. Самая частая — <strong>пустой outboundTag</strong> в routing.json или ссылка на несуществующий outbound. Auto-fix: <strong>🔧 Перегенерить routing</strong> (через watchdog.sh из template).</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>Версия watchdog</code></td><td style="padding: 5px 10px;">Версия <code>watchdog.sh</code> на роутере СТАРЕЕ встроенной в панель. Auto-fix НЕТ — обновится <strong>автоматически при следующем «Сохранить»</strong> (авто-синк v1.0.50: панель сама заливает свежий watchdog перед применением любой настройки).</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>PRIMARY_TAG</code></td><td style="padding: 5px 10px;">В <code>watchdog.config</code> поле <code>PRIMARY_TAG=""</code> (пустое). Watchdog не может построить routing → xray валится. Auto-fix: <strong>🔧 PRIMARY = direct</strong> (трафик через провайдера, безопасный default).</td></tr>
@@ -13500,7 +13500,7 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>kill-switch политики</code></td><td style="padding: 5px 10px;">Хук <code>zz_xkeen_killswitch.sh</code> не установлен, потерял <code>+x</code>/cron-строку, переход не первый в <code>FORWARD</code> или параметры (метка политики, порты) разошлись с роутером. Auto-fix «🛡 Установить kill-switch» перегенерирует хук и проверит правила. Подробнее — «🛡 Kill-switch политики XKeen» в Помощи.</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>watchdog log без ошибок</code></td><td style="padding: 5px 10px;">В <code>/opt/var/log/xray/watchdog.log</code> свежие WARN/ERROR. Auto-fix НЕТ — нужно посмотреть детали в раскрытой проверке. Может быть нормально (временная недоступность канала).</td></tr>
           <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>geoip.dat категории</code></td><td style="padding: 5px 10px;">GeoIP-категории из routing (например <code>geoip:telegram</code>) отсутствуют в установленном <code>geoip.dat</code> → xray падает на старте. Auto-fix: <strong>📥 Установить / обновить расширенный geoip.dat</strong> — берёт <code>geoip_v2fly.dat</code> с роутера (если в нём есть telegram) или скачивает от Loyalsoldier; рабочий файл заменяется только после проверки нового. Категории сервисов в расширенной базе: telegram, cloudflare, google, facebook, twitter, netflix, fastly, cloudfront (discord там нет — только доменными правилами). Проверяются категории канала «📱 Зарубежные сервисы».</td></tr>
-          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>curl + RCI Keenetic</code></td><td style="padding: 5px 10px;">На роутере нет рабочего <code>curl</code> (watchdog пробит им каналы) или недоступен RCI Keenetic (<code>localhost:79</code> — DNS-профили/политики). Auto-fix НЕТ — проверь <code>opkg install curl</code> и доступность веб-интерфейса роутера.</td></tr>
+          <tr style="border-bottom: 1px solid #eee;"><td style="padding: 5px 10px; vertical-align: top;"><code>curl + RCI Keenetic</code></td><td style="padding: 5px 10px;">На роутере нет рабочего <code>curl</code> (watchdog пробит им каналы) или недоступен RCI Keenetic (<code>localhost:79</code> — DNS-профили/политики). Auto-fix НЕТ — проверить <code>opkg install curl</code> и доступность веб-интерфейса роутера.</td></tr>
           <tr><td style="padding: 5px 10px; vertical-align: top;"><code>Entware GNU tar</code></td><td style="padding: 5px 10px;">Установлен BusyBox tar (не GNU) — миграция через <code>tar</code> может не работать (нет <code>--exclude</code> и пр.). Auto-fix НЕТ — <code>opkg install tar</code> ставит GNU tar.</td></tr>
         </tbody>
       </table>
@@ -13513,7 +13513,7 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
       <ol style="margin: 0 0 0 22px; padding: 0;">
         <li><strong>«💾 Бэкап и восстановление» → «🔄 Восстановить из файла»</strong> — самый надёжный способ. Возврат к последнему сохранённому рабочему состоянию.</li>
         <li><strong>«🔧 Подключение к роутеру» → «🚀 Развернуть на чистом XKeen»</strong> + галочка «Перезаписать существующие файлы» — пересоздаст конфиги XKeen из шаблонов. Outbound'ы из подписки сохранятся (v1.4.7+ защита).</li>
-        <li><strong>Если ничего не помогает</strong> — SSH в роутер (порт 222, root) и <code>xkeen -start 2>&amp;1 | tail -30</code>. Скопируй вывод и пиши в issue на GitHub.</li>
+        <li><strong>Если ничего не помогает</strong> — SSH в роутер (порт 222, root) и <code>xkeen -start 2>&amp;1 | tail -30</code>. Скопировать вывод и писать в issue на GitHub.</li>
       </ol>
     </div>
   </details>
@@ -13528,8 +13528,8 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
     Watchdog шлёт в Telegram сообщения о важных событиях: переключение PRIMARY↔FAILOVER,
     активация/снятие AI/YT kill-switch, падение каналов, полный отказ. Если ничего не задать —
     алерты просто не идут (watchdog работает обычным режимом). Подходит <strong>любой</strong>
-    Telegram-бот: создай нового в <a href="https://t.me/BotFather" target="_blank">@BotFather</a> или
-    укажи существующего. Хранится на роутере в <code>/opt/etc/xray/watchdog.config</code>
+    Telegram-бот: создать нового в <a href="https://t.me/BotFather" target="_blank">@BotFather</a> или
+    указать существующего. Хранится на роутере в <code>/opt/etc/xray/watchdog.config</code>
     (НЕ в файлах панели — при передаче её другу токен не утечёт).
   </p>
 
@@ -13569,7 +13569,7 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
       <details open style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #29b; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #15506b;">🤖 Шаг 1. Создать (или взять существующего) Telegram-бота</summary>
         <div style="margin-top: 8px;">
-          <p>В Telegram найди <a href="https://t.me/BotFather" target="_blank"><strong>@BotFather</strong></a> (официальный бот для создания ботов) и напиши ему:</p>
+          <p>В Telegram найти <a href="https://t.me/BotFather" target="_blank"><strong>@BotFather</strong></a> (официальный бот для создания ботов) и написать ему:</p>
           <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em;">/newbot</pre>
           <p>Он спросит:</p>
           <ol>
@@ -13580,25 +13580,25 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
           <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">Done! Congratulations on your new bot. ...
 Use this token to access the HTTP API:
 <strong style="color:#ffd700;">123456789:AAHfXXXXXXXXXXXXXXXXXXXXXXXXXXXX</strong></pre>
-          <p>Скопируй эту строку — это и есть твой <strong>Bot Token</strong>. Вставь в поле выше.</p>
-          <p class="muted">💡 Если у тебя уже есть бот — открой переписку с @BotFather, напиши <code>/mybots</code> → выбери бота → API Token.</p>
+          <p>Скопировать эту строку — это и есть <strong>Bot Token</strong>. Вставить в поле выше.</p>
+          <p class="muted">💡 Если бот уже есть — открыть переписку с @BotFather, написать <code>/mybots</code> → выбрать бота → API Token.</p>
         </div>
       </details>
 
       <details style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #29b; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #15506b;">💬 Шаг 2. Узнать свой Chat ID</summary>
         <div style="margin-top: 8px;">
-          <p>Chat ID — это куда бот будет слать сообщения. Чаще всего — твой личный chat с ботом.</p>
+          <p>Chat ID — это куда бот будет слать сообщения. Чаще всего — личный chat с ботом.</p>
           <p><strong>Способ A — через того же бота:</strong></p>
           <ol>
-            <li>Найди своего нового бота в Telegram (по username, например <code>@my_xkeen_alerts_bot</code>)</li>
-            <li>Напиши ему <code>/start</code> (любое сообщение)</li>
-            <li>Открой в браузере URL (вставив свой токен вместо <code>YOUR_TOKEN</code>):
+            <li>Найти своего нового бота в Telegram (по username, например <code>@my_xkeen_alerts_bot</code>)</li>
+            <li>Написать ему <code>/start</code> (любое сообщение)</li>
+            <li>Открыть в браузере URL (вставив свой токен вместо <code>YOUR_TOKEN</code>):
               <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">https://api.telegram.org/botYOUR_TOKEN/getUpdates</pre>
             </li>
-            <li>В ответе ищи поле <code>"chat":{"id": <strong>123456789</strong>, ...}</code> — это и есть твой Chat ID.</li>
+            <li>В ответе искать поле <code>"chat":{"id": <strong>123456789</strong>, ...}</code> — это и есть Chat ID.</li>
           </ol>
-          <p><strong>Способ B — через @userinfobot:</strong> найди в Telegram <a href="https://t.me/userinfobot" target="_blank">@userinfobot</a>, напиши <code>/start</code> — он сразу пришлёт твой ID.</p>
+          <p><strong>Способ B — через @userinfobot:</strong> найти в Telegram <a href="https://t.me/userinfobot" target="_blank">@userinfobot</a>, написать <code>/start</code> — он сразу пришлёт ID.</p>
           <p class="muted">💡 Для приватного чата ID — положительное число. Для группы — отрицательное (типа <code>-1001234567890</code>). Можно вместо ID указать <code>@username</code> канала (если бот туда admin).</p>
         </div>
       </details>
@@ -13607,9 +13607,9 @@ Use this token to access the HTTP API:
         <summary style="cursor: pointer; font-weight: 700; color: #1f4d2c;">✅ Шаг 3. Проверить и сохранить</summary>
         <div style="margin-top: 8px;">
           <ol>
-            <li>Вставь Bot Token и Chat ID в форму выше.</li>
-            <li>Нажми <strong>«📨 Отправить тестовое сообщение»</strong> — придёт в Telegram сообщение «🧪 Тестовое сообщение от xray-dashboard …». Если пришло — всё ок.</li>
-            <li>Нажми <strong>«💾 Сохранить»</strong>. Watchdog подхватит новые настройки на следующем тике (в течение минуты).</li>
+            <li>Вставить Bot Token и Chat ID в форму выше.</li>
+            <li>Нажать <strong>«📨 Отправить тестовое сообщение»</strong> — придёт в Telegram сообщение «🧪 Тестовое сообщение от xray-dashboard …». Если пришло — всё ок.</li>
+            <li>Нажать <strong>«💾 Сохранить»</strong>. Watchdog подхватит новые настройки на следующем тике (в течение минуты).</li>
           </ol>
         </div>
       </details>
@@ -13618,11 +13618,11 @@ Use this token to access the HTTP API:
         <summary style="cursor: pointer; font-weight: 700; color: #6a1a1a;">🆘 Если тест не доходит</summary>
         <div style="margin-top: 8px;">
           <ul>
-            <li><strong>chat not found</strong> — ты не написал боту <code>/start</code>. Сначала напиши, потом тестируй.</li>
+            <li><strong>chat not found</strong> — боту не написали <code>/start</code>. Сначала написать, потом тестировать.</li>
             <li><strong>Unauthorized</strong> — токен неверный или бот удалён в BotFather.</li>
-            <li><strong>bot was blocked</strong> — ты заблокировал бота в Telegram. Разблокируй и напиши /start.</li>
-            <li><strong>Timeout / connection refused</strong> — роутер не может выйти на <code>api.telegram.org</code>. Проверь, что PRIMARY/FAILOVER канал работает (раздел ниже).</li>
-            <li><strong>curl: (7) Failed to connect to 127.0.0.1 port 10808</strong> — на этом роутере не поднят локальный SOCKS5-inbound (через него идут алерты в обход блокировки Telegram для RU-IP). Нажми появившуюся кнопку <strong>«🔧 Починить канал TG-алертов»</strong> — панель сама поднимет его и пропишет маршрут через зарубежный канал (с бэкапом и откатом). Если зарубежного канала на роутере нет — сначала добавь outbound и назначь ему роль «📱 Зарубежные сервисы» или AI.</li>
+            <li><strong>bot was blocked</strong> — бот заблокирован в Telegram. Разблокировать и написать /start.</li>
+            <li><strong>Timeout / connection refused</strong> — роутер не может выйти на <code>api.telegram.org</code>. Проверить, что PRIMARY/FAILOVER канал работает (раздел ниже).</li>
+            <li><strong>curl: (7) Failed to connect to 127.0.0.1 port 10808</strong> — на этом роутере не поднят локальный SOCKS5-inbound (через него идут алерты в обход блокировки Telegram для RU-IP). Нажать появившуюся кнопку <strong>«🔧 Починить канал TG-алертов»</strong> — панель сама поднимет его и пропишет маршрут через зарубежный канал (с бэкапом и откатом). Если зарубежного канала на роутере нет — сначала добавить outbound и назначить ему роль «📱 Зарубежные сервисы» или AI.</li>
           </ul>
         </div>
       </details>
@@ -13676,7 +13676,7 @@ Use this token to access the HTTP API:
 
       <div id="wgiOut" style="display:none; margin-top:12px;">
         <div id="wgiRes" style="padding:8px 10px; border-radius:4px; font-size:0.92em;"></div>
-        <div style="margin:8px 0; padding:8px 10px; background:#fbe5e5; border-left:3px solid #c33; font-size:0.9em; color:#7a1f1f;">🔴 Приватный ключ клиента показывается <b>один раз</b> и в панели не хранится. Скачайте <code>.conf</code> или покажите QR сейчас. Потерян — выдайте доступ заново.</div>
+        <div style="margin:8px 0; padding:8px 10px; background:#fbe5e5; border-left:3px solid #c33; font-size:0.9em; color:#7a1f1f;">🔴 Приватный ключ клиента показывается <b>один раз</b> и в панели не хранится. Скачать <code>.conf</code> или показать QR сейчас. Потерян — выдать доступ заново.</div>
         <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start;">
           <div style="flex:1 1 420px; min-width:0;">
             <div style="font-weight:600;">📄 Клиентский .conf:</div>
@@ -13733,7 +13733,7 @@ Use this token to access the HTTP API:
     <summary style="cursor:pointer; font-weight:600;">🧩 .conf вручную для существующего подключения</summary>
     <div style="margin-top:8px;">
       <p class="muted" style="margin-top:0;">Для подключений, созданных не через «Выдать доступ»: панель читает параметры с роутера и собирает клиентский <code>.conf</code> с плейсхолдером приватного ключа. Здесь же — выборочные подсети, адреса-исключения и своя точка подключения (Endpoint).</p>
-      <div id="wgGenStatus" class="muted" style="margin:8px 0;">Нажмите «🔄 Прочитать с роутера», чтобы загрузить WG-интерфейсы.</div>
+      <div id="wgGenStatus" class="muted" style="margin:8px 0;">Нажать «🔄 Прочитать с роутера», чтобы загрузить WG-интерфейсы.</div>
       <button type="button" class="btn" id="wgLoadBtn">🔄 Прочитать с роутера</button>
       <div id="wgForm" style="display:none; margin-top:12px;">
         <div style="margin:6px 0;">
@@ -13772,7 +13772,7 @@ Use this token to access the HTTP API:
         <div id="wgLanNote" style="display:none; margin:8px 0; padding:8px 10px; background:#eef6ee; border-radius:4px; font-size:0.9em;">🏠 Обычный клиент: видит домашнюю сеть (LAN + подсеть туннеля), интернет у него идёт напрямую. Заворот в анти-DPI для такого подключения не нужен.</div>
         <button type="button" class="btn" id="wgGenBtn" style="margin-top:8px;">🧩 Сгенерировать .conf</button>
         <div id="wgResult" style="display:none; margin-top:12px;">
-          <div style="background:#fbe5e5; border-left:3px solid #c33; padding:8px 11px; margin:8px 0; font-size:0.9em; color:#7a1f1f;">🔴 Перед использованием замените <code>PrivateKey = ВСТАВЬ_СВОЙ_ПРИВАТНЫЙ_КЛЮЧ</code> на приватный ключ устройства.</div>
+          <div style="background:#fbe5e5; border-left:3px solid #c33; padding:8px 11px; margin:8px 0; font-size:0.9em; color:#7a1f1f;">🔴 Перед использованием заменить <code>PrivateKey = ВСТАВИТЬ_СВОЙ_ПРИВАТНЫЙ_КЛЮЧ</code> на приватный ключ устройства.</div>
           <textarea id="wgConf" readonly rows="14" style="width:100%; font-family:monospace; font-size:0.82em; white-space:pre; overflow-x:auto;"></textarea>
           <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
             <button type="button" class="btn" id="wgCopyBtn">📋 Скопировать</button>
@@ -13869,7 +13869,7 @@ Use this token to access the HTTP API:
     }
     var s = d.slot;
     if(!s){ setIssueReady(false, 'слот не вычислен'); el.textContent = ''; return; }
-    if(s.full){ setIssueReady(false, 'нет свободного места'); el.innerHTML = '<b style="color:#b02a37;">⛔ Кончились ' + esc(s.why) + '</b> (занято ' + s.used + ' из ' + s.max + ') — отзовите ненужный доступ.'; return; }
+    if(s.full){ setIssueReady(false, 'нет свободного места'); el.innerHTML = '<b style="color:#b02a37;">⛔ Кончились ' + esc(s.why) + '</b> (занято ' + s.used + ' из ' + s.max + ') — отозвать ненужный доступ.'; return; }
     setIssueReady(!d.lan_warn, 'ЛВС роутера не определена');
     var t = 'Новому доступу достанется: подсеть <code>' + esc(d.prefix) + '.' + s.sub_x + '.0/24</code> (роутер .1, клиент .2), порт <code>' + s.port + '</code>, интерфейс <code>' + esc(s.iface) + '</code> · занято ' + s.used + ' из ' + s.max + '.';
     if(d.endpoint_warn) t += '<br><b style="color:#b02a37;">⚠ ' + esc(d.endpoint_warn) + '</b>';
@@ -13957,7 +13957,7 @@ Use this token to access the HTTP API:
 
   function issue(){
     var name = (($('wgiName') && $('wgiName').value) || '').trim();
-    if(!name){ alert('Укажите имя доступа'); return; }
+    if(!name){ alert('Указать имя доступа'); return; }
     var ex = document.querySelector('input[name="wgiExit"]:checked');
     var body = { name: name, exit: ex ? ex.value : 'direct', full: !!($('wgiFull') && $('wgiFull').checked),
       services: checkedSvc($('wgiSvc')), extra: ($('wgiExtra') && $('wgiExtra').value) || '',
@@ -13974,15 +13974,15 @@ Use this token to access the HTTP API:
         html = (c.ok ? '🚀 <b>Готово на роутере.</b> ' : '❌ <b>На роутере не получилось.</b> ') + esc(c.msg);
         if(c.ok){
           html += '<br>Режим: <b>' + (d.s2s ? ('🔗 site-to-site ' + esc(d.remote_lan)) : esc(d.exit_label)) + '</b>. Осталось отдать клиенту ' + (d.s2s ? '<code>.conf</code> (на удалённый Keenetic).' : 'QR или <code>.conf</code>.');
-          if(c.xray){ html += '<br>' + (c.xray.ok ? '🛡 Заворот в xray: ' + esc(c.xray.msg) : '<b style="color:#b02a37;">⚠ Заворот в xray не включён: ' + esc(c.xray.msg) + '</b> — включите в «📡 На роутере» кнопкой «🛡 Анти-DPI».'); }
+          if(c.xray){ html += '<br>' + (c.xray.ok ? '🛡 Заворот в xray: ' + esc(c.xray.msg) : '<b style="color:#b02a37;">⚠ Заворот в xray не включён: ' + esc(c.xray.msg) + '</b> — включить в «📡 На роутере» кнопкой «🛡 Анти-DPI».'); }
         } else if(c.left){
-          html += '<br>Интерфейс остался на роутере — <b>серверный файл не загружать</b> (будет дубль): в «📋 Выданные» нажмите «🔒 Правила» или «🗑 Отозвать».';
+          html += '<br>Интерфейс остался на роутере — <b>серверный файл не загружать</b> (будет дубль): в «📋 Выданные» нажать «🔒 Правила» или «🗑 Отозвать».';
         } else {
-          html += '<br>На роутере ничего не осталось. Повторите выдачу или пройдите ручным путём (серверный .conf ниже).';
+          html += '<br>На роутере ничего не осталось. Повторить выдачу или пройти ручным путём (серверный .conf ниже).';
         }
       } else {
-        html = '📋 <b>Доступ выдан без создания на роутере</b> (ручной путь): загрузите серверный <code>.conf</code> в Keenetic («Загрузить из файла»), включите подключение, затем в «📋 Выданные» нажмите «🔒 Правила».';
-        if(d.s2s) html += '<br>🔗 Маршрут к удалённой ЛВС <code>' + esc(d.remote_lan) + '</code> «🔒 Правила» не добавляют — добавьте его в Keenetic (строка <code>ip route … auto</code> в блоке CLI ниже).';
+        html = '📋 <b>Доступ выдан без создания на роутере</b> (ручной путь): загрузить серверный <code>.conf</code> в Keenetic («Загрузить из файла»), включить подключение, затем в «📋 Выданные» нажать «🔒 Правила».';
+        if(d.s2s) html += '<br>🔗 Маршрут к удалённой ЛВС <code>' + esc(d.remote_lan) + '</code> «🔒 Правила» не добавляют — добавить его в Keenetic (строка <code>ip route … auto</code> в блоке CLI ниже).';
       }
       if(d.endpoint_warn) html += '<br><b style="color:#b02a37;">⚠ ' + esc(d.endpoint_warn) + '</b>';
       if(d.s2s) html += '<br>🔗 Site-to-site: клиентский <code>.conf</code> — на удалённый Keenetic («Загрузить из файла»), там разрешить в межсетевом экране трафик из туннеля и маршрут к <code>' + esc(WG.lan) + '</code>.';
@@ -14057,7 +14057,7 @@ Use this token to access the HTTP API:
     fetch('/api/xkeen/wg-backup?iface=' + encodeURIComponent(iface)).then(function(r){
       var ct = r.headers.get('Content-Type') || '';
       if(!r.ok || r.redirected || ct.indexOf('text/plain') < 0){
-        return r.text().then(function(t){ throw new Error(r.redirected ? 'сессия истекла — войдите заново' : (t || ('HTTP ' + r.status)).slice(0, 200)); });
+        return r.text().then(function(t){ throw new Error(r.redirected ? 'сессия истекла — войти заново' : (t || ('HTTP ' + r.status)).slice(0, 200)); });
       }
       var cd = r.headers.get('Content-Disposition') || '';
       var m = /filename="([^"]+)"/.exec(cd);
@@ -14082,7 +14082,7 @@ Use this token to access the HTTP API:
   function renderOrphans(list){
     var el = $('wgrOrphan'); if(!el) return;
     if(!list.length){ el.style.display = 'none'; el.innerHTML = ''; return; }
-    el.innerHTML = '<b>⚠ Найдены осиротевшие хуки анти-DPI</b> — интерфейс удалён без снятия заворота, его правила держит cron; новое подключение с тем же номером подхватит старый хук и не заработает. Уберите их:<br>'
+    el.innerHTML = '<b>⚠ Найдены осиротевшие хуки анти-DPI</b> — интерфейс удалён без снятия заворота, его правила держит cron; новое подключение с тем же номером подхватит старый хук и не заработает. Убрать их:<br>'
       + list.map(function(k){ return '🔴 <code>' + esc(k) + '</code> <button type="button" class="btn" data-orphan="' + esc(k) + '">🧹 Убрать ' + esc(k) + '</button>'; }).join('<br>');
     el.style.display = '';
     var btns = el.querySelectorAll('button[data-orphan]');
@@ -14116,7 +14116,7 @@ Use this token to access the HTTP API:
       else h += '<ul style="margin:4px 0; font-family:monospace; font-size:0.85em; max-height:160px; overflow:auto;">' + cur.map(function(x){ return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>';
       var pre = d.pre || {};
       h += '<div class="muted" style="font-size:0.88em; margin-top:6px;">Применится только отмеченное, текущие правила заменятся.' + (pre.src ? ' Предзаполнено по данным ' + esc(pre.src) + '.' : '') + '</div>';
-      if(pre.exit === null && !d.s2s) h += '<div style="color:#b26a00; font-size:0.88em;">⚠ Текущий NAT/правила не прочитаны — режим не угадан, выберите сами.</div>';
+      if(pre.exit === null && !d.s2s) h += '<div style="color:#b26a00; font-size:0.88em;">⚠ Текущий NAT/правила не прочитаны — режим не угадан, выбрать сами.</div>';
       if(d.warnings && d.warnings.length) h += '<div style="margin:6px 0; padding:6px 10px; background:#fff3cd; border-left:3px solid #e0a800; font-size:0.88em;"><b>⚠ При применении:</b><ul style="margin:2px 0 0 18px; padding:0;">'
         + d.warnings.map(function(w){ return '<li>' + esc(w) + '</li>'; }).join('') + '</ul></div>';
       if(d.s2s){
@@ -14142,7 +14142,7 @@ Use this token to access the HTTP API:
 
   function applyRules(iface, s2s, xrayOn){
     var ex = document.querySelector('input[name="wgRExit"]:checked') || document.querySelector('input[name="wgRExit"][type="hidden"]');
-    if(!ex){ alert('Выберите режим выхода в интернет'); return; }
+    if(!ex){ alert('Выбрать режим выхода в интернет'); return; }
     var warnX = (xrayOn && ex.value !== 'xray') ? ' Заворот в xray у этого подключения будет СНЯТ.' : '';
     if(!confirm('Применить правила к ' + iface + ' и сохранить конфигурацию роутера? Текущие правила будут заменены.' + warnX)) return;
     var b = $('wgRApply'); b.disabled = true; $('wgRStatus').textContent = 'применяю…';
@@ -14164,7 +14164,7 @@ Use this token to access the HTTP API:
     if($('wgClientIp')) $('wgClientIp').placeholder = 'авто: ' + (i.suggested_client_ip || '?');
     if($('wgIfaceInfo')){
       var info = 'Порт ' + (i.listen_port || '?') + ' · MTU ' + (i.mtu || '?') + ' · подсеть ' + (i.subnet_cidr || '?') + ' · пиров: ' + (i.peers_count != null ? i.peers_count : '?');
-      info += i.iface_up ? ' · 🟢 включён' : ' · 🔴 ВЫКЛЮЧЕН — включите подключение в Keenetic (Другие подключения)';
+      info += i.iface_up ? ' · 🟢 включён' : ' · 🔴 ВЫКЛЮЧЕН — включить подключение в Keenetic (Другие подключения)';
       info += i.connected ? ' · 🛡 заведён в анти-DPI' : '';
       $('wgIfaceInfo').textContent = info;
       $('wgIfaceInfo').style.color = i.iface_up ? '' : '#c33';
@@ -14189,11 +14189,11 @@ Use this token to access the HTTP API:
       if($('wgEndpoint')) $('wgEndpoint').placeholder = 'авто: ' + (wan || '—');
       if($('wgForm')) $('wgForm').style.display = '';
       onIfaceChange(); onModeChange();
-      setStatus('✅ Прочитано. WAN: ' + (wan || '—') + ' · DNS: ' + (dns || '—') + '. Выберите интерфейс и нажмите «Сгенерировать».');
+      setStatus('✅ Прочитано. WAN: ' + (wan || '—') + ' · DNS: ' + (dns || '—') + '. Выбрать интерфейс и нажать «Сгенерировать».');
     }).catch(function(e){ setStatus('⚠ ошибка: ' + e); });
   }
   function gen(){
-    var i = curIface(); if(!i){ alert('Сначала прочитайте интерфейсы с роутера'); return; }
+    var i = curIface(); if(!i){ alert('Сначала прочитать интерфейсы с роутера'); return; }
     var body = { iface_id: i.id, mode: $('wgMode').value, client_ip: ($('wgClientIp').value || '').trim(),
       endpoint_host: ($('wgEndpoint').value || '').trim(), selective_cidrs: ($('wgSelectiveCidrs').value || '').trim(),
       exclude_cidrs: (($('wgExcludeCidrs') && $('wgExcludeCidrs').value) || '').trim(),
@@ -14245,8 +14245,8 @@ Use this token to access the HTTP API:
 <div class="card">
   <p class="subtitle" style="margin-top: 0;">
     Подробное описание всего что есть в этой панели + примеры use-case'ов в конце.
-    Ничего не запоминать — вернись сюда когда забудешь как что работает.
-    Подразделы свёрнуты — открой нужный.
+    Ничего не запоминать — сюда можно вернуться, когда нужно вспомнить, как что работает.
+    Подразделы свёрнуты — открыть нужный.
   </p>
 
   <details class="help-section">
@@ -14297,12 +14297,12 @@ Use this token to access the HTTP API:
           <tr>
             <td style="border:1px solid #ccc; padding: 6px 10px;"><code>start.bat</code></td>
             <td style="border:1px solid #ccc; padding: 6px 10px;">Запускает <code>python dashboard.py</code> в видимом окне cmd. Все логи Flask выводятся в это окно. <strong>Окно должно быть открыто</strong> — закроется = панель закроется.</td>
-            <td style="border:1px solid #ccc; padding: 6px 10px;">Для <strong>отладки</strong>: хочешь видеть какие запросы приходят, какие ошибки Python. Не для постоянной работы.</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Для <strong>отладки</strong>: видно, какие запросы приходят, какие ошибки Python. Не для постоянной работы.</td>
           </tr>
           <tr>
             <td style="border:1px solid #ccc; padding: 6px 10px;"><code>start-bg.bat</code></td>
             <td style="border:1px solid #ccc; padding: 6px 10px;">Запускает <code>pythonw dashboard.py</code> (windowless) в фоне. Окно cmd закрывается, процесс продолжает работать.</td>
-            <td style="border:1px solid #ccc; padding: 6px 10px;">Для <strong>повседневной работы</strong> без сервиса. Жмёшь — забываешь — пользуешься. Перезапуск Windows = панель не стартанёт автоматически.</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Для <strong>повседневной работы</strong> без сервиса. Один запуск — и панель работает. Перезапуск Windows = панель не стартанёт автоматически.</td>
           </tr>
           <tr>
             <td style="border:1px solid #ccc; padding: 6px 10px;"><code>stop.bat</code></td>
@@ -14327,22 +14327,22 @@ Use this token to access the HTTP API:
         <div style="margin:10px 0;">
           <strong>2️⃣ Структура на роутере (watchdog / routing / socks-local)</strong>
           <ul style="margin:4px 0 0 18px; font-size:0.9em; line-height:1.5;">
-            <li>Заливается <strong>автоматически</strong>: открой панель → нажми <strong>«💾 Сохранить»</strong> на любой настройке каналов <em>или</em> <strong>«🔧 Починить»</strong>. Панель сверит версию watchdog на роутере со встроенной и, если на роутере старее, зальёт свежую <em>перед</em> применением (с бэкапом и проверкой <code>xray -test</code>) + перегенерит routing.</li>
+            <li>Заливается <strong>автоматически</strong>: открыть панель → нажать <strong>«💾 Сохранить»</strong> на любой настройке каналов <em>или</em> <strong>«🔧 Починить»</strong>. Панель сверит версию watchdog на роутере со встроенной и, если на роутере старее, зальёт свежую <em>перед</em> применением (с бэкапом и проверкой <code>xray -test</code>) + перегенерит routing.</li>
             <li>Роутер <strong>с нуля</strong>: <strong>«🚀 Развернуть на чистом XKeen»</strong> — ставит всё разом, включая socks-local для TG-алертов.</li>
           </ul>
         </div>
 
         <div style="margin:10px 0;">
-          <strong>3️⃣ ОБЯЗАТЕЛЬНО после обновления — открой «🔬 Диагностика XKeen»</strong>
+          <strong>3️⃣ ОБЯЗАТЕЛЬНО после обновления — открыть «🔬 Диагностика XKeen»</strong>
           <ul style="margin:4px 0 0 18px; font-size:0.9em; line-height:1.5;">
-            <li>Смотри строку <strong>«Версия watchdog на роутере»</strong>. Если она <strong>отстаёт</strong> от встроенной в панель (⚠) — значит в обновлении менялась и структура роутера, но она ещё НЕ применилась. Нажми <strong>«💾 Сохранить»</strong> или <strong>«🔧 Починить»</strong> → авто-синк догонит watchdog и перегенерит routing. Открой Диагностику ещё раз — должно стать ✅.</li>
+            <li>См. строку <strong>«Версия watchdog на роутере»</strong>. Если она <strong>отстаёт</strong> от встроенной в панель (⚠) — значит в обновлении менялась и структура роутера, но она ещё НЕ применилась. Нажать <strong>«💾 Сохранить»</strong> или <strong>«🔧 Починить»</strong> → авто-синк догонит watchdog и перегенерит routing. Открыть Диагностику ещё раз — должно стать ✅.</li>
             <li>Версия панели — бейдж <code>vX.Y.Z</code> в шапке (клик → релиз на GitHub).</li>
           </ul>
           <p style="margin:6px 0 0; font-size:0.86em; color:#777;">💡 Обновление кода (шаг 1) само по себе роутер НЕ трогает — структуру на роутере догоняет только «Сохранить»/«Починить» (шаг 2). Диагностика показывает, надо ли это сделать.</p>
         </div>
 
         <div style="background:#fff8e6; border-left:3px solid #e6a817; padding:8px 12px; margin-top:10px; font-size:0.88em;">
-          ⚠️ <strong>Порядок при нескольких роутерах</strong> (например дом и работа): чтобы обновить роутер на другой машине, код панели туда сначала приходит с GitHub (<code>update.bat</code> = <code>git pull</code>). То есть свежий код сперва <strong>публикуется</strong>, потом подтягивается на каждой машине. Сначала обнови и проверь на одной, затем — на остальных.
+          ⚠️ <strong>Порядок при нескольких роутерах</strong> (например дом и работа): чтобы обновить роутер на другой машине, код панели туда сначала приходит с GitHub (<code>update.bat</code> = <code>git pull</code>). То есть свежий код сперва <strong>публикуется</strong>, потом подтягивается на каждой машине. Сначала обновить и проверить на одной, затем — на остальных.
         </div>
       </div>
 
@@ -14388,7 +14388,7 @@ Use this token to access the HTTP API:
           <tr>
             <td style="border:1px solid #ccc; padding: 6px 10px;"><code>install_service.ps1</code></td>
             <td style="border:1px solid #ccc; padding: 6px 10px;">Создаёт Task Scheduler task <code>XrayDashboard</code> под <strong>SYSTEM</strong> с <code>/SC ONSTART /RL HIGHEST</code>. После reboot панель стартует автоматически без логина юзера. Авто-чинит MS Store Python (если venv там), копирует SSH-ключ из <code>~/.ssh/</code> в проектную папку с правильным ACL для SYSTEM.</td>
-            <td style="border:1px solid #ccc; padding: 6px 10px;">Когда хочешь чтобы панель работала <strong>24/7</strong> без необходимости логиниться в Windows. Сценарий «PC включён всегда» (домашний сервер).</td>
+            <td style="border:1px solid #ccc; padding: 6px 10px;">Когда нужно, чтобы панель работала <strong>24/7</strong> без необходимости логиниться в Windows. Сценарий «PC включён всегда» (домашний сервер).</td>
           </tr>
         </tbody>
       </table>
@@ -14418,7 +14418,7 @@ Use this token to access the HTTP API:
         💡 <strong>Сводно: какой когда использовать</strong>
         <ul style="margin: 6px 0 0 18px; padding: 0;">
           <li><strong>Первая установка</strong>: <code>install.bat</code> → <code>start-bg.bat</code></li>
-          <li><strong>Перезагрузил Windows</strong>, панель не стартанула? → <code>start-bg.bat</code> (или ставь <code>install_service.bat</code> чтобы автоматически)</li>
+          <li><strong>Перезагрузил Windows</strong>, панель не стартанула? → <code>start-bg.bat</code> (или ставить <code>install_service.bat</code> чтобы автоматически)</li>
           <li><strong>Обновить с GitHub</strong>: <code>update.bat</code></li>
           <li><strong>Применить локальные правки</strong> (без git pull): <code>Restart-Clean.bat</code> (если сервисный режим) или <code>stop.bat</code> + <code>start-bg.bat</code> (если просто фоновой)</li>
           <li><strong>Сервис 24/7</strong>: <code>install_service.bat</code> — один раз от админа</li>
@@ -14431,7 +14431,7 @@ Use this token to access the HTTP API:
       </p>
 
       <p class="subtitle" style="font-size: 0.85em; margin-top: 8px;">
-        ℹ <strong>Все .bat в репо — pure ASCII</strong> (английские строки в echo). Это нужно потому что cmd.exe в Windows читает .bat в OEM-кодировке (cp866 на русской Windows), и UTF-8 без BOM ломает парсер на русских строках («ОШИБКА: 'rocess' is not recognized...»). Если будешь править .bat — оставляй ASCII.
+        ℹ <strong>Все .bat в репо — pure ASCII</strong> (английские строки в echo). Это нужно потому что cmd.exe в Windows читает .bat в OEM-кодировке (cp866 на русской Windows), и UTF-8 без BOM ломает парсер на русских строках («ОШИБКА: 'rocess' is not recognized...»). При правке .bat — оставлять ASCII.
       </p>
     </div>
   </details>
@@ -14442,7 +14442,7 @@ Use this token to access the HTTP API:
       <h4>Как обновлять панель</h4>
       <ul>
         <li><strong>Через Git</strong> (если ставил через <code>git clone</code>): <code>cd C:\xray-dashboard</code> + <code>.\update.bat</code> — стянет последний релиз с GitHub, поставит новые зависимости из <code>requirements.txt</code> если он изменился, перезапустит панель в фоне.</li>
-        <li><strong>Без Git</strong> (если ставил из ZIP): скачать свежий ZIP с GitHub → остановить панель (<code>stop.bat</code>) → распаковать архив поверх <code>C:\xray-dashboard</code> с заменой файлов (твои <code>config_local.py</code>, <code>.venv</code>, <code>backups\</code> в архиве нет — не перезапишутся) → <code>install.bat</code> для обновления зависимостей → <code>start-bg.bat</code>.</li>
+        <li><strong>Без Git</strong> (если ставил из ZIP): скачать свежий ZIP с GitHub → остановить панель (<code>stop.bat</code>) → распаковать архив поверх <code>C:\xray-dashboard</code> с заменой файлов (свои <code>config_local.py</code>, <code>.venv</code>, <code>backups\</code> в архиве нет — не перезапишутся) → <code>install.bat</code> для обновления зависимостей → <code>start-bg.bat</code>.</li>
       </ul>
 
       <h4>Что синхронизируется на роутер автоматически</h4>
@@ -14466,7 +14466,7 @@ Use this token to access the HTTP API:
       <ol>
         <li><strong>Бэкап</strong> — копирует <code>watchdog.sh</code> + <code>05_routing.template.json</code> + <code>05_routing.json</code> с суффиксом <code>.syncbak-YYYYMMDD-HHMMSS</code>. Если что-то пойдёт не так — откат к этим бэкапам автоматический.</li>
         <li><strong>watchdog → актуальный</strong> — заливает свежую версию <code>watchdog.sh</code> на роутер (если ещё не подтянулся при «Сохранить»).</li>
-        <li><strong>template → актуальный</strong> — заливает свежий <code>05_routing.template.json</code> + <strong>пересинкивает IP-адреса</strong> из текущих outbounds (твои кастомные IP сохраняются, не теряются после overwrite).</li>
+        <li><strong>template → актуальный</strong> — заливает свежий <code>05_routing.template.json</code> + <strong>пересинкивает IP-адреса</strong> из текущих outbounds (кастомные IP сохраняются, не теряются после overwrite).</li>
         <li><strong>Прогон watchdog</strong> — запускает <code>watchdog.sh</code>, который перегенерирует <code>05_routing.json</code> из новых watchdog/template.</li>
         <li><strong>Валидация</strong> — <code>xray -test</code> на новом конфиге (с обязательным <code>XRAY_LOCATION_ASSET=/opt/etc/xray/dat</code>).</li>
         <li><strong>Применение</strong> — <code>xkeen -restart</code> + <strong>health-check</strong>: проверка что процесс <code>xray run</code> жив И DNS резолвится через LAN-IP роутера (до 6 попыток с интервалом 3 секунды).</li>
@@ -14483,7 +14483,7 @@ Use this token to access the HTTP API:
       <h4>Когда НЕ нажимать</h4>
       <ul>
         <li>На свежем релизе сразу после первой установки — здесь структура и так актуальна (баннера не будет, кнопка вернёт «Структура уже актуальна, применять нечего»).</li>
-        <li>Если только что вручную правил <code>watchdog.sh</code> или <code>05_routing.template.json</code> на роутере под себя — кнопка перезапишет твои изменения свежей версией из панели. Сохрани свою копию заранее.</li>
+        <li>Если <code>watchdog.sh</code> или <code>05_routing.template.json</code> на роутере правились вручную — кнопка перезапишет эти изменения свежей версией из панели. Сохранить свою копию заранее.</li>
       </ul>
     </div>
   </details>
@@ -14493,7 +14493,7 @@ Use this token to access the HTTP API:
     <div class="help-body">
       <h4>🟢 PRIMARY — основной канал</h4>
       <p>Через него идёт <strong>весь трафик</strong> (кроме того что попадает под специальные правила: AI / YouTube / «Зарубежные сервисы» / DIRECT).
-      Дефолт — <code>vless-reality</code> (твой собственный VPN-сервер). Watchdog раз в минуту пингует его через <code>https://&lt;your-vpn-domain&gt;:8444/</code>.
+      Дефолт — <code>vless-reality</code> (собственный VPN-сервер). Watchdog раз в минуту пингует его через <code>https://&lt;your-vpn-domain&gt;:8444/</code>.
       Если 2 пинга подряд провалились → переключается на FAILOVER. Если потом 3 пинга подряд успешны → возвращается обратно.</p>
 
       <h4>🟡 FAILOVER — резервный канал</h4>
@@ -14501,12 +14501,12 @@ Use this token to access the HTTP API:
 
       <h4>🤖 AI-sticky outbound</h4>
       <p>Sticky-канал именно для AI-сайтов из списка <code>📦 Список AI-доменов</code>. <strong>Независим</strong> от PRIMARY/FAILOVER — даже если default переключился, AI всё равно идёт через выбранный канал.</p>
-      <p>Зачем: AI-сервисы (Anthropic, OpenAI, Gemini) <strong>геоблокируют российские IP</strong> — получишь 403/region-denied. Поэтому выбирай EU-канал (Германия, Нидерланды, Финляндия). НЕ выбирай канал с бейджем <strong>🛡️ Обход</strong> или <strong>📺 Ютуб</strong> — это RU-exit, AI заблокирует. В dropdown'е такие подсвечены коричневым с предупреждением.</p>
+      <p>Зачем: AI-сервисы (Anthropic, OpenAI, Gemini) <strong>геоблокируют российские IP</strong> — ответ 403/region-denied. Поэтому выбирать EU-канал (Германия, Нидерланды, Финляндия). НЕ выбирать канал с бейджем <strong>🛡️ Обход</strong> или <strong>📺 Ютуб</strong> — это RU-exit, AI заблокирует. В dropdown'е такие подсвечены коричневым с предупреждением.</p>
       <p><strong>Kill-switch (рекомендуется включённым)</strong>: когда AI-канал упал и цепочка резерва (см. ниже) пуста или тоже молчит — AI-домены идут в <code>block</code> (drop), а не через PRIMARY. Это защита от засветки российского IP в Anthropic/OpenAI: после такого аккаунт могут заблокировать.</p>
 
       <h4>📺 YouTube-sticky outbound</h4>
       <p>Sticky-канал для YouTube/Google-видео из списка <code>📺 Список YouTube-доменов</code>. Аналог AI-sticky. <em>(Instagram/Telegram/Twitter/Discord сюда НЕ кладём — они в отдельном канале «Зарубежные сервисы» ниже.)</em></p>
-      <p>Зачем: при просмотре YouTube через EU/US-VPN — <strong>лезет реклама</strong> (Google показывает по geo-IP) и видео могут тротлить. Если же канал — <strong>RU-exit</strong> (через российский IP), рекламы меньше и троттлинга нет (специфика политики Google для RU-аудитории). Поэтому выбирай канал с бейджем <strong>📺 Ютуб</strong> в dropdown'е (это RU-exit без anti-DPI маскировки).</p>
+      <p>Зачем: при просмотре YouTube через EU/US-VPN — <strong>лезет реклама</strong> (Google показывает по geo-IP) и видео могут тротлить. Если же канал — <strong>RU-exit</strong> (через российский IP), рекламы меньше и троттлинга нет (специфика политики Google для RU-аудитории). Поэтому выбирать канал с бейджем <strong>📺 Ютуб</strong> в dropdown'е (это RU-exit без anti-DPI маскировки).</p>
       <p><strong>Kill-switch выключен по умолчанию</strong> — если YT-канал и его цепочка резерва (см. ниже) молчат, YouTube идёт через PRIMARY (с рекламой, но работает).</p>
 
 
@@ -14521,7 +14521,7 @@ Use this token to access the HTTP API:
 
       <h4>📱 «Зарубежные сервисы»-sticky outbound</h4>
       <p>Sticky-канал для <strong>зарубежных сервисов</strong>: Meta/Instagram, WhatsApp, Telegram, Twitter/X, Discord (список <code>📱 Список доменов</code> в этом канале).</p>
-      <p>Зачем отдельно от YouTube: у них <strong>противоположные</strong> требования к выходу. YouTube хочет <strong>российский</strong> выход (де-троттл + меньше рекламы), а Meta/Telegram <strong>заблокированы</strong> — российский выход блокировку НЕ обходит (DPI режет TLS даже через RU-IP). Поэтому здесь выбирай <strong>заграничный</strong> выход (🇳🇱/🇩🇪/🇪🇪). <em>(Раньше Instagram сидел в YouTube-канале с RU-выходом и не открывался — «вместо сайта скачивался файл».)</em></p>
+      <p>Зачем отдельно от YouTube: у них <strong>противоположные</strong> требования к выходу. YouTube хочет <strong>российский</strong> выход (де-троттл + меньше рекламы), а Meta/Telegram <strong>заблокированы</strong> — российский выход блокировку НЕ обходит (DPI режет TLS даже через RU-IP). Поэтому здесь выбирать <strong>заграничный</strong> выход (🇳🇱/🇩🇪/🇪🇪). <em>(Раньше Instagram сидел в YouTube-канале с RU-выходом и не открывался — «вместо сайта скачивался файл».)</em></p>
       <p><strong>GeoIP-категория <code>telegram</code> обязательна</strong> в этом канале для iOS — iPhone-Telegram бьёт по IP минуя DNS, без неё MTProto-соединения улетят в PRIMARY, и если PRIMARY=RU — Telegram зависнет в «Connecting» (на ПК работает через DNS-домен, поэтому проблема ловит только iOS). На «Зарубежные сервисы» эту категорию ставит UI-кнопка в подсекции «🌍 GeoIP-категории». Опционально — <code>facebook</code>/<code>twitter</code>. Категории <code>discord</code> в geoip.dat нет — Discord направляется доменными правилами.</p>
       <p><strong>Kill-switch (рекомендую включён)</strong>: если загран-канал упал — эти сервисы идут в <code>block</code>, а не через PRIMARY. Иначе при RU-default они всё равно не откроются (Meta/X недоступны для RU-IP), а реальный IP засветится. Подробнее — отдельная тема <a href="#help-foreign" onclick="openHelpAnchor('help-foreign'); return false;">«📱 Канал Зарубежные сервисы»</a>.</p>
 
@@ -14559,17 +14559,17 @@ Use this token to access the HTTP API:
       <p>Домены <strong>IPv6-only сайтов</strong> (нет A-записи, только AAAA) — идут через канал «Через IPv6». При добавлении домена сюда панель автоматически прописывает <strong>fake-IP</strong> <code>198.18.0.1</code> на роутере (<code>ip host &lt;domain&gt; 198.18.0.1</code>) — это нужно чтобы IPv4-only клиент (например ПК с выключенным IPv6) смог дотянуться до xray, а xray восстановил домен из SNI и отправил на узел канала. При удалении домена fake-IP снимается тоже. Пресет — <code>ntc.party</code>. <strong>Пустой список = правило выключено.</strong></p>
 
       <h4>↪️ Сайты НАПРЯМУЮ без VPN — DIRECT (оранжевая карточка)</h4>
-      <p>Домены которые идут <strong>через твоего обычного провайдера</strong> минуя VPN. Полезно для:</p>
+      <p>Домены, которые идут <strong>через обычного провайдера</strong> минуя VPN. Полезно для:</p>
       <ul>
         <li>Банков (Сбер/ВТБ/Альфа/Тинькофф) — они проверяют RU-IP, через VPN могут не пустить</li>
         <li>Госуслуг (требуют RU-IP)</li>
         <li>Российских стримингов (Okko, Кинопоиск) — через RU-IP быстрее</li>
         <li>Mail.ru / Yandex — нет смысла гонять через заграницу</li>
       </ul>
-      <div class="tip">⚠️ Большая часть RU-сайтов <strong>уже идёт direct автоматически</strong> через regex <code>*.ru</code> / <code>*.su</code> / <code>*.рф</code> + <code>geosite</code> (yandex, vk, steam). В этот список добавляй ТОЛЬКО варианты <code>.com</code> / <code>.net</code> / <code>.tv</code> / <code>.cloud</code> которые НЕ ловятся базовым regex.</div>
+      <div class="tip">⚠️ Большая часть RU-сайтов <strong>уже идёт direct автоматически</strong> через regex <code>*.ru</code> / <code>*.su</code> / <code>*.рф</code> + <code>geosite</code> (yandex, vk, steam). В этот список добавлять ТОЛЬКО варианты <code>.com</code> / <code>.net</code> / <code>.tv</code> / <code>.cloud</code> которые НЕ ловятся базовым regex.</div>
 
       <h4>После сохранения</h4>
-      <p>Watchdog подхватит новый список <strong>в течение 1 минуты</strong> (на следующем тике cron). Чтобы применить <strong>сразу</strong> — нажми кнопку <strong>🔄 AUTO</strong> в подразделе «⚡ Принудительно переключить watchdog».</p>
+      <p>Watchdog подхватит новый список <strong>в течение 1 минуты</strong> (на следующем тике cron). Чтобы применить <strong>сразу</strong> — нажать кнопку <strong>🔄 AUTO</strong> в подразделе «⚡ Принудительно переключить watchdog».</p>
     </div>
   </details>
 
@@ -14584,7 +14584,7 @@ Use this token to access the HTTP API:
       <p>Оба <strong>необязательны</strong>. Если ручных доменов в списке достаточно — их можно не трогать.</p>
 
       <h4>🩻 v2fly категории — зачем</h4>
-      <p>Это списки доменов которые ведёт <a href="https://github.com/v2fly/domain-list-community/tree/master/data" target="_blank" rel="noopener">v2fly community</a>. Watchdog подставляет их как <code>ext:geosite_v2fly.dat:NAME</code> рядом с твоими ручными доменами.</p>
+      <p>Это списки доменов которые ведёт <a href="https://github.com/v2fly/domain-list-community/tree/master/data" target="_blank" rel="noopener">v2fly community</a>. Watchdog подставляет их как <code>ext:geosite_v2fly.dat:NAME</code> рядом с ручными доменами.</p>
       <p><strong>Преимущество над ручными доменами</strong>: когда сервис добавит новый поддомен (например <code>music-beta.youtube.com</code>), он попадёт в правило <strong>автоматически</strong> после <code>xkeen -ug</code> — без правок UI. Категория <code>youtube</code> покрывает <em>все</em> известные домены YouTube, включая редкие региональные.</p>
       <p><strong>Типичные категории</strong>: <code>youtube</code>, <code>tiktok</code>, <code>discord</code>, <code>spotify</code>, <code>twitter</code>, <code>facebook</code>, <code>instagram</code>, <code>openai</code>, <code>anthropic</code>, <code>google</code>.</p>
 
@@ -14598,7 +14598,7 @@ Use this token to access the HTTP API:
       <h4>🌍 GeoIP-категории — зачем</h4>
       <p>Доменные правила не ловят трафик приложений, которые коннектятся <strong>напрямую к IP-датацентров минуя DNS</strong>. Классический пример — <strong>Telegram Desktop</strong>: он идёт на IP вроде <code>149.154.x.x</code> / <code>91.108.x.x</code>, доменное правило <code>domain:telegram.org</code> его трафик не видит.</p>
       <p>GeoIP-категория матчит по <strong>IP-диапазонам</strong> из <code>geoip.dat</code>. Секция «🌍 GeoIP-категории» находится в канале <strong>«📱 Зарубежные сервисы»</strong>. Watchdog генерирует <strong>отдельное правило</strong> <code>"ip": ["geoip:telegram"]</code> с тем же outboundTag, что у доменного правила этого канала (и с тем же kill-switch через FOREIGN_FAIL_BLOCK).</p>
-      <p><strong>Когда использовать</strong>: если приложение «зависает на Connecting», а тот же сервис через браузер работает — это IP-only-проблема. Добавьте категорию (обычно <code>telegram</code>) → трафик пойдёт через канал «Зарубежные сервисы» по IP.</p>
+      <p><strong>Когда использовать</strong>: если приложение «зависает на Connecting», а тот же сервис через браузер работает — это IP-only-проблема. Добавить категорию (обычно <code>telegram</code>) → трафик пойдёт через канал «Зарубежные сервисы» по IP.</p>
       <p><strong>Какие категории сервисов есть в geoip.dat</strong>: <code>telegram</code>, <code>cloudflare</code>, <code>google</code>, <code>facebook</code>, <code>twitter</code>, <code>netflix</code>, <code>fastly</code>, <code>cloudfront</code> (плюс страны: <code>ru</code>, <code>us</code>, <code>cn</code> и т.д., и <code>private</code>). Категории <code>discord</code> в geoip.dat нет ни в одной базе — Discord направляется доменными правилами (пресет и v2fly-категория <code>discord</code>).</p>
 
       <h4>🌍 GeoIP-категории — какая база geoip.dat нужна</h4>
@@ -14632,14 +14632,14 @@ Use this token to access the HTTP API:
   <details class="help-section" id="help-scenarios">
     <summary>🎯 Готовые сценарии настройки (рецепты для типовых задач)</summary>
     <div class="help-body">
-      <p>Если не знаешь с чего начать — выбери сценарий который ближе всего к твоей задаче и пройди по шагам. В UI секция «🎯 Основное и резервное подключение» — там все основные dropdown'ы.</p>
+      <p>С чего начать — выбрать сценарий, который ближе всего к задаче, и пройти по шагам. В UI секция «🎯 Основное и резервное подключение» — там все основные dropdown'ы.</p>
 
       <details open style="margin: 10px 0; padding: 10px 14px; background: #f0f9ff; border-left: 4px solid #0288d1; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #01579b;">📺 Сценарий 1: VPN только для YouTube / Instagram / Telegram, остальное напрямую</summary>
         <div style="margin-top: 8px;">
           <p><strong>Цель</strong>: обычный трафик идёт быстро через провайдера (банки, Госуслуги, Яндекс, рабочие сайты), а через VPN — только то что иначе не работает: YouTube (без рекламы или вообще не открывается), Instagram (недоступен напрямую), Telegram Desktop (IP-блокировка провайдера).</p>
 
-          <p><strong>Что получаешь:</strong></p>
+          <p><strong>Результат:</strong></p>
           <ul>
             <li>Браузер по умолчанию → через провайдера (скорость нативного интернета)</li>
             <li>youtube.com / instagram.com → через VPN</li>
@@ -14648,10 +14648,10 @@ Use this token to access the HTTP API:
           </ul>
 
           <h4 style="margin: 12px 0 6px;">Шаг 1. PRIMARY = «Напрямую без VPN»</h4>
-          <p>Секция <strong>«🎯 Основное и резервное подключение»</strong> → dropdown <strong>«🛡️ Основной канал (PRIMARY)»</strong> → выбери первый вариант <code>🌐 Напрямую без VPN — через провайдера</code> → жми зелёную кнопку <strong>«💾 Сохранить PRIMARY»</strong>.</p>
+          <p>Секция <strong>«🎯 Основное и резервное подключение»</strong> → dropdown <strong>«🛡️ Основной канал (PRIMARY)»</strong> → выбрать первый вариант <code>🌐 Напрямую без VPN — через провайдера</code> → нажать зелёную кнопку <strong>«💾 Сохранить PRIMARY»</strong>.</p>
 
-          <h4 style="margin: 12px 0 6px;">Шаг 2. YT-канал = твой VPN-outbound</h4>
-          <p>Та же секция → dropdown <strong>«📺 YouTube-sticky outbound»</strong> → выбери VPN-канал. Какой именно — зависит от приоритетов:</p>
+          <h4 style="margin: 12px 0 6px;">Шаг 2. YT-канал = VPN-outbound</h4>
+          <p>Та же секция → dropdown <strong>«📺 YouTube-sticky outbound»</strong> → выбрать VPN-канал. Какой именно — зависит от приоритетов:</p>
           <table style="border-collapse: collapse; margin: 8px 0; width: 100%;">
             <thead><tr style="background:#f0f0f0;"><th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">Канал</th><th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">YouTube</th><th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">Instagram</th><th style="border:1px solid #ccc; padding:6px 10px; text-align:left;">Telegram</th></tr></thead>
             <tbody>
@@ -14669,31 +14669,31 @@ Use this token to access the HTTP API:
               </tr>
             </tbody>
           </table>
-          <p>Большинство юзеров выбирает <strong>EU-канал</strong> — потерпеть рекламу в YouTube ради рабочего Instagram. Жми <strong>«Сохранить YouTube outbound»</strong>.</p>
+          <p>Большинство юзеров выбирает <strong>EU-канал</strong> — потерпеть рекламу в YouTube ради рабочего Instagram. Нажать <strong>«Сохранить YouTube outbound»</strong>.</p>
 
           <h4 style="margin: 12px 0 6px;">Шаг 3. YT-домены — пресетами</h4>
-          <p>Раздел <strong>«📺 Список YouTube-доменов»</strong> (красная карточка ниже dropdown'ов). Нажми по очереди кнопки-пресеты:</p>
+          <p>Раздел <strong>«📺 Список YouTube-доменов»</strong> (красная карточка ниже dropdown'ов). Нажать по очереди кнопки-пресеты:</p>
           <ul>
             <li><strong>📺 YouTube</strong> — youtube.com, ytimg.com, googlevideo.com, youtu.be и т.д.</li>
             <li><strong>📷 Instagram</strong> — instagram.com, cdninstagram.com, fbcdn.net и т.д.</li>
             <li><strong>💌 Telegram</strong> — telegram.org, t.me, web.telegram.org, cdn-telegram.org и т.д.</li>
-            <li><strong>💚 WhatsApp</strong> — whatsapp.com, whatsapp.net (subdomain-match ловит все *.whatsapp.com/.net), web.whatsapp.com, wa.me (короткие ссылки), mmg.whatsapp.net + Meta-backend (mqtt-mini/mqtt/chatd/latest.facebook.com). Заблокирован DPI в РФ с 2025-08 — через VPN обязательно. ⚠ Для первого <strong>связывания нового устройства</strong> (QR-код) пресета может быть мало — клиент ходит на доп. Edge-серверы по IP. Лайфхак: временно поставь PRIMARY=VPN → linking → верни PRIMARY обратно.</li>
+            <li><strong>💚 WhatsApp</strong> — whatsapp.com, whatsapp.net (subdomain-match ловит все *.whatsapp.com/.net), web.whatsapp.com, wa.me (короткие ссылки), mmg.whatsapp.net + Meta-backend (mqtt-mini/mqtt/chatd/latest.facebook.com). Заблокирован DPI в РФ с 2025-08 — через VPN обязательно. ⚠ Для первого <strong>связывания нового устройства</strong> (QR-код) пресета может быть мало — клиент ходит на доп. Edge-серверы по IP. Лайфхак: временно поставить PRIMARY=VPN → linking → вернуть PRIMARY обратно.</li>
           </ul>
-          <p>В textarea появятся домены. Жми <strong>«💾 Сохранить YT-домены»</strong>.</p>
+          <p>В textarea появятся домены. Нажать <strong>«💾 Сохранить YT-домены»</strong>.</p>
 
           <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #1a5276;">
             💡 <strong>Пресет нужен для web-версии</strong> (в браузере) — там трафик идёт по DNS (открыл youtube.com → DNS lookup → правило сработало). Для <strong>десктоп- и мобильных приложений</strong> некоторые сервисы (например, Telegram Desktop) ходят по IP без DNS — для них пресета недостаточно, нужен GeoIP (см. Шаг 5). Discord направляется только доменными правилами — категории discord в geoip.dat нет.
           </div>
 
           <h4 style="margin: 12px 0 6px;">Шаг 4. v2fly категории (для автоподхвата новых доменов)</h4>
-          <p>Под YT-доменами раскрой <strong>«🩻 v2fly категории»</strong> → добавь <strong>📺 youtube</strong>. Это нужно чтобы новые поддомены YouTube (которые Google запустит завтра) автоматически попадали через VPN после <code>xkeen -ug</code> без правок руками.</p>
+          <p>Под YT-доменами раскрыть <strong>«🩻 v2fly категории»</strong> → добавить <strong>📺 youtube</strong>. Это нужно чтобы новые поддомены YouTube (которые Google запустит завтра) автоматически попадали через VPN после <code>xkeen -ug</code> без правок руками.</p>
           <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin: 4px 0; font-size: 0.9em;">
-            ⚠ Если YT-канал = <strong>RU</strong> — НЕ добавляй <code>facebook</code> / <code>instagram</code> / <code>twitter</code>: Meta/X недоступны через RU-IP, Instagram перестанет работать. Если YT-канал = <strong>EU/DE</strong> — можно добавить <code>instagram</code>.
+            ⚠ Если YT-канал = <strong>RU</strong> — НЕ добавлять <code>facebook</code> / <code>instagram</code> / <code>twitter</code>: Meta/X недоступны через RU-IP, Instagram перестанет работать. Если YT-канал = <strong>EU/DE</strong> — можно добавить <code>instagram</code>.
           </div>
-          <p>Жми <strong>«💾 Сохранить категории»</strong>.</p>
+          <p>Нажать <strong>«💾 Сохранить категории»</strong>.</p>
 
           <h4 style="margin: 12px 0 6px;">Шаг 5. GeoIP-категории для Telegram Desktop (по IP, не по домену)</h4>
-          <p>Раскрой <strong>«🌍 GeoIP-категории»</strong> → нажми <strong>📱 telegram</strong> → жми <strong>«💾 Сохранить GeoIP-категории»</strong>.</p>
+          <p>Раскрыть <strong>«🌍 GeoIP-категории»</strong> → нажать <strong>📱 telegram</strong> → нажать <strong>«💾 Сохранить GeoIP-категории»</strong>.</p>
           <p>Это нужно потому что Telegram Desktop коннектится напрямую к IP датацентров минуя DNS — без GeoIP-правила он бы шёл через PRIMARY (провайдера) и не подключался.</p>
 
           <p><strong>Шпаргалка</strong>: для каких сервисов что нужно добавить?</p>
@@ -14733,7 +14733,7 @@ Use this token to access the HTTP API:
                 <td style="border:1px solid #ccc; padding:6px 10px;"><strong>WhatsApp</strong></td>
                 <td style="border:1px solid #ccc; padding:6px 10px; color:#2e7d32;">✅ обязательно</td>
                 <td style="border:1px solid #ccc; padding:6px 10px; color:#888;">не нужна</td>
-                <td style="border:1px solid #ccc; padding:6px 10px;">Web и мобильный клиент ходят по DNS (whatsapp.com/whatsapp.net + wa.me + Meta MQTT-эндпоинты). Категории <code>whatsapp</code> в geoip.dat нет — а <code>facebook</code> захватил бы FB/IG, не подходит. ⚠ <strong>Для первичного linking устройства</strong> пресета может быть недостаточно — клиент при первой авторизации (сканировании QR) ходит на доп. Edge-серверы по IP. Лайфхак: временно поставь PRIMARY = VPN → сделай linking → верни PRIMARY обратно. Дальше всё покрывается пресетом. Заблокирован DPI в РФ с 2025-08.</td>
+                <td style="border:1px solid #ccc; padding:6px 10px;">Web и мобильный клиент ходят по DNS (whatsapp.com/whatsapp.net + wa.me + Meta MQTT-эндпоинты). Категории <code>whatsapp</code> в geoip.dat нет — а <code>facebook</code> захватил бы FB/IG, не подходит. ⚠ <strong>Для первичного linking устройства</strong> пресета может быть недостаточно — клиент при первой авторизации (сканировании QR) ходит на доп. Edge-серверы по IP. Лайфхак: временно поставить PRIMARY = VPN → сделать linking → вернуть PRIMARY обратно. Дальше всё покрывается пресетом. Заблокирован DPI в РФ с 2025-08.</td>
               </tr>
               <tr>
                 <td style="border:1px solid #ccc; padding:6px 10px;"><strong>TikTok / Twitch / Twitter / Reddit / Spotify</strong></td>
@@ -14745,24 +14745,24 @@ Use this token to access the HTTP API:
           </table>
 
           <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 6px 10px; margin: 4px 0; font-size: 0.9em;">
-            ⚠ Если после сохранения GeoIP <code>xkeen -status</code> покажет «в режиме <strong>Mixed/Hybrid</strong>» — <strong>проверьте <code>error.log</code></strong>: если там <code>code not found</code>/<code>failed to load</code>, то категория действительно не найдена в geoip.dat. Если секция «🌍 GeoIP-категории» показывает, что категории telegram в geoip.dat нет, — нажмите зелёную кнопку <strong>«📥 Установить / обновить расширенный geoip.dat»</strong> в жёлтом блоке там же. <em>Если error.log чистый — Mixed/Hybrid это валидный режим работы XKeen, VPN работает (проверка через <code>https://checkip.amazonaws.com</code> покажет VPN-IP).</em>
+            ⚠ Если после сохранения GeoIP <code>xkeen -status</code> покажет «в режиме <strong>Mixed/Hybrid</strong>» — <strong>проверить <code>error.log</code></strong>: если там <code>code not found</code>/<code>failed to load</code>, то категория действительно не найдена в geoip.dat. Если секция «🌍 GeoIP-категории» показывает, что категории telegram в geoip.dat нет, — нажать зелёную кнопку <strong>«📥 Установить / обновить расширенный geoip.dat»</strong> в жёлтом блоке там же. <em>Если error.log чистый — Mixed/Hybrid это валидный режим работы XKeen, VPN работает (проверка через <code>https://checkip.amazonaws.com</code> покажет VPN-IP).</em>
           </div>
 
           <h4 style="margin: 12px 0 6px;">Шаг 6. Проверка</h4>
           <ul>
-            <li>Открой <a href="https://2ip.ru" target="_blank">2ip.ru</a> → должен показать IP <strong>твоего провайдера</strong> (потому что 2ip.ru не в YT-списке)</li>
-            <li>Открой <a href="https://youtube.com" target="_blank">youtube.com</a> → должен открыться (через VPN — Google IP не RU)</li>
-            <li>Открой Instagram в браузере → должен работать (если канал EU/US)</li>
-            <li>Открой Telegram Desktop → должен подключиться</li>
+            <li>Открыть <a href="https://2ip.ru" target="_blank">2ip.ru</a> → должен показать IP <strong>провайдера</strong> (потому что 2ip.ru не в YT-списке)</li>
+            <li>Открыть <a href="https://youtube.com" target="_blank">youtube.com</a> → должен открыться (через VPN — Google IP не RU)</li>
+            <li>Открыть Instagram в браузере → должен работать (если канал EU/US)</li>
+            <li>Открыть Telegram Desktop → должен подключиться</li>
           </ul>
 
           <h4 style="margin: 12px 0 6px;">Опционально: AI-канал (Claude / ChatGPT)</h4>
-          <p>Если пользуешься AI-сервисами (OpenAI/Anthropic/Gemini) — те же шаги для <strong>«🤖 AI-sticky outbound»</strong> в той же секции. Выбери <strong>EU/US-канал</strong> (RU-IP они банят аккаунты). Включи <strong>kill-switch AI</strong> (галочка «Блокировать если канал упал») — чтобы при падении канала твой RU-IP не засветился в Anthropic. См. подсекцию «📡 4 канала» выше.</p>
+          <p>Для AI-сервисов (OpenAI/Anthropic/Gemini) — те же шаги для <strong>«🤖 AI-sticky outbound»</strong> в той же секции. Выбрать <strong>EU/US-канал</strong> (RU-IP они банят аккаунты). Включить <strong>kill-switch AI</strong> (галочка «Блокировать если канал упал») — чтобы при падении канала RU-IP не засветился в Anthropic. См. подсекцию «📡 4 канала» выше.</p>
 
           <h4 style="margin: 12px 0 6px;">Что НЕ нужно делать в этом сценарии</h4>
           <ul>
             <li><strong>FAILOVER</strong> необязателен — PRIMARY=direct, провайдер не может «упасть» так чтобы failover понадобился (если упал провайдер — упал и роутер).</li>
-            <li><strong>DIRECT-домены</strong> необязательны — там собираются домены которые «всегда напрямую». В нашем сценарии PRIMARY=direct, поэтому ВСЁ кроме YT уже идёт напрямую. Список используй только если хочешь явно зафиксировать что определённые сайты будут через провайдера даже если когда-то поменяешь PRIMARY.</li>
+            <li><strong>DIRECT-домены</strong> необязательны — там собираются домены которые «всегда напрямую». В нашем сценарии PRIMARY=direct, поэтому ВСЁ кроме YT уже идёт напрямую. Список нужен, только чтобы явно зафиксировать, что определённые сайты пойдут через провайдера, даже если PRIMARY когда-то поменяется.</li>
             <li><strong>BLOCK-домены</strong> отдельная задача — выкл. Windows Update / Adobe Genuine / телеметрию. К этому сценарию не относится.</li>
           </ul>
         </div>
@@ -14771,31 +14771,31 @@ Use this token to access the HTTP API:
       <details id="help-yt-recaptcha" open style="margin: 10px 0; padding: 10px 14px; background: #fef3e2; border-left: 4px solid #f0c200; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #6a4900;">❓ Сценарий 2: YouTube показывает «подозрительный трафик» (reCAPTCHA) — полный комплекс настроек</summary>
         <div style="margin-top: 8px;">
-          <p><strong>Симптом</strong>: YouTube в браузере показывает страницу <em>«Мы зарегистрировали подозрительный трафик, исходящий из вашей сети»</em> с указанием <strong>двух разных IP</strong> (например IPv4 твоего PRIMARY + IPv6 какой-то ещё). Видео не открывается, требуется reCAPTCHA.</p>
+          <p><strong>Симптом</strong>: YouTube в браузере показывает страницу <em>«Мы зарегистрировали подозрительный трафик…»</em> с указанием <strong>двух разных IP</strong> (например IPv4 PRIMARY + IPv6 какой-то ещё). Видео не открывается, требуется reCAPTCHA.</p>
 
           <p><strong>Причина</strong>: YouTube-страница тянет ресурсы с <strong>множества Google-доменов</strong>. Часть покрывается пресетом <code>📺 YouTube</code> (<code>youtube.com</code>, <code>googlevideo.com</code>, <code>ytimg.com</code>) → идёт через YT-tag. <strong>Остальная часть</strong> (<code>googleusercontent.com</code>, <code>1e100.net</code>, <code>googleapis.com</code>, <code>gstatic.com</code>) — НЕ в стандартном пресете → идёт через PRIMARY (catch-all). Google видит запросы одного сессионного токена <strong>с двух разных IP</strong> → anti-abuse → reCAPTCHA.</p>
 
-          <p><strong>Решение зависит от твоего YT-канала</strong>. Открой секцию <strong>«🎯 Основное и резервное подключение»</strong> → посмотри dropdown <strong>«📺 YouTube-sticky outbound»</strong>:</p>
+          <p><strong>Решение зависит от YT-канала</strong>. Открыть секцию <strong>«🎯 Основное и резервное подключение»</strong> → посмотреть dropdown <strong>«📺 YouTube-sticky outbound»</strong>:</p>
 
           <h4 style="margin: 14px 0 6px; color: #c0392b;">🇷🇺 Рецепт A — если YT-канал = RU (Россия_YouTube, СПб_YouTube — для DPI-обхода рекламы)</h4>
           <p>Главное правило для RU: <strong>НЕ тащить через RU-выход чувствительные Google-сервисы</strong> (Gmail / Drive / Calendar / Photos / Search). Google может пометить аккаунт как подозрительный регион. Поэтому используем <strong>узкие точечные пресеты</strong>, не широкую категорию <code>google</code>.</p>
           <ol>
             <li>В секции <strong>«📺 Список YouTube-доменов»</strong>:
               <ul>
-                <li>Нажми <strong>📺 YouTube</strong> (если ещё не добавлен)</li>
-                <li>Нажми <strong>🌐 Google для YT</strong> ← добавит 4 точечных домена: <code>gstatic.com</code>, <code>googleapis.com</code>, <code>googleusercontent.com</code>, <code>1e100.net</code>. <em>Gmail/Drive не задевает — они под <code>mail.google.com</code> / <code>drive.google.com</code>.</em></li>
-                <li>Нажми <strong>«💾 Сохранить YT-домены»</strong></li>
+                <li>Нажать <strong>📺 YouTube</strong> (если ещё не добавлен)</li>
+                <li>Нажать <strong>🌐 Google для YT</strong> ← добавит 4 точечных домена: <code>gstatic.com</code>, <code>googleapis.com</code>, <code>googleusercontent.com</code>, <code>1e100.net</code>. <em>Gmail/Drive не задевает — они под <code>mail.google.com</code> / <code>drive.google.com</code>.</em></li>
+                <li>Нажать <strong>«💾 Сохранить YT-домены»</strong></li>
               </ul>
             </li>
             <li>В свёрнутом блоке <strong>«🩻 v2fly категории»</strong>:
               <ul>
-                <li>Нажми <strong>📺 youtube</strong> ← авто-обновление новых поддоменов YouTube через <code>xkeen -ug</code></li>
-                <li><strong>НЕ нажимай</strong> <code>🌐 google</code> — потянет за собой Gmail/Drive (см. выше)</li>
-                <li><strong>НЕ нажимай</strong> <code>facebook</code> / <code>instagram</code> / <code>twitter</code> — Meta/X недоступны для RU-IP, через RU-канал не пробьёшь</li>
-                <li>Нажми <strong>«💾 Сохранить категории»</strong></li>
+                <li>Нажать <strong>📺 youtube</strong> ← авто-обновление новых поддоменов YouTube через <code>xkeen -ug</code></li>
+                <li><strong>НЕ нажимать</strong> <code>🌐 google</code> — потянет за собой Gmail/Drive (см. выше)</li>
+                <li><strong>НЕ нажимать</strong> <code>facebook</code> / <code>instagram</code> / <code>twitter</code> — Meta/X недоступны для RU-IP, через RU-канал не открываются</li>
+                <li>Нажать <strong>«💾 Сохранить категории»</strong></li>
               </ul>
             </li>
-            <li>(Опционально) для Telegram Desktop — в <strong>«🌍 GeoIP-категории»</strong> добавь <code>telegram</code>.</li>
+            <li>(Опционально) для Telegram Desktop — в <strong>«🌍 GeoIP-категории»</strong> добавить <code>telegram</code>.</li>
           </ol>
 
           <h4 style="margin: 14px 0 6px; color: #2e7d32;">🇳🇱 🇩🇪 🇺🇸 Рецепт B — если YT-канал = EU/US (Нидерланды, Германия, США, и т.п.)</h4>
@@ -14803,16 +14803,16 @@ Use this token to access the HTTP API:
           <ol>
             <li>В секции <strong>«📺 Список YouTube-доменов»</strong>:
               <ul>
-                <li>Нажми <strong>📺 YouTube</strong></li>
+                <li>Нажать <strong>📺 YouTube</strong></li>
                 <li>(Можно дополнительно нажать <strong>🌐 Google для YT</strong> — но это уже избыточно с категорией <code>google</code> в шаге 2)</li>
-                <li>Нажми <strong>«💾 Сохранить YT-домены»</strong></li>
+                <li>Нажать <strong>«💾 Сохранить YT-домены»</strong></li>
               </ul>
             </li>
             <li>В <strong>«🩻 v2fly категории»</strong>:
               <ul>
-                <li>Нажми <strong>🌐 google</strong> ← покрывает ВСЕ Google-домены (включая Gmail/Drive/Photos). Через EU/US — без проблем.</li>
-                <li>Опционально: <code>youtube</code>, <code>tiktok</code>, <code>discord</code>, <code>instagram</code> — нужные тебе</li>
-                <li>Нажми <strong>«💾 Сохранить категории»</strong></li>
+                <li>Нажать <strong>🌐 google</strong> ← покрывает ВСЕ Google-домены (включая Gmail/Drive/Photos). Через EU/US — без проблем.</li>
+                <li>Опционально: <code>youtube</code>, <code>tiktok</code>, <code>discord</code>, <code>instagram</code> — по необходимости</li>
+                <li>Нажать <strong>«💾 Сохранить категории»</strong></li>
               </ul>
             </li>
             <li>YouTube будет <strong>с рекламой</strong> (Google по geo-IP видит EU/US → показывает обычные ads). Это плата за рабочий Instagram и отсутствие reCAPTCHA.</li>
@@ -14836,30 +14836,30 @@ Use this token to access the HTTP API:
 
           <h4 style="margin: 14px 0 6px;">🔍 Проверка</h4>
           <ol>
-            <li>Подожди <strong>≤1 минуту</strong> — watchdog подхватит, xray перегенерирует <code>routing.json</code></li>
+            <li>Подождать <strong>≤1 минуту</strong> — watchdog подхватит, xray перегенерирует <code>routing.json</code></li>
             <li>Закрой <strong>все</strong> YouTube-вкладки в браузере (даже сворачивание не считается — нужно закрыть, либо рестарт Chrome полностью)</li>
-            <li>Открой YouTube <strong>в новом инкогнито-окне</strong> — старые cookies и connection pool не путают</li>
-            <li>Если reCAPTCHA <strong>не уйдёт сразу</strong> — подожди <strong>10-15 минут</strong> (Google anti-abuse session со старым fingerprint истечёт по таймауту)</li>
+            <li>Открыть YouTube <strong>в новом инкогнито-окне</strong> — старые cookies и connection pool не путают</li>
+            <li>Если reCAPTCHA <strong>не уйдёт сразу</strong> — подождать <strong>10-15 минут</strong> (Google anti-abuse session со старым fingerprint истечёт по таймауту)</li>
           </ol>
 
           <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #1a5276;">
-            💡 <strong>Бонус — IPv6 leak</strong>: если у тебя домашний провайдер выдаёт IPv6 (например Ростелеком fiber) — IPv6-трафик уходит мимо xray (TPROXY ловит только IPv4). YouTube может увидеть твой реальный домашний IPv6 — это тоже триггерит reCAPTCHA. Лечится в Web UI Keenetic → подключение → <strong>«Параметры IPv6» → «Не используется»</strong>. После этого Chrome не получит AAAA-записи и пойдёт только по IPv4. <a href="#help-ipv6-leak" onclick="openHelpAnchor('help-ipv6-leak'); return false;">Подробнее → отдельная тема «🌐 Утечка IPv6»</a>.
+            💡 <strong>Бонус — IPv6 leak</strong>: если домашний провайдер выдаёт IPv6 — IPv6-трафик уходит мимо xray (TPROXY ловит только IPv4). YouTube может увидеть реальный домашний IPv6 — это тоже триггерит reCAPTCHA. Лечится в Web UI Keenetic → подключение → <strong>«Параметры IPv6» → «Не используется»</strong>. После этого Chrome не получит AAAA-записи и пойдёт только по IPv4. <a href="#help-ipv6-leak" onclick="openHelpAnchor('help-ipv6-leak'); return false;">Подробнее → отдельная тема «🌐 Утечка IPv6»</a>.
           </div>
 
           <div style="background: #fee; border-left: 3px solid #c33; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #6a1010;">
-            ⚠ <strong>Опасное QUIC поведение</strong>: Chrome агрессивно использует QUIC (HTTP/3 over UDP) для YouTube. xray sniffing для UDP может не сработать → пакет видится только по dest IP → правило <code>domain:youtube.com</code> не матчится → fallback на PRIMARY. Если рецепты A/B не помогли — попробуй отключить QUIC: <code>chrome://flags/#enable-quic</code> → Disabled → перезапусти Chrome.
+            ⚠ <strong>Опасное QUIC поведение</strong>: Chrome агрессивно использует QUIC (HTTP/3 over UDP) для YouTube. xray sniffing для UDP может не сработать → пакет видится только по dest IP → правило <code>domain:youtube.com</code> не матчится → fallback на PRIMARY. Если рецепты A/B не помогли — попробовать отключить QUIC: <code>chrome://flags/#enable-quic</code> → Disabled → перезапустить Chrome.
           </div>
         </div>
       </details>
 
-      <p style="margin-top: 12px;" class="muted">Хочешь больше сценариев — например «полный VPN для всего» или «AI + банки направления» — напиши, добавим.</p>
+      <p style="margin-top: 12px;" class="muted">Другие сценарии — например «полный VPN для всего» или «AI + банки направления» — можно предложить в Issues.</p>
     </div>
   </details>
 
   <details class="help-section" id="help-ipv6-leak">
     <summary>🌐 Утечка IPv6 — реальный IP светится мимо VPN</summary>
     <div class="help-body">
-      <p><strong>Симптом</strong>: VPN включён и сайты открываются, но сервис всё равно видит твой <strong>реальный домашний IP</strong> — YouTube/Google показывают reCAPTCHA «подозрительный трафик» (с двумя разными IP), AI-сервисы (Claude/OpenAI) ловят geo-mismatch и просят верификацию, Instagram/Meta периодически не пускают. На <a href="https://test-ipv6.com" target="_blank">test-ipv6.com</a> или <a href="https://browserleaks.com/ip" target="_blank">browserleaks.com/ip</a> виден IPv6-адрес твоего провайдера.</p>
+      <p><strong>Симптом</strong>: VPN включён и сайты открываются, но сервис всё равно видит <strong>реальный домашний IP</strong> — YouTube/Google показывают reCAPTCHA «подозрительный трафик» (с двумя разными IP), AI-сервисы (Claude/OpenAI) ловят geo-mismatch и просят верификацию, Instagram/Meta периодически не пускают. На <a href="https://test-ipv6.com" target="_blank">test-ipv6.com</a> или <a href="https://browserleaks.com/ip" target="_blank">browserleaks.com/ip</a> виден IPv6-адрес провайдера.</p>
 
       <h4>Причина</h4>
       <p>XKeen перехватывает трафик через <code>redirect</code>/<code>tproxy</code> — но <strong>только IPv4</strong>. Если домашний провайдер выдаёт ещё и <strong>IPv6</strong> (Ростелеком fiber, МГТС GPON и т.п.), браузер/приложение, получив <code>AAAA</code>-запись, идёт по IPv6 <strong>напрямую, мимо xray</strong>. Туннель не задействован → сервис видит реальный домашний IPv6.</p>
@@ -14869,16 +14869,16 @@ Use this token to access the HTTP API:
 
       <h4>Проверка</h4>
       <ol>
-        <li>Открой <a href="https://test-ipv6.com" target="_blank">test-ipv6.com</a> — если «Your IPv6 address» показывает адрес (не «no IPv6») и он НЕ совпадает с твоим VPN-выходом → есть утечка.</li>
+        <li>Открыть <a href="https://test-ipv6.com" target="_blank">test-ipv6.com</a> — если «Your IPv6 address» показывает адрес (не «no IPv6») и он НЕ совпадает с VPN-выходом → есть утечка.</li>
         <li>В консоли PC: <code>ping -6 google.com</code> — если отвечает (а не «could not find host» / «General failure») → IPv6 активен на устройстве.</li>
         <li>На роутере по SSH: <code>ip -6 route show default</code> — если есть default-маршрут v6 → провайдер раздаёт IPv6.</li>
       </ol>
 
       <h4>Фикс — отключить IPv6 на роутере (рекомендуется)</h4>
       <ol>
-        <li>Web UI Keenetic → <strong>Интернет → Подключения</strong> → твоё WAN-подключение.</li>
-        <li>Найди <strong>«Параметры IPv6»</strong> (или «Настройка IPv6») → поставь <strong>«Не используется» / «Отключен»</strong>.</li>
-        <li>Сохрани, переподключись. Роутер перестаёт раздавать IPv6, браузер не получает <code>AAAA</code>-записи → весь трафик идёт по IPv4 через xray.</li>
+        <li>Web UI Keenetic → <strong>Интернет → Подключения</strong> → WAN-подключение.</li>
+        <li>Найти <strong>«Параметры IPv6»</strong> (или «Настройка IPv6») → поставить <strong>«Не используется» / «Отключен»</strong>.</li>
+        <li>Сохранить, переподключиться. Роутер перестаёт раздавать IPv6, браузер не получает <code>AAAA</code>-записи → весь трафик идёт по IPv4 через xray.</li>
       </ol>
       <p class="muted">💡 Если IPv6 нужен для других задач — можно не трогать роутер, а отключить IPv6 только на нужном PC: Windows → Свойства сетевого подключения → снять галку <strong>«IP версии 6 (TCP/IPv6)»</strong>. Тогда этот PC пойдёт по IPv4, остальные устройства не затронуты.</p>
       <p class="muted">Связанная тема: <a href="#help-yt-recaptcha" onclick="openHelpAnchor('help-yt-recaptcha'); return false;">Сценарий 2 «YouTube reCAPTCHA»</a> — там IPv6-leak это одна из причин mixed-IP.</p>
@@ -14902,7 +14902,7 @@ nslookup instagram.com 8.8.8.8     # напрямую через Google — ес
       <h4 style="margin: 12px 0 6px;">Решение — 2 настройки в Web UI Keenetic</h4>
 
       <p><strong>① Игнорировать DNS провайдера</strong> (на WAN-интерфейсе):<br>
-      <strong>«Проводное подключение»</strong> (или твой WAN) → раздел <strong>«Параметры IPv4»</strong> → поставь галочку <strong>«Игнорировать DNSv4 интернет-провайдера»</strong>.<br>
+      <strong>«Проводное подключение»</strong> (или другой WAN) → раздел <strong>«Параметры IPv4»</strong> → поставить галочку <strong>«Игнорировать DNSv4 интернет-провайдера»</strong>.<br>
       Без неё Keenetic автоматически добавляет DNS провайдера (по DHCP) в список и использует их.</p>
 
       <p><strong>② Добавить чистые DoH/DoT серверы</strong>:<br>
@@ -14911,20 +14911,20 @@ nslookup instagram.com 8.8.8.8     # напрямую через Google — ес
         <li>DoT: <code>9.9.9.9</code>, <code>9.9.9.10</code> (Quad9), <code>8.8.8.8</code>, <code>8.8.4.4</code> (Google)</li>
         <li>DoH: <code>https://9.9.9.9/dns-query</code>, <code>https://dns.google/dns-query</code></li>
       </ul>
-      <p>Затем карандашик ✏️ у профиля → сними <strong>«Разрешить транзит запросов»</strong> (станет «Транзитные запросы блокируются») — чтобы роутер не форвардил на провайдерские DNS.</p>
+      <p>Затем карандашик ✏️ у профиля → снять <strong>«Разрешить транзит запросов»</strong> (станет «Транзитные запросы блокируются») — чтобы роутер не форвардил на провайдерские DNS.</p>
 
       <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #1a5276;">
-        💡 <strong>Почему DoH/DoT, а не обычный 8.8.8.8</strong>: обычный DNS (порт 53) провайдер может перехватывать и подменять ответы даже когда ты указал Google. <strong>DoH (через 443) и DoT (через 853) — зашифрованы</strong>, провайдер не может вскрыть и подменить. В списке у зашифрованных <strong>зелёный замок</strong> 🔒, у обычных — открытый 🔓. Используй именно зашифрованные.
+        💡 <strong>Почему DoH/DoT, а не обычный 8.8.8.8</strong>: обычный DNS (порт 53) провайдер может перехватывать и подменять ответы, даже когда указан Google. <strong>DoH (через 443) и DoT (через 853) — зашифрованы</strong>, провайдер не может вскрыть и подменить. В списке у зашифрованных <strong>зелёный замок</strong> 🔒, у обычных — открытый 🔓. Использовать именно зашифрованные.
       </div>
 
       <div style="background: #fff3cd; border-left: 3px solid #f0c200; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #6a4900;">
-        ⚠ <strong>Провайдерские DNS не удаляются вручную?</strong> Keenetic не даёт убрать авто-добавленные DNS пока активен DHCP-lease. Поставь галочку «Игнорировать DNSv4 провайдера» (①) и <strong>перезагрузи роутер</strong> — при новом DHCP провайдерские DNS будут проигнорированы и в список не попадут. Но если уже добавил DoH/DoT (②) — сайт заработает и без перезагрузки (зашифрованные приоритетнее).
+        ⚠ <strong>Провайдерские DNS не удаляются вручную?</strong> Keenetic не даёт убрать авто-добавленные DNS пока активен DHCP-lease. Поставить галочку «Игнорировать DNSv4 провайдера» (①) и <strong>перезагрузить роутер</strong> — при новом DHCP провайдерские DNS будут проигнорированы и в список не попадут. Но если уже добавил DoH/DoT (②) — сайт заработает и без перезагрузки (зашифрованные приоритетнее).
       </div>
 
       <h4 style="margin: 12px 0 6px;">После фикса — на клиенте</h4>
-      <p>Сбрось DNS-кеш и перезапусти браузер (он кеширует отравленный ответ):</p>
+      <p>Сбросить DNS-кеш и перезапустить браузер (он кеширует отравленный ответ):</p>
       <pre style="background:#1e1e1e; color:#ddd; padding:8px 12px; border-radius:4px; font-size:0.85em;">ipconfig /flushdns</pre>
-      <p>Открой сайт в новом окне (лучше инкогнито).</p>
+      <p>Открыть сайт в новом окне (лучше инкогнито).</p>
 
       <div style="background: #f0fff0; border-left: 3px solid #2e7d32; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #1b5e20;">
         ✅ <strong>Как это связано с VPN</strong>: после фикса DNS домен резолвится в реальный IP → браузер шлёт пакет наружу → xray TPROXY его перехватывает → sniffing видит домен (например instagram.com) → роутит через нужный VPN-канал. Без правильного DNS пакет уходил на localhost и до xray вообще не доходил — поэтому VPN-канал был «ни при чём», проблема была до туннеля.
@@ -14947,9 +14947,9 @@ nslookup instagram.com 8.8.8.8     # напрямую через Google — ес
 
       <h4>Как настроить</h4>
       <ol>
-        <li>В разделе <strong>«🎯 Основное и резервное подключение» → «📱 Зарубежные сервисы»</strong> выбери <strong>заграничный</strong> outbound (🇳🇱 Нидерланды, 🇩🇪 Германия, 🇪🇪 Эстония и т.п.). <strong>НЕ</strong> российский (🇷🇺 — пометка «НЕ годится») и <strong>НЕ</strong> «Напрямую».</li>
+        <li>В разделе <strong>«🎯 Основное и резервное подключение» → «📱 Зарубежные сервисы»</strong> выбрать <strong>заграничный</strong> outbound (🇳🇱 Нидерланды, 🇩🇪 Германия, 🇪🇪 Эстония и т.п.). <strong>НЕ</strong> российский (🇷🇺 — пометка «НЕ годится») и <strong>НЕ</strong> «Напрямую».</li>
         <li>Список доменов задаётся там же — есть пресеты (Meta, Telegram, Twitter/X, Discord). Можно добавлять свои.</li>
-        <li><strong>GeoIP-категории</strong> — для приложений, которые ходят на IP <em>мимо DNS</em> (Telegram Desktop коннектится прямо к датацентрам). Доменные правила их не ловят — добавь <code>telegram</code> в GeoIP, чтобы и они шли через загран-выход.</li>
+        <li><strong>GeoIP-категории</strong> — для приложений, которые ходят на IP <em>мимо DNS</em> (Telegram Desktop коннектится прямо к датацентрам). Доменные правила их не ловят — добавить <code>telegram</code> в GeoIP, чтобы и они шли через загран-выход.</li>
       </ol>
 
       <h4>⛓️ Цепочка резерва и общая цепочка</h4>
@@ -14963,7 +14963,7 @@ nslookup instagram.com 8.8.8.8     # напрямую через Google — ес
       <p>Если включён (<code>FOREIGN_FAIL_BLOCK=1</code>) и заграничный выход <strong>упадёт</strong> (вместе со всей цепочкой резерва, если она задана) — трафик Meta/Telegram <strong>блокируется</strong>, а не уходит через провайдера напрямую. Зачем: иначе при падении канала сервисы всё равно не откроются (Meta/Telegram недоступны для RU-IP), а <strong>реальный IP засветится</strong>. Лучше временно заблокировать до восстановления канала. Восстанавливается автоматически, как только выход оживёт.</p>
 
       <div style="background: #f6f0fb; border-left: 3px solid #8e44ad; padding: 8px 12px; margin: 8px 0; font-size: 0.9em; color: #5b2c6f;">
-        💡 <strong>Совет по надёжности</strong>: если выбрать для этого канала <strong>тот же сервер</strong>, что и основной (PRIMARY), то при его падении ляжет и инстаграм. Для независимого резерва выбери <strong>другой</strong> заграничный узел.
+        💡 <strong>Совет по надёжности</strong>: если выбрать для этого канала <strong>тот же сервер</strong>, что и основной (PRIMARY), то при его падении ляжет и инстаграм. Для независимого резерва выбрать <strong>другой</strong> заграничный узел.
       </div>
       <p class="muted">Связанные темы: <a href="#help-dns-block" onclick="openHelpAnchor('help-dns-block'); return false;">DNS-блокировка провайдера</a>, <a href="#help-ipv6-leak" onclick="openHelpAnchor('help-ipv6-leak'); return false;">Утечка IPv6</a> — обе тоже могут мешать заблокированным сервисам.</p>
     </div>
@@ -14976,7 +14976,7 @@ nslookup instagram.com 8.8.8.8     # напрямую через Google — ес
       <p>Во всех 6 секциях доменов (<strong>AI / YT / «Зарубежные сервисы» / «Через IPv6» / DIRECT / BLOCK</strong>) часто накапливается куча доменов из разных пресетов вперемешку с ручными добавлениями. Чтобы не путаться — каждый домен помечается заметкой:</p>
       <ul>
         <li><strong>📦 &lt;имя пресета&gt;</strong> — добавлен через кнопку-пресет (например <code>📦 youtube</code>, <code>📦 whatsapp</code>)</li>
-        <li><strong>✏️ &lt;твоё описание&gt;</strong> — добавлен вручную, можно подписать (или оставить пустым)</li>
+        <li><strong>✏️ &lt;описание&gt;</strong> — добавлен вручную, можно подписать (или оставить пустым)</li>
       </ul>
 
       <h4>Как это выглядит в textarea</h4>
@@ -14986,28 +14986,28 @@ openai.com          # 📦 openai
 chatgpt.com         # 📦 openai
 my-vpn-server.io    # ✏️ запасной канал для теста
 another-server.io   # ✏️</pre>
-      <p>После символа <code>#</code> — заметка. Можешь редактировать в textarea как обычный текст: добавлять / менять заметки. Парсится при сохранении.</p>
+      <p>После символа <code>#</code> — заметка. Её можно редактировать в textarea как обычный текст: добавлять / менять заметки. Парсится при сохранении.</p>
 
       <h4>Где хранятся заметки</h4>
       <p>В отдельном файле <code>/opt/etc/xray/domain_notes.json</code> на роутере (sidecar JSON, не trogает <code>watchdog.config</code>). Попадает в наш бэкап-snapshot, так что не теряется при миграции на новый роутер.</p>
 
       <h4>Новые элементы управления над каждой textarea</h4>
       <ul>
-        <li><strong>🔍 Найти домен...</strong> — введи часть домена → Enter → курсор прыгнет на match (native browser highlight)</li>
+        <li><strong>🔍 Найти домен...</strong> — ввести часть домена → Enter → курсор прыгнет на match (native browser highlight)</li>
         <li><strong>🔤 А-Я</strong> — отсортировать по алфавиту</li>
         <li><strong>📦 По пресету</strong> — сгруппировать: сначала пресеты (по имени), потом ручные</li>
         <li><strong>⚠ N дублей</strong> — бейдж, если эти домены встречаются также в других секциях (hover для деталей)</li>
       </ul>
 
       <h4>Кнопка 🧹 рядом с каждым пресетом</h4>
-      <p>В блоке кнопок-пресетов теперь есть маленькая кнопка <strong>🧹</strong> сразу после каждой. Жмёшь — удаляются только домены этого пресета. Ручные домены (с пометкой <code>✏️</code>) остаются. Удобно для отката случайного выбора.</p>
+      <p>В блоке кнопок-пресетов теперь есть маленькая кнопка <strong>🧹</strong> сразу после каждой. Нажатие удаляет только домены этого пресета. Ручные домены (с пометкой <code>✏️</code>) остаются. Удобно для отката случайного выбора.</p>
 
       <div style="background:#e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
-        💡 <strong>Backward-compat</strong>: если у тебя были домены без заметок (со старых версий) — они показываются как есть, заметки появятся постепенно по мере нажатий на пресеты. Можешь дописать вручную после <code>#</code>.
+        💡 <strong>Backward-compat</strong>: если были домены без заметок (со старых версий) — они показываются как есть, заметки появятся постепенно по мере нажатий на пресеты. Их можно дописать вручную после <code>#</code>.
       </div>
 
       <h4>Подсветка дублей</h4>
-      <p>Если один и тот же домен случайно попал в <strong>и YT и DIRECT</strong> — увидишь бейдж <code>⚠ N дублей</code>. Hover → tooltip покажет какой домен где. Это <strong>не ошибка</strong>, просто warning — в routing.json приоритет правил: BLOCK → DIRECT → AI → YT → PRIMARY. То есть домен попавший и в YT и в DIRECT → пойдёт через DIRECT (правило DIRECT выше по приоритету).</p>
+      <p>Если один и тот же домен случайно попал в <strong>и YT и DIRECT</strong> — появится бейдж <code>⚠ N дублей</code>. Hover → tooltip покажет какой домен где. Это <strong>не ошибка</strong>, просто warning — в routing.json приоритет правил: BLOCK → DIRECT → AI → YT → PRIMARY. То есть домен попавший и в YT и в DIRECT → пойдёт через DIRECT (правило DIRECT выше по приоритету).</p>
     </div>
   </details>
 
@@ -15027,7 +15027,7 @@ another-server.io   # ✏️</pre>
       <h4>⚡ Кнопки «Принудительно переключить»</h4>
       <ul>
         <li><strong>🟢 PRIMARY</strong> — жёстко держать основной канал, игнорировать probe (даже если упал)</li>
-        <li><strong>🟡 FAILOVER</strong> — жёстко переключиться на первый живой из цепочки. PRIMARY обратно НЕ вернётся пока не нажмёшь AUTO</li>
+        <li><strong>🟡 FAILOVER</strong> — жёстко переключиться на первый живой из цепочки. PRIMARY обратно НЕ вернётся, пока не нажата AUTO</li>
         <li><strong>🔄 AUTO</strong> — вернуть автоматику + применить любые свежие правки конфига сразу (без ожидания тика)</li>
       </ul>
 
@@ -15048,12 +15048,12 @@ another-server.io   # ✏️</pre>
     <summary>📦 Подписки, группы и бейджи (🛡️ Обход / 📺 Ютуб)</summary>
     <div class="help-body">
       <h4>Что такое «подписка»</h4>
-      <p>Платный VPN-провайдер даёт тебе ссылку (URL) — это «подписка». По ссылке скачивается список их серверов (vless-конфиги). Примеры провайдеров:</p>
+      <p>Платный VPN-провайдер даёт ссылку (URL) — это «подписка». По ссылке скачивается список их серверов (vless-конфиги). Примеры провайдеров:</p>
       <ul>
         <li><strong>Provider A</strong> — основная платная подписка (страны EU/JP и т.д.)</li>
         <li><strong>Provider B</strong> — анти-DPI обход + RU-каналы для YT (если есть)</li>
         <li><strong>Provider C / Provider D</strong> — большая подписка (много серверов разных стран)</li>
-        <li><strong>VLESS</strong> (служебная) — твой собственный VPN-сервер (если есть)</li>
+        <li><strong>VLESS</strong> (служебная) — собственный VPN-сервер (если есть)</li>
       </ul>
 
       <h4>Группировка в dropdown'ах</h4>
@@ -15065,7 +15065,7 @@ another-server.io   # ✏️</pre>
         <li><strong>📺 Ютуб</strong> — канал с <strong>RU-IP без anti-DPI обхода</strong> (флаг 🇷🇺 в имени или префикс <code>ru_</code>). Идеально для YouTube — российский IP не показывает рекламу.</li>
         <li><strong>Без бейджа</strong> — обычный EU/US/Asia канал. Подходит для всего остального (PRIMARY/FAILOVER/AI).</li>
       </ul>
-      <div class="warn">⚠️ В <strong>AI-dropdown</strong> любой канал с бейджем (🛡️ или 📺) подсвечен коричневым с предупреждением «AI заблокирует» — Anthropic/OpenAI геоблокируют RU-IP. Не ставь такие в роль AI.</div>
+      <div class="warn">⚠️ В <strong>AI-dropdown</strong> любой канал с бейджем (🛡️ или 📺) подсвечен коричневым с предупреждением «AI заблокирует» — Anthropic/OpenAI геоблокируют RU-IP. Не ставить такие в роль AI.</div>
     </div>
   </details>
 
@@ -15073,29 +15073,29 @@ another-server.io   # ✏️</pre>
     <summary>➕ Добавление outbound'ов (vless URL, JSON, sync с подписки)</summary>
     <div class="help-body">
       <h4>Один outbound — vless URL</h4>
-      <p>В разделе <strong>«➕ Добавить новый outbound»</strong> вставь vless-URL (начинается с <code>vless://</code>) и нажми «Добавить и применить». Вариант для разовых конфигов — например друг прислал свой VPN.</p>
+      <p>В разделе <strong>«➕ Добавить новый outbound»</strong> вставить vless-URL (начинается с <code>vless://</code>) и нажать «Добавить и применить». Вариант для разовых конфигов — например друг прислал свой VPN.</p>
 
       <h4>Один outbound — JSON-конфиг</h4>
-      <p>Тот же раздел — можешь вставить полный <code>xray-config JSON</code> (с секцией <code>outbounds</code>). Полезно если конфиг сложный (с reality-настройками, multiplexer'ом и т.п.).</p>
+      <p>Тот же раздел принимает и полный <code>xray-config JSON</code> (с секцией <code>outbounds</code>). Полезно если конфиг сложный (с reality-настройками, multiplexer'ом и т.п.).</p>
 
       <h4>Много серверов — sync с подписки</h4>
-      <p>Раздел <strong>«📡 Обновить из подписки»</strong> — введи URL подписки (или выбери из сохранённых) и нажми «🔍 Предпросмотр» → увидишь что будет добавлено/обновлено. Потом «📥 Скачать и обновить».</p>
+      <p>Раздел <strong>«📡 Обновить из подписки»</strong> — ввести URL подписки (или выбрать из сохранённых) и нажать «🔍 Предпросмотр» → видно, что будет добавлено/обновлено. Потом «📥 Скачать и обновить».</p>
       <p>Чекбоксы:</p>
       <ul>
-        <li><strong>➕ Добавлять новые</strong> — outbound'ы которые есть в подписке но нет у тебя (по умолчанию вкл)</li>
-        <li><strong>🗑 Удалять отсутствующие</strong> — если провайдер убрал сервер, удалить и у тебя (потенциально опасно — выкл по умолчанию). Сверка по <code>meta.sub_url</code>: outbound'ы соседних подписок и импортированные вручную (без записанного <code>sub_url</code>) <strong>не трогаются</strong> — нет шанса случайно снести outbound'ы другого провайдера, обновляя подписку первого. Поведение для тех что попали в orphan'ы — см. бейджи ниже.</li>
+        <li><strong>➕ Добавлять новые</strong> — outbound'ы, которые есть в подписке, но нет на роутере (по умолчанию вкл)</li>
+        <li><strong>🗑 Удалять отсутствующие</strong> — если провайдер убрал сервер, удалить и на роутере (потенциально опасно — выкл по умолчанию). Сверка по <code>meta.sub_url</code>: outbound'ы соседних подписок и импортированные вручную (без записанного <code>sub_url</code>) <strong>не трогаются</strong> — нет шанса случайно снести outbound'ы другого провайдера, обновляя подписку первого. Поведение для тех что попали в orphan'ы — см. бейджи ниже.</li>
         <li><strong>📅 Автоматически обновлять дату истечения</strong> — если провайдер шлёт header <code>Subscription-Userinfo: expire=&lt;ts&gt;</code> (Provider B умеет, Provider A нет)</li>
       </ul>
 
       <h4>Бейджи в превью — что они значат</h4>
-      <p>При нажатии «🔍 Предпросмотр» панель сверяет outbound'ы из подписки с твоей конфигурацией и активными ролями watchdog (секция <strong>«🎯 Основное и резервное подключение»</strong>). Рядом с каждым tag'ом может появиться бейдж:</p>
+      <p>При нажатии «🔍 Предпросмотр» панель сверяет outbound'ы из подписки с текущей конфигурацией и активными ролями watchdog (секция <strong>«🎯 Основное и резервное подключение»</strong>). Рядом с каждым tag'ом может появиться бейдж:</p>
       <ul>
         <li><span style="background:#e0eef8;color:#1a5490;border:1px solid #a0c8e8;border-radius:3px;padding:1px 6px;font-weight:600;">🎯 PRIMARY</span> / <span style="background:#e0eef8;color:#1a5490;border:1px solid #a0c8e8;border-radius:3px;padding:1px 6px;font-weight:600;">🎯 AI</span> / <span style="background:#e0eef8;color:#1a5490;border:1px solid #a0c8e8;border-radius:3px;padding:1px 6px;font-weight:600;">🎯 YouTube</span> и т.д. (голубой) — <strong>в таблице «Будут обновлены»</strong>: outbound выбран в одном из 6 уникальных dropdown'ов «🎯 Основное и резервное подключение» (PRIMARY / Резервное / AI / YouTube / Зарубежные / Через IPv6). Это <strong>информационный</strong> бейдж: обновление не ломает роль — обновятся только UUID/Reality-ключи, tag и его участие в watchdog остаются. Hover мышью → tooltip с пояснением.</li>
-        <li><span style="background:#fff4d4;color:#a8801c;border:1px solid #e8c878;border-radius:3px;padding:1px 6px;font-weight:600;">🔗 FAILOVER #N</span> (жёлтый) — outbound в хвосте цепочки резерва (позиция #2..#N). В таблице «Будут обновлены» это информационно (обновление не влияет на цепочку). В секции «У тебя, но НЕ в подписке» при включённой галке «🗑 Удалить отсутствующие» — outbound будет удалён + панель <strong>автоматически уберёт</strong> tag из <code>FAILOVER_TAGS</code> в <code>watchdog.config</code>, цепочка просто сократится на 1.</li>
-        <li><span style="background:#fde0e0;color:#c44;border:1px solid #f4b0b0;border-radius:3px;padding:1px 6px;font-weight:600;">⛔ &lt;роль&gt;</span> (красный) — <strong>только в секции «У тебя, но НЕ в подписке»</strong>: orphan выбран в уникальном dropdown'е (PRIMARY / Резервное / AI / YouTube / Зарубежные / Через IPv6). При включённой галке «🗑 Удалить отсутствующие» <strong>sync целиком отменится</strong> с просьбой сначала сменить роль через соответствующий dropdown. Защита от случайного breakage — нельзя удалить outbound который держит активную роль, иначе watchdog ляжет.</li>
+        <li><span style="background:#fff4d4;color:#a8801c;border:1px solid #e8c878;border-radius:3px;padding:1px 6px;font-weight:600;">🔗 FAILOVER #N</span> (жёлтый) — outbound в хвосте цепочки резерва (позиция #2..#N). В таблице «Будут обновлены» это информационно (обновление не влияет на цепочку). В секции «На роутере, но НЕ в подписке» при включённой галке «🗑 Удалить отсутствующие» — outbound будет удалён + панель <strong>автоматически уберёт</strong> tag из <code>FAILOVER_TAGS</code> в <code>watchdog.config</code>, цепочка просто сократится на 1.</li>
+        <li><span style="background:#fde0e0;color:#c44;border:1px solid #f4b0b0;border-radius:3px;padding:1px 6px;font-weight:600;">⛔ &lt;роль&gt;</span> (красный) — <strong>только в секции «На роутере, но НЕ в подписке»</strong>: orphan выбран в уникальном dropdown'е (PRIMARY / Резервное / AI / YouTube / Зарубежные / Через IPv6). При включённой галке «🗑 Удалить отсутствующие» <strong>sync целиком отменится</strong> с просьбой сначала сменить роль через соответствующий dropdown. Защита от случайного breakage — нельзя удалить outbound который держит активную роль, иначе watchdog ляжет.</li>
         <li>Без бейджа — обычный outbound, ни в одной активной роли watchdog не задействован. В «Будут обновлены» — просто обновится; в «orphan» — при галке «Удалить отсутствующие» просто удалится из конфига.</li>
       </ul>
-      <p>Label секции «У тебя, но НЕ в подписке» <strong>динамический</strong>: переключается между «🗑 БУДУТ УДАЛЕНЫ» (галка стоит, красный) и «📋 останутся как есть» (галка снята, серый) на лету, как только тогглишь чекбокс.</p>
+      <p>Label секции «На роутере, но НЕ в подписке» <strong>динамический</strong>: переключается между «🗑 БУДУТ УДАЛЕНЫ» (галка стоит, красный) и «📋 останутся как есть» (галка снята, серый) на лету, при переключении чекбокса.</p>
 
       <h4>Tag (имя outbound'а)</h4>
       <p>Tag берётся из URL после символа <code>#</code>. Группировка по подпискам делается по <strong>tag-префиксу</strong> (до первого <code>-</code>) ИЛИ по pbk Reality identity. Поэтому: <code>provider-a-de1</code>, <code>provider-a-nl</code> → группа «Provider A».</p>
@@ -15129,9 +15129,9 @@ another-server.io   # ✏️</pre>
   <details class="help-section">
     <summary>📦 Передать панель другу — что включить, что вычеркнуть</summary>
     <div class="help-body">
-      <p>Если хочешь дать копию этой панели другу — нужно <strong>отделить персональные секреты</strong>
-      от общих компонентов. Иначе друг получит твой пароль от панели, токен подписки, домашний внешний
-      IP и vless-ссылки с UUID/pbk/sid (твои реальные VPN-профили).</p>
+      <p>Чтобы передать копию этой панели другому человеку, нужно <strong>отделить персональные секреты</strong>
+      от общих компонентов. Иначе получатель увидит пароль от панели, токен подписки, домашний внешний
+      IP и vless-ссылки с UUID/pbk/sid (реальные VPN-профили).</p>
 
       <h4>✅ Что положить в архив для друга</h4>
       <table style="width:100%; border-collapse:collapse; font-size:0.92em; margin: 8px 0;">
@@ -15159,8 +15159,8 @@ another-server.io   # ✏️</pre>
         </tr></thead>
         <tbody>
           <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>config_local.py</code></td><td style="padding:6px 10px;"><strong>пароль панели, SECRET_KEY, SUBSCRIPTION_TOKEN, домашний внешний IP, vless URL с UUID/pbk/sid</strong></td></tr>
-          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>runtime_settings.json</code></td><td style="padding:6px 10px;">IP твоего роутера, путь к твоему SSH-ключу</td></tr>
-          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>backups/</code></td><td style="padding:6px 10px;">снимки твоих XKeen-конфигов со всеми outbound'ами/паролями</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>runtime_settings.json</code></td><td style="padding:6px 10px;">IP роутера, путь к SSH-ключу</td></tr>
+          <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>backups/</code></td><td style="padding:6px 10px;">снимки XKeen-конфигов со всеми outbound'ами/паролями</td></tr>
           <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>.venv/</code></td><td style="padding:6px 10px;">локальный Python-environment (большой и под другую ОС не подойдёт — друг создаст свой через <code>install.bat</code>)</td></tr>
           <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>__pycache__/</code></td><td style="padding:6px 10px;">кэш Python (не нужен — пересоберётся)</td></tr>
           <tr style="border-bottom:1px solid #eee;"><td style="padding:6px 10px;"><code>*.bak-*</code>, <code>*.log</code></td><td style="padding:6px 10px;">бэкапы и логи могут содержать персональные данные</td></tr>
@@ -15168,13 +15168,13 @@ another-server.io   # ✏️</pre>
       </table>
 
       <h4>📋 Команда для PowerShell — собрать архив автоматически</h4>
-      <p>Запусти в PowerShell в папке панели (C:\xray-dashboard\ или C:\xray-dashboard-dev\):</p>
+      <p>Запустить в PowerShell в папке панели (C:\xray-dashboard\ или C:\xray-dashboard-dev\):</p>
       <pre style="background:#1e1e1e; color:#ddd; padding:12px; border-radius:4px; font-size:0.83em; overflow-x:auto;">$src = "C:\xray-dashboard"
 $dst = "$env:USERPROFILE\Desktop\xray-dashboard-for-friend.zip"
 $exclude = @(
     "config_local.py",                # ⚠ пароль, токен, IP, vless URL
     "runtime_settings.json",          # ⚠ IP роутера, путь к ключу
-    ".venv",                          # большая папка под твою ОС
+    ".venv",                          # большая папка под конкретную ОС
     "__pycache__",                    # кэш
     "backups",                        # снимки XKeen-конфигов
     "*.bak-*",                        # бэкапы перед правками
@@ -15188,14 +15188,14 @@ Write-Output "Готово: $dst"</pre>
 
       <h4>📩 Что сказать другу при передаче архива</h4>
       <ol>
-        <li>Распакуй архив в любую папку (например <code>C:\xray-dashboard</code>).</li>
-        <li>Установи Python 3.10+ (если нет): <a href="https://www.python.org/downloads/" target="_blank">python.org/downloads</a></li>
-        <li>Запусти <code>install.bat</code> — он создаст <code>.venv</code> и поставит зависимости.</li>
-        <li>Скопируй <code>config_local.example.py</code> → <code>config_local.py</code>, открой в любом редакторе и заполни значения по комментариям внутри (минимум: <code>PASSWORD</code>, <code>SECRET_KEY</code>, <code>SUBSCRIPTION_TOKEN</code>, <code>EXTERNAL_IP</code>, <code>KEENETIC_SSH_KEY</code>).</li>
-        <li>Запусти <code>start.bat</code> — панель поднимется на <code>http://localhost:5000</code> .</li>
-        <li>Открой в браузере → войди → раздел <strong>«🔧 Подключение к роутеру»</strong> → впиши IP/SSH-ключ → <strong>«🔌 Проверить связь»</strong> → <strong>«💾 Сохранить»</strong>.</li>
-        <li>Если на роутере уже стоит XKeen но пустой — нажми <strong>«🚀 Развернуть на чистом XKeen»</strong> в той же секции.</li>
-        <li>Если в Telegram нужны алерты — раздел <strong>«🤖 Telegram-бот для алертов»</strong>, заведи своего бота через @BotFather (см. справку там).</li>
+        <li>Распаковать архив в любую папку (например <code>C:\xray-dashboard</code>).</li>
+        <li>Установить Python 3.10+ (если нет): <a href="https://www.python.org/downloads/" target="_blank">python.org/downloads</a></li>
+        <li>Запустить <code>install.bat</code> — он создаст <code>.venv</code> и поставит зависимости.</li>
+        <li>Скопировать <code>config_local.example.py</code> → <code>config_local.py</code>, открыть в любом редакторе и заполнить значения по комментариям внутри (минимум: <code>PASSWORD</code>, <code>SECRET_KEY</code>, <code>SUBSCRIPTION_TOKEN</code>, <code>EXTERNAL_IP</code>, <code>KEENETIC_SSH_KEY</code>).</li>
+        <li>Запустить <code>start.bat</code> — панель поднимется на <code>http://localhost:5000</code> .</li>
+        <li>Открыть в браузере → войти → раздел <strong>«🔧 Подключение к роутеру»</strong> → вписать IP/SSH-ключ → <strong>«🔌 Проверить связь»</strong> → <strong>«💾 Сохранить»</strong>.</li>
+        <li>Если на роутере уже стоит XKeen но пустой — нажать <strong>«🚀 Развернуть на чистом XKeen»</strong> в той же секции.</li>
+        <li>Если в Telegram нужны алерты — раздел <strong>«🤖 Telegram-бот для алертов»</strong>, завести своего бота через @BotFather (см. справку там).</li>
       </ol>
 
       <div style="margin-top: 12px; padding: 10px 14px; background: #fff8e7; border-left: 4px solid #e80; border-radius: 4px;">
@@ -15214,10 +15214,10 @@ Write-Output "Готово: $dst"</pre>
       <details open style="margin: 12px 0; padding: 10px 14px; background: #e8f5e8; border-left: 4px solid #2a7; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #1f4d2c;">▶ Способ 1 (рекомендуемый) — готовый install_service.bat</summary>
         <div style="margin-top: 10px;">
-          <p><strong>Кликни правой кнопкой</strong> по файлу <code>install_service.bat</code> в проводнике →
+          <p><strong>Кликнуть правой кнопкой</strong> по файлу <code>install_service.bat</code> в проводнике →
           <strong>«Запустить от имени администратора»</strong>. Скрипт сам:</p>
           <ol>
-            <li>Проверит что у тебя админские права</li>
+            <li>Проверит, что есть права администратора</li>
             <li>Проверит что <code>.venv</code> создан (то есть <code>install.bat</code> ранее запускался)</li>
             <li>Зарегистрирует задачу <code>XrayDashboard</code> в Планировщике Windows со следующими настройками:
               <ul style="margin-top:6px;">
@@ -15232,14 +15232,14 @@ Write-Output "Готово: $dst"</pre>
             <li>Запустит задачу сразу же (без ожидания reboot'а)</li>
             <li>Покажет статус: запущен ли pythonw, слушает ли :5000</li>
           </ol>
-          <p>После — панель будет жить как Windows-сервис. Перезагружай PC сколько хочешь — она поднимется заранее.</p>
+          <p>После — панель будет жить как Windows-сервис. PC можно перезагружать сколько угодно — она поднимется заранее.</p>
         </div>
       </details>
 
       <details style="margin: 12px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #888; border-radius: 4px;">
-        <summary style="cursor: pointer; font-weight: 700; color: #444;">▶ Способ 2 — вручную через GUI Планировщика (если не доверяешь скриптам)</summary>
+        <summary style="cursor: pointer; font-weight: 700; color: #444;">▶ Способ 2 — вручную через GUI Планировщика (без скриптов)</summary>
         <div style="margin-top: 10px;">
-          <p><kbd>Win</kbd>+<kbd>R</kbd> → <code>taskschd.msc</code> → <strong>«Создать задачу…»</strong> (НЕ «простую задачу» — нужны расширенные параметры). Заполни так:</p>
+          <p><kbd>Win</kbd>+<kbd>R</kbd> → <code>taskschd.msc</code> → <strong>«Создать задачу…»</strong> (НЕ «простую задачу» — нужны расширенные параметры). Заполнить так:</p>
 
           <p><strong>Вкладка «Общие»</strong></p>
           <ul>
@@ -15247,7 +15247,7 @@ Write-Output "Готово: $dst"</pre>
             <li>«Изменить…» под <em>«При выполнении задачи использовать следующую учётную запись»</em> → вписать <code>SYSTEM</code> → ОК</li>
             <li>☑ <strong>Выполнить с наивысшими правами</strong></li>
             <li>☑ <strong>Скрытая задача</strong></li>
-            <li>«Настроить для:» — <em>Windows 10</em> (или твоя версия)</li>
+            <li>«Настроить для:» — <em>Windows 10</em> (или установленная версия)</li>
           </ul>
 
           <p><strong>Вкладка «Триггеры» → «Создать…»</strong></p>
@@ -15293,7 +15293,7 @@ Get-NetTCPConnection -LocalPort 5000 -State Listen | Format-Table LocalAddress, 
 
 # Кто это (должен быть pythonw)
 Get-Process -Id (Get-NetTCPConnection -LocalPort 5000 -State Listen).OwningProcess | Select-Object Name, Path</pre>
-          <p>Открой <code>http://localhost:5000</code> — должно открыться окно логина.</p>
+          <p>Открыть <code>http://localhost:5000</code> — должно открыться окно логина.</p>
         </div>
       </details>
 
@@ -15312,12 +15312,12 @@ schtasks /Delete /TN XrayDashboard /F</pre>
         <div style="margin-top: 8px;">
           <ul>
             <li><strong>Стартует ДО логина.</strong> Триггер <em>AtStartup</em> у user-аккаунта не сработает пока юзер не зайдёт. SYSTEM запускается сразу после старта Windows — панель будет доступна с момента когда ОС загрузилась.</li>
-            <li><strong>Не умирает при logoff.</strong> Если ты вышел из своей учётки или сменился — user-задача остановится, SYSTEM продолжит работать.</li>
+            <li><strong>Не умирает при logoff.</strong> Если пользователь вышел из учётки или сменился — user-задача остановится, SYSTEM продолжит работать.</li>
             <li><strong>Нет проблем с правами файлов</strong> — SYSTEM имеет доступ ко всему. (Юзер должен убедиться что приватный SSH-ключ для роутера лежит там где SYSTEM его прочитает — обычно <code>C:\</code> или <code>D:\</code> подходят; в <code>C:\Users\&lt;имя&gt;\</code> SYSTEM по умолчанию доступа НЕ имеет, ключ оттуда не прочитается.)</li>
             <li><strong>Защищено от sleep/standby.</strong> User-сессия может уйти в сон, SYSTEM-сервисы продолжают работать в фоне.</li>
           </ul>
-          <p class="muted"><strong>Минус:</strong> SYSTEM не имеет HOME-папки и стандартных env-vars. Если тебе нужно
-          в <code>config_local.py</code> прописать какие-то пути относительно USERPROFILE — пиши абсолютные пути.</p>
+          <p class="muted"><strong>Минус:</strong> SYSTEM не имеет HOME-папки и стандартных env-vars. Если нужно
+          в <code>config_local.py</code> прописать какие-то пути относительно USERPROFILE — писать абсолютные пути.</p>
         </div>
       </details>
     </div>
@@ -15326,22 +15326,22 @@ schtasks /Delete /TN XrayDashboard /F</pre>
   <details class="help-section">
     <summary>💻 Установка панели на новый PC (git clone vs ZIP-архив)</summary>
     <div class="help-body">
-      <p>Эта инструкция — для случая когда ты разворачиваешь панель на <strong>новом компьютере</strong> (например купил новый ноут, переустановил Windows, или хочешь поставить дома + на работе). XKeen-роутер уже настроен — теперь нужна панель управления на этом PC.</p>
+      <p>Эта инструкция — для развёртывания панели на <strong>новом компьютере</strong> (например новый ноутбук, переустановленная Windows или вторая установка на другом ПК). XKeen-роутер уже настроен — теперь нужна панель управления на этом PC.</p>
 
       <h4>🥇 Путь 1 (рекомендую): git clone</h4>
       <p>Один раз клонировать репозиторий, потом обновляться двойным кликом на <code>update.bat</code>:</p>
       <ol>
-        <li>Установи <strong>Git for Windows</strong>: <a href="https://git-scm.com/download/win" target="_blank">git-scm.com</a> (~50MB, 1 минута)</li>
-        <li>Открой PowerShell в любой папке → выполни:
+        <li>Установить <strong>Git for Windows</strong>: <a href="https://git-scm.com/download/win" target="_blank">git-scm.com</a> (~50MB, 1 минута)</li>
+        <li>Открыть PowerShell в любой папке → выполнить:
           <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">git clone https://github.com/yuran2000/xkeen-windows-dashboard.git C:\xray-dashboard
 cd C:\xray-dashboard
 .\install.bat</pre>
         </li>
         <li><code>install.bat</code> создаст venv, поставит зависимости, скопирует <code>config_local.example.py</code> → <code>config_local.py</code>, откроет в Notepad для редактирования</li>
-        <li>В <code>config_local.py</code> отредактируй: <code>KEENETIC_HOST</code> (IP роутера), <code>KEENETIC_USER</code>, <code>KEENETIC_SSH_KEY</code> (путь к ключу), <code>ADMIN_PASSWORD</code>, при желании — <code>DASHBOARD_PORT</code> (если 5000 занят)</li>
-        <li>Запусти <code>start-bg.bat</code> (фоновый режим) или <code>start.bat</code> (с окном для дебага)</li>
+        <li>В <code>config_local.py</code> отредактировать: <code>KEENETIC_HOST</code> (IP роутера), <code>KEENETIC_USER</code>, <code>KEENETIC_SSH_KEY</code> (путь к ключу), <code>ADMIN_PASSWORD</code>, при желании — <code>DASHBOARD_PORT</code> (если 5000 занят)</li>
+        <li>Запустить <code>start-bg.bat</code> (фоновый режим) или <code>start.bat</code> (с окном для дебага)</li>
         <li>Опционально — <code>install_service.bat</code> от админа: панель будет запускаться при boot Windows как Task Scheduler-сервис (auto-чинит SSH-ключ + MS Store Python в v1.5.6+)</li>
-        <li>Открой <code>http://localhost:5000</code></li>
+        <li>Открыть <code>http://localhost:5000</code></li>
       </ol>
       <p><strong>Обновления потом</strong>: двойной клик на <code>C:\xray-dashboard\update.bat</code> — он сам делает <code>git pull</code> + рестарт сервиса. С v1.6.7 при локальных изменениях auto-stash.</p>
 
@@ -15351,7 +15351,7 @@ cd C:\xray-dashboard
         <li><strong>Последняя версия</strong>: <a href="https://github.com/yuran2000/xkeen-windows-dashboard/archive/refs/heads/main.zip" target="_blank">main.zip</a> (всегда свежайший с main)</li>
         <li><strong>Конкретная версия</strong>: на странице <a href="https://github.com/yuran2000/xkeen-windows-dashboard/releases" target="_blank">Releases</a> у каждого тега есть «Source code (zip)» и «Source code (tar.gz)»</li>
       </ul>
-      <p>Распакуй в <code>C:\xray-dashboard\</code> (содержимое одной папки внутри ZIP — переименуй так чтобы было правильно). Дальше как в Путь 1 с шага 3 (<code>install.bat</code>).</p>
+      <p>Распаковать в <code>C:\xray-dashboard\</code> (содержимое одной папки внутри ZIP — переименовать так чтобы было правильно). Дальше как в Путь 1 с шага 3 (<code>install.bat</code>).</p>
 
       <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
         ⚠ <strong>Что НЕ работает с ZIP-архивом</strong>:
@@ -15359,11 +15359,11 @@ cd C:\xray-dashboard
           <li><code>update.bat</code> — он внутри делает <code>git pull</code> → ошибка «Not a git repository»</li>
           <li>Все скрипты которые ожидают <code>.git</code> папку</li>
         </ul>
-        Если потом захочешь обновляться нормально — конвертируй папку в git-репозиторий (см. ниже).
+        Чтобы потом обновляться нормально — конвертировать папку в git-репозиторий (см. ниже).
       </div>
 
       <h4>⚠ ZIP поверх git-папки — НЕ делать!</h4>
-      <p>Если уже установлено через <code>git clone</code> — для обновления используй <strong>`update.bat`</strong> или <code>git pull</code>, не качай ZIP.</p>
+      <p>Если уже установлено через <code>git clone</code> — для обновления использовать <strong>`update.bat`</strong> или <code>git pull</code>, не качать ZIP.</p>
       <p>Если всё-таки скачал ZIP и разархивировал поверх — что произойдёт:</p>
       <ul>
         <li><strong>Tracked файлы</strong> (<code>dashboard.py</code>, <code>update.bat</code>, <code>bootstrap/*</code>) — перезаписаны новой версией ✅</li>
@@ -15373,9 +15373,9 @@ cd C:\xray-dashboard
         <li>При следующем <code>git pull</code> будет конфликт «local changes would be overwritten»</li>
       </ul>
       <p><strong>Как починить</strong> если уже сделал ZIP-overlay:</p>
-      <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;"># Вариант 1 (мягкий): запусти update.bat - в v1.6.7+ auto-stash сам решит конфликт.
+      <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;"># Вариант 1 (мягкий): запустить update.bat - в v1.6.7+ auto-stash сам решит конфликт.
 # Stash засорится "мусор-копией" - удали потом вручную:
-git stash list                    # увидишь auto-stash-by-update-...
+git stash list                    # будет auto-stash-by-update-...
 git stash drop stash@{0}           # удалить верхний stash
 
 # Вариант 2 (чистый): жёстко выровнять с remote, выбросив локальные "изменения":
@@ -15383,37 +15383,37 @@ git fetch origin
 git reset --hard origin/main      # config_local.py не тронется (он не tracked)</pre>
 
       <h4>🔄 Конвертация ZIP-папки в git-репозиторий (для обновлений в будущем)</h4>
-      <p>Если ставил из ZIP, а потом передумал и хочешь иметь возможность обновляться через <code>update.bat</code>:</p>
+      <p>Если панель ставилась из ZIP, а теперь нужно обновляться через <code>update.bat</code>:</p>
       <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">cd C:\xray-dashboard
 git init
 git remote add origin https://github.com/yuran2000/xkeen-windows-dashboard.git
 git fetch origin
 git reset --hard origin/main
 git branch -M main</pre>
-      <p>После этого папка превратилась в git checkout последней версии main. <code>update.bat</code> теперь работает. Если на момент конверсии в папке были локальные правки — они потеряются (<code>reset --hard</code> их затрёт). Сделай бэкап файлов перед конверсией если что-то ценное правил руками.</p>
+      <p>После этого папка превратилась в git checkout последней версии main. <code>update.bat</code> теперь работает. Если на момент конверсии в папке были локальные правки — они потеряются (<code>reset --hard</code> их затрёт). Сделать бэкап файлов перед конверсией если что-то ценное правил руками.</p>
 
       <h4>📋 Что должно быть в config_local.py (минимум)</h4>
       <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">KEENETIC_HOST = "192.168.1.1"  # IP роутера
 KEENETIC_USER = "root"
 KEENETIC_SSH_PORT = 222
 KEENETIC_SSH_KEY = r"C:\xray-dashboard\.ssh\id_keenetic"  # путь к приватному ключу
-ADMIN_PASSWORD = "ваш-пароль-для-входа-в-панель"
+ADMIN_PASSWORD = "пароль-для-входа-в-панель"
 SECRET_KEY = "случайная-строка-для-flask-сессий-сюда"
 SUBSCRIPTION_TOKEN = "случайная-строка"
 DASHBOARD_PORT = 5000  # опционально, если порт 5000 занят</pre>
       <p><code>install.bat</code> в v1.4+ сам генерирует случайные <code>SECRET_KEY</code> и <code>SUBSCRIPTION_TOKEN</code> при первой установке. Остальное нужно вписать руками.</p>
 
       <h4>🔑 SSH-ключ для роутера</h4>
-      <p>Если ключа ещё нет — сгенерируй:</p>
+      <p>Если ключа ещё нет — сгенерировать:</p>
       <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">ssh-keygen -t ed25519 -f C:\xray-dashboard\.ssh\id_keenetic -N ""</pre>
-      <p>Публичную часть (<code>.pub</code>) скопируй на роутер в <code>/opt/etc/dropbear/authorized_keys</code>. На v1.5.6+ при <code>install_service.bat</code> от админа — скрипт сам предложит скопировать ключ из <code>~/.ssh/</code> в проектную папку с правильными permissions для SYSTEM.</p>
+      <p>Публичную часть (<code>.pub</code>) скопировать на роутер в <code>/opt/etc/dropbear/authorized_keys</code>. На v1.5.6+ при <code>install_service.bat</code> от админа — скрипт сам предложит скопировать ключ из <code>~/.ssh/</code> в проектную папку с правильными permissions для SYSTEM.</p>
     </div>
   </details>
 
   <details class="help-section">
     <summary>🛠️ Установка XKeen с нуля на новый роутер</summary>
     <div class="help-body">
-      <p>Эта инструкция — для случая когда у тебя <strong>новый чистый Keenetic</strong>, на нём ничего нет,
+      <p>Эта инструкция — для случая, когда есть <strong>новый чистый Keenetic</strong>, на нём ничего нет,
       и нужно поставить XKeen (xray-клиент) чтобы эта панель могла им управлять.
       Что в итоге получится: на роутере — пакеты <code>xkeen</code> + <code>xray_s</code>, автозапуск через init.d,
       конфиги в <code>/opt/etc/xray/configs/</code>, доступ по SSH-ключу.</p>
@@ -15439,10 +15439,10 @@ DASHBOARD_PORT = 5000  # опционально, если порт 5000 заня
             <li>Альтернатива: WSL2 (<code>wsl --mount &lt;диск&gt; --bare</code> + <code>mkfs.ext4</code>) или загрузочный Linux-USB.</li>
           </ul>
 
-          <p><strong>Все данные на флешке будут стёрты.</strong> Используй чистую флешку или ту что не жалко (минимум 1 ГБ, лучше 4+ ГБ).</p>
+          <p><strong>Все данные на флешке будут стёрты.</strong> Использовать чистую флешку или ту что не жалко (минимум 1 ГБ, лучше 4+ ГБ).</p>
 
           <div style="background: #e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
-            💡 <strong>Не вытаскивай флешку в Windows после форматирования</strong>, чтобы скопировать туда установщик — Windows не умеет писать в ext4 без сторонних драйверов. <strong>Папку <code>install</code> и сам файл-установщик загрузим через Web UI Keenetic на Шаге 3</strong> — роутер с ext4 работает нативно.
+            💡 <strong>Не вытаскивать флешку в Windows после форматирования</strong>, чтобы скопировать туда установщик — Windows не умеет писать в ext4 без сторонних драйверов. <strong>Папку <code>install</code> и сам файл-установщик загрузим через Web UI Keenetic на Шаге 3</strong> — роутер с ext4 работает нативно.
           </div>
 
           <p>На этом этап «PC» закончен. Дальше всё через Web UI Keenetic.</p>
@@ -15452,28 +15452,28 @@ DASHBOARD_PORT = 5000  # опционально, если порт 5000 заня
       <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">📦 Шаг 2. Установить компонент OPKG в KeeneticOS</summary>
         <div style="margin-top: 8px;">
-          <p>Web → <strong>Управление → Общие настройки → Изменить набор компонентов</strong> (кнопка «Изменить набор компонентов»). В разделе «Утилиты и сервисы» найди и поставь галку:</p>
+          <p>Web → <strong>Управление → Общие настройки → Изменить набор компонентов</strong> (кнопка «Изменить набор компонентов»). В разделе «Утилиты и сервисы» найти и поставить галку:</p>
           <ul>
             <li><strong>Менеджер пакетов OPKG</strong> (обязательно)</li>
             <li><strong>Модули ядра для USB-накопителей: ext4</strong> (если ещё не включён)</li>
-            <li><strong>Доступ к командной строке (CLI)</strong> — если хочешь зайти по SSH</li>
+            <li><strong>Доступ к командной строке (CLI)</strong> — для входа по SSH</li>
           </ul>
-          <p>Нажми «Установить обновление» и подожди — роутер скачает компоненты и перезагрузится.</p>
+          <p>Нажать «Установить обновление» и подождать — роутер скачает компоненты и перезагрузится.</p>
         </div>
       </details>
 
       <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">⚙ Шаг 3. Установить Entware через Web UI Keenetic (папка <code>install</code> + tar.gz)</summary>
         <div style="margin-top: 8px;">
-          <p>Воткни ext4-флешку (из Шага 1) в USB-порт роутера. Дальше всё через Web UI Keenetic — НЕ нужно вытаскивать флешку обратно в Windows.</p>
+          <p>Воткнуть ext4-флешку (из Шага 1) в USB-порт роутера. Дальше всё через Web UI Keenetic — НЕ нужно вытаскивать флешку обратно в Windows.</p>
 
           <ol>
-            <li>Открой Web UI: <code>http://{{ keenetic_settings.current.host or '192.168.1.1' }}</code></li>
-            <li><strong>«Управление» → «Приложения»</strong> → увидишь свою флешку в списке USB-накопителей (по имени тома)</li>
-            <li>Кликни на флешку — откроется файловый менеджер. <strong>Создай папку <code>install</code></strong> в корне флешки. Имя точное, lowercase.</li>
-            <li>Скачай на PC <strong>Entware-установщик</strong>: <a href="https://github.com/Corvus-Malus/XKeen/releases" target="_blank" rel="noopener">github.com/Corvus-Malus/XKeen/releases</a> → файл <code>mipsel-installer.tar.gz</code> (для MT7621-роутеров — Giga/Ultra/Hero/Hopper/Sprinter; для другой архитектуры см. таблицу в README репозитория).</li>
-            <li><strong>Через Web UI Keenetic загрузи</strong> <code>mipsel-installer.tar.gz</code> в созданную папку <code>install/</code> (drag&amp;drop или кнопка «Загрузить»).</li>
-            <li><strong>«Настройки» → «OPKG»</strong> (этот раздел появляется только после установки компонента из Шага 2!) → в выпадающем списке «Накопитель» выбери свою флешку → <strong>«Применить»</strong>.</li>
+            <li>Открыть Web UI: <code>http://{{ keenetic_settings.current.host or '192.168.1.1' }}</code></li>
+            <li><strong>«Управление» → «Приложения»</strong> → флешка видна в списке USB-накопителей (по имени тома)</li>
+            <li>Кликнуть на флешку — откроется файловый менеджер. <strong>Создать папку <code>install</code></strong> в корне флешки. Имя точное, lowercase.</li>
+            <li>Скачать на PC <strong>Entware-установщик</strong>: <a href="https://github.com/Corvus-Malus/XKeen/releases" target="_blank" rel="noopener">github.com/Corvus-Malus/XKeen/releases</a> → файл <code>mipsel-installer.tar.gz</code> (для MT7621-роутеров — Giga/Ultra/Hero/Hopper/Sprinter; для другой архитектуры см. таблицу в README репозитория).</li>
+            <li><strong>Через Web UI Keenetic загрузить</strong> <code>mipsel-installer.tar.gz</code> в созданную папку <code>install/</code> (drag&amp;drop или кнопка «Загрузить»).</li>
+            <li><strong>«Настройки» → «OPKG»</strong> (этот раздел появляется только после установки компонента из Шага 2!) → в выпадающем списке «Накопитель» выбрать свою флешку → <strong>«Применить»</strong>.</li>
             <li>Keenetic найдёт <code>install/mipsel-installer.tar.gz</code> и развернёт Entware на флешке. Прогресс видно в <strong>«Диагностика»</strong> (журнал событий). Занимает ~3-5 минут.</li>
           </ol>
 
@@ -15482,7 +15482,7 @@ DASHBOARD_PORT = 5000  # опционально, если порт 5000 заня
           </div>
 
           <div style="background:#fff8e7; border-left: 3px solid #e80; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
-            ⚠️ <strong>Если флешка не видна в «Управление → Приложения»</strong> — проверь Шаг 2 (компонент «Модули ядра для USB-накопителей: ext4» должен быть включён). Без этого компонента KeeneticOS не распознаёт ext4-разделы.
+            ⚠️ <strong>Если флешка не видна в «Управление → Приложения»</strong> — проверить Шаг 2 (компонент «Модули ядра для USB-накопителей: ext4» должен быть включён). Без этого компонента KeeneticOS не распознаёт ext4-разделы.
           </div>
         </div>
       </details>
@@ -15494,11 +15494,11 @@ DASHBOARD_PORT = 5000  # опционально, если порт 5000 заня
 
           <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p 222</pre>
 
-          <p>Дефолтный пароль <code>root</code> на свежем dropbear: <code>keenetic</code>. <strong>СРАЗУ ПОМЕНЯЙ</strong>:</p>
+          <p>Дефолтный пароль <code>root</code> на свежем dropbear: <code>keenetic</code>. <strong>СРАЗУ ПОМЕНЯТЬ</strong>:</p>
 
           <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">passwd root</pre>
 
-          <p>Поставь зависимости которые понадобятся для XKeen-installer:</p>
+          <p>Поставить зависимости которые понадобятся для XKeen-installer:</p>
 
           <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">opkg update
 opkg install curl tar unzip
@@ -15507,7 +15507,7 @@ opkg install ca-bundle ca-certificates</pre>
           <p>Это потянет ~30 MB зависимостей (libcurl, openssl, libnghttp2, libzstd и др.) — 1-2 минуты. Это нормально, происходит автоматически.</p>
 
           <div style="background:#e7f5ff; border-left: 3px solid #3498db; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
-            💡 <strong>SSH-ключи лучше пароля</strong>. Сгенерируй на PC ключ <code>ssh-keygen -t ed25519</code>, скопируй публичную часть в <code>/opt/etc/dropbear/authorized_keys</code> на роутере, отключи парольный вход. См. подраздел «🔧 Подключение к роутеру» в этой панели.
+            💡 <strong>SSH-ключи лучше пароля</strong>. Сгенерировать на PC ключ <code>ssh-keygen -t ed25519</code>, скопировать публичную часть в <code>/opt/etc/dropbear/authorized_keys</code> на роутере, отключить парольный вход. См. подраздел «🔧 Подключение к роутеру» в этой панели.
           </div>
         </div>
       </details>
@@ -15532,21 +15532,21 @@ chmod +x /opt/sbin/xray
 /opt/sbin/xray version</pre>
 
           <div style="background:#fde8e8; border-left: 3px solid #c33; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
-            ⚠ <strong>unzip обязательно с флагом <code>-o</code></strong>. Без него при повторном запуске будет интерактивный prompt «replace? [y/n]» — если ты копируешь следующую команду как ответ, скрипт ломается.
+            ⚠ <strong>unzip обязательно с флагом <code>-o</code></strong>. Без него при повторном запуске будет интерактивный prompt «replace? [y/n]» — если следующая команда вставится как ответ, скрипт ломается.
           </div>
 
-          <p class="muted">💡 На свежей Entware-установке детекция архитектуры в xkeen-installer обычно работает правильно. Но безопаснее ВСЕГДА класть xray руками заранее — даёт 100% контроль над binary + гарантирует версию которую ты тестировал.</p>
+          <p class="muted">💡 На свежей Entware-установке детекция архитектуры в xkeen-installer обычно работает правильно. Но безопаснее ВСЕГДА класть xray руками заранее — даёт 100% контроль над binary + гарантирует проверенную версию.</p>
         </div>
       </details>
 
       <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">📦 Шаг 6. Запустить XKeen-installer (jameszeroX) с пропуском Xray</summary>
         <div style="margin-top: 8px;">
-          <p>Теперь когда наш проверенный <code>/opt/sbin/xray</code> уже лежит — можем запустить installer и сказать ему «не качай xray, используй существующий»:</p>
+          <p>Теперь когда наш проверенный <code>/opt/sbin/xray</code> уже лежит — можем запустить installer и сказать ему «не качать xray, использовать существующий»:</p>
 
           <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">sh -c "$(curl -sSL https://raw.githubusercontent.com/jameszeroX/XKeen/main/install.sh)"</pre>
 
-          <p>Будет несколько prompt'ов — отвечай так:</p>
+          <p>Будет несколько prompt'ов — ответы такие:</p>
 
           <table style="border-collapse: collapse; margin: 8px 0; width: 100%;">
             <thead>
@@ -15557,8 +15557,8 @@ chmod +x /opt/sbin/xray
             </thead>
             <tbody>
               <tr><td style="border: 1px solid #ccc; padding: 6px 10px;">«Какую версию XKeen»</td><td style="border: 1px solid #ccc; padding: 6px 10px;"><code>1</code> (Stable)</td></tr>
-              <tr><td style="border: 1px solid #ccc; padding: 6px 10px;">«Выберите ядро проксирования»</td><td style="border: 1px solid #ccc; padding: 6px 10px;"><code>1</code> (Xray)</td></tr>
-              <tr><td style="border: 1px solid #ccc; padding: 6px 10px;"><strong>«Выберите номер релиза Xray»</strong></td><td style="border: 1px solid #ccc; padding: 6px 10px;"><strong><code>0</code></strong> (ПРОПУСТИТЬ — у нас уже свой)</td></tr>
+              <tr><td style="border: 1px solid #ccc; padding: 6px 10px;">«Выбрать ядро проксирования»</td><td style="border: 1px solid #ccc; padding: 6px 10px;"><code>1</code> (Xray)</td></tr>
+              <tr><td style="border: 1px solid #ccc; padding: 6px 10px;"><strong>«Выбрать номер релиза Xray»</strong></td><td style="border: 1px solid #ccc; padding: 6px 10px;"><strong><code>0</code></strong> (ПРОПУСТИТЬ — у нас уже свой)</td></tr>
               <tr><td style="border: 1px solid #ccc; padding: 6px 10px;">«Действия для GeoSite»</td><td style="border: 1px solid #ccc; padding: 6px 10px;"><code>1</code> (Установить все)</td></tr>
               <tr><td style="border: 1px solid #ccc; padding: 6px 10px;">«Действия для GeoIP»</td><td style="border: 1px solid #ccc; padding: 6px 10px;"><code>1</code> (Установить все)</td></tr>
               <tr><td style="border: 1px solid #ccc; padding: 6px 10px;">«Автообновление GeoFile»</td><td style="border: 1px solid #ccc; padding: 6px 10px;"><code>1</code> (Включить cron)</td></tr>
@@ -15569,7 +15569,7 @@ chmod +x /opt/sbin/xray
             ⚠ <strong>Пункт «0. Пропустить загрузку»</strong> работает ТОЛЬКО если <code>/opt/sbin/xray</code> уже существует. Если ввести 0 при пустой <code>/opt/sbin/</code> — installer скажет «Невозможно установить XKeen без ядра» и отменит установку. Поэтому Шаг 5 обязателен ДО Шага 6.
           </div>
 
-          <p>После установки проверь:</p>
+          <p>После установки проверить:</p>
           <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">xkeen -status
 ls -la /opt/etc/xray/configs/
 /opt/sbin/xray version</pre>
@@ -15582,11 +15582,11 @@ ls -la /opt/etc/xray/configs/
           <p>XKeen-installer ставит сам xray + GeoFile + базовую структуру конфигов. Но <strong>watchdog</strong> (failover между каналами), <strong>05_routing.template.json</strong> (с placeholder'ами AI/YT/DIRECT/BLOCK/GeoIP) и <strong>watchdog.config</strong> нужно положить отдельно. Делаем одной кнопкой через эту панель:</p>
 
           <ol>
-            <li>На PC открой эту панель (<code>http://localhost:{{ cfg.DASHBOARD_PORT or 5000 }}/xkeen</code>)</li>
-            <li>Раскрой секцию <strong>«🔧 Подключение к роутеру»</strong> в конце страницы → пропиши IP роутера, порт <code>222</code>, путь к SSH-ключу → <strong>«🔌 Проверить связь»</strong> → должно показать «✅ Связь есть»</li>
-            <li>Раскрой <strong>«🚀 Развернуть на чистом XKeen»</strong> → <strong>«Показать план»</strong></li>
+            <li>На PC открыть эту панель (<code>http://localhost:{{ cfg.DASHBOARD_PORT or 5000 }}/xkeen</code>)</li>
+            <li>Раскрыть секцию <strong>«🔧 Подключение к роутеру»</strong> в конце страницы → прописать IP роутера, порт <code>222</code>, путь к SSH-ключу → <strong>«🔌 Проверить связь»</strong> → должно показать «✅ Связь есть»</li>
+            <li>Раскрыть <strong>«🚀 Развернуть на чистом XKeen»</strong> → <strong>«Показать план»</strong></li>
             <li>Все галочки уже выставлены правильно — на свежей установке <strong>галочку «Перезаписать существующие файлы» ставить НЕ нужно</strong>. С v1.4.9 наш bootstrap сам подменяет шаблонный <code>04_outbounds.json</code> от XKeen-installer'а (374 байта, только комментарии) на минимальный с <code>direct + block</code>, даже без галочки.</li>
-            <li>Нажми <strong>«✅ Применить выбранное»</strong></li>
+            <li>Нажать <strong>«✅ Применить выбранное»</strong></li>
           </ol>
 
           <p>Что произойдёт:</p>
@@ -15601,7 +15601,7 @@ ls -la /opt/etc/xray/configs/
           </ul>
 
           <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
-            ⚠ <strong>Когда галочка «Перезаписать» нужна</strong>: только если делаешь <strong>полный сброс</strong> уже работающей установки (см. раздел «🔄 Полный сброс конфигов» ниже) — тогда галочка нужна чтобы перетереть существующие <code>watchdog.config</code> / <code>05_routing.template.json</code>. На свежей установке (только что после <code>xkeen -i</code>) — НЕ ставь. Если уже добавил подписку и outbound'ы — тем более НЕ ставь (потеряешь их).
+            ⚠ <strong>Когда галочка «Перезаписать» нужна</strong>: только при <strong>полном сбросе</strong> уже работающей установки (см. раздел «🔄 Полный сброс конфигов» ниже) — тогда галочка нужна чтобы перетереть существующие <code>watchdog.config</code> / <code>05_routing.template.json</code>. На свежей установке (только что после <code>xkeen -i</code>) — НЕ ставить. Если подписка и outbound'ы уже добавлены — тем более НЕ ставить (они потеряются).
           </div>
         </div>
       </details>
@@ -15612,7 +15612,7 @@ ls -la /opt/etc/xray/configs/
           <p>XKeen-installer создаёт всё на стороне Entware (xray, конфиги, iptables-правила) — но <strong>политика доступа в Keenetic Web UI НЕ добавляется автоматически</strong>. Без неё ни один клиент не получит метку fwmark, без fwmark XKeen-iptables не сработает, и трафик пойдёт мимо xray.</p>
 
           <div style="background:#fde8e8; border-left: 3px solid #c33; padding: 10px 14px; margin: 10px 0; font-size: 0.92em;">
-            🔴 <strong>Имя политики должно быть СТРОГО <code>XKeen</code></strong> (case-sensitive, без пробелов, без префиксов/суффиксов). XKeen-installer ищет политику по <em>description</em> ровно «XKeen» — если назовёшь иначе, fwmark не подцепится и xray-перехват не сработает. Внутреннее имя политики у Keenetic своё (Policy0/Policy1/Policy2…) — его не правь, оно генерируется автоматически.
+            🔴 <strong>Имя политики должно быть СТРОГО <code>XKeen</code></strong> (case-sensitive, без пробелов, без префиксов/суффиксов). XKeen-installer ищет политику по <em>description</em> ровно «XKeen» — при другом имени fwmark не подцепится и xray-перехват не сработает. Внутреннее имя политики у Keenetic своё (Policy0/Policy1/Policy2…) — его не править, оно генерируется автоматически.
           </div>
 
           <p><strong>Часть A — Создать политику</strong>:</p>
@@ -15621,27 +15621,27 @@ ls -la /opt/etc/xray/configs/
             <li>Раздел <strong>«Сетевые правила» → «Приоритеты подключений»</strong> → вкладка <strong>«Политики доступа в интернет»</strong></li>
             <li>«<strong>+ Добавить политику</strong>» → <strong>имя: <code>XKeen</code></strong> (только так!)</li>
             <li>В списке подключений политики отметь <strong>провайдера (или нескольких)</strong> — например <code>ROSTELEKOM</code> / <code>Подключение Ethernet</code>. Это нужно как fallback на случай если xray ляжет.<br>
-              <span style="color:#777; font-size:0.9em;">⚠ <strong>«Интерфейс xray» в этом списке НЕ появится</strong> — xray работает на уровне iptables в обход маршрутизации Keenetic. Не ищи его и не отмечай ничего лишнего.</span></li>
+              <span style="color:#777; font-size:0.9em;">⚠ <strong>«Интерфейс xray» в этом списке НЕ появится</strong> — xray работает на уровне iptables в обход маршрутизации Keenetic. Не искать его и не отмечать ничего лишнего.</span></li>
             <li>«<strong>Сохранить</strong>»</li>
           </ol>
 
           <p><strong>Часть B — Привязать клиентов к политике</strong> (без этого xray не получит ни одного пакета!):</p>
           <ol>
-            <li>В том же разделе перейди на вкладку <strong>«Применение политик»</strong></li>
-            <li>Найди созданную политику <code>XKeen</code> → «<strong>+ Добавить цель</strong>»</li>
-            <li>Выбери <strong>«Клиент»</strong> (для одного устройства) или <strong>«Сеть»</strong> (для подсети, например <code>192.168.1.0/24</code> чтобы весь LAN)</li>
+            <li>В том же разделе перейти на вкладку <strong>«Применение политик»</strong></li>
+            <li>Найти созданную политику <code>XKeen</code> → «<strong>+ Добавить цель</strong>»</li>
+            <li>Выбрать <strong>«Клиент»</strong> (для одного устройства) или <strong>«Сеть»</strong> (для подсети, например <code>192.168.1.0/24</code> чтобы весь LAN)</li>
             <li>При выборе «Клиент» отметь нужные устройства из списка (можно несколько) → «<strong>Сохранить</strong>»</li>
           </ol>
 
           <div style="background:#eefbe5; border-left: 3px solid #2a7; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
-            💡 <strong>Кто привязан — тот через xray, кто нет — мимо.</strong> Не привязывай к политике XKeen то, чему VPN не нужен: принтеры, IoT-розетки, IP-камеры (если им не нужен удалённый доступ из-за границы), гостевой Wi-Fi. Каждый лишний клиент в политике XKeen — это нагрузка на CPU роутера (особенно на MT7621-классе типа Keenetic Hopper/Giga/Ultra). Список фактически привязанных клиентов смотри в секции <strong>«👥 Клиенты в политике XKeen»</strong> на главной /xkeen.
+            💡 <strong>Кто привязан — тот через xray, кто нет — мимо.</strong> Не привязывать к политике XKeen то, чему VPN не нужен: принтеры, IoT-розетки, IP-камеры (если им не нужен удалённый доступ из-за границы), гостевой Wi-Fi. Каждый лишний клиент в политике XKeen — это нагрузка на CPU роутера (особенно на MT7621-классе типа Keenetic Hopper/Giga/Ultra). Список фактически привязанных клиентов — в секции <strong>«👥 Клиенты в политике XKeen»</strong> на главной /xkeen.
           </div>
 
           <div style="background:#fde8e8; border-left: 3px solid #c33; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
-            ⚠ <strong>Применение политик тяжёлое</strong>. Web UI может зависнуть на 1-2 минуты пока Keenetic пересобирает fwmark/routing-таблицы. <strong>Не нажимай повторно</strong>, не reboot'й роутер. Подожди.
+            ⚠ <strong>Применение политик тяжёлое</strong>. Web UI может зависнуть на 1-2 минуты пока Keenetic пересобирает fwmark/routing-таблицы. <strong>Не нажимать повторно</strong>, не reboot'й роутер. Подождать.
           </div>
 
-          <p><strong>Проверка</strong>: открой <a href="https://2ip.ru" target="_blank">2ip.ru</a> с того клиента которого ты привязал к политике XKeen — должен показаться IP <strong>VPN-сервера</strong> (или провайдера твоего VPN-канала), а не твоего домашнего ROSTELEKOM/Билайн. С клиента который НЕ в политике — IP должен быть твоего домашнего провайдера.</p>
+          <p><strong>Проверка</strong>: открыть <a href="https://2ip.ru" target="_blank">2ip.ru</a> с клиента, привязанного к политике XKeen, — должен показаться IP <strong>VPN-сервера</strong> (или провайдера VPN-канала), а не домашнего провайдера. С клиента, который НЕ в политике, — IP домашнего провайдера.</p>
 
           <p style="font-size:0.88em; color:#666;">📚 Источник: <a href="https://github.com/Corvus-Malus/XKeen" target="_blank">README Corvus-Malus/XKeen</a> раздел «Предварительные настройки», а также <a href="https://jameszero.net/faq-xkeen.htm" target="_blank">FAQ jameszero</a>.</p>
         </div>
@@ -15650,17 +15650,17 @@ ls -la /opt/etc/xray/configs/
       <details open style="margin: 10px 0; padding: 10px 14px; background: #fff8e7; border-left: 4px solid #e80; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #7a5500;">💾 Шаг 9. Сохранить PRIMARY в UI (ОБЯЗАТЕЛЬНЫЙ нюанс!)</summary>
         <div style="margin-top: 8px;">
-          <p>После Bootstrap (Шаг 7) в <code>watchdog.config</code> лежит <code>PRIMARY_TAG="vless-reality"</code> — placeholder который вряд ли совпадает с твоим реальным outbound'ом. Нужно явно выбрать и <strong>обязательно сохранить</strong>:</p>
+          <p>После Bootstrap (Шаг 7) в <code>watchdog.config</code> лежит <code>PRIMARY_TAG="vless-reality"</code> — placeholder, который вряд ли совпадает с реальным outbound'ом. Нужно явно выбрать и <strong>обязательно сохранить</strong>:</p>
 
           <ol>
-            <li>В UI открой секцию <strong>«🎯 Основное и резервное подключение»</strong></li>
-            <li>В dropdown <strong>«🛡️ Основной канал (PRIMARY)»</strong> выбери:
+            <li>В UI открыть секцию <strong>«🎯 Основное и резервное подключение»</strong></li>
+            <li>В dropdown <strong>«🛡️ Основной канал (PRIMARY)»</strong> выбрать:
               <ul>
-                <li><strong>«🌐 Напрямую без VPN»</strong> — если у тебя ещё нет подписки (минимальная рабочая конфигурация: трафик идёт через провайдера, VPN не нужен), или</li>
+                <li><strong>«🌐 Напрямую без VPN»</strong> — если подписки ещё нет (минимальная рабочая конфигурация: трафик идёт через провайдера, VPN не нужен), или</li>
                 <li>Конкретный VPN-канал из подписки (например <code>provider-a-nl</code>) — если подписку уже добавил.</li>
               </ul>
             </li>
-            <li><strong>ОБЯЗАТЕЛЬНО нажми зелёную кнопку «💾 Сохранить PRIMARY»</strong> под dropdown'ом!</li>
+            <li><strong>ОБЯЗАТЕЛЬНО нажать зелёную кнопку «💾 Сохранить PRIMARY»</strong> под dropdown'ом!</li>
             <li>Через ≤1 мин watchdog подхватит и:
               <ul>
                 <li>В шапке исчезнет «⚠ работаем через резерв»</li>
@@ -15678,17 +15678,17 @@ ls -la /opt/etc/xray/configs/
       <details style="margin: 10px 0; padding: 10px 14px; background: #fafafa; border-left: 4px solid #36a; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #1f3d6b;">📡 Шаг 10. Добавить VLESS-подписку (опционально, если есть платный провайдер)</summary>
         <div style="margin-top: 8px;">
-          <p>Если ты на PRIMARY=direct, всё уже работает — Шаг 10 не нужен. Подписка нужна когда хочешь использовать платный VPN-провайдер (3X-UI, Provider A/B/C/D и т.п.).</p>
+          <p>При PRIMARY=direct всё уже работает — Шаг 10 не нужен. Подписка нужна для платного VPN-провайдера (3X-UI, Provider A/B/C/D и т.п.).</p>
 
           <ol>
-            <li>Получи у провайдера <strong>subscription URL</strong> (обычно начинается с <code>https://...sub=...</code>, при открытии в браузере отдаёт base64 со списком серверов)</li>
-            <li>В UI открой секцию <strong>«📡 Обновить из подписки»</strong></li>
-            <li>Впиши URL → <strong>«🔍 Предпросмотр»</strong> → увидишь сколько outbound'ов добавится</li>
+            <li>Получить у провайдера <strong>subscription URL</strong> (обычно начинается с <code>https://...sub=...</code>, при открытии в браузере отдаёт base64 со списком серверов)</li>
+            <li>В UI открыть секцию <strong>«📡 Обновить из подписки»</strong></li>
+            <li>Вписать URL → <strong>«🔍 Предпросмотр»</strong> → видно, сколько outbound'ов добавится</li>
             <li><strong>«📥 Скачать и обновить»</strong></li>
-            <li>В шапке после обновления увидишь outbound'ы сгруппированными по подписке (с цветными бейджами)</li>
+            <li>После обновления outbound'ы видны сгруппированными по подписке (с цветными бейджами)</li>
           </ol>
 
-          <p>После этого можешь поменять PRIMARY на конкретный сервер из подписки в Шаге 9. И настроить AI-sticky / YT-sticky на нужные каналы.</p>
+          <p>После этого PRIMARY можно поменять на конкретный сервер из подписки в Шаге 9. И настроить AI-sticky / YT-sticky на нужные каналы.</p>
         </div>
       </details>
 
@@ -15710,7 +15710,7 @@ system configuration save
 exit</pre>
 
           <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
-            💡 В имени политики важно <strong>точное</strong> совпадение. Используй то имя что видишь в <code>show ip policy</code>. Если в имени пробелы — кавычки: <code>no ip policy "My Policy"</code>.
+            💡 В имени политики важно <strong>точное</strong> совпадение. Использовать имя ровно так, как его показывает <code>show ip policy</code>. Если в имени пробелы — кавычки: <code>no ip policy "My Policy"</code>.
           </div>
         </div>
       </details>
@@ -15730,14 +15730,14 @@ exit</pre>
             </tbody>
           </table>
 
-          <p><strong>Рекомендация</strong>: reboot роутера раз в неделю. Linux на embedded не любит длинный uptime, swap копится. Не применяй «Применить» в Web UI Keenetic чаще раза в минуту — каждый раз тяжёлая пересборка iptables.</p>
+          <p><strong>Рекомендация</strong>: reboot роутера раз в неделю. Linux на embedded не любит длинный uptime, swap копится. Не применять «Применить» в Web UI Keenetic чаще раза в минуту — каждый раз тяжёлая пересборка iptables.</p>
         </div>
       </details>
 
       <details style="margin: 10px 0; padding: 10px 14px; background: #e8f5e9; border-left: 4px solid #2e7d32; border-radius: 4px;">
         <summary style="cursor: pointer; font-weight: 700; color: #1b4d1f;">💾 Бэкапы — лучший способ страховки</summary>
         <div style="margin-top: 8px;">
-          <p>В этой панели есть секция <strong>«💾 Бэкап и восстановление»</strong> — она снимает все XKeen-настройки роутера в один JSON-файл. <strong>Делай бэкап после каждой стабильной конфигурации</strong>:</p>
+          <p>В этой панели есть секция <strong>«💾 Бэкап и восстановление»</strong> — она снимает все XKeen-настройки роутера в один JSON-файл. <strong>Делать бэкап после каждой стабильной конфигурации</strong>:</p>
 
           <ul>
             <li>✅ Сразу после успешной установки + первой настройки</li>
@@ -15746,8 +15746,8 @@ exit</pre>
             <li>✅ Перед обновлением Xray-binary</li>
           </ul>
 
-          <p>Кнопкой <strong>«💾 Создать бэкап»</strong> — скачается файл вида <code>xkeen-backup-2026-05-18-13-00.json</code>. Сохраняй в надёжное место (Google Drive, Dropbox).</p>
-          <p>Если эксперимент сломал работу — <strong>«🔄 Восстановить из файла»</strong> → выбираешь нужный бэкап → за 5 секунд возврат в рабочее состояние. Без потери подписки, outbound'ов, доменов и т.п.</p>
+          <p>Кнопкой <strong>«💾 Создать бэкап»</strong> — скачается файл вида <code>xkeen-backup-2026-05-18-13-00.json</code>. Сохранять в надёжное место (Google Drive, Dropbox).</p>
+          <p>Если эксперимент сломал работу — <strong>«🔄 Восстановить из файла»</strong> → выбрать нужный бэкап → за 5 секунд возврат в рабочее состояние. Без потери подписки, outbound'ов, доменов и т.п.</p>
         </div>
       </details>
 
@@ -15764,15 +15764,15 @@ xkeen -restart</pre>
 
           <h4 style="margin: 8px 0;">Опция B — Полный bootstrap (потеря подписки)</h4>
           <ol>
-            <li><strong>Сохрани URL подписки</strong> в блокнот: <code>cat /opt/etc/xray/subscription_meta.json</code> на роутере</li>
+            <li><strong>Сохранить URL подписки</strong> в блокнот: <code>cat /opt/etc/xray/subscription_meta.json</code> на роутере</li>
             <li>В UI → «🚀 Развернуть на чистом XKeen» → ✅ галочка «Перезаписать» → «✅ Применить»</li>
             <li>Это сбросит watchdog.config / 04_outbounds.json / 05_routing.template.json к дефолтам. <strong>Подписка теряется</strong>.</li>
-            <li>Добавь подписку заново через «📡 Обновить из подписки»</li>
-            <li>Настрой PRIMARY/AI/YT через UI</li>
+            <li>Добавить подписку заново через «📡 Обновить из подписки»</li>
+            <li>Настроить PRIMARY/AI/YT через UI</li>
           </ol>
 
           <h4 style="margin: 8px 0;">Опция C — Snапшот из бэкапа</h4>
-          <p>Если у тебя есть свежий бэкап (см. выше) — просто восстанови из него. Это самый надёжный путь, без потери данных.</p>
+          <p>Если есть свежий бэкап (см. выше) — просто восстановить из него. Это самый надёжный путь, без потери данных.</p>
         </div>
       </details>
 
@@ -15780,24 +15780,24 @@ xkeen -restart</pre>
         <summary style="cursor: pointer; font-weight: 700; color: #7a5500;">🆘 Если что-то пошло не так — полный список граблей</summary>
         <div style="margin-top: 8px;">
           <ul>
-            <li><strong>Раздел «OPKG» не появился в Web → Настройки</strong> — проверь что в Шаге 2 поставил компонент «Менеджер пакетов OPKG» (после установки нужна перезагрузка роутера). Раздел появляется только после этого.</li>
+            <li><strong>Раздел «OPKG» не появился в Web → Настройки</strong> — проверить что в Шаге 2 поставил компонент «Менеджер пакетов OPKG» (после установки нужна перезагрузка роутера). Раздел появляется только после этого.</li>
             <li><strong>Флешка не видна в Web → Управление → Приложения</strong> — нужен компонент «Модули ядра для USB-накопителей: ext4» (Шаг 2). NTFS/FAT32 для <code>/opt</code> не подойдут — обязательно ext4, отформатированный на PC через MiniTool Partition Wizard (Шаг 1).</li>
-            <li><strong>«Применить» в Web → Настройки → OPKG не запускает установку</strong> — проверь что: (1) папка точно называется <code>install</code> (lowercase, не <code>Install</code>); (2) файл точно <code>mipsel-installer.tar.gz</code> (не переименован, не распакован); (3) он лежит ВНУТРИ папки <code>install/</code>, не в корне флешки.</li>
-            <li><strong>XKeen-installer (Шаг 6) ругается на сеть</strong> — у тебя на роутере должен быть выход в интернет (не через XKeen). Проверь что обычный VPN отключён, и роутер ходит наружу.</li>
+            <li><strong>«Применить» в Web → Настройки → OPKG не запускает установку</strong> — проверить что: (1) папка точно называется <code>install</code> (lowercase, не <code>Install</code>); (2) файл точно <code>mipsel-installer.tar.gz</code> (не переименован, не распакован); (3) он лежит ВНУТРИ папки <code>install/</code>, не в корне флешки.</li>
+            <li><strong>XKeen-installer (Шаг 6) ругается на сеть</strong> — на роутере должен быть выход в интернет (не через XKeen). Проверить что обычный VPN отключён, и роутер ходит наружу.</li>
             <li><strong>xray даёт SIGSEGV / runtime crash при запуске</strong> — это арх-mismatch (xkeen-installer скачал mips32 BE вместо mips32le). Решение — Шаг 5 (скачать xray-mips32le вручную) + Шаг 6 (installer с ответом 0 «пропустить ядро»).</li>
             <li><strong>«Невозможно установить XKeen без ядра»</strong> при ответе 0 в installer — это значит <code>/opt/sbin/xray</code> ещё не существует. Сначала Шаг 5 (положить xray руками), потом Шаг 6.</li>
             <li><strong>После Шага 6 нет <code>/opt/sbin/xkeen</code></strong> — установка прервалась (sigint / нет интернета / нехватка места). <code>xkeen -dk</code> (deinstall) и снова с Шага 6.</li>
-            <li><strong><code>xkeen -status</code> показывает «не запущен»</strong> — смотри логи: <code>/opt/var/log/xray/error.log</code> + <code>logread | grep -i xray</code>. Самые частые причины: битый <code>05_routing.json</code> (Шаг 7 с галочкой «Перезаписать» должен помочь), отсутствует direct/block в <code>04_outbounds.json</code>, ссылка на несуществующий outbound.</li>
+            <li><strong><code>xkeen -status</code> показывает «не запущен»</strong> — см. логи: <code>/opt/var/log/xray/error.log</code> + <code>logread | grep -i xray</code>. Самые частые причины: битый <code>05_routing.json</code> (Шаг 7 с галочкой «Перезаписать» должен помочь), отсутствует direct/block в <code>04_outbounds.json</code>, ссылка на несуществующий outbound.</li>
             <li><strong>XKeen запущен, но трафик идёт мимо</strong> (2ip.ru показывает IP провайдера) — частые причины: <br>
                 <strong>(а)</strong> Шаг 8 Часть A не сделан или политика названа НЕ <code>XKeen</code> (case-sensitive!) — без точного совпадения description XKeen-installer не подцепит fwmark; <br>
                 <strong>(б)</strong> Шаг 8 Часть B не сделан — политика создана, но ни одного клиента к ней не привязано во вкладке «Применение политик»; <br>
-                <strong>(в)</strong> Клиент с которого ты проверяешь 2ip.ru — НЕ привязан к политике XKeen (она whitelist'ная: кто не привязан, тот через провайдера напрямую). Проверь привязки в секции «👥 Клиенты в политике XKeen» на главной /xkeen.</li>
+                <strong>(в)</strong> Клиент, с которого проверяется 2ip.ru, — НЕ привязан к политике XKeen (она whitelist'ная: кто не привязан, тот через провайдера напрямую). Проверить привязки в секции «👥 Клиенты в политике XKeen» на главной /xkeen.</li>
             <li><strong>В шапке «PRIMARY () недоступен»</strong> — Шаг 9 не сделан (не нажата «💾 Сохранить PRIMARY»).</li>
             <li><strong>Web UI Keenetic завис после применения политики</strong> — это нормально на 1-2 минуты (пересборка iptables). Если затянулось — reboot роутера через ndmsv2 SSH (admin@host:22 → <code>system reboot</code>) или через Web UI Управление.</li>
             <li><strong>Залипшая пустая политика, нельзя удалить через Web UI</strong> — через Keenetic CLI (см. опциональный шаг «Удаление политики через Keenetic CLI»).</li>
-            <li><strong>«unzip: replace?» / прерывание prompt'ом</strong> — всегда используй <code>unzip -o</code> (force overwrite, без интерактивности).</li>
+            <li><strong>«unzip: replace?» / прерывание prompt'ом</strong> — всегда использовать <code>unzip -o</code> (force overwrite, без интерактивности).</li>
             <li><strong>Telegram Desktop виснет на «Connecting»</strong> — это IP-only-проблема. Доменные правила его не ловят, нужна GeoIP-категория <code>telegram</code> (Discord направляется только доменными правилами — категории discord в geoip.dat нет). См. подраздел «🩻 v2fly категории и 🌍 GeoIP-категории» выше.</li>
-            <li><strong>geoip:telegram не работает (xkeen в Mixed/Hybrid + в error.log <code>code not found</code>)</strong> — в установленном <code>geoip.dat</code> нет категории (база «только страны»). XKeen 2.0 обычно сам держит расширенную базу (<code>xkeen -ug</code> ежедневно); если секция «🌍 GeoIP-категории» показывает, что категории telegram нет, — там же кнопка «📥 Установить / обновить расширенный geoip.dat». ⚠ Если в Mixed/Hybrid но в error.log пусто — это просто другой режим работы XKeen, VPN при этом работает. Проверь через <code>curl https://checkip.amazonaws.com</code> с устройства в политике XKeen — должен показать VPN-IP.</li>
+            <li><strong>geoip:telegram не работает (xkeen в Mixed/Hybrid + в error.log <code>code not found</code>)</strong> — в установленном <code>geoip.dat</code> нет категории (база «только страны»). XKeen 2.0 обычно сам держит расширенную базу (<code>xkeen -ug</code> ежедневно); если секция «🌍 GeoIP-категории» показывает, что категории telegram нет, — там же кнопка «📥 Установить / обновить расширенный geoip.dat». ⚠ Если в Mixed/Hybrid но в error.log пусто — это просто другой режим работы XKeen, VPN при этом работает. Проверить через <code>curl https://checkip.amazonaws.com</code> с устройства в политике XKeen — должен показать VPN-IP.</li>
             <li><strong>Полная переустановка</strong> — <code>xkeen -remove</code> снесёт всё подчистую (xray + конфиги + cron). Можно начать заново с Шага 5.</li>
           </ul>
           <p class="muted">💡 Актуальная официальная документация и обсуждение проблем — в Telegram-канале XKeen
@@ -15816,7 +15816,7 @@ xkeen -restart</pre>
       <ul>
         <li><strong>🔽 Скачать бэкап</strong> — собирает все XKeen-конфиги с роутера (<code>/opt/etc/xray/configs/*</code> + <code>outbound_meta.json</code> + <code>subscription_meta.json</code> + <code>watchdog.config</code>) в один JSON-файл. Можно сохранять локально, в облако, передавать.</li>
         <li><strong>💾 Сохранить на диск</strong> — пишет тот же snapshot в <code>C:\xray-dashboard\backups\xkeen-snapshot-manual-&lt;timestamp&gt;.json</code> (рядом с автоматическими если настроены).</li>
-        <li><strong>🔄 Восстановить из файла</strong> — обратная операция: выбираешь JSON-файл → панель заливает все конфиги обратно на роутер и перезапускает xray. Используется при миграции на новый роутер, откате после сломанной правки, передаче друзьям.</li>
+        <li><strong>🔄 Восстановить из файла</strong> — обратная операция: выбрать JSON-файл → панель заливает все конфиги обратно на роутер и перезапускает xray. Используется при миграции на новый роутер, откате после сломанной правки, передаче друзьям.</li>
       </ul>
 
       <h4>Автоматизировать ежедневный snapshot (опционально)</h4>
@@ -15830,9 +15830,9 @@ xkeen -restart</pre>
       <h4>Если всё совсем плохо — восстановление с нуля</h4>
       <p>Если потерял и панель и snapshot — но роутер живой:</p>
       <ol>
-        <li>На любом PC поставь панель из архива (см. «📦 Передать панель другу»).</li>
-        <li>В «🔧 Подключение к роутеру» введи IP/SSH-ключ → «🔌 Проверить связь».</li>
-        <li>В «📋 Все outbounds» увидишь все конфиги с роутера — никуда не делись.</li>
+        <li>На любом PC поставить панель из архива (см. «📦 Передать панель другу»).</li>
+        <li>В «🔧 Подключение к роутеру» ввести IP/SSH-ключ → «🔌 Проверить связь».</li>
+        <li>В «📋 Все outbounds» видны все конфиги с роутера — ничего не потерялось.</li>
       </ol>
       <p>Если потерял и роутер — нужен последний snapshot + новый роутер с XKeen (см. «🛠️ Установка XKeen с нуля» → «🚀 Развернуть на чистом XKeen» → «🔄 Восстановить из файла»).</p>
     </div>
@@ -15858,7 +15858,7 @@ xkeen -restart</pre>
       <h4>Как включить и проверить</h4>
       <ol>
         <li>Раздел «🛡 Kill-switch политики XKeen» → <strong>«👁 Только наблюдение»</strong>. Панель покажет метку политики, порты и WAN, а счётчик «прямых соединений» — сколько соединений клиентов политики идут мимо xray прямо сейчас.</li>
-        <li>При живом XKeen счётчик должен быть нулём (или показывать только старые соединения, оставшиеся с прошлых перезапусков). Если он растёт — исключения XKeen и панели разошлись: посмотрите, что за адреса, и сообщите в Issues.</li>
+        <li>При живом XKeen счётчик должен быть нулём (или показывать только старые соединения, оставшиеся с прошлых перезапусков). Если он растёт — исключения XKeen и панели разошлись: посмотреть, что за адреса, и сообщить в Issues.</li>
         <li><strong>«🛡 Включить защиту»</strong>. Дальше хук поддерживает себя сам: cron раз в минуту возвращает правила после пересборки firewall Keenetic, панель при открытии страницы сверяет параметры и чинит расхождения.</li>
         <li>«🚑 Восстановление и диагностика» → «🔬 Диагностика XKeen» — отдельная проверка kill-switch с auto-fix. «🚀 Развернуть на чистом XKeen» ставит kill-switch вместе с остальным.</li>
       </ol>
@@ -15891,24 +15891,24 @@ xkeen -restart</pre>
       <h4>Шаг 1. Установить WireGuard и создать туннель</h4>
       <p>На удалённом ПК (PowerShell от администратора):</p>
       <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">winget install --id WireGuard.WireGuard -e</pre>
-      <p>В приложении WireGuard → <strong>Add Tunnel → Add empty tunnel…</strong> — приватный ключ создастся сам, публичный показан сверху (его добавляют пиром на роутере). Заполни конфиг по шаблону шага 2 (или возьми готовый из генератора и вставь свой приватный ключ).</p>
+      <p>В приложении WireGuard → <strong>Add Tunnel → Add empty tunnel…</strong> — приватный ключ создастся сам, публичный показан сверху (его добавляют пиром на роутере). Заполнить конфиг по шаблону шага 2 (или взять готовый из генератора и вставить свой приватный ключ).</p>
 
       <h4>Шаг 2. AllowedIPs — что заворачиваем в туннель</h4>
-      <p><strong>Вариант A — выборочно:</strong> только нужные сервисы (если у сервиса стабильный собственный IP-блок, а не «прыгающий» CDN). Перечисли CIDR назначения + домашнюю LAN и подсеть туннеля:</p>
+      <p><strong>Вариант A — выборочно:</strong> только нужные сервисы (если у сервиса стабильный собственный IP-блок, а не «прыгающий» CDN). Перечислить CIDR назначения + домашнюю LAN и подсеть туннеля:</p>
       <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">AllowedIPs = &lt;CIDR-сервиса&gt;, 192.168.X.0/24, &lt;tunnel-subnet&gt;</pre>
       <p><strong>Вариант B — весь трафик (full-tunnel)</strong> в SPLIT-форме:</p>
       <div style="background:#fbe5e5; border-left:3px solid #c33; padding:8px 11px; margin:8px 0; font-size:0.92em; color:#7a1f1f;">
-        🔴 <strong>НИКОГДА не пиши литеральный <code>0.0.0.0/0</code></strong> в AllowedIPs на Windows. WireGuard-for-Windows включает на него встроенный kill-switch (WFP-блокировку): при падении/затухании туннеля машина теряет даже свою LAN и становится <strong>недоступной ниоткуда</strong> — лечится <strong>только с физической консоли</strong>. Вместо этого — split-форма ниже («все адреса» минус приватные диапазоны).
+        🔴 <strong>НИКОГДА не писать литеральный <code>0.0.0.0/0</code></strong> в AllowedIPs на Windows. WireGuard-for-Windows включает на него встроенный kill-switch (WFP-блокировку): при падении/затухании туннеля машина теряет даже свою LAN и становится <strong>недоступной ниоткуда</strong> — лечится <strong>только с физической консоли</strong>. Вместо этого — split-форма ниже («все адреса» минус приватные диапазоны).
       </div>
-      <p>Готовая безопасная строка (<code>0.0.0.0/0</code> минус RFC1918) — вставь целиком в одну строку, добавив в конец свою LAN и подсеть туннеля:</p>
+      <p>Готовая безопасная строка (<code>0.0.0.0/0</code> минус RFC1918) — вставить целиком в одну строку, добавив в конец свою LAN и подсеть туннеля:</p>
       <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">AllowedIPs = 0.0.0.0/5, 8.0.0.0/7, 11.0.0.0/8, 12.0.0.0/6, 16.0.0.0/4, 32.0.0.0/3, 64.0.0.0/2, 128.0.0.0/3, 160.0.0.0/5, 168.0.0.0/6, 172.0.0.0/12, 172.32.0.0/11, 172.64.0.0/10, 172.128.0.0/9, 173.0.0.0/8, 174.0.0.0/7, 176.0.0.0/4, 192.0.0.0/9, 192.128.0.0/11, 192.160.0.0/13, 192.169.0.0/16, 192.170.0.0/15, 192.172.0.0/14, 192.176.0.0/12, 192.192.0.0/10, 193.0.0.0/8, 194.0.0.0/7, 196.0.0.0/6, 200.0.0.0/5, 208.0.0.0/4, 192.168.X.0/24, &lt;tunnel-subnet&gt;</pre>
       <p class="muted">Эта запись покрывает весь публичный IPv4, но исключает <code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>, <code>192.168.0.0/16</code> — поэтому своя сеть и доступ к самой машине не блокируются. Хвост (LAN + подсеть туннеля) добавляет обратный маршрут к дому.</p>
-      <p class="muted">💾 Правки AllowedIPs сохраняй кнопкой <strong>Save</strong> в приложении WireGuard (Edit → Save) — <code>wg set</code> меняет только runtime, после ребута маршрут слетит.</p>
+      <p class="muted">💾 Правки AllowedIPs сохранять кнопкой <strong>Save</strong> в приложении WireGuard (Edit → Save) — <code>wg set</code> меняет только runtime, после ребута маршрут слетит.</p>
 
       <h4>Шаг 3. DNS</h4>
-      <p>В секции <code>[Interface]</code> укажи DNS = LAN-IP роутера, чтобы резолв шёл через дом:</p>
+      <p>В секции <code>[Interface]</code> указать DNS = LAN-IP роутера, чтобы резолв шёл через дом:</p>
       <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">DNS = &lt;router-lan-ip&gt;</pre>
-      <p class="muted">⚠️ Если в Windows включён Secure DNS / DoH (Параметры → Сеть → свойства адаптера) — система перехватит резолв мимо этой строки. Для предсказуемого DNS через дом выключи Secure DNS.</p>
+      <p class="muted">⚠️ Если в Windows включён Secure DNS / DoH (Параметры → Сеть → свойства адаптера) — система перехватит резолв мимо этой строки. Для предсказуемого DNS через дом выключить Secure DNS.</p>
 
       <h4>Шаг 4. IPv6 — закрывается автоматически</h4>
       <p><strong>Отдельных действий не нужно.</strong> Генератор по умолчанию (галка «🛡 Закрыть IPv6-утечку») добавляет в конфиг заворот IPv6 в туннель: весь глобальный v6 (<code>2000::/3</code>, БЕЗ литерального <code>::/0</code> → kill-switch не взводится) уходит в туннель и, если у дома нет v6-выхода, тихо отбрасывается на сервере (<strong>fail-closed</strong>) — реальный v6 не светится. Работает на всех ОС (Windows / Android / iOS / Mac) без настройки на клиенте.</p>
@@ -15921,13 +15921,13 @@ xkeen -restart</pre>
       <h4>Шаг 5. Пин endpoint к шлюзу (нужен НЕ всегда)</h4>
       <p>Нужен <strong>только</strong> если на машине есть локальный VPN-клиент, способный перехватить маршрут по умолчанию (тогда хендшейк к <code>&lt;endpoint-host&gt;</code> пойдёт через него, и его сбой обрушит туннель). Постоянный маршрут к endpoint через физический шлюз. PowerShell от администратора:</p>
       <pre style="background:#1e1e1e; color:#ddd; padding:10px 12px; border-radius:4px; font-size:0.85em; overflow-x:auto;">route -p add &lt;endpoint-ip&gt; mask 255.255.255.255 &lt;physical-gateway&gt;</pre>
-      <p class="muted">Нет локального VPN-клиента — шаг пропусти.</p>
+      <p class="muted">Нет локального VPN-клиента — шаг пропустить.</p>
 
       <h4>Шаг 6. (Опционально) Watchdog туннеля</h4>
-      <p>WireGuard-for-Windows со временем может «затухать» (служба жива, handshake устарел, трафика нет; keepalive не лечит — помогает только рестарт службы). Если машина работает без присмотра — поставь задачу планировщика <strong>от SYSTEM, «выполнять вне зависимости от входа», триггеры «при запуске» + каждые 2 мин</strong>, которая рестартует службу туннеля при устаревшем handshake (>240 c). Тогда после ребута/затухания машина оживает сама, без логина.</p>
+      <p>WireGuard-for-Windows со временем может «затухать» (служба жива, handshake устарел, трафика нет; keepalive не лечит — помогает только рестарт службы). Если машина работает без присмотра — поставить задачу планировщика <strong>от SYSTEM, «выполнять вне зависимости от входа», триггеры «при запуске» + каждые 2 мин</strong>, которая рестартует службу туннеля при устаревшем handshake (>240 c). Тогда после ребута/затухания машина оживает сама, без логина.</p>
 
       <h4>Шаг 7. Не «Deactivate» service-туннель в GUI</h4>
-      <p>Если туннель установлен службой автозапуска (режим без логина), кнопка <strong>Deactivate</strong> в приложении вызывает <code>/uninstalltunnelservice</code> и <strong>удаляет службу</strong> — после ребута туннель сам не поднимется. Таким туннелем управляй командами (<code>Restart-Service</code>), а не кнопками GUI. Обычным GUI-туннелем — кнопками можно.</p>
+      <p>Если туннель установлен службой автозапуска (режим без логина), кнопка <strong>Deactivate</strong> в приложении вызывает <code>/uninstalltunnelservice</code> и <strong>удаляет службу</strong> — после ребута туннель сам не поднимется. Таким туннелем управлять командами (<code>Restart-Service</code>), а не кнопками GUI. Обычным GUI-туннелем — кнопками можно.</p>
 
       <h4>Чек-лист готовности</h4>
       <ul>
@@ -16150,7 +16150,7 @@ function addPresetGeneric(sectionKey, presetName, presetDomains) {
     }
   });
   writeSection(sectionKey, sec.items);
-  flash(true, `Добавлено ${added} новых доменов (пресет "${presetName}"). Не забудь нажать «Сохранить».`, null, {noScroll: true});
+  flash(true, `Добавлено ${added} новых доменов (пресет "${presetName}"). Не забыть нажать «Сохранить».`, null, {noScroll: true});
   return added;
 }
 
@@ -16168,7 +16168,7 @@ function removePresetGeneric(sectionKey, presetName) {
   }
   if (!confirm(`Удалить ${removed} доменов из пресета "${presetName}"?\n\nРучные домены (с пометкой ✏️) останутся.`)) return 0;
   writeSection(sectionKey, filtered);
-  flash(true, `Удалено ${removed} доменов пресета "${presetName}". Нажми «Сохранить».`, null, {noScroll: true});
+  flash(true, `Удалено ${removed} доменов пресета "${presetName}". Нажать «Сохранить».`, null, {noScroll: true});
   return removed;
 }
 
@@ -16590,7 +16590,7 @@ function refreshFailoverInfo() {
     } else if (WATCHDOG_LAST_BAD_MD5) {
       note = '<span style="background:#fbd7d7; color:#c33; padding:1px 6px; border-radius:3px;">🛡 авто-откат: PRIMARY не прошёл проверку связи — держим рабочий канал</span>';
     } else {
-      note = '<span style="background:#dfe8ff; color:#1a55cc; padding:1px 6px; border-radius:3px;">🔄 PRIMARY только что изменён — ещё применяется (обнови страницу через ~30 c)</span>';
+      note = '<span style="background:#dfe8ff; color:#1a55cc; padding:1px 6px; border-radius:3px;">🔄 PRIMARY только что изменён — ещё применяется (обновить страницу через ~30 c)</span>';
     }
   }
   const labelEl = document.getElementById('failover-active-label');
@@ -16767,7 +16767,7 @@ function getChannelStatusNote(tag, effective, failBlock, roleLabel) {
   if (effective === tag) {
     const title = m.status_ms != null
       ? 'Watchdog пингует канал каждую минуту — последний probe успешный. ms-значение — от ручного probe (кнопка 🔄).'
-      : 'Watchdog пингует канал каждую минуту — последний probe успешный. Нажми 🔄 чтобы измерить ms.';
+      : 'Watchdog пингует канал каждую минуту — последний probe успешный. Нажать 🔄 чтобы измерить ms.';
     return '<span style="background:#d8eecc; color:#2a7; padding:1px 6px; border-radius:3px;" title="' + title + '">🟢 жив' + msPart + '</span>';
   }
   // Сюда попадаем если effective пустой — watchdog ещё не успел отработать (свежий
@@ -16781,7 +16781,7 @@ function getChannelStatusNote(tag, effective, failBlock, roleLabel) {
   if (m.status_ok === false) {
     return '<span style="background:#c33; color:#fff; padding:1px 6px; border-radius:3px;" title="Канал не отвечает (ручной probe).">⛔ не отвечает</span>';
   }
-  return '<span style="background:#eee; color:#777; padding:1px 6px; border-radius:3px;" title="Watchdog ещё не отработал тик после рестарта (≤1 мин) либо канал/домены не сконфигурированы. Нажми 🔄 для probe.">⚪ статус ждём</span>';
+  return '<span style="background:#eee; color:#777; padding:1px 6px; border-radius:3px;" title="Watchdog ещё не отработал тик после рестарта (≤1 мин) либо канал/домены не сконфигурированы. Нажать 🔄 для probe.">⚪ статус ждём</span>';
 }
 // Сквозная проверка AI-туннеля (данные watchdog.aiprobe). Ловит «залипший xray»:
 // сервер отвечает (handshake зелёный), а СКВОЗЬ туннель запросы не ходят — так было
@@ -16792,7 +16792,7 @@ function aiThroughProbeNote() {
   const age = p.age_min < 60 ? p.age_min + ' мин назад' : Math.floor(p.age_min / 60) + ' ч назад';
   if (p.empty > 0 || p.stage > 0) {
     const fix = p.stage >= 1
-      ? 'Авто-рестарт уже был и не помог — канал не пропускает, смени AI-узел.'
+      ? 'Авто-рестарт уже был и не помог — канал не пропускает, сменить AI-узел.'
       : 'После 3 пустых проб watchdog сам перезапустит xray (~полчаса). Быстрее: xkeen -restart на роутере.';
     return ' <span style="background:#fdd; color:#b00; padding:1px 6px; border-radius:3px;"' +
            ' title="Запрос СКВОЗЬ туннель не прошёл (пустых проб подряд: ' + p.empty + ', замер ' + age + '). ' +
@@ -16938,7 +16938,7 @@ function chainRenderCommonView(allowRu) {
   if (!useCommon) { view.style.display = 'none'; view.innerHTML = ''; return; }
   view.style.display = '';
   if (!WATCHDOG_FAILOVER_TAGS.length) {
-    view.innerHTML = '⚠️ Общая цепочка резерва (FAILOVER) пуста — заполните её в разделе «⛓️ Цепочка резерва (FAILOVER)», иначе при падении канала сразу сработает настройка блокировки выше.';
+    view.innerHTML = '⚠️ Общая цепочка резерва (FAILOVER) пуста — заполнить её в разделе «⛓️ Цепочка резерва (FAILOVER)», иначе при падении канала сразу сработает настройка блокировки выше.';
     return;
   }
   const parts = WATCHDOG_FAILOVER_TAGS.map(function (tag) {
@@ -17047,7 +17047,7 @@ function chainAdd(kind) {
   const sel = document.getElementById(kind + '-chain-add');
   if (!st || !sel) return;
   const tag = sel.value;
-  if (!tag) { flash(false, 'Сначала выберите канал в списке', null, { noScroll: true }); return; }
+  if (!tag) { flash(false, 'Сначала выбрать канал в списке', null, { noScroll: true }); return; }
   if (st.tags.indexOf(tag) >= 0) { flash(false, 'Канал ' + tag + ' уже в цепочке', null, { noScroll: true }); return; }
   const mainSel = document.getElementById(st.mainSel);
   if (mainSel && mainSel.value === tag) {
@@ -17410,9 +17410,9 @@ function _xkShowReminderOnLoad() {
   const who = (rem && rem !== '1') ? ('«' + rem.replace(/</g, '&lt;') + '»') : 'Новое подключение';
   flash(true,
     who + ' добавлено, но пока <b>НЕ задействовано</b> — трафик через него НЕ идёт.<br>' +
-    'Чтобы включить: в разделе <b>«📋 Все outbounds»</b> найди его и нажми роль ' +
+    'Чтобы включить: в разделе <b>«📋 Все outbounds»</b> найти его и нажать роль ' +
     '(🟢 PRIMARY · 🟡 FAILOVER · 🤖 AI · 📺 YouTube · 📱 Зарубежные сервисы), ' +
-    'либо добавь в <b>«🎯 Цепочка резерва (FAILOVER)»</b>.');
+    'либо добавить в <b>«🎯 Цепочка резерва (FAILOVER)»</b>.');
 }
 try { setTimeout(_xkShowReminderOnLoad, 500); } catch (e) {}
 
@@ -17450,7 +17450,7 @@ function fillSubUrl(url) {
 async function previewSubscription() {
   const url = document.getElementById('sub-url').value.trim();
   const preview = document.getElementById('sub-preview');
-  if (!url) { flash(false, 'Введи URL подписки'); return; }
+  if (!url) { flash(false, 'Ввести URL подписки'); return; }
   preview.innerHTML = '<p style="color:#888;">⏳ Скачиваю подписку...</p>';
   const fd = new FormData();
   fd.append('url', url);
@@ -17467,7 +17467,7 @@ async function previewSubscription() {
     if (!res.existing_name) {
       html += `<br><span style="color:#2a7;">🏷 Имя из Profile-Title: <strong>${res.profile_title}</strong> <span style="color:#888; font-size:0.85em;">— подтянется автоматически при sync</span></span>`;
     } else if (res.existing_name !== res.profile_title) {
-      html += `<br><span style="color:#a55a18;">🏷 В подписке: <strong>${res.profile_title}</strong> · у тебя задано: <strong>${res.existing_name}</strong> <span style="color:#888; font-size:0.85em;">— твоё имя не будет затронуто (очисти поле в ✏️ Подписка чтобы взять имя из подписки)</span></span>`;
+      html += `<br><span style="color:#a55a18;">🏷 В подписке: <strong>${res.profile_title}</strong> · задано в панели: <strong>${res.existing_name}</strong> <span style="color:#888; font-size:0.85em;">— это имя не будет затронуто (очистить поле в ✏️ Подписка чтобы взять имя из подписки)</span></span>`;
     } else {
       html += `<br><span style="color:#888; font-size:0.9em;">🏷 Имя совпадает с подпиской: <strong>${res.profile_title}</strong></span>`;
     }
@@ -17496,12 +17496,12 @@ async function previewSubscription() {
     html += `<div style="background:#fff4d6; border:2px solid #996600; border-radius:6px; padding:10px; margin-bottom:12px;">
       <strong style="color:#996600;">⚠️ У ${res.expire_conflicts.length} ${res.expire_conflicts.length === 1 ? 'группы' : 'групп'} уже задана дата истечения, и она ОТЛИЧАЕТСЯ от той что в подписке</strong>
       <table style="margin-top:6px; font-size:0.85em;">
-        <tr><th>pbk</th><th>твоя дата</th><th>в подписке</th></tr>`;
+        <tr><th>pbk</th><th>текущая дата</th><th>в подписке</th></tr>`;
     res.expire_conflicts.forEach(c => {
       html += `<tr><td class="mono">${c.pbk_short}</td><td>${c.old_expire}</td><td>${c.new_expire}</td></tr>`;
     });
     html += `</table>
-      <p style="color:#996600; font-size:0.85em; margin:6px 0 0;">Если включишь «Автоматически обновлять дату истечения» и подтвердишь — твоя дата будет перетёрта новой. Без подтверждения — твоя сохранится.</p>
+      <p style="color:#996600; font-size:0.85em; margin:6px 0 0;">С галкой «Автоматически обновлять дату истечения» и подтверждением текущая дата будет перетёрта новой. Без подтверждения — текущая сохранится.</p>
     </div>`;
   }
 
@@ -17510,12 +17510,12 @@ async function previewSubscription() {
   if (collisions.length > 0) {
     html += `<div style="background:#fff0f0; border:2px solid #c33; border-radius:6px; padding:10px; margin-bottom:12px;">
       <strong style="color:#c33; font-size:1.05em;">🚨 ВНИМАНИЕ: ${collisions.length} ${collisions.length === 1 ? 'tag принадлежит' : 'tags принадлежат'} ДРУГОМУ провайдеру!</strong>
-      <p style="color:#a33; font-size:0.9em; margin:6px 0;">У них меняется <strong>publicKey</strong> Reality — это значит подписка от другого провайдера, а не апдейт твоего текущего. Если применишь sync — твои текущие серверы будут заменены на чужие, и старые перестанут работать.</p>
+      <p style="color:#a33; font-size:0.9em; margin:6px 0;">У них меняется <strong>publicKey</strong> Reality — это значит подписка от другого провайдера, а не апдейт текущего. После sync текущие серверы будут заменены на чужие, и старые перестанут работать.</p>
       <p style="color:#a33; font-size:0.9em; margin:6px 0;">Что делать:</p>
       <ul style="color:#a33; font-size:0.9em; margin:4px 0 0 18px;">
-        <li>Если это вправду новый провайдер — переименуй tags при импорте через «➕ Добавить outbound» с явным Tag override</li>
-        <li>Если ты случайно вставил не тот URL — отмени, проверь URL</li>
-        <li>Если хочешь действительно заменить (старая подписка кончилась) — продолжай sync, но осознанно</li>
+        <li>Если это вправду новый провайдер — переименовать tags при импорте через «➕ Добавить outbound» с явным Tag override</li>
+        <li>Если по ошибке вставлен не тот URL — отменить, проверить URL</li>
+        <li>Если замена действительно нужна (старая подписка кончилась) — продолжать sync, но осознанно</li>
       </ul>
     </div>`;
   }
@@ -17526,7 +17526,7 @@ async function previewSubscription() {
   // в отличие от ⛔ в секции orphans_local, который сигнализирует «sync отменит удаление».
   if (res.matches && res.matches.length > 0) {
     html += `<strong style="color:#2a7;">✅ Будут обновлены (${res.matches.length}):</strong><table style="margin-top:6px; font-size:0.85em;">`;
-    html += `<tr><th>tag</th><th>host:port в подписке</th><th>host:port у тебя</th><th>изменится?</th><th>pbk / SNI</th></tr>`;
+    html += `<tr><th>tag</th><th>host:port в подписке</th><th>host:port на роутере</th><th>изменится?</th><th>pbk / SNI</th></tr>`;
     res.matches.forEach(m => {
       const chg = m.changed ? '<span style="color:#e80;">⚠️ да</span>' : '<span style="color:#888;">нет</span>';
       let identity = '';
@@ -17551,13 +17551,13 @@ async function previewSubscription() {
     });
     html += `</table>`;
   } else {
-    html += `<p style="color:#e80;">⚠️ <strong>НЕ найдено совпадений по tag</strong> — обновлять нечего. Имена tag в подписке не совпадают с твоими.</p>`;
+    html += `<p style="color:#e80;">⚠️ <strong>НЕ найдено совпадений по tag</strong> — обновлять нечего. Имена tag в подписке не совпадают с текущими.</p>`;
   }
 
   // Новые в подписке — с чекбоксами для выборочного импорта
   if (res.orphans_in_sub && res.orphans_in_sub.length > 0) {
     const antiDpiCount = res.orphans_in_sub.filter(o => o.is_anti_dpi).length;
-    html += `<br><strong style="color:#888;">📥 В подписке, но НЕ у тебя</strong>`;
+    html += `<br><strong style="color:#888;">📥 В подписке, но НЕ на роутере</strong>`;
     html += ` <span style="font-size:0.85em;color:#666;">(${res.orphans_in_sub.length} серверов`;
     if (antiDpiCount > 0) html += `, ${antiDpiCount} помечены 🛡️ anti-DPI / RU-exit`;
     html += `)</span>`;
@@ -17613,7 +17613,7 @@ async function previewSubscription() {
     res.orphans_local.forEach(o => {
       let badge = '';
       if (o.critical_role) {
-        badge = ` <span title="Выбран в уникальном dropdown'е «${o.critical_role}» секции «🎯 Основное и резервное подключение». Sync с галкой «Удалить отсутствующие» будет отменён — сначала смени роль в dropdown'е." style="background:#fde0e0;color:#c44;border:1px solid #f4b0b0;border-radius:3px;padding:1px 6px;font-size:0.82em;font-weight:600;margin-left:6px;">⛔ ${o.critical_role}</span>`;
+        badge = ` <span title="Выбран в уникальном dropdown'е «${o.critical_role}» секции «🎯 Основное и резервное подключение». Sync с галкой «Удалить отсутствующие» будет отменён — сначала сменить роль в dropdown'е." style="background:#fde0e0;color:#c44;border:1px solid #f4b0b0;border-radius:3px;padding:1px 6px;font-size:0.82em;font-weight:600;margin-left:6px;">⛔ ${o.critical_role}</span>`;
       } else if (o.in_failover_only) {
         badge = ` <span title="Только в хвосте FAILOVER-цепочки (позиция #${o.failover_position}). При удалении панель автоматически уберёт tag из FAILOVER_TAGS в watchdog.config — цепочка просто сократится на 1." style="background:#fff4d4;color:#a8801c;border:1px solid #e8c878;border-radius:3px;padding:1px 6px;font-size:0.82em;font-weight:600;margin-left:6px;">🔗 FAILOVER #${o.failover_position}</span>`;
       }
@@ -17647,9 +17647,9 @@ async function previewSubscription() {
         } else {
           hint = ':';
         }
-        lbl.innerHTML = '🗑 <span style="color:#c44">У тебя, но НЕ в подписке — БУДУТ УДАЛЕНЫ</span> при «Скачать и обновить»' + hint;
+        lbl.innerHTML = '🗑 <span style="color:#c44">На роутере, но НЕ в подписке — БУДУТ УДАЛЕНЫ</span> при «Скачать и обновить»' + hint;
       } else {
-        lbl.innerHTML = '📋 <span style="color:#888">У тебя, но НЕ в подписке (останутся как есть — галка «🗑 Удалить отсутствующие» снята):</span>';
+        lbl.innerHTML = '📋 <span style="color:#888">На роутере, но НЕ в подписке (останутся как есть — галка «🗑 Удалить отсутствующие» снята):</span>';
       }
     };
     updateLbl();
@@ -17689,7 +17689,7 @@ async function importSelectedOrphans() {
     .filter(cb => cb.checked)
     .map(cb => cb.getAttribute('data-tag'));
   if (selected.length === 0) {
-    flash(false, 'Не выбрано ни одного outbound. Поставь галочки или нажми «☑️ Все» / «🛡️ Только anti-DPI».');
+    flash(false, 'Не выбрано ни одного outbound. Поставить галочки или нажать «☑️ Все» / «🛡️ Только anti-DPI».');
     return;
   }
   const url = document.getElementById('sub-url').value.trim();
@@ -17713,7 +17713,7 @@ async function importSelectedOrphans() {
 
 async function syncSubscription() {
   const url = document.getElementById('sub-url').value.trim();
-  if (!url) { flash(false, 'Введи URL подписки'); return; }
+  if (!url) { flash(false, 'Ввести URL подписки'); return; }
   if (!url.startsWith('http://') && !url.startsWith('https://')) {
     flash(false, 'URL должен начинаться с http(s)://'); return;
   }
@@ -17735,10 +17735,10 @@ async function syncSubscription() {
     const tagsList = collisions.map(c => `${c.tag} (pbk: ${c.old_pbk_short} → ${c.new_pbk_short})`).join('\n  • ');
     if (!confirm(
       `🚨 ВНИМАНИЕ! Sync собирается ПЕРЕЗАПИСАТЬ ${collisions.length} outbound'а(-ов) ДРУГИМ провайдером (Reality pbk меняется):\n\n  • ${tagsList}\n\n` +
-      `Если применишь — твои текущие серверы пропадут, на их месте окажутся новые.\n\n` +
+      `При применении текущие серверы пропадут, на их месте окажутся новые.\n\n` +
       `Точно продолжить?`
     )) {
-      flash(false, '✋ Отменено. Сначала проверь URL или используй «➕ Добавить outbound» с переопределением tag.');
+      flash(false, '✋ Отменено. Сначала проверить URL или использовать «➕ Добавить outbound» с переопределением tag.');
       return;
     }
   }
@@ -17747,11 +17747,11 @@ async function syncSubscription() {
   let overwriteExpires = false;
   const expireConflicts = preview.expire_conflicts || [];
   if (updateExpires && expireConflicts.length > 0) {
-    const list = expireConflicts.map(c => `${c.pbk_short}: твоя ${c.old_expire} → в подписке ${c.new_expire}`).join('\n  • ');
+    const list = expireConflicts.map(c => `${c.pbk_short}: текущая ${c.old_expire} → в подписке ${c.new_expire}`).join('\n  • ');
     overwriteExpires = confirm(
       `⚠️ У ${expireConflicts.length} ${expireConflicts.length === 1 ? 'подписки' : 'подписок'} уже задана своя дата истечения, и она ОТЛИЧАЕТСЯ:\n\n  • ${list}\n\n` +
       `OK — перетереть на новую дату из подписки (${preview.sub_expire_at}).\n` +
-      `Отмена — оставить твою дату как есть.`
+      `Отмена — оставить текущую дату как есть.`
     );
   }
 
@@ -17798,7 +17798,7 @@ function prepareUpdateOutbound(tag) {
   box.innerHTML = `
     <h3 style="margin:0 0 12px; color:#2a7;">🔄 Обновить outbound <code>${tag}</code></h3>
     <p style="color:#555; margin:0 0 12px; line-height:1.5;">
-      Вставь <strong>новый</strong> vless:// URL или JSON-конфиг для этого outbound.
+      Вставить <strong>новый</strong> vless:// URL или JSON-конфиг для этого outbound.
       Будут обновлены: <code>uuid</code>, <code>host</code>, <code>port</code>,
       <code>network</code>, <code>security</code>, <code>sni</code>, <code>publicKey</code>,
       <code>shortId</code>, <code>fingerprint</code>, <code>flow</code>, <code>path</code>, <code>mode</code>.
@@ -17825,7 +17825,7 @@ function prepareUpdateOutbound(tag) {
 
   applyBtn.addEventListener('click', async () => {
     const payload = ta.value.trim();
-    if (!payload) { alert('Пусто. Вставь vless URL или JSON-конфиг.'); return; }
+    if (!payload) { alert('Пусто. Вставить vless URL или JSON-конфиг.'); return; }
     applyBtn.disabled = true;
     applyBtn.textContent = '⏳ Применяю...';
     const fd = new FormData();
@@ -17969,7 +17969,7 @@ async function removeSubscription(key, name, count) {
   } else if (res.blocked) {
     const lst = Object.entries(res.protected || {}).map(([t, r]) => `  • ${t} — ${r}`).join('\n');
     flash(false, 'Подписка не удалена — есть активные узлы',
-      `Снимите роль / уберите из цепочки резерва, затем повторите:\n\n${lst}`);
+      `Снять роль / убрать из цепочки резерва, затем повторить:\n\n${lst}`);
   } else {
     flash(false, 'Ошибка удаления подписки', res.stderr || JSON.stringify(res));
   }
@@ -18068,8 +18068,8 @@ async function createMigrationBackup(btn) {
 
   btn.disabled = true;
   const origText = btn.textContent;
-  btn.textContent = '⏳ Создаю архив (~1-3 мин, не закрывай)...';
-  flash(true, '⏳ Создаю tar.gz на роутере + скачиваю на PC. Это займёт 1-3 минуты — не закрывай страницу.', null, { autoDismiss: false });
+  btn.textContent = '⏳ Создаю архив (~1-3 мин, не закрывать)...';
+  flash(true, '⏳ Создаю tar.gz на роутере + скачиваю на PC. Это займёт 1-3 минуты — не закрывать страницу.', null, { autoDismiss: false });
 
   try {
     const res = await fetch('/api/xkeen/migration-backup', { method: 'POST', credentials: 'same-origin' });
@@ -18083,7 +18083,7 @@ async function createMigrationBackup(btn) {
         '📦 Файл: <code>' + escapeHtml(j.filename) + '</code> (' + j.size_mb + ' МБ)<br>' +
         '📂 Путь: <code style="user-select:all; background:#f5f5f5; padding:2px 6px; border-radius:3px;">' + escapeHtml(j.path) + '</code><br><br>' +
         '<button type="button" class="btn btn-sm" style="background:#17a2b8; color:#fff;" onclick="navigator.clipboard.writeText(\'' + folderPath.replace(/\\/g, '\\\\').replace(/\'/g, "\\\'") + '\').then(()=>{this.textContent=\'✓ Путь к папке скопирован\'})">📋 Скопировать путь к папке</button><br><br>' +
-        '👉 <strong>Следующий шаг</strong>: переименуй в <code>entware_backup.tar.gz</code>, положи на USB в папку <code>install/</code> рядом с <code>mipsel-installer.tar.gz</code>. Детали в свёрнутом блоке ниже кнопки.',
+        '👉 <strong>Следующий шаг</strong>: переименовать в <code>entware_backup.tar.gz</code>, положить на USB в папку <code>install/</code> рядом с <code>mipsel-installer.tar.gz</code>. Детали в свёрнутом блоке ниже кнопки.',
         null, { autoDismiss: false }
       );
     } else {
@@ -18117,7 +18117,7 @@ async function createMigrationBackup(btn) {
               const r = await fetch('/api/xkeen/auto-fix', { method: 'POST', body: fd, credentials: 'same-origin' });
               const d = await r.json();
               if (d.ok) {
-                flash(true, '✅ ' + (d.label || 'Фикс применён') + '. Теперь жми «Создать архив миграции» снова.', d.log || '', { autoDismiss: 12000 });
+                flash(true, '✅ ' + (d.label || 'Фикс применён') + '. Теперь нажать «Создать архив миграции» снова.', d.log || '', { autoDismiss: 12000 });
               } else {
                 flash(false, '❌ Не получилось установить', d.log || JSON.stringify(d));
               }
@@ -18143,7 +18143,7 @@ async function createMigrationBackup(btn) {
 async function restoreSnapshot() {
   const fileInput = document.getElementById('restore-file');
   if (!fileInput.files || fileInput.files.length === 0) {
-    flash(false, 'Сначала выбери файл .json');
+    flash(false, 'Сначала выбрать файл .json');
     return;
   }
   const f = fileInput.files[0];
@@ -18267,7 +18267,7 @@ Get-NetTCPConnection -LocalPort 5000 -State Listen | Select OwningProcess`;
     </div>
 
     <h4 style="margin:18px 0 6px; color:#444;">Вариант 2: PowerShell от админа</h4>
-    <p style="color:#555; margin:0 0 6px;">Открой PowerShell <strong>от админа</strong> (Win+X → «Терминал (Администратор)») и вставь:</p>
+    <p style="color:#555; margin:0 0 6px;">Открыть PowerShell <strong>от админа</strong> (Win+X → «Терминал (Администратор)») и вставить:</p>
     <pre id="ps-cmd" style="background:#1e1e1e; color:#dcdcdc; padding:12px; border-radius:4px; font-size:12px; line-height:1.5; overflow-x:auto; margin:0;">${psCmd.replace(/</g,'&lt;')}</pre>
     <button class="btn btn-sm" style="margin-top:6px;" onclick="copyText(document.getElementById('ps-cmd').textContent, this)">📋 Копировать команды</button>
 
@@ -18452,7 +18452,7 @@ async function pingFailoverChain(btn) {
 }
 async function removeDeadFromChain() {
   if (!_fcDeadTags.length) {
-    flash(false, 'Сначала нажми «🏓 Пинг цепочки» — мёртвых пока не помечено');
+    flash(false, 'Сначала нажать «🏓 Пинг цепочки» — мёртвых пока не помечено');
     return;
   }
   // НЕ трогаем DOM до подтверждения и успешного сохранения (иначе при отмене / пустом
@@ -18469,7 +18469,7 @@ async function removeDeadFromChain() {
     }
   });
   if (items.length === 0) {
-    flash(false, 'В цепочке не останется ни одного живого сервера — убирать нельзя. Добавь рабочий резерв или проверь подписки.');
+    flash(false, 'В цепочке не останется ни одного живого сервера — убирать нельзя. Добавить рабочий резерв или проверить подписки.');
     return;
   }
   items.sort((a, b) => a.order - b.order);
@@ -18524,7 +18524,7 @@ async function removeFromFailoverChain(tag) {
     }
   });
   if (items.length === 0) {
-    flash(false, '«' + tag + '» — последний в цепочке резерва; убрать нельзя (цепочка не может быть пустой). Сначала добавь другой резерв или смени роль PRIMARY.');
+    flash(false, '«' + tag + '» — последний в цепочке резерва; убрать нельзя (цепочка не может быть пустой). Сначала добавить другой резерв или сменить роль PRIMARY.');
     return;
   }
   if (!confirm('Убрать «' + tag + '» из цепочки резерва (FAILOVER)?\n\nОстанется ' + items.length + ' канал(ов). Watchdog перестанет переключаться на него при падении PRIMARY.')) return;
@@ -18620,7 +18620,7 @@ function addAllPresets(sectionKey, presetDict, labelForFlash) {
     });
   });
   writeSection(sectionKey, sec.items);
-  flash(true, `Добавлено ${totalAdded} новых из ${totalInPresets} (${labelForFlash}). Не забудь нажать «Сохранить».`, null, {noScroll: true});
+  flash(true, `Добавлено ${totalAdded} новых из ${totalInPresets} (${labelForFlash}). Не забыть нажать «Сохранить».`, null, {noScroll: true});
 }
 function addAllAIPresets()     { addAllPresets('ai',     AI_PRESETS,     'все AI'); }
 function addAllYTPresets()     { addAllPresets('yt',     YT_PRESETS,     'все YT'); }
@@ -18630,17 +18630,17 @@ function addAllBlockPresets()  { addAllPresets('block',  BLOCK_PRESETS,  'все
 function clearAIDomains() {
   if (!confirm('Очистить весь список AI-доменов?\n\nПосле сохранения AI-sticky правило исчезнет, claude/openai пойдут через PRIMARY.')) return;
   setAIDomainsArray([]);
-  flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Список очищен. Нажать «Сохранить».', null, {noScroll: true});
 }
 function resetAIDefaults() {
   if (!confirm('Сбросить список к дефолтному (только Claude + ChatGPT)?')) return;
   setAIDomainsArray([...AI_PRESETS.claude, ...AI_PRESETS.openai].sort());
-  flash(true, 'Сброшено к дефолту. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Сброшено к дефолту. Нажать «Сохранить».', null, {noScroll: true});
 }
 // DIRECT domain presets — НАПРЯМУЮ без VPN.
 // Большинство .ru-доменов и так покрыто базовыми правилами в template (regex *.ru/*.su/*.рф
 // + geosite yandex/vk/category-gov-ru/steam). Пресеты добавляют их в текстовый список для
-// ПРОЗРАЧНОСТИ (видишь что точно идёт direct) + добавляют .com / .net / .tv / .cloud
+// ПРОЗРАЧНОСТИ (видно, что точно идёт direct) + добавляют .com / .net / .tv / .cloud
 // варианты которые regex не ловит.
 const DIRECT_PRESETS = {
   mailru:       ['mail.ru', 'mailru.ru', 'my.com', 'mycdn.me', 'cdn.mail.ru', 'disk-o.cloud'],
@@ -18705,12 +18705,12 @@ function removeDirectPreset(name) { removePresetGeneric('direct', name); }
 function clearDirectDomains() {
   if (!confirm('Очистить весь список DIRECT-доменов?\n\nБазовые правила *.ru/*.su/*.рф/geosite останутся.')) return;
   setDirectDomainsArray([]);
-  flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Список очищен. Нажать «Сохранить».', null, {noScroll: true});
 }
 function resetDirectDefaults() {
-  if (!confirm('Сбросить к дефолтному (VK + Mail.ru + Okko)?\n\nВсё что было в списке — заменится. Если хочешь свой VPN-домен — впиши его в textarea вручную после сброса.')) return;
+  if (!confirm('Сбросить к дефолтному (VK + Mail.ru + Okko)?\n\nВсё что было в списке — заменится. Свой VPN-домен — вписать в textarea вручную после сброса.')) return;
   setDirectDomainsArray([...DIRECT_PRESETS.vk, ...DIRECT_PRESETS.mailru, ...DIRECT_PRESETS.okko].sort());
-  flash(true, 'Сброшено к дефолту. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Сброшено к дефолту. Нажать «Сохранить».', null, {noScroll: true});
 }
 async function saveDirectDomains() {
   const domains = getDirectDomainsArray();
@@ -18837,7 +18837,7 @@ function removeBlockPreset(name) { removePresetGeneric('block', name); }
 function clearBlockDomains() {
   if (!confirm('Очистить весь список BLOCK-доменов?\n\nПосле сохранения ничего не будет блокироваться.')) return;
   setBlockDomainsArray([]);
-  flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Список очищен. Нажать «Сохранить».', null, {noScroll: true});
 }
 async function saveBlockDomains() {
   const domains = getBlockDomainsArray();
@@ -18964,7 +18964,7 @@ function renderRoutingTemplateRules(j) {
   }
 
   html += '<p class="subtitle" style="margin-top:10px; color:#888; font-size:0.85em;">';
-  html += '💡 Эти правила работают <strong>в дополнение</strong> к твоим DIRECT/BLOCK/AI/YT доменам (в textarea выше). Приоритет: <strong>BLOCK → DIRECT → AI → YT → catch-all</strong>. Чтобы изменить template — SSH на роутер, редактировать <code>' + escapeHtml(j.template_path) + '</code>, потом <code>xkeen -restart</code>. ⚠ Bootstrap-команда в дашборде ПЕРЕЗАПИСЫВАЕТ template (с галочкой «Перезаписать») — не делай этого если кастомизировал руками.';
+  html += '💡 Эти правила работают <strong>в дополнение</strong> к пользовательским DIRECT/BLOCK/AI/YT доменам (в textarea выше). Приоритет: <strong>BLOCK → DIRECT → AI → YT → catch-all</strong>. Чтобы изменить template — SSH на роутер, редактировать <code>' + escapeHtml(j.template_path) + '</code>, потом <code>xkeen -restart</code>. ⚠ Bootstrap-команда в дашборде ПЕРЕЗАПИСЫВАЕТ template (с галочкой «Перезаписать») — не делать этого если кастомизировал руками.';
   html += '</p>';
 
   out.innerHTML = html;
@@ -19074,7 +19074,7 @@ async function installConntrackTools(btn) {
   btn.disabled = true;
   const origText = btn.textContent;
   btn.textContent = '⏳ Устанавливаю (~60 сек)...';
-  flash(true, '⏳ Запускаю opkg update && opkg install conntrack на роутере (это займёт ~30-60 сек, не закрывай страницу)...');
+  flash(true, '⏳ Запускаю opkg update && opkg install conntrack на роутере (это займёт ~30-60 сек, не закрывать страницу)...');
 
   try {
     const r = await fetch('/api/xkeen/install-conntrack-tools', { method: 'POST', credentials: 'same-origin' });
@@ -19108,7 +19108,7 @@ async function flushConntrack(btn) {
   // (и потенциально redirect'ы юзера если он на том же PC).
   const isSelf = (ip === window.PC_LAN_HOST);
   const selfWarn = isSelf
-    ? '\n\n⚠ ЭТО ТЫ САМ (' + ip + ' = этот PC, dashboard). SSH-сессия dashboard→роутер прервётся, страница может зависнуть на 1-2 сек. Перезагрузи страницу после.'
+    ? '\n\n⚠ ЭТО САМ ПК ПАНЕЛИ (' + ip + ' = этот PC, dashboard). SSH-сессия dashboard→роутер прервётся, страница может зависнуть на 1-2 сек. Перезагрузить страницу после.'
     : '';
 
   if (!confirm('Сбросить conntrack для «' + name + '» (' + ip + ')?\n\nВсе существующие TCP/UDP-соединения этого клиента будут разорваны и пересозданы заново — новая политика применится сразу.' + selfWarn)) return;
@@ -19214,7 +19214,7 @@ function renderPolicyClients(j) {
 
   if (!j.policy_found) {
     html += '<div style="background:#fff3cd; border-left:3px solid #f0c200; padding:8px 12px; border-radius:3px; margin-bottom:10px;">';
-    html += '⚠️ <strong>Политика с description=«XKeen» не найдена на роутере!</strong> Создай её через Keenetic Web UI (см. Шаг 8 в Помощи). Без неё XKeen-iptables не сработает.';
+    html += '⚠️ <strong>Политика с description=«XKeen» не найдена на роутере!</strong> Создать её через Keenetic Web UI (см. Шаг 8 в Помощи). Без неё XKeen-iptables не сработает.';
     if (Object.keys(j.all_policies || {}).length > 0) {
       html += '<br><small>Существующие политики на роутере: ';
       html += Object.keys(j.all_policies).map(d => '<code>' + escapeHtml(d) + '</code>').join(', ');
@@ -19234,7 +19234,7 @@ function renderPolicyClients(j) {
     }
     html += '.';
     if (j.stats.in_xkeen >= 20) {
-      html += '<br>🚦 <span style="color:#c33;">У тебя <strong>' + j.stats.in_xkeen + ' клиентов</strong> в XKeen — это много для MT7621-класса роутера. Каждый клиент в политике даёт нагрузку на CPU (xray-TPROXY перехват). Если кому-то VPN не нужен — поменяй ему политику на «🌐 напрямую» через dropdown.</span>';
+      html += '<br>🚦 <span style="color:#c33;">В XKeen <strong>' + j.stats.in_xkeen + ' клиентов</strong> — это много для MT7621-класса роутера. Каждый клиент в политике даёт нагрузку на CPU (xray-TPROXY перехват). Если кому-то VPN не нужен — поменять ему политику на «🌐 напрямую» через dropdown.</span>';
     }
     html += '</div>';
   }
@@ -19325,7 +19325,7 @@ function renderPolicyClients(j) {
     html += '<div style="background:#fff3cd; border-left:3px solid #f0c200; padding:8px 12px; margin:0 0 10px; border-radius:3px;">';
     html += '⚠ <strong>Пакет conntrack не установлен</strong> на роутере. ';
     html += 'Кнопка <strong>🔄</strong> в таблице не сработает (KeeneticOS не имеет нативной команды для сброса conntrack по фильтру). ';
-    html += 'Установи одним кликом (~50KB + зависимости, ~30-60 сек):<br>';
+    html += 'Установить одним кликом (~50KB + зависимости, ~30-60 сек):<br>';
     html += '<button class="btn btn-sm" style="background:#3498db; color:#fff; margin-top:6px;" onclick="installConntrackTools(this)">📦 Установить пакет conntrack на роутер</button>';
     html += '</div>';
   } else if (j.conntrack_tools_installed === true) {
@@ -19401,7 +19401,7 @@ const YT_PRESETS = {
   // ВСЕ Google-сервисы (Gmail, Drive, Calendar, Photos, Search, Maps) пойдут через YT-канал.
   // Если YT-канал = RU-exit (например 🇷🇺_Санкт-Петербург_⚡️_YouTube_Instagram_Discord) —
   // Gmail/Drive/Search будут с RU-IP. Для большинства задач это OK, но если важно сохранить
-  // EU/US-выход для Google-сервисов — НЕ добавляй этот пресет, а вместо него используй
+  // EU/US-выход для Google-сервисов — НЕ добавлять этот пресет, а вместо него использовать
   // v2fly категорию `geosite:google` в AI-канале (раздел v2fly категории под AI-textarea).
   google_for_yt: [
     'gstatic.com',          // Google static (шрифты, CSS, JS) — YT player их загружает
@@ -19449,12 +19449,12 @@ function removeYTPreset(name) { removePresetGeneric('yt', name); }
 function clearYTDomains() {
   if (!confirm('Очистить весь список YouTube-доменов?\n\nПосле сохранения YT-sticky правило исчезнет, YouTube/IG/Discord пойдут через PRIMARY.')) return;
   setYTDomainsArray([]);
-  flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Список очищен. Нажать «Сохранить».', null, {noScroll: true});
 }
 function resetYTDefaults() {
   if (!confirm('Сбросить к дефолтному (только YouTube)?')) return;
   setYTDomainsArray([...YT_PRESETS.youtube].sort());
-  flash(true, 'Сброшено к дефолту (YouTube). Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Сброшено к дефолту (YouTube). Нажать «Сохранить».', null, {noScroll: true});
 }
 async function saveYTDomains() {
   const domains = getYTDomainsArray();
@@ -19536,19 +19536,19 @@ function _extCatAdd(inputId, name) {
   }
   arr.push(name);
   _extCatSetArray(inputId, arr);
-  flash(true, `Добавлена категория "${name}". Не забудь нажать «Сохранить».`, null, {noScroll: true});
+  flash(true, `Добавлена категория "${name}". Не забыть нажать «Сохранить».`, null, {noScroll: true});
 }
 function addAIExtCat(name) { _extCatAdd('ai-ext-categories', name); }
 function addYTExtCat(name) { _extCatAdd('yt-ext-categories', name); }
 function clearAIExtCats() {
   if (!confirm('Очистить все v2fly категории для AI? Останутся только ручные домены.')) return;
   document.getElementById('ai-ext-categories').value = '';
-  flash(true, 'Категории очищены. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Категории очищены. Нажать «Сохранить».', null, {noScroll: true});
 }
 function clearYTExtCats() {
   if (!confirm('Очистить все v2fly категории для YT? Останутся только ручные домены.')) return;
   document.getElementById('yt-ext-categories').value = '';
-  flash(true, 'Категории очищены. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Категории очищены. Нажать «Сохранить».', null, {noScroll: true});
 }
 async function _saveExtCategories(endpoint, inputId, label) {
   const cats = _extCatGetArray(inputId);
@@ -19582,7 +19582,7 @@ function addAIIpRange(cidr) { _extCatAdd('ai-ip-ranges', cidr); }
 function clearAIIpRanges() {
   if (!confirm(`Очистить IP-диапазоны AI-канала? Соединения по чистому IP снова пойдут через PRIMARY.`)) return;
   document.getElementById('ai-ip-ranges').value = '';
-  flash(true, `IP-диапазоны очищены. Нажми «Сохранить IP-диапазоны».`, null, {noScroll: true});
+  flash(true, `IP-диапазоны очищены. Нажать «Сохранить IP-диапазоны».`, null, {noScroll: true});
 }
 async function saveAIIpRanges() {
   const el = document.getElementById('ai-ip-ranges');
@@ -19617,7 +19617,7 @@ function addYTGeoipCat(name) { _extCatAdd('yt-geoip-categories', name); }
 function clearYTGeoipCats() {
   if (!confirm('Очистить все GeoIP-категории для YT? IP-only приложения снова пойдут через PRIMARY.')) return;
   document.getElementById('yt-geoip-categories').value = '';
-  flash(true, 'GeoIP-категории очищены. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'GeoIP-категории очищены. Нажать «Сохранить».', null, {noScroll: true});
 }
 async function saveYTGeoipCategories() { await _saveExtCategories('/api/xkeen/set-yt-geoip-categories', 'yt-geoip-categories', 'YT GeoIP'); }
 
@@ -19662,12 +19662,12 @@ function removeForeignPreset(name) { removePresetGeneric('foreign', name); }
 function clearForeignDomains() {
   if (!confirm('Очистить весь список «Зарубежные сервисы»?\n\nПосле сохранения правило исчезнет, эти домены пойдут через PRIMARY.')) return;
   setForeignDomainsArray([]);
-  flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Список очищен. Нажать «Сохранить».', null, {noScroll: true});
 }
 function resetForeignDefaults() {
   if (!confirm('Сбросить к дефолту (Instagram + Telegram)?')) return;
   setForeignDomainsArray([...FOREIGN_PRESETS.instagram, ...FOREIGN_PRESETS.telegram].sort());
-  flash(true, 'Сброшено (Instagram + Telegram). Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Сброшено (Instagram + Telegram). Нажать «Сохранить».', null, {noScroll: true});
 }
 async function saveForeignDomains() {
   const domains = getForeignDomainsArray();
@@ -19712,7 +19712,7 @@ function removeIpv6Preset(name) { removePresetGeneric('ipv6', name); }
 function clearIpv6Domains() {
   if (!confirm('Очистить список «Через IPv6»?\n\nПосле сохранения правило исчезнет, эти домены пойдут через PRIMARY.')) return;
   setIpv6DomainsArray([]);
-  flash(true, 'Список очищен. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Список очищен. Нажать «Сохранить».', null, {noScroll: true});
 }
 async function saveIpv6Domains() {
   const domains = getIpv6DomainsArray();
@@ -19754,10 +19754,10 @@ async function checkIpv6Node() {
       html += `<div style="margin-top:6px; padding:6px 10px; border-radius:4px; background:${opens ? '#e9f7ef' : '#fff4e0'}; color:${opens ? '#1a5a1a' : '#8a5a00'}; font-size:0.86em;">`
             + `<strong>${escapeHtml(r.name)}</strong> — `
             + (opens ? '✅ узел отдаёт IPv6 (TLS прошёл)'
-                     : '⚠ через текущий узел НЕ открывается (TLS не прошёл) — выбери узел с IPv6-выходом, надёжнее свой VPS')
+                     : '⚠ через текущий узел НЕ открывается (TLS не прошёл) — выбрать узел с IPv6-выходом, надёжнее свой VPS')
             + `</div>`;
     }
-    html += `<div style="font-size:0.78em; color:#999; margin-top:4px;">Проверка по реальному маршруту с этого ПК. Запускай ПОСЛЕ «Сохранить outbound» + «Сохранить домены» (watchdog применяет ≤1 мин).</div>`;
+    html += `<div style="font-size:0.78em; color:#999; margin-top:4px;">Проверка по реальному маршруту с этого ПК. Запускать ПОСЛЕ «Сохранить outbound» + «Сохранить домены» (watchdog применяет ≤1 мин).</div>`;
     out.innerHTML = html;
   } catch (e) {
     out.innerHTML = `<span style="color:#c33; font-size:0.85em;">Ошибка: ${escapeHtml(e.message)}</span>`;
@@ -19767,7 +19767,7 @@ async function checkIpv6Node() {
 // «➕ В канал «Через IPv6»» из диагностики: добавляет домен в IPV6_DOMAINS + ставит fake-IP
 // одним вызовом (endpoint action=add). Закрывает ловушку «fake-IP есть, а маршрут мимо узла».
 async function addToIpv6Channel(domain) {
-  if (!confirm(`Перенести «${domain}» в канал «🌐 Через IPv6»?\n\nДомен пойдёт через узел этого канала (с IPv6-выходом) и ему сразу поставится fake-IP (198.18.0.1).\nЕсли узел в канале ещё не выбран — выбери его в секции «🌐 Через IPv6» (надёжнее всего свой VPS), иначе домен пойдёт через PRIMARY.`)) return;
+  if (!confirm(`Перенести «${domain}» в канал «🌐 Через IPv6»?\n\nДомен пойдёт через узел этого канала (с IPv6-выходом) и ему сразу поставится fake-IP (198.18.0.1).\nЕсли узел в канале ещё не выбран — выбрать его в секции «🌐 Через IPv6» (надёжнее всего свой VPS), иначе домен пойдёт через PRIMARY.`)) return;
   const fd = new FormData();
   fd.append('action', 'add');
   fd.append('domain', domain);
@@ -19776,7 +19776,7 @@ async function addToIpv6Channel(domain) {
   if (res.ok) {
     let m = res.stdout || 'Готово.';
     if (res.ipv6_tag) m += ' Идёт через ' + res.ipv6_tag + '. Watchdog применит ≤1 мин.';
-    else m += ' ⚠ Узел в канале «Через IPv6» НЕ выбран — открой секцию канала и выбери узел с IPv6-выходом, иначе домен пойдёт через PRIMARY.';
+    else m += ' ⚠ Узел в канале «Через IPv6» НЕ выбран — открыть секцию канала и выбрать узел с IPv6-выходом, иначе домен пойдёт через PRIMARY.';
     flash(true, m);
     setTimeout(() => location.reload(), 2000);
   } else {
@@ -19819,14 +19819,14 @@ function addForeignExtCat(name) { _extCatAdd('foreign-ext-categories', name); }
 function clearForeignExtCats() {
   if (!confirm('Очистить все v2fly категории канала «Зарубежные сервисы»? Останутся только ручные домены.')) return;
   document.getElementById('foreign-ext-categories').value = '';
-  flash(true, 'Категории очищены. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'Категории очищены. Нажать «Сохранить».', null, {noScroll: true});
 }
 async function saveForeignExtCategories() { await _saveExtCategories('/api/xkeen/set-foreign-ext-categories', 'foreign-ext-categories', 'Заблок. в РФ'); }
 function addForeignGeoipCat(name) { _extCatAdd('foreign-geoip-categories', name); }
 function clearForeignGeoipCats() {
   if (!confirm('Очистить все GeoIP-категории канала «Зарубежные сервисы»? IP-only приложения снова пойдут через PRIMARY.')) return;
   document.getElementById('foreign-geoip-categories').value = '';
-  flash(true, 'GeoIP-категории очищены. Нажми «Сохранить».', null, {noScroll: true});
+  flash(true, 'GeoIP-категории очищены. Нажать «Сохранить».', null, {noScroll: true});
 }
 async function saveForeignGeoipCategories() { await _saveExtCategories('/api/xkeen/set-foreign-geoip-categories', 'foreign-geoip-categories', 'Заблок. GeoIP'); }
 
@@ -19928,7 +19928,7 @@ async function setTarget(role) {
       '🚨 ВНИМАНИЕ: «' + tag + '» помечен как anti-DPI / whitelist!\n\n' +
       'Такие outbound\'ы обычно имеют РОССИЙСКИЙ exit-IP (Yandex Cloud / X5 / RU LTE).\n\n' +
       'AI-сервисы (Anthropic Claude, OpenAI, Gemini) ГЕОБЛОКИРУЮТ российские IP — ' +
-      'получишь 403 / region-denied вместо ответов.\n\n' +
+      'ответ будет 403 / region-denied.\n\n' +
       'Для AI нужен EU-exit (например 🇳🇱_Netherlands, 🇩🇪_Germany, 🇫🇮_FInland).\n\n' +
       'Точно ставить «' + tag + '» как AI-канал?'
     )) return;
@@ -19963,7 +19963,7 @@ async function setRole(tag, role, isAntiDpi) {
     failover: { name: 'FAILOVER (первый резерв)',
                 warn: 'Этот outbound встанет в начало FAILOVER_TAGS — watchdog переключится сюда первым при падении PRIMARY.' },
     ai:       { name: 'AI-sticky (claude/openai)',
-                warn: 'AI-трафик пойдёт через этот сервер sticky. ⚠️ Если сменишь страну — Anthropic может зафлажить аккаунт за geo-jump.' },
+                warn: 'AI-трафик пойдёт через этот сервер sticky. ⚠️ При смене страны Anthropic может зафлажить аккаунт за geo-jump.' },
   };
   const l = labels[role];
   if (!l) { alert('Неизвестная роль: ' + role); return; }
@@ -19974,7 +19974,7 @@ async function setRole(tag, role, isAntiDpi) {
       `🚨 ВНИМАНИЕ: «${tag}» помечен как anti-DPI / whitelist!\n\n` +
       `Такие outbound'ы обычно имеют РОССИЙСКИЙ exit-IP (Yandex Cloud / X5 / RU LTE).\n\n` +
       `AI-сервисы (Anthropic Claude, OpenAI, Gemini) ГЕОБЛОКИРУЮТ российские IP — `+
-      `получишь 403 / region-denied вместо ответов.\n\n` +
+      `ответ будет 403 / region-denied.\n\n` +
       `Для AI нужен EU-exit (например 🇳🇱_Netherlands, 🇩🇪_Germany, 🇫🇮_FInland).\n\n` +
       `Точно ставить «${tag}» как AI-канал?`
     )) return;
@@ -20132,7 +20132,7 @@ async function checkTemplateIpSync() {
       btn.disabled = true;
     } else {
       const add = (j.to_add || []).length, rem = (j.to_remove || []).length;
-      st.innerHTML = '<span style="color:#a55a18; font-weight:600;">⚠ Расхождение: +' + add + ' новых / −' + rem + ' лишних IP — нажми «Синхронизировать».</span>';
+      st.innerHTML = '<span style="color:#a55a18; font-weight:600;">⚠ Расхождение: +' + add + ' новых / −' + rem + ' лишних IP — нажать «Синхронизировать».</span>';
       btn.disabled = false;
     }
   } catch (e) { st.innerHTML = '<span style="color:#a33;">❌ ' + e.message + '</span>'; btn.disabled = true; }
@@ -20186,7 +20186,7 @@ function editSubMeta(pbk, groupName, curNote, curExpires, curSubUrl, curCustomNa
     <div style="border:1px solid #cfd8e8; background:#f6f8fb; border-radius:6px; padding:12px; margin-bottom:10px;">
       <label style="font-size:0.9em; color:#444; display:block; margin-bottom:6px;">🏷 Название подписки:</label>
       <input type="text" id="sub-meta-name" value="${esc(curCustomName || '')}" placeholder="${esc(autoName ? 'авто: ' + autoName : 'например Provider C, Provider A, Provider B')}" style="width:100%; padding:6px 8px; font-size:0.95em; border:1px solid #b8c5d8; border-radius:4px; background:#fff;">
-      <span class="subtitle" style="font-size:0.82em;">пусто = авто-имя по hostname/pbk; иначе твоё название (как у провайдера в боте/Happ)</span>
+      <span class="subtitle" style="font-size:0.82em;">пусто = авто-имя по hostname/pbk; иначе заданное название (как у провайдера в боте/Happ)</span>
     </div>
 
     <div style="border:1px solid #d8eecc; background:#f7fbf3; border-radius:6px; padding:12px; margin-bottom:10px;">
@@ -20248,11 +20248,11 @@ function editMeta(tag, curNote) {
   box.innerHTML = `
     <h3 style="margin:0 0 12px; color:#2a7;">📝 Примечание для <code>${tag}</code></h3>
     <p style="color:#666; font-size:0.85em; margin:0 0 12px;">
-      Твоя личная заметка про <strong>этот конкретный сервер</strong>. Subscription URL и срок истечения подписки настраиваются у группы целиком — нажми <strong>✏️ Подписка</strong> в её шапке.
+      Личная заметка про <strong>этот конкретный сервер</strong>. Subscription URL и срок истечения подписки настраиваются у группы целиком — нажать <strong>✏️ Подписка</strong> в её шапке.
     </p>
 
     <div style="border:1px solid #d8eecc; background:#f7fbf3; border-radius:6px; padding:12px; margin-bottom:12px;">
-      <label style="font-size:0.9em; color:#444; display:block; margin-bottom:6px;">Твоя заметка:</label>
+      <label style="font-size:0.9em; color:#444; display:block; margin-bottom:6px;">Заметка:</label>
       <textarea id="meta-note" placeholder="Например: лучший пинг для Германии, мама использует, и т.п." style="width:100%; min-height:80px; padding:8px; font-size:0.95em; border:1px solid #b8d5b8; border-radius:4px; font-family:inherit; background:#fff;">${esc(curNote)}</textarea>
     </div>
 
@@ -20447,7 +20447,7 @@ function renderBootstrapPlan(state) {
 
   // Items table
   if (!state.ok) {
-    document.getElementById('bootstrap-items').innerHTML = '<p style="color:#c33; font-weight:600;">Развёртывание невозможно — устрани проблемы выше и нажми «📋 Показать план» снова.</p>';
+    document.getElementById('bootstrap-items').innerHTML = '<p style="color:#c33; font-weight:600;">Развёртывание невозможно — устранить проблемы выше и нажать «📋 Показать план» снова.</p>';
     document.getElementById('btn-bootstrap-apply').disabled = true;
     document.getElementById('btn-bootstrap-apply').style.opacity = '0.5';
     return;
@@ -20542,7 +20542,7 @@ async function bootstrapApply() {
   btn.disabled = true;
   btn.textContent = '⏳ Применяю...';
   const logBox = document.getElementById('bootstrap-log');
-  logBox.innerHTML = '<div style="padding:10px; background:#f9f9f9; border-radius:4px; font-style:italic; color:#666;">Заливаю на роутер, подожди ~10-30 сек...</div>';
+  logBox.innerHTML = '<div style="padding:10px; background:#f9f9f9; border-radius:4px; font-style:italic; color:#666;">Заливаю на роутер, подождать ~10-30 сек...</div>';
   try {
     const res = await fetch('/api/keenetic/bootstrap-apply', {
       method: 'POST',
@@ -20557,7 +20557,7 @@ async function bootstrapApply() {
       return `<div style="padding:6px 10px; margin:3px 0; background:${bg}; color:${color}; border-radius:4px; font-size:0.88em;">${icon} <strong>${escapeHtml(l.label || l.key)}</strong> — ${escapeHtml(l.msg || '')}</div>`;
     }).join('');
     const summary = j.ok
-      ? `<div style="padding:10px; background:#d4eedd; border:1px solid #2a7; border-radius:4px; margin-top:8px; color:#1a5a1a; font-weight:600;">🎉 Развёртывание завершено успешно! Watchdog запущен. Теперь иди в раздел «🎯 Основное и резервное подключение» наверху и настрой PRIMARY/FAILOVER/AI/YT каналы.</div>`
+      ? `<div style="padding:10px; background:#d4eedd; border:1px solid #2a7; border-radius:4px; margin-top:8px; color:#1a5a1a; font-weight:600;">🎉 Развёртывание завершено успешно! Watchdog запущен. Дальше — раздел «🎯 Основное и резервное подключение» наверху и настроить PRIMARY/FAILOVER/AI/YT каналы.</div>`
       : `<div style="padding:10px; background:#fbd7d7; border:1px solid #c33; border-radius:4px; margin-top:8px; color:#6a1a1a; font-weight:600;">⚠ Развёртывание завершено с ошибками — см. лог выше.</div>`;
     logBox.innerHTML = lines + summary;
     btn.textContent = '✅ Готово (можно закрыть)';
@@ -20834,7 +20834,7 @@ async function repairTgChannel() {
 }
 
 async function syncStructure(btn) {
-  if (!confirm('Применить актуальную структуру (watchdog + routing-шаблон) на роутер?\n\nТвои кастомные IP сохранятся. Будет xkeen -restart (несколько секунд связь моргнёт). Если сеть сломается — автоматический откат к рабочей версии.')) return;
+  if (!confirm('Применить актуальную структуру (watchdog + routing-шаблон) на роутер?\n\nКастомные IP сохранятся. Будет xkeen -restart (несколько секунд связь моргнёт). Если сеть сломается — автоматический откат к рабочей версии.')) return;
   btn.disabled = true;
   const status = document.getElementById('sync-structure-status');
   const out = document.getElementById('sync-structure-output');
@@ -20953,7 +20953,7 @@ function renderDiagnose(j) {
   }
 
   html += '</tbody></table>';
-  html += `<p style="margin-top: 12px; font-size: 0.85em; color: #888;">Совет: после применения fix'а — нажми «🔬 Диагностика XKeen» снова чтобы проверить что проблема решена.</p>`;
+  html += `<p style="margin-top: 12px; font-size: 0.85em; color: #888;">Совет: после применения fix'а — нажать «🔬 Диагностика XKeen» снова чтобы проверить что проблема решена.</p>`;
 
   out.innerHTML = html;
 }
@@ -21064,7 +21064,7 @@ function chCell(channels, name) {
 function renderSiteCheck(j) {
   const out = document.getElementById('site-check-output');
   if (!j.available) {
-    out.innerHTML = `<div style="padding: 10px 14px; background: #fff8e1; border-left: 4px solid #f0c200; border-radius: 4px; font-size: 0.9em;">⚠ Модуль диагностики недоступен.<br><span style="color:#888;">${escapeHtml(j.error || '')}</span><br>Проверь, что папка <code>rkn_checker/</code> лежит рядом с dashboard.py и установлен <code>requests</code> (<code>pip install -r requirements.txt</code>).</div>`;
+    out.innerHTML = `<div style="padding: 10px 14px; background: #fff8e1; border-left: 4px solid #f0c200; border-radius: 4px; font-size: 0.9em;">⚠ Модуль диагностики недоступен.<br><span style="color:#888;">${escapeHtml(j.error || '')}</span><br>Проверить, что папка <code>rkn_checker/</code> лежит рядом с dashboard.py и установлен <code>requests</code> (<code>pip install -r requirements.txt</code>).</div>`;
     return;
   }
   if (!j.ok || !j.results) {
@@ -21095,7 +21095,7 @@ function renderSiteCheck(j) {
     }
     html += '</tbody></table>';
     if (j.via_error) html += `<p style="color:#c33; font-size:0.85em; margin-top:8px;">⚠ ${escapeHtml(j.via_error)}</p>`;
-    html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">Слева — как идёт сейчас (твой роутинг). Справа — через выбранный outbound. Если справа ✅, а слева блок — лечится переносом домена в этот канал.</p>`;
+    html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">Слева — как идёт сейчас (текущий роутинг). Справа — через выбранный outbound. Если справа ✅, а слева блок — лечится переносом домена в этот канал.</p>`;
     out.innerHTML = html;
     return;
   }
@@ -21138,14 +21138,14 @@ function renderSiteCheck(j) {
                 + `<div style="font-size:0.82em; color:#555; margin-top:3px; line-height:1.5;">fake-IP стоит (<code>${escapeHtml(r.name)}</code> → <code>${fip}</code>) и выбранный узел реально открыл сайт по IPv6 (TLS прошёл). Менять ничего не нужно.</div>`;
         } else {
           html += ` <span style="font-size:0.85em; color:#8a5a00; font-weight:600;">⚠ fake-IP стоит, но через узел НЕ открывается</span>`
-                + `<div style="font-size:0.82em; color:#8a5a00; margin-top:3px; line-height:1.5;">Роутер выдаёт <code>${escapeHtml(r.name)}</code> → <code>${fip}</code> и заворачивает в VPN, <strong>но TLS не прошёл</strong> — текущий узел <strong>не отдаёт IPv6</strong> (или не восстанавливает домен из fake-IP). Заведи домен в канал <strong>«🌐 Через IPv6»</strong> и выбери там узел с IPv6-выходом — надёжнее всего <strong>свой VPS</strong> (сторонний RU-узел и «Напрямую» не подойдут).</div>`
+                + `<div style="font-size:0.82em; color:#8a5a00; margin-top:3px; line-height:1.5;">Роутер выдаёт <code>${escapeHtml(r.name)}</code> → <code>${fip}</code> и заворачивает в VPN, <strong>но TLS не прошёл</strong> — текущий узел <strong>не отдаёт IPv6</strong> (или не восстанавливает домен из fake-IP). Завести домен в канал <strong>«🌐 Через IPv6»</strong> и выбрать там узел с IPv6-выходом — надёжнее всего <strong>свой VPS</strong> (сторонний RU-узел и «Напрямую» не подойдут).</div>`
                 + `<button onclick="addToIpv6Channel('${escapeHtml(r.name)}')" style="margin-top:6px; margin-right:6px; padding:5px 12px; background:#2980b9; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:0.86em;">➕ В канал «Через IPv6»</button>`;
         }
         html += `<button onclick="removeFromIpv6Channel('${escapeHtml(r.name)}')" style="margin-top:6px; padding:4px 10px; background:#eee; color:#666; border:1px solid #ccc; border-radius:4px; cursor:pointer; font-size:0.82em;">✖ убрать из «Через IPv6» (+ fake-IP)</button>`;
       } else {
         const okNow = (r.verdict === 'OK');
         html += (okNow ? ` <span style="font-size:0.8em; color:#1a5a1a;">✅ сейчас открывается с этого ПК</span>` : '')
-              + `<div style="font-size:0.82em; color:#555; margin-top:3px; line-height:1.5;">У сайта только IPv6-адрес, а на роутере IPv6 выключен. Чтобы открывался у <strong>всех устройств дома</strong> — перенеси его в канал <strong>«🌐 Через IPv6»</strong>: он направит домен на узел с IPv6-выходом <strong>и сразу поставит fake-IP</strong> (<code>${fip}</code>). <span style="color:#8a5a00;">Просто fake-IP без правильного узла не поможет — домен уйдёт через PRIMARY и может не открыться.</span></div>`
+              + `<div style="font-size:0.82em; color:#555; margin-top:3px; line-height:1.5;">У сайта только IPv6-адрес, а на роутере IPv6 выключен. Чтобы открывался у <strong>всех устройств дома</strong> — перенести его в канал <strong>«🌐 Через IPv6»</strong>: он направит домен на узел с IPv6-выходом <strong>и сразу поставит fake-IP</strong> (<code>${fip}</code>). <span style="color:#8a5a00;">Просто fake-IP без правильного узла не поможет — домен уйдёт через PRIMARY и может не открыться.</span></div>`
               + `<button onclick="addToIpv6Channel('${escapeHtml(r.name)}')" style="margin-top:6px; padding:5px 12px; background:#2980b9; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:0.86em;">➕ В канал «Через IPv6» (+ fake-IP)</button>`;
       }
       html += `<span class="mk-reachable-msg" style="font-size:0.83em;"></span></td>`;
@@ -21178,7 +21178,7 @@ function renderSiteCheck(j) {
         html += `</div><div style="margin-top:8px; padding:8px 10px; background:#fff8e1; border-left:3px solid #f0c200; border-radius:3px; font-size:0.84em; color:#6a4a00; line-height:1.5;">`
               + `<strong>🟡 Anti-bot защита Cloudflare/сервиса (попыток: ${cfp.attempts}, HTTP ${cfp.status_code}).</strong> `
               + `Это <strong>не значит</strong> что IP реально забанен — наш probe всё ещё проще реального Chrome (нет JS-движка, нет полной HTTP/3). `
-              + `Реальный браузер на этом узле обычно проходит. Открой в браузере — это финальный тест.`
+              + `Реальный браузер на этом узле обычно проходит. Открыть в браузере — это финальный тест.`
               + `</div>`;
       } else if (cfp && cfp.error) {
         html += `</div><div style="margin-top:8px; padding:8px 10px; background:#fff8e1; border-left:3px solid #f0c200; border-radius:3px; font-size:0.84em; color:#6a4a00; line-height:1.5;">`
@@ -21186,7 +21186,7 @@ function renderSiteCheck(j) {
               + `</div>`;
       } else {
         // Auto-fallback не делался (curl-cffi выключен или домен не AI-чувствительный)
-        html += (isAI ? ` У AI-сервисов (Anthropic/OpenAI) часто срабатывает <strong>Cloudflare anti-bot</strong>, который пускает только реальный браузер с JS. Это не обязательно означает блокировку IP.` : ` Часто = IP в чёрном списке сервиса, попробуй другой выход.`)
+        html += (isAI ? ` У AI-сервисов (Anthropic/OpenAI) часто срабатывает <strong>Cloudflare anti-bot</strong>, который пускает только реальный браузер с JS. Это не обязательно означает блокировку IP.` : ` Часто = IP в чёрном списке сервиса, попробовать другой выход.`)
               + `</div>`;
       }
       // Кнопка-ссылка «Открыть в браузере» — самый надёжный sanity-чек
@@ -21209,7 +21209,7 @@ function renderSiteCheck(j) {
   }
   html += '</tbody></table>';
   if (j.via_error) html += `<p style="color:#c33; font-size:0.85em; margin-top:8px;">⚠ ${escapeHtml(j.via_error)}</p>`;
-  html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">«Вердикт» — на каком уровне рвётся соединение (с этого ПК). TLS-DPI / DNS-блок лечатся включением нужного канала; «лежит / таймаут» может быть проблемой самого сайта.<br>🧭 <strong>«Идёт через»</strong> — в какой канал роутер направит домен <em>по твоим пресетам</em> (списки доменов в каналах). Удобно проверять настройки: например instagram должен идти через «📱 Зарубежные сервисы» на загран-выход. <em>Совпадения через geo-категории (<code>geosite:*</code>) подгружаются ниже в столбце «Идёт через» — фоном после загрузки таблицы.</em></p>`;
+  html += `<p style="margin-top:10px; font-size:0.82em; color:#888;">«Вердикт» — на каком уровне рвётся соединение (с этого ПК). TLS-DPI / DNS-блок лечатся включением нужного канала; «лежит / таймаут» может быть проблемой самого сайта.<br>🧭 <strong>«Идёт через»</strong> — в какой канал роутер направит домен <em>по текущим пресетам</em> (списки доменов в каналах). Удобно проверять настройки: например instagram должен идти через «📱 Зарубежные сервисы» на загран-выход. <em>Совпадения через geo-категории (<code>geosite:*</code>) подгружаются ниже в столбце «Идёт через» — фоном после загрузки таблицы.</em></p>`;
   out.innerHTML = html;
   // Параллельный enrichment категориями из dat-сканера (v1.0.81) — не блокирует основную таблицу
   enrichSiteCheckWithDatCategories(j).catch(() => {});
@@ -21312,7 +21312,7 @@ async function makeSiteReachable(btn) {
         if (msg) msg.innerHTML = ` <span style="color:#777;">fake-IP снят (${escapeHtml(domain)}). Сайт снова станет недоступен напрямую.</span>`;
       } else {
         btn.textContent = '✅ Сделано';
-        if (msg) msg.innerHTML = ` <span style="color:#1a5a1a;">Готово (${escapeHtml(domain)} → ${escapeHtml(j.ip || '')}). Обнови страницу сайта (Ctrl+F5); если была открыта — закрой вкладку и зайди заново.</span>`;
+        if (msg) msg.innerHTML = ` <span style="color:#1a5a1a;">Готово (${escapeHtml(domain)} → ${escapeHtml(j.ip || '')}). Обновить страницу сайта (Ctrl+F5); если была открыта — закрой вкладку и зайти заново.</span>`;
       }
     } else {
       btn.disabled = false; btn.textContent = old;
@@ -21373,7 +21373,7 @@ async function makeSiteReachable(btn) {
 
     const layout = document.createElement('div'); layout.className = 'xk-layout';
     const aside  = document.createElement('aside'); aside.className = 'xk-sidebar';
-    const resizer = document.createElement('div'); resizer.className = 'xk-resizer'; resizer.title = 'Потяни, чтобы изменить ширину панели · двойной клик — сброс';
+    const resizer = document.createElement('div'); resizer.className = 'xk-resizer'; resizer.title = 'Потянуть, чтобы изменить ширину панели · двойной клик — сброс';
     const main   = document.createElement('main');  main.className = 'xk-content';
     layout.appendChild(aside); layout.appendChild(resizer); layout.appendChild(main);
     groups[0].els[0].parentNode.insertBefore(layout, groups[0].els[0]);
@@ -21724,7 +21724,7 @@ async function xkeenCmd(cmd) {
     'restart':        'Restart XKeen ~2 секунды (трафик прервётся на момент рестарта). Продолжить?',
     'stop':           'Остановить XKeen (xkeen -stop)?\n\nИнтернет у XKeen-устройств пойдёт НАПРЯМУЮ, без VPN. ⚠ Удалённый доступ через сам VPN (RDP/SSH/туннель поверх xray) тоже прервётся. Включить обратно — «▶️ Restart XKeen» или «🔧 Restart XKeen с паузой».',
     'restart-clean':  'Перезапуск XKeen со сбросом: stop → пауза 15с → start (~25-30 сек).\n\nЛечит зависший xray/DNS, когда обычный Restart не помогает. На время паузы прервётся VPN (и удалённый доступ через него), потом восстановится. Продолжить?',
-    'update-xray':    'Обновить Xray-core до latest версии?\n\nБудет выбрана ПЕРВАЯ версия из списка релизов (может быть pre-release/бета!). Скачается ~30 MB, xray перезапустится (трафик прервётся ~5 сек).\n\nЕсли хочешь именно stable — используй TTY-SSH с ручным выбором номера версии.',
+    'update-xray':    'Обновить Xray-core до latest версии?\n\nБудет выбрана ПЕРВАЯ версия из списка релизов (может быть pre-release/бета!). Скачается ~30 MB, xray перезапустится (трафик прервётся ~5 сек).\n\nЕсли нужен именно stable — использовать TTY-SSH с ручным выбором номера версии.',
     'update-geofile': 'Обновить GeoFile (geosite.dat + geoip.dat)?\n\nЗагрузит свежие списки доменов от v2fly community. Безопасно — только списки, бинари не меняются. ~30-60 сек.',
     'update-xkeen':   'Обновить XKeen (bash-обёртку)?\n\nБудет выбрана первая (latest) версия. Сам xray не трогается, обновляется только менеджер.',
   };
@@ -21793,7 +21793,7 @@ async function scanDatCategories() {
       }
       const tags = Object.keys(byOutbound).sort();
 
-      html += '<h4 style="margin: 10px 0 8px; color: #2e7d32;">📍 Где применяются эти базы у тебя сейчас</h4>';
+      html += '<h4 style="margin: 10px 0 8px; color: #2e7d32;">📍 Где применяются эти базы сейчас</h4>';
       html += '<p style="font-size: 0.88em; color: #555; margin: 0 0 10px;">Категории из <code>.dat</code> файлов используются в правилах роутинга (<code>05_routing.json</code>). Колонка «Куда» — что Xray делает с трафиком матчнутым на эту категорию.</p>';
       html += '<table style="border-collapse: collapse; font-size: 0.88em; width: 100%; max-width: 900px;">';
       html += '<tr style="background: #f5f5f5;"><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Категория</th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Файл базы</th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Куда направляется</th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Что это</th></tr>';
@@ -21812,7 +21812,7 @@ async function scanDatCategories() {
       html += '</table>';
       html += '<p style="font-size: 0.82em; color: #888; margin: 6px 0 14px;">Источник: <code>' + escapeHtml((j.usage[0] && j.usage[0].source) || '?') + '</code>. Правила редактируются в шаблоне <code>05_routing.template.json</code> на роутере — watchdog их подставляет.</p>';
     } else {
-      html += '<p style="color:#888; padding: 10px 14px; background: #fffae6; border-left: 3px solid #f0c200; margin: 10px 0;">⚠️ Не нашёл использований <code>ext:geosite*.dat:...</code> / <code>ext:geoip*.dat:...</code> в твоём routing. Значит .dat базы скачиваются но фактически не применяются — добавь правило в шаблон <code>05_routing.template.json</code> с <code>"domain": ["ext:geosite_v2fly.dat:yandex"]</code> или подобное.</p>';
+      html += '<p style="color:#888; padding: 10px 14px; background: #fffae6; border-left: 3px solid #f0c200; margin: 10px 0;">⚠️ Не нашёл использований <code>ext:geosite*.dat:...</code> / <code>ext:geoip*.dat:...</code> в твоём routing. Значит .dat базы скачиваются но фактически не применяются — добавить правило в шаблон <code>05_routing.template.json</code> с <code>"domain": ["ext:geosite_v2fly.dat:yandex"]</code> или подобное.</p>';
     }
 
     // === Блок 2: .dat файлы на роутере ===
@@ -21827,7 +21827,7 @@ async function scanDatCategories() {
 
     // === Блок 3: Известные категории v2fly (для подсказки что ещё можно добавить) ===
     html += '<details style="margin-top: 14px;"><summary style="cursor: pointer; font-weight: 600; color: #74c;">🌐 Все известные категории v2fly (можно использовать в правилах)</summary>';
-    html += '<p style="font-size: 0.86em; color: #555; margin: 8px 0;">Чтобы добавить новую категорию — пропиши её в <code>05_routing.template.json</code> через <code>ext:geosite_v2fly.dat:&lt;name&gt;</code> в нужном правиле (DIRECT / BLOCK / proxy outboundTag).</p>';
+    html += '<p style="font-size: 0.86em; color: #555; margin: 8px 0;">Чтобы добавить новую категорию — прописать её в <code>05_routing.template.json</code> через <code>ext:geosite_v2fly.dat:&lt;name&gt;</code> в нужном правиле (DIRECT / BLOCK / proxy outboundTag).</p>';
     html += '<table style="border-collapse: collapse; font-size: 0.86em; width: 100%; max-width: 800px;"><tr style="background: #f5f5f5;"><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Категория</th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Что внутри</th></tr>';
     const inUseSet = new Set((j.in_use || []).map(u => u.category));
     for (const c of j.known) {
@@ -21857,7 +21857,7 @@ function _datLookupRenderHtml(j) {
     html += `<p style="color:#888; padding: 10px 14px; background: #fff8e6; border-left: 3px solid #f0c200; margin: 0;">Этот ${kindLabel} не найден ни в одной категории кэшированных GeoFile-баз.</p>`;
   } else {
     html += '<table style="border-collapse: collapse; font-size: 0.9em; width: 100%; max-width: 900px;">';
-    html += '<tr style="background: #f5f5f5;"><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Файл базы</th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Категории <span style="font-weight:400; color:#888; font-size:0.9em;">(наведи для описания)</span></th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">ext-ссылки (клик — копировать)</th></tr>';
+    html += '<tr style="background: #f5f5f5;"><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Файл базы</th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">Категории <span style="font-weight:400; color:#888; font-size:0.9em;">(навести для описания)</span></th><th style="padding: 6px 10px; text-align:left; border-bottom: 2px solid #ddd;">ext-ссылки (клик — копировать)</th></tr>';
     for (const r of j.results) {
       html += '<tr style="border-bottom: 1px solid #eee;">';
       html += `<td style="padding: 6px 10px; font-family: monospace; color: #888; white-space: nowrap; vertical-align: top;">${escapeHtml(r.file)}</td>`;
@@ -21872,7 +21872,7 @@ function _datLookupRenderHtml(j) {
       html += '<td style="padding: 6px 10px; vertical-align: top; font-size: 0.82em;">';
       for (const ref of (r.ext_refs || [])) {
         const safe = escapeHtml(ref).replaceAll("'", '&#39;');
-        html += `<code style="display:block; color: #74c; padding: 1px 0; cursor: pointer;" title="Кликни для копирования" onclick="navigator.clipboard.writeText(this.textContent); this.style.background='#e8f5e9'; setTimeout(()=>{this.style.background='';}, 800);">${safe}</code>`;
+        html += `<code style="display:block; color: #74c; padding: 1px 0; cursor: pointer;" title="Кликнуть для копирования" onclick="navigator.clipboard.writeText(this.textContent); this.style.background='#e8f5e9'; setTimeout(()=>{this.style.background='';}, 800);">${safe}</code>`;
       }
       html += '</td></tr>';
     }
@@ -21897,7 +21897,7 @@ async function runDatLookup() {
   if (!inp || !out) return;
   const target = (inp.value || '').trim();
   if (!target) {
-    out.innerHTML = '<p style="color:#888; font-style:italic;">Введите домен или IP-адрес.</p>';
+    out.innerHTML = '<p style="color:#888; font-style:italic;">Ввести домен или IP-адрес.</p>';
     return;
   }
   out.innerHTML = '<p style="color:#888; font-style:italic;">🔄 Поиск в базах… (первый запрос может занять до 30 секунд — кэш скачивается с роутера)</p>';
@@ -22065,7 +22065,7 @@ document.addEventListener('DOMContentLoaded', () => {
   &nbsp;·&nbsp;
   <a href="#" id="xk-contact-mail" rel="nofollow" style="color:#5a3a99;text-decoration:none;" title="Показать адрес и скопировать в буфер">✉ написать автору на почту</a>
   <span id="xk-mail-reveal" style="display:none;"></span>
-  <div style="margin-top:7px;font-size:0.86em;color:#999;">Не разобрался или что-то не работает — напиши, помогу.</div>
+  <div style="margin-top:7px;font-size:0.86em;color:#999;">Не разобрался или что-то не работает — написать, помогу.</div>
 </footer>
 <script>
 (function(){
@@ -22113,5 +22113,5 @@ if __name__ == "__main__":
     # Порт берётся из config_local.py (DASHBOARD_PORT). Дефолт 5000.
     # Для нескольких инстансов панели на одной машине — разные папки с разными DASHBOARD_PORT.
     port = int(getattr(cfg, "DASHBOARD_PORT", 5000))
-    print(f"  Логин:    {cfg.USERNAME}    Открой: http://localhost:{port}{path}")
+    print(f"  Логин:    {cfg.USERNAME}    Открыть: http://localhost:{port}{path}")
     app.run(host="0.0.0.0", port=port, debug=False)

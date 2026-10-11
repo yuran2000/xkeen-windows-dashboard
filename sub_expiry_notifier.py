@@ -203,7 +203,7 @@ def main():
 
     # LAN URL для ссылки в TG — берём из cfg.LAN_HOST если задан, иначе generic placeholder
     lan_host = getattr(cfg, "LAN_HOST", "") or "<your-pc-lan-ip>"
-    lines.append(f"Управление: <code>http://{lan_host}:5000/xkeen</code> (нажми ✏️ Подписка у группы)")
+    lines.append(f"Управление: <code>http://{lan_host}:5000/xkeen</code> (нажать ✏️ Подписка у группы)")
     text = "\n".join(lines)
 
     # 5. Отправляем

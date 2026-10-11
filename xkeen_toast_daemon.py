@@ -267,12 +267,12 @@ def main():
                 if was_good:
                     # ПЕРВЫЙ переход в bad
                     log.info(f"transition good→bad: prev={prev} new={new_state} label={label!r}")
-                    show_toast("🔴 Xray упал!", label + " — открой /xkeen")
+                    show_toast("🔴 Xray упал!", label + " — открыть /xkeen")
                     state["last_toast_ts"] = now_ts
                 elif was_bad and (now_ts - last_ts >= TOAST_REPEAT_SEC):
                     # ПОВТОРНЫЙ toast пока bad
                     log.info(f"repeat toast (bad >= {TOAST_REPEAT_SEC}s): label={label!r}")
-                    show_toast("🔴 Xray всё ещё упал", label + " — открой /xkeen")
+                    show_toast("🔴 Xray всё ещё упал", label + " — открыть /xkeen")
                     state["last_toast_ts"] = now_ts
                 state["prev_state"] = new_state
             else:

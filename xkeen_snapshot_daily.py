@@ -30,7 +30,7 @@ try:
     SSH_USER = cfg.KEENETIC_USER
 except Exception as ex:
     print(f"[FATAL] Не удалось загрузить config_local.py: {ex}", file=sys.stderr)
-    print("Убедись что рядом со скриптом лежит config_local.py с переменными KEENETIC_HOST/PORT/USER/SSH_KEY.", file=sys.stderr)
+    print("Убедиться что рядом со скриптом лежит config_local.py с переменными KEENETIC_HOST/PORT/USER/SSH_KEY.", file=sys.stderr)
     sys.exit(1)
 
 BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")

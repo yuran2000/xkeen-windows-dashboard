@@ -161,7 +161,7 @@ def _json_read(path):
     except FileNotFoundError:
         return {}
     except PermissionError as e:
-        raise RegistryError(f"{os.path.basename(path)} занят другим процессом (не повреждён), повторите: {e}")
+        raise RegistryError(f"{os.path.basename(path)} занят другим процессом (не повреждён), повторить: {e}")
     except Exception as e:
         raise RegistryError(f"{os.path.basename(path)} повреждён: {e}")
     if not isinstance(d, dict):
@@ -333,12 +333,12 @@ def endpoint_warning():
     """Текст предупреждения, если endpoint пуст или серый (снаружи недостижим)."""
     h = endpoint_host()
     if not h:
-        return "WAN-адрес роутера не определён — задайте WG_ENDPOINT_HOST (белый IP или DDNS) в config_local.py."
+        return "WAN-адрес роутера не определён — задать WG_ENDPOINT_HOST (белый IP или DDNS) в config_local.py."
     try:
         a = ipaddress.ip_address(h)
         grey = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8")
         if any(a in ipaddress.ip_network(n) for n in grey):
-            return (f"Endpoint {h} — частный/CGNAT-адрес, снаружи он недостижим. Задайте WG_ENDPOINT_HOST "
+            return (f"Endpoint {h} — частный/CGNAT-адрес, снаружи он недостижим. Задать WG_ENDPOINT_HOST "
                     f"(белый IP или DDNS) в config_local.py.")
     except ValueError:
         pass
@@ -819,7 +819,7 @@ def apply_acl(iface, grants, exit_mode="", remote_net=None):
         return False, "не удалось перечитать правила для проверки (конфиг НЕ сохранён)"
     if len(got) != len(lines):
         return False, (f"на роутере {len(got)} правил вместо {len(lines)} — старые не удалились, "
-                       "проверьте «Межсетевой экран» интерфейса вручную (конфиг НЕ сохранён)")
+                       "проверить «Межсетевой экран» интерфейса вручную (конфиг НЕ сохранён)")
     if exit_mode == "direct":
         err = _rci_run([f"ip nat {iface}"], "включение NAT")
         if err:
@@ -955,7 +955,7 @@ def create_iface(slot, desc, server_priv, server_pub, client_pub, remote_net=Non
     if ex is None:
         return False, f"не удалось проверить, свободен ли {iface}", False
     if ex:
-        return False, f"{iface} уже занят на роутере (создан только что?) — повторите выдачу", False
+        return False, f"{iface} уже занят на роутере (создан только что?) — повторить выдачу", False
     pref, x = _pref(), slot["sub_x"]
     # description с пробелом — только в кавычках (иначе argument parse error); комментарий пира
     # (!…) — БЕЗ кавычек: он берёт остаток строки, кавычки попали бы в само имя.
@@ -1007,10 +1007,10 @@ def delete_iface(iface, client_pub, remote_net=None, before_change=None, xray_of
         return False, f"{iface} на роутере не совпадает с записью (ключ клиента) — удаление отменено"
     if info["is_link"]:
         return False, (f"{iface} доработан вне панели (в allow-ips чужая сеть или endpoint) — панель его "
-                       f"не удаляет: удалите его в Keenetic вручную, потом отзовите запись")
+                       f"не удаляет: удалить его в Keenetic вручную, потом отозвать запись")
     if len(info["peers"]) != 1:
         return False, (f"у {iface} кроме клиента ещё пиров: {len(info['peers']) - 1} — интерфейс не удаляется: "
-                       f"уберите только пир клиента в Keenetic, потом отзовите запись")
+                       f"убрать только пир клиента в Keenetic, потом отозвать запись")
     hook = xray_hook_for(info["index"])
     if hook is None:
         return False, "не удалось проверить хуки xray на роутере"
@@ -1019,14 +1019,14 @@ def delete_iface(iface, client_pub, remote_net=None, before_change=None, xray_of
         return False, "NAT с роутера не прочитан — удаление отменено"
     if hook:
         if not xray_off:
-            return False, f"у {iface} включён заворот в xray (nwg{info['index']}) — сначала отключите его"
+            return False, f"у {iface} включён заворот в xray (nwg{info['index']}) — сначала отключить его"
         ok, msg = xray_off(iface)
         if not ok or xray_hook_for(info["index"]) is not False:
             return False, f"заворот в xray у {iface} не снят ({msg}) — удаление отменено"
     if before_change:
         err = before_change()
         if err:
-            return False, err + (f"; ⚠ заворот в xray у {iface} уже снят — включите его снова, если доступ остаётся"
+            return False, err + (f"; ⚠ заворот в xray у {iface} уже снят — включить его снова, если доступ остаётся"
                                  if hook else "")
     nat_off = iface in nat and not _rci_run([f"no ip nat {iface}"], "NAT")
     route = f"{remote_net.network_address} {remote_net.netmask} {iface}" if remote_net else ""
@@ -1037,12 +1037,12 @@ def delete_iface(iface, client_pub, remote_net=None, before_change=None, xray_of
         back = [(f"ip nat {iface}", "NAT")] if nat_off else []
         back += [(f"ip route {route} auto", f"маршрут к {remote_net}")] if route_off else []
         lost = [what for c, what in back if _rci_run([c], "возврат")]
-        tail = (f"; ⚠ НЕ возвращено: {', '.join(lost)} — проверьте в Keenetic" if lost
+        tail = (f"; ⚠ НЕ возвращено: {', '.join(lost)} — проверить в Keenetic" if lost
                 else "; снятые NAT/маршрут возвращены" if back else "")
         if hook:    # заворот тоже снимали сами — вернуть, иначе клиент xray остался бы без интернета молча
             xok = bool(xray_on) and xray_on(iface)[0]
             tail += ("; заворот в xray возвращён" if xok else
-                     "; ⚠ заворот в xray снят и НЕ возвращён — включите его заново или повторите отзыв")
+                     "; ⚠ заворот в xray снят и НЕ возвращён — включить его заново или повторить отзыв")
         return False, "не удалён: " + (err or "интерфейс всё ещё на роутере") + tail
     err = _save()
     if err:
@@ -1199,7 +1199,7 @@ def issue(name, exit_mode="direct", full=False, services=None, extra="", s2s=Fal
     except ValueError as e:
         return {"ok": False, "error": str(e)}
     if not exit_mode and not grants:
-        return {"ok": False, "error": "Не выбрано ни одного доступа: включите интернет или отметьте, что "
+        return {"ok": False, "error": "Не выбрано ни одного доступа: включить интернет или отметить, что "
                                       "открыть в ЛВС" + (" (для site-to-site — обязательно)." if s2s else ".")}
     with _OP_LOCK:
         try:
@@ -1216,7 +1216,7 @@ def issue(name, exit_mode="direct", full=False, services=None, extra="", s2s=Fal
         existing = {norm(f.get("desc")) for f in state["ifaces"] if f.get("desc")}
         existing |= {norm(c.get("name")) for c in active}
         if norm(name) in existing:
-            return {"ok": False, "error": f"Имя «{name}» уже занято (на роутере или в реестре). Выберите другое."}
+            return {"ok": False, "error": f"Имя «{name}» уже занято (на роутере или в реестре). Выбрать другое."}
         # выданные, но ещё не загруженные на роутер — их слоты тоже заняты
         for c in active:
             if iface_by_pub(state, c.get("client_pub")):
@@ -1230,7 +1230,7 @@ def issue(name, exit_mode="direct", full=False, services=None, extra="", s2s=Fal
                 state["ifaces"].append({"name": c["iface"], "n": int(mm.group(1)), "peers": []})
         slot = free_slot(state)
         if slot.get("full"):
-            return {"ok": False, "error": f"Кончились {slot['why']} — освободите место (отзовите ненужный доступ)."}
+            return {"ok": False, "error": f"Кончились {slot['why']} — освободить место (отозвать ненужный доступ)."}
         s_priv, s_pub = genkey()
         c_priv, c_pub = genkey()
         if not (s_priv and c_priv):
@@ -1510,7 +1510,7 @@ def apply_rules(iface, exit_mode, full=False, services=None, extra=""):
     if not re.fullmatch(r"Wireguard\d+", iface or ""):
         return False, "некорректный интерфейс", exit_mode
     if exit_mode not in EXIT_MODES:
-        return False, "Выберите режим выхода в интернет.", exit_mode
+        return False, "Выбрать режим выхода в интернет.", exit_mode
     services = list(services or [])
     info = iface_info(iface)
     if not info:
