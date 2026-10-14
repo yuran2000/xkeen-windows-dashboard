@@ -1,4 +1,9 @@
 #!/bin/sh
+# XKeen failover watchdog v39 (2026-10-14, честный текст ухода по перегрузке):
+#   • YouTube / «Зарубежные» ушли на резерв потому, что их канал обвинён в перегрузке xray (XRAY_BUSY_BLAME
+#     этого тика), — TG и лог называют эту причину («xray перегружал процессор роутера»), а не «отвечает, но
+#     трафик сквозь него не проходит». Основной канал и так пишет нейтральное «default переключён A → B».
+#
 # XKeen failover watchdog v38 (2026-10-14, несколько pid xray во время рестарта):
 #   • Пока старый xray не ушёл, `pidof xray` отдаёт ДВА pid («новый старый», видели 14.10). _xk_restart
 #     считал рестарт законченным, едва строка pidof отличалась от прежней, — теперь готово = есть pid, которого
@@ -2634,8 +2639,15 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
             tg_alert "✅ <b>YouTube вернулся на основной канал</b> <code>$YT_TAG</code>."
           fi
         elif [ "${DYT_DEAF:-0}" = "1" ]; then
-          log "YT-FAILOVER: канал $_yt_eff_prev глух (трафик сквозь не идёт) → YouTube переключён на $_yt_pick"
-          tg_alert "🔀 <b>YouTube переключён на резерв</b>: канал <code>$_yt_eff_prev</code> отвечает, но трафик сквозь него не проходит → трафик идёт через <code>$_yt_pick</code>."
+          # v39: глухота назначена перегрузкой xray (XRAY_BUSY_BLAME этого тика) — причина другая, так и пишем.
+          case " $XRAY_BUSY_BLAME " in
+            *" YT=$_yt_eff_prev "*)
+              log "YT-FAILOVER: с каналом $_yt_eff_prev xray перегружает процессор → YouTube переключён на $_yt_pick"
+              tg_alert "🔀 <b>YouTube переключён на резерв</b>: с каналом <code>$_yt_eff_prev</code> xray перегружал процессор роутера → трафик идёт через <code>$_yt_pick</code>." ;;
+            *)
+              log "YT-FAILOVER: канал $_yt_eff_prev глух (трафик сквозь не идёт) → YouTube переключён на $_yt_pick"
+              tg_alert "🔀 <b>YouTube переключён на резерв</b>: канал <code>$_yt_eff_prev</code> отвечает, но трафик сквозь него не проходит → трафик идёт через <code>$_yt_pick</code>." ;;
+          esac
         else
           log "YT-FAILOVER: основной $YT_TAG недоступен → YouTube переключён на резерв $_yt_pick"
           tg_alert "🔀 <b>YouTube переключён на резерв</b>: основной <code>$YT_TAG</code> не отвечает → трафик идёт через <code>$_yt_pick</code>. Вернусь на основной, когда он оживёт."
@@ -2820,8 +2832,14 @@ if [ -n "$FOREIGN_DOMAINS$FOREIGN_EXT_CATEGORIES$FOREIGN_GEOIP_CATEGORIES" ] && 
             tg_alert "✅ <b>Заграничный канал вернулся на основной</b> <code>$FOREIGN_TAG</code>."
           fi
         elif [ "${DFGN_DEAF:-0}" = "1" ]; then
-          log "FOREIGN-FAILOVER: канал $_fgn_eff_prev глух (трафик сквозь не идёт) → переключён на $_fgn_pick"
-          tg_alert "🔀 <b>Заграничный канал переключён на резерв</b>: <code>$_fgn_eff_prev</code> отвечает, но трафик сквозь него не проходит → Telegram/Instagram идут через <code>$_fgn_pick</code>."
+          case " $XRAY_BUSY_BLAME " in
+            *" FGN=$_fgn_eff_prev "*)
+              log "FOREIGN-FAILOVER: с каналом $_fgn_eff_prev xray перегружает процессор → переключён на $_fgn_pick"
+              tg_alert "🔀 <b>Заграничный канал переключён на резерв</b>: с каналом <code>$_fgn_eff_prev</code> xray перегружал процессор роутера → Telegram/Instagram идут через <code>$_fgn_pick</code>." ;;
+            *)
+              log "FOREIGN-FAILOVER: канал $_fgn_eff_prev глух (трафик сквозь не идёт) → переключён на $_fgn_pick"
+              tg_alert "🔀 <b>Заграничный канал переключён на резерв</b>: <code>$_fgn_eff_prev</code> отвечает, но трафик сквозь него не проходит → Telegram/Instagram идут через <code>$_fgn_pick</code>." ;;
+          esac
         else
           log "FOREIGN-FAILOVER: основной $FOREIGN_TAG недоступен → переключён на резерв $_fgn_pick"
           tg_alert "🔀 <b>Заграничный канал переключён на резерв</b>: основной <code>$FOREIGN_TAG</code> не отвечает → Telegram/Instagram идут через <code>$_fgn_pick</code>."

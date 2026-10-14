@@ -2981,9 +2981,15 @@ def keenetic_read_watchdog_config():
     чистом роутере до первого «Сохранить»); None — чтение НЕ УДАЛОСЬ (SSH-сбой/
     таймаут). Спутать None с {} = fail-open: удаление «защищённого» активного
     outbound'а или перезапись конфига дефолтами с потерей доменов/TG-токена."""
-    r = keenetic_ssh("if [ -f /opt/etc/xray/watchdog.config ]; then cat /opt/etc/xray/watchdog.config; else echo __WDCFG_ABSENT__; fi")
+    _cmd = "if [ -f /opt/etc/xray/watchdog.config ]; then cat /opt/etc/xray/watchdog.config; else echo __WDCFG_ABSENT__; fi"
+    r = keenetic_ssh(_cmd)
     if not r["ok"]:
-        return None
+        # Разовый сбой SSH (14.10: «не прочитался» при смене роли, повтор сразу прошёл) — чтение ничего не
+        # меняет, один повтор безопасен. Второй сбой — None (fail-closed, как и раньше).
+        _time_mod.sleep(2)
+        r = keenetic_ssh(_cmd)
+        if not r["ok"]:
+            return None
     if "__WDCFG_ABSENT__" in (r["stdout"] or ""):
         return {}
     return _parse_watchdog_config(r["stdout"])

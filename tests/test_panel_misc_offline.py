@@ -10,6 +10,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import dashboard as D  # noqa: E402
+_ORIG_READ_WD = D.keenetic_read_watchdog_config   # ниже тесты подменяют её без возврата
 
 fails = 0
 
@@ -72,6 +73,27 @@ for cfgd, want, label in cases:
 # --- kill-switch политики в сайдбаре не «Прочее» ---
 src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dashboard.py"), encoding="utf-8").read()
 check("catFor относит kill-switch к «Обслуживание»", "wireguard|kill-switch/.test(t)) return 'Обслуживание'" in src)
+
+# keenetic_read_watchdog_config: один повтор при разовом сбое SSH, второй сбой — None (fail-closed)
+_orig_ssh, _orig_sleep = D.keenetic_ssh, D._time_mod.sleep
+_calls = []
+def _fake_ssh(seq):
+    def f(cmd, *a, **k):
+        _calls.append(cmd)
+        ok = seq.pop(0)
+        return {"ok": ok, "stdout": 'PRIMARY_TAG="S3"\n' if ok else "", "stderr": "" if ok else "boom", "code": 0 if ok else 255}
+    return f
+D._time_mod.sleep = lambda s: None
+try:
+    _calls.clear(); D.keenetic_ssh = _fake_ssh([False, True])
+    r = _ORIG_READ_WD()
+    check("чтение watchdog.config: разовый сбой SSH — повтор и успех", isinstance(r, dict) and r.get("PRIMARY_TAG") == "S3" and len(_calls) == 2, r)
+    _calls.clear(); D.keenetic_ssh = _fake_ssh([False, False])
+    check("чтение watchdog.config: два сбоя подряд — None (fail-closed)", _ORIG_READ_WD() is None and len(_calls) == 2)
+    _calls.clear(); D.keenetic_ssh = _fake_ssh([True])
+    check("чтение watchdog.config: успех с первого раза — без повтора", _ORIG_READ_WD() is not None and len(_calls) == 1)
+finally:
+    D.keenetic_ssh, D._time_mod.sleep = _orig_ssh, _orig_sleep
 
 print("test_panel_misc_offline: " + ("OK" if not fails else f"FAIL ({fails})"))
 sys.exit(1 if fails else 0)

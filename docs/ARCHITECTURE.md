@@ -461,7 +461,8 @@ fix_explain)`):
   ASCII. Вывод Keenetic CLI с ANSI — чистить; ошибки `ndmc` искать в stdout (`error[`), код возврата
   часто 0.
 - **JSON XKeen с `//`-комментариями** — `keenetic_load_json`/`_strip_json_comments`.
-- **Fail-closed**: `keenetic_read_watchdog_config()` → `{}` (файла нет) ≠ `None` (сбой);
+- **Fail-closed**: `keenetic_read_watchdog_config()` → `{}` (файла нет) ≠ `None` (сбой; при сбое SSH — один повтор
+  через 2 с, чтение идемпотентно);
   `keenetic_get_outbounds()` → `[]` ≠ `None`. В удалении и записи сбой чтения = отказ
   (`keenetic_get_watchdog_targets(strict=True)`).
 - argv мимо `_ssh_args`: `api_keenetic_test_connection`, `api_xkeen_migration_backup`,

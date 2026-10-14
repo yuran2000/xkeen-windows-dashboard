@@ -464,6 +464,15 @@ write(STATE, "primary 0 S3 AI_EFF=S1 YT_EFF=S1 FGN_EFF=S3\n")
 out, _ = run('xray_busy_eval; echo "B=$XRAY_BUSY"', {"FAKE_NOW": str(T), "FAKE_PID": ""})
 check(out == "B=0", "xray не запущен: XRAY_BUSY=0, пробы не давятся", out)
 
+# 30) v39: текст ухода YouTube/«Зарубежных» по перегрузке называет причину (статическая проверка .cur).
+yt_blk = src[src.index('elif [ "${DYT_DEAF:-0}" = "1" ]; then'):]
+yt_blk = yt_blk[:yt_blk.index("esac")]
+check('*" YT=$_yt_eff_prev "*)' in yt_blk and "перегружал процессор" in yt_blk and "трафик сквозь него не проходит" in yt_blk,
+      "v39: YouTube — при обвинении текст про перегрузку, иначе прежний про глухоту")
+fg_blk = src[src.index('elif [ "${DFGN_DEAF:-0}" = "1" ]; then'):]
+fg_blk = fg_blk[:fg_blk.index("esac")]
+check('*" FGN=$_fgn_eff_prev "*)' in fg_blk and "перегружал процессор" in fg_blk, "v39: «Зарубежные» — то же")
+
 # 12) Выключено — ничего не меряет.
 out, _ = run('XRAY_BUSY_ENABLE=0; xray_busy_eval; echo "$XRAY_BUSY/$XRAY_BUSY_PCT"', {"FAKE_NOW": str(T), "FAKE_PID": "4242"})
 check(out == "0/", "XRAY_BUSY_ENABLE=0: замера нет", out)
