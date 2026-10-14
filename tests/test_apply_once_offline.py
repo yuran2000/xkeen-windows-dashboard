@@ -114,7 +114,8 @@ def _paths(text, tp):
             .replace('"/tmp/xkeen_apply.', f'"{tp}/apply.'))
 
 
-def harness(t, done=0, rb="", hc_seq="0", xt=0, wait=3, need=0, crash=False, done_before_crash=False):
+def harness(t, done=0, rb="", hc_seq="0", xt=0, wait=3, need=0, crash=False, done_before_crash=False, tc=0, force=0,
+            edit_after_swap=False):
     """Скрипт: стабы + настоящие пролог/итог из .cur. Пути роутера → временная папка."""
     tp = t.replace("\\", "/")
     parts = [
@@ -123,13 +124,17 @@ def harness(t, done=0, rb="", hc_seq="0", xt=0, wait=3, need=0, crash=False, don
         'tg_alert() { echo "TG $*" >> ' + tp + '/log; }',
         "_xk_restart() { echo R >> " + tp + "/restarts; return 0; }",
         "xray_test_live() { return " + str(xt) + "; }",
+        "traffic_check() { return " + str(tc) + "; }",
+        f"WD_APPLY_FORCE={force}",
         "_hc_n=0",
         "health_check() {",
         '  _hc_n=$((_hc_n+1)); _r=$(echo "' + hc_seq + '" | cut -d" " -f$_hc_n); [ -z "$_r" ] && _r=0; return $_r',
         "}",
         fn("_wd_lock_try"),
+        fn("_apply_health"),
         _paths(PROLOGUE, tp),
         '. "$CFG"',
+        f"echo EDITED=1 > {tp}/cfg" if edit_after_swap else "",
         "_APPLY_DONE=1" if done_before_crash else "",
         "exit 3" if crash else "",
         f"_APPLY_NEED={need}",
@@ -219,6 +224,36 @@ else:
 
     o = run_case(hc_seq="1 1")
     check("и после отката проверка не прошла → ROLLBACK after=fail", "after=fail" in o["res"], o)
+
+    o = run_case(tc=1)
+    check("v36: после рестарта xray не выпускает трафик → откат файлов, ROLLBACK reason=traffic",
+          o["res"].startswith("ROLLBACK reason=traffic restart=2 after=fail") and files(o) == OLD, o)
+
+    o = run_case(hc_seq="1 0", edit_after_swap=True)
+    check("откат не затирает файл, изменённый ПОСЛЕ подмены (правка в панели во время применения)",
+          o["res"].startswith("ROLLBACK") and o["cfg"] == "EDITED=1" and o["ob"] == "OLD_ob_json=1"
+          and "не откатываю" in o["log"], o)
+
+    o = run_case(staged=(), force=1, rb="blocked")
+    check("force без файлов, кандидат отклонён → FAIL … nofiles=1 (панель не пишет «откачены»)",
+          o["res"].startswith("FAIL reason=blocked restart=0 nofiles=1") and o["restarts"] == 0, o)
+
+    o = run_case(staged=(), force=1, rb="health", done=1)
+    check("force без файлов, откат routing к lastgood → ROLLBACK … nofiles=1 БЕЗ выхода (Save state сохранит LAST_BAD_MD5)",
+          "ROLLBACK reason=health restart=2" in o["res"] and "nofiles=1" in o["res"] and o["rc"] == 0, o)
+
+    o = run_case(staged=(), force=1, hc_seq="1")
+    check("v36: force без подменённых файлов, проверка не прошла → FAIL nofiles, без второго рестарта и отката",
+          o["res"].startswith("FAIL reason=health restart=1 nofiles=1") and o["restarts"] == 1
+          and o["rt"] == "OLD_05_routing_json=1", o)
+
+    o = run_case(staged=(), force=1)
+    check("v36: WD_APPLY_FORCE без подменённых файлов → ровно один рестарт, OK",
+          o["res"].startswith("OK routing=same restart=1") and o["restarts"] == 1, o)
+
+    o = run_case(staged=())
+    check("ничего не подменено и без force → без рестарта", o["res"].startswith("OK routing=same restart=0")
+          and o["restarts"] == 0, o)
 
     o = run_case(rb="blocked")
     check("кандидат отклонён до рестарта → FAIL без рестарта, файлы откачены",
@@ -451,7 +486,7 @@ order = []
 REAL_BULK = D.keenetic_remove_outbounds_bulk
 
 
-def setup(apply_status="OK", wd_ver=35, fresh_subs=None):
+def setup(apply_status="OK", wd_ver=36, fresh_subs=None):
     calls.clear()
     order.clear()
     D.keenetic_get_outbounds = lambda: list(OBS)
@@ -539,7 +574,7 @@ check("применение откатилось → ok=False, removed пуст,
 
 setup(wd_ver=34)
 r = D.keenetic_remove_subscription(URL)
-check("watchdog на роутере старее v35 → отказ ДО любых изменений",
+check("watchdog на роутере старее нужной версии → отказ ДО любых изменений",
       not r.get("ok") and r.get("phase") == "watchdog" and not calls.get("wcfg") and not calls.get("bulk")
       and not calls.get("ssh"), (r, calls))
 
@@ -554,16 +589,14 @@ check("нестандартные пути XKeen → отказ до измен�
 # второй запрос во время первого — «занято»
 setup()
 gate = threading.Event()
-D.keenetic_apply_staged = lambda run_id, fp, **kw: (gate.wait(5), {"ok": True, "status": "OK", "reason": "",
-                                                                   "restart": "1", "routing": "same",
-                                                                   "pending": False, "stderr": ""})[1]
+entered = threading.Event()
+D.keenetic_apply_staged = lambda run_id, fp, **kw: (entered.set(), gate.wait(5),
+                                                    {"ok": True, "status": "OK", "reason": "", "restart": "1",
+                                                     "routing": "same", "pending": False, "stderr": ""})[2]
 res1 = {}
 th = threading.Thread(target=lambda: res1.update(D.keenetic_remove_subscription(URL)))
 th.start()
-for _ in range(200):
-    if D._REMOVE_SUB_LOCK.locked():
-        break
-    threading.Event().wait(0.01)
+entered.wait(5)
 r2 = D.keenetic_remove_subscription(URL)
 gate.set()
 th.join(10)

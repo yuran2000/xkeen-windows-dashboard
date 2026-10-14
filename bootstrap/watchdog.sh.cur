@@ -1,4 +1,17 @@
 #!/bin/sh
+# XKeen failover watchdog v36 (2026-10-14, проба трафика после рестарта):
+#   • После рестарта xray проверяется не только «процесс жив и DNS отвечает», но и что xray
+#     ВЫПУСКАЕТ трафик: свой вход socks-health (127.0.0.1:HEALTH_PROBE_PORT, 10822) с правилом
+#     → direct, запрос на TRAFFIC_PROBE_URLS. Не зависит от VPN-узлов: упавший VPS ложного
+#     «xray сломан» не даёт (их ловит сквозная проба). Не прошло, а роутер сам (мимо xray) в
+#     интернет выходит — xray сломан; не выходит и роутер — нет интернета, xray не виноват (0).
+#     curl не запускается (код 127, нет библиотеки) — мерить нечем (0).
+#     Обычный тик: xray сломан — один лечебный рестарт + алерт, не чаще раза в TRAFFIC_HEAL_COOLDOWN
+#     (1800 с); без отката routing и анти-флапа. Режим применения: как провал health-check
+#     (reason=traffic), откат файлов панели. Вход socks-health заводит self-heal (один рестарт).
+#   • WD_APPLY_FORCE=1 — режим применения делает рестарт, даже если файлы не подменялись
+#     (восстановление из бэкапа, «Применить структуру» — файлы записаны напрямую).
+#
 # XKeen failover watchdog v35 (2026-10-14, применение изменений панели одним рестартом):
 #   • Режим применения (env WD_APPLY=<id>, запускает панель): сторож берёт lock (ждёт текущий тик до
 #     WD_APPLY_WAIT с), подменяет подготовленные панелью файлы *.applynew (watchdog.config,
@@ -344,12 +357,13 @@ WD_APPLY_ID="${WD_APPLY:-}"
 case "$WD_APPLY_ID" in *[!A-Za-z0-9_-]*) WD_APPLY_ID="" ;; esac
 APPLY_RES="/tmp/xkeen_apply.$WD_APPLY_ID.res"
 APPLY_MANIFEST="/tmp/xkeen_apply.$WD_APPLY_ID.manifest"
+APPLY_SWAPPED="/tmp/xkeen_apply.$WD_APPLY_ID.swapped"   # «<путь> <md5 после подмены>»
 APPLY_STAGE_LIST="$CFG /opt/etc/xray/configs/04_outbounds.json /opt/etc/xray/configs.bak/05_routing.template.json"
 APPLY_FILES=""
 _apply_result() {
   echo "$*" > "$APPLY_RES"
   log "APPLY $WD_APPLY_ID: $*"
-  rm -f "$APPLY_MANIFEST"
+  rm -f "$APPLY_MANIFEST" "$APPLY_SWAPPED"
 }
 _apply_unstage() {
   for _x in $APPLY_STAGE_LIST; do rm -f "$_x.applynew.$WD_APPLY_ID"; done
@@ -360,8 +374,16 @@ _md5_or_dash() {
 # Вернуть файлы, подменённые применением, и живой routing к копиям *.bak-apply-<id>.
 APPLY_ROUTING="$CONFIG_DIR/05_routing.json"
 _apply_restore() {
+  [ -n "$APPLY_FILES" ] || return 0
   for _af in $APPLY_FILES $APPLY_ROUTING; do
-    [ -f "$_af.bak-apply-$WD_APPLY_ID" ] && cp "$_af.bak-apply-$WD_APPLY_ID" "$_af"
+    [ -f "$_af.bak-apply-$WD_APPLY_ID" ] || continue
+    # Файл изменили уже ПОСЛЕ подмены (сохранение в панели во время применения) — не затирать.
+    _sw=$(awk -v p="$_af" '$1==p {print $2; exit}' "$APPLY_SWAPPED" 2>/dev/null)
+    if [ -n "$_sw" ] && [ "$_sw" != "$(_md5_or_dash "$_af")" ]; then
+      log "APPLY $WD_APPLY_ID: $_af изменён во время применения — не откатываю (чужая правка)"
+      continue
+    fi
+    cp "$_af.bak-apply-$WD_APPLY_ID" "$_af"
   done
   [ -n "$APPLY_FILES" ] && log "APPLY $WD_APPLY_ID: файлы панели и routing откачены ($APPLY_FILES)"
 }
@@ -433,6 +455,7 @@ if [ -n "$WD_APPLY_ID" ]; then
       exit 1
     fi
     APPLY_FILES="$APPLY_FILES $_af"
+    echo "$_af $(_md5_or_dash "$_af")" >> "$APPLY_SWAPPED"
   done
   log "APPLY $WD_APPLY_ID: начало (lock ждал ${_aw}с, подменены:${APPLY_FILES:- нет})"
 else
@@ -1089,6 +1112,21 @@ generate_routing() {
     fi
   fi
 
+  # v36: проба здоровья самого xray — socks-health → direct (не зависит от VPN-узлов). Только если
+  # inbound уже заведён (self-heal v36 ниже) и outbound direct есть.
+  if [ -f "$CONFIG_DIR/03_inbounds.json" ] && grep -q '"socks-health"' "$CONFIG_DIR/03_inbounds.json" 2>/dev/null \
+     && grep -q '"tag": *"direct"' "$OUTBOUNDS_JSON" 2>/dev/null && command -v jq >/dev/null 2>&1; then
+    sed -n '1,/^{/p' "$CONFIG_DIR/05_routing.json.new" | sed '$d' > /tmp/r36.head 2>/dev/null
+    sed -n '/^{/,$p' "$CONFIG_DIR/05_routing.json.new" > /tmp/r36.body 2>/dev/null
+    if jq '.routing.rules = [{"inboundTag":["socks-health"],"outboundTag":"direct","type":"field"}] + .routing.rules' \
+         /tmp/r36.body > /tmp/r36.body.new 2>/dev/null; then
+      cat /tmp/r36.head /tmp/r36.body.new > "$CONFIG_DIR/05_routing.json.new" 2>/dev/null
+    else
+      log "v36 WARN: jq не смог добавить правило socks-health → direct (проба трафика не сработает)"
+    fi
+    rm -f /tmp/r36.head /tmp/r36.body /tmp/r36.body.new 2>/dev/null
+  fi
+
   # v9: валидация JSON перед возвратом. Если awk/template/sed где-то сгенерили
   # битый JSON (например trailing comma, пустой outboundTag) — не применять.
   # Сегодня юзер ловил оба этих кейса.
@@ -1229,7 +1267,15 @@ if [ -z "$WD_APPLY_ID" ]; then
       [ -f "$_af.bak-apply-$_mid" ] && _moved="$_moved $_af"
     done
     [ -n "$_moved" ] || continue
-    for _af in $_moved; do cp "$_af.bak-apply-$_mid" "$_af"; done
+    for _af in $_moved; do
+      _sw=$(awk -v p="$_af" '$1==p {print $2; exit}' "/tmp/xkeen_apply.$_mid.swapped" 2>/dev/null)
+      if [ -n "$_sw" ] && [ "$_sw" != "$(md5sum < "$_af" 2>/dev/null | awk '{print $1}')" ]; then
+        log "APPLY $_mid: $_af изменён после подмены — не откатываю (чужая правка)"
+        continue
+      fi
+      cp "$_af.bak-apply-$_mid" "$_af"
+    done
+    rm -f "/tmp/xkeen_apply.$_mid.swapped"
     for _af in $APPLY_STAGE_LIST; do rm -f "$_af.applynew.$_mid"; done
     rm -f "$_m"
     log "APPLY $_mid: применение прервано после подмены — файлы откачены ($_moved), перезапуск на прежних"
@@ -1243,6 +1289,75 @@ if [ -z "$WD_APPLY_ID" ]; then
     find "$(dirname "$_af")" -maxdepth 1 -name "$(basename "$_af").applynew.*" -mmin +60 -exec rm -f {} \; 2>/dev/null
   done
 fi
+
+# ---------- v36: трафик сквозь xray ----------
+# 0 — xray выпускает трафик через свой вход socks-health (→ direct), ИЛИ мерить нечем (нет входа / правила
+# в живом routing / curl не запускается), ИЛИ нет интернета у самого роутера (xray не виноват).
+# 1 — роутер мимо xray в интернет выходит, а через xray — нет: xray сломан.
+TRAFFIC_PROBE_URLS="${TRAFFIC_PROBE_URLS:-https://ya.ru/ http://connectivitycheck.gstatic.com/generate_204}"
+# Итог последней пробы в TC_RESULT: ok | broken | nonet | skip (алерты не врут, когда «0» = «нечем мерить»).
+traffic_check() {
+  local _try=0 _u _code _rc
+  TC_RESULT=skip
+  grep -q '"socks-health"' /opt/etc/xray/configs/03_inbounds.json 2>/dev/null || return 0
+  grep -q '"socks-health"' /opt/etc/xray/configs/05_routing.json 2>/dev/null || return 0
+  while [ "$_try" -lt 2 ]; do
+    for _u in $TRAFFIC_PROBE_URLS; do
+      _code=$(curl -s -o /dev/null --max-time 6 --socks5-hostname "127.0.0.1:${HEALTH_PROBE_PORT:-10822}" -w '%{http_code}' "$_u" 2>/dev/null)
+      _rc=$?
+      [ "$_rc" -eq 127 ] && return 0
+      [ -n "$_code" ] && [ "$_code" != "000" ] && { TC_RESULT=ok; return 0; }
+    done
+    _try=$((_try+1))
+    [ "$_try" -lt 2 ] && sleep 3
+  done
+  for _u in $TRAFFIC_PROBE_URLS; do
+    _code=$(curl -s -o /dev/null --max-time 6 -w '%{http_code}' "$_u" 2>/dev/null)
+    if [ -n "$_code" ] && [ "$_code" != "000" ]; then
+      log "TRAFFIC: роутер напрямую выходит в интернет, а через xray (socks-health → direct) — нет"
+      TC_RESULT=broken
+      return 1
+    fi
+  done
+  log "TRAFFIC: нет интернета и у самого роутера (мимо xray) — xray не виноват, проверку пропускаю"
+  TC_RESULT=nonet
+  return 0
+}
+# Обычный тик после удачного рестарта: xray не выпускает трафик — один лечебный рестарт (без отката
+# routing: причина не в конфиге, а в «залипшем» после рестарта xray), не чаще раза в
+# TRAFFIC_HEAL_COOLDOWN. 0 — трафик идёт, 1 — нет (после лечения или лечение в кулдауне).
+TRAFFIC_HEAL_STATE=/opt/etc/xray/watchdog.trafficheal
+_traffic_ok_or_heal() {
+  local _now _last
+  traffic_check && return 0
+  _now=$(date +%s)
+  _last=$(cat "$TRAFFIC_HEAL_STATE" 2>/dev/null)
+  case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+  if [ $((_now - _last)) -lt "$TRAFFIC_HEAL_COOLDOWN" ] 2>/dev/null; then
+    log "TRAFFIC: лечебный рестарт был $((_now - _last))с назад — повторно не делаю (кулдаун)"
+    return 1
+  fi
+  echo "$_now" > "$TRAFFIC_HEAL_STATE"
+  log "TRAFFIC: лечебный рестарт xray"
+  _xk_restart
+  if traffic_check; then
+    if [ "$TC_RESULT" = "ok" ]; then
+      log "TRAFFIC: после лечебного рестарта трафик пошёл"
+      tg_alert "🩹 <b>XKeen watchdog</b>: после перезапуска xray не выпускал трафик (даже напрямую) — сделан повторный перезапуск, трафик пошёл."
+    else
+      log "TRAFFIC: после лечебного рестарта проверить нечем ($TC_RESULT) — алерт не шлю"
+    fi
+    return 0
+  fi
+  tg_alert "🚨 <b>XKeen watchdog</b>: xray не выпускает трафик даже напрямую, а сам роутер в интернет выходит. Повторный перезапуск не помог — нужна проверка роутера. Следующая попытка — не раньше чем через $((TRAFFIC_HEAL_COOLDOWN / 60)) мин."
+  return 1
+}
+# Режим применения: здоровье после рестарта. Причина провала — в _APPLY_HREASON (health | traffic).
+_apply_health() {
+  health_check 8 || { _APPLY_HREASON=health; return 1; }
+  traffic_check || { _APPLY_HREASON=traffic; return 1; }
+  return 0
+}
 
 # ---------- Досыл застрявших TG-алертов (v15) ----------
 # В начале каждого тика пробуем дослать всё, что не ушло из-за упавшего канала.
@@ -1460,6 +1575,24 @@ if [ "$DEEP_PROBE_ENABLE" = "1" ] && [ -f "$_INB_FILE" ] && command -v jq >/dev/
   fi
 fi
 # ---------- /v29 self-heal inbound ----------
+
+# ---------- v36: self-heal inbound socks-health (проба трафика самого xray, → direct) ----------
+HEALTH_PROBE_PORT=$(_num "${HEALTH_PROBE_PORT:-10822}" 10822)
+TRAFFIC_HEAL_COOLDOWN=$(_num "${TRAFFIC_HEAL_COOLDOWN:-1800}" 1800)
+if [ -f "$_INB_FILE" ] && command -v jq >/dev/null 2>&1 && ! grep -q '"socks-health"' "$_INB_FILE" 2>/dev/null; then
+  cp "$_INB_FILE" "$_INB_FILE.bak-v36-$(date +%Y%m%d-%H%M%S)" 2>/dev/null
+  if jq --argjson p "$HEALTH_PROBE_PORT" \
+       '.inbounds += [{"tag":"socks-health","listen":"127.0.0.1","port":$p,"protocol":"socks","settings":{"auth":"noauth","udp":false}}]' \
+       "$_INB_FILE" > "$_INB_FILE.tmp-v36" 2>/dev/null; then
+    mv "$_INB_FILE.tmp-v36" "$_INB_FILE" 2>/dev/null
+    # Без отдельного рестарта: generate_routing в этом же тике добавит правило socks-health → direct,
+    # routing изменится, и блок Apply сделает ОДИН рестарт — он поднимет и вход, и правило.
+    log "v36: добавлен inbound socks-health на 127.0.0.1:$HEALTH_PROBE_PORT (проба трафика xray → direct) — применится рестартом этого тика"
+  else
+    rm -f "$_INB_FILE.tmp-v36" 2>/dev/null
+    log "v36 WARN: jq не смог добавить inbound socks-health — проба трафика выключена"
+  fi
+fi
 
 # v24: self-heal LIVE 05_routing.json — добавить правило socks-ai-check → AI_TAG если его там нет.
 # Хук в generate_routing() покрывает случай регенерации (изменилась подписка/настройки), но
@@ -2549,7 +2682,11 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
       # v12: health-check ПОСЛЕ применения — реально ли живы xray и клиентский DNS.
       # Ловит рантайм-обвалы, которые xray -test пропускает (валидный конфиг, но DNS подвис).
       # v35: и что рестарт вообще закончился новым xray (_xk_restart ждёт до 90 с).
-      if _xk_restart && health_check 8; then
+      # v36: в режиме применения нет трафика = провал (откат файлов панели); в обычном тике —
+      # лечебный рестарт ниже, без отката routing.
+      if [ -n "$WD_APPLY_ID" ]; then _xk_restart && _apply_health; else _xk_restart && health_check 8; fi
+      if [ $? -eq 0 ]; then
+        [ -z "$WD_APPLY_ID" ] && { _traffic_ok_or_heal || :; }
         cp "$CONFIG_DIR/05_routing.json" "$CONFIG_DIR/05_routing.json.lastgood" 2>/dev/null
         LAST_BAD_MD5=""   # успешное применение — снимаем «бракованную» метку
         if [ "$NEW_DEFAULT" != "$CUR_DEFAULT" ] && [ "$_pri_main_chg" = "1" ] && [ "$NEW_DEFAULT" = "$PRIMARY_TAG" ] \
@@ -2610,14 +2747,17 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
         cp "$CONFIG_DIR/05_routing.json" "$CONFIG_DIR/05_routing.json.unhealthy-${_ts}" 2>/dev/null
         LAST_BAD_MD5="$NEW_MD5"   # запомнить чтобы не переприменять (анти-флап)
         # v35: в режиме применения назад идут файлы панели и routing, бывший ДО применения
-        # (точнее lastgood); откатный рестарт поднимет прежнее.
-        if [ -n "$WD_APPLY_ID" ]; then
-          _apply_restore; _APPLY_RB="health"
+        # (точнее lastgood); откатный рестарт поднимет прежнее. Подменённых файлов нет (force:
+        # restore / структура) — как обычный тик, к lastgood.
+        [ -n "$WD_APPLY_ID" ] && _APPLY_RB="${_APPLY_HREASON:-health}"
+        if [ -n "$WD_APPLY_ID" ] && [ -n "$APPLY_FILES" ]; then
+          _apply_restore
         elif [ -f "$CONFIG_DIR/05_routing.json.lastgood" ]; then
           cp "$CONFIG_DIR/05_routing.json.lastgood" "$CONFIG_DIR/05_routing.json"
         fi
-        if [ -n "$WD_APPLY_ID" ] || [ -f "$CONFIG_DIR/05_routing.json.lastgood" ]; then
-          if _xk_restart && health_check 8; then
+        if { [ -n "$WD_APPLY_ID" ] && [ -n "$APPLY_FILES" ]; } || [ -f "$CONFIG_DIR/05_routing.json.lastgood" ]; then
+          if [ -n "$WD_APPLY_ID" ]; then _xk_restart && _apply_health; else _xk_restart && health_check 8; fi
+          if [ $? -eq 0 ]; then
             _APPLY_AFTER=ok
             log "AUTO-ROLLBACK OK: новый routing уронил DNS/инет → откат на lastgood, сеть восстановлена. Битый кандидат → 05_routing.json.unhealthy-${_ts}"
             tg_alert "🛡️ <b>XKeen watchdog</b>: новая конфигурация уронила DNS/интернет — выполнен <b>авто-откат</b> на последнюю рабочую. Сеть восстановлена. Изменения НЕ применятся повторно, пока не сменишь настройки в панели."
@@ -2659,16 +2799,25 @@ if [ -n "$WD_APPLY_ID" ]; then
   _need=0
   case " $APPLY_FILES " in *" /opt/etc/xray/configs/04_outbounds.json "*) _need=1 ;; esac
   [ "${_APPLY_NEED:-0}" = "1" ] && _need=1
+  [ "${WD_APPLY_FORCE:-0}" = "1" ] && _need=1
+  # Подменённых файлов нет (force: restore / структура записали файлы сами) — откатывать нечего;
+  # признак уходит в итог, панель пишет честный текст.
+  _nf=""; [ -z "$APPLY_FILES" ] && _nf=" nofiles=1"
   if [ -n "$_APPLY_RB" ] && [ "$_APPLY_DONE" = "0" ]; then
     # Кандидат отклонён ДО рестарта: вернуть файлы; отложенный тиком рестарт — всё равно сделать.
     _apply_restore
     if [ "${_APPLY_NEED:-0}" = "1" ]; then
       _xk_restart
-      _apply_result "FAIL reason=$_APPLY_RB restart=1 deferred=1"
+      _apply_result "FAIL reason=$_APPLY_RB restart=1 deferred=1$_nf"
     else
-      _apply_result "FAIL reason=$_APPLY_RB restart=0"
+      _apply_result "FAIL reason=$_APPLY_RB restart=0$_nf"
     fi
     exit 1
+  elif [ -n "$_APPLY_RB" ] && [ -n "$_nf" ]; then
+    # force без файлов, health/трафик провалены после пересборки routing: routing откачен к lastgood
+    # (как в обычном тике). БЕЗ выхода: Save state сохранит LAST_BAD_MD5 — иначе следующий тик
+    # применил бы тот же плохой routing ещё раз.
+    _apply_result "ROLLBACK reason=$_APPLY_RB restart=2 after=${_APPLY_AFTER:-fail}$_nf"
   elif [ -n "$_APPLY_RB" ]; then
     # health-check после рестарта провален: файлы и routing откачены, откатный рестарт сделан выше.
     _apply_result "ROLLBACK reason=$_APPLY_RB restart=2 after=${_APPLY_AFTER:-fail}"
@@ -2682,19 +2831,23 @@ if [ -n "$WD_APPLY_ID" ]; then
   elif ! xray_test_live; then
     _apply_restore
     if [ "${_APPLY_NEED:-0}" = "1" ]; then _xk_restart; _r=1; else _r=0; fi
-    _apply_result "FAIL reason=xraytest restart=$_r"
+    _apply_result "FAIL reason=xraytest restart=$_r$_nf"
     exit 1
   else
     # routing не изменился — рестарт ради новых outbound'ов / inbound'ов.
     _APPLY_DONE=1
-    if _xk_restart && health_check 8; then
+    if _xk_restart && _apply_health; then
       _apply_prune_baks
       _apply_result "OK routing=same restart=1"
+    elif [ -z "$APPLY_FILES" ]; then
+      # force без подменённых файлов (restore / структура): откатывать нечего — честный отказ.
+      _apply_result "FAIL reason=${_APPLY_HREASON:-health} restart=1 nofiles=1"
+      exit 1
     else
       _apply_restore
-      if _xk_restart && health_check 8; then _ar="ok"; else _ar="fail"; fi
+      if _xk_restart && _apply_health; then _ar="ok"; else _ar="fail"; fi
       tg_alert "🛡️ <b>XKeen watchdog</b>: изменения из панели уронили сеть — файлы откачены, xray перезапущен (проверка после отката: $_ar)."
-      _apply_result "ROLLBACK reason=health restart=2 after=$_ar"
+      _apply_result "ROLLBACK reason=${_APPLY_HREASON:-health} restart=2 after=$_ar"
       exit 1
     fi
   fi

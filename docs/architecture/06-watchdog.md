@@ -150,6 +150,14 @@ PRIMARY и state-машина (глухота `DPRI_DEAF` форсирует dow
 анти-флап → `validate_routing_xray` → `mv` → `_xk_restart` → `health_check` → `.lastgood` или
 `AUTO-ROLLBACK`) → итог режима применения (§6.7) → обход FAILOVER → Save state.
 
+**Проба трафика (v36).** `traffic_check` — curl через СВОЙ вход `socks-health` (127.0.0.1:`HEALTH_PROBE_PORT`
+10822; заводит self-heal, правило → `direct` ставит `generate_routing`) на `TRAFFIC_PROBE_URLS`: проверяется сам
+xray, не VPN-узлы (упавший VPS ложного «xray сломан» не даёт). Не прошло — запрос мимо xray: роутер выходит, а
+xray нет → 1; не выходит и роутер (нет интернета), нет входа/правила, curl не запускается (127) → 0. Обычный тик
+после удачного рестарта: `_traffic_ok_or_heal` — один лечебный рестарт + TG, не чаще `TRAFFIC_HEAL_COOLDOWN`
+(1800 с, `watchdog.trafficheal`), без отката routing. Режим применения: `_apply_health` (health → traffic,
+причина в `_APPLY_HREASON`) — провал = откат файлов панели (`reason=traffic`).
+
 **`_xk_restart` (v35).** XKeen 2.0 запускает `xkeen -restart` без терминала (cron, ssh, скрипт) **в фоне**
 (`start-stop-daemon`, лог `/opt/var/log/xkeen-detached.log`) и сразу возвращает управление; синхронно — только с
 `XKEEN_FOREGROUND=1`. До v35 `health_check` сразу после рестарта мерил ещё СТАРЫЙ xray. `_xk_restart` ждёт чужой
@@ -179,7 +187,8 @@ v21, v23) — через `_bg_restart_or_defer`.
 
 ### 6.7. Режим применения (v35, `WD_APPLY=<id>`)
 
-Запускает панель (`keenetic_apply_staged`, §3.5): `WD_APPLY=<id> nohup /opt/etc/xray/watchdog.sh`. Id — только
+Запускает панель (`keenetic_apply_staged`, §3.5): `WD_APPLY=<id> [WD_APPLY_FORCE=1] nohup /opt/etc/xray/watchdog.sh`
+(`WD_APPLY_FORCE=1`, v36 — рестарт и без подменённых файлов: restore, «Применить структуру»). Id — только
 `[A-Za-z0-9_-]`. Файлы: подготовленные `<живой>.applynew.<id>` (список `APPLY_STAGE_LIST` = `watchdog.config`,
 `04_outbounds.json`, routing-template — тот же, что `APPLY_STAGE_FILES` панели), манифест
 `/tmp/xkeen_apply.<id>.manifest` (`<путь> <md5 | ->`), итог `/tmp/xkeen_apply.<id>.res`, копии `*.bak-apply-<id>`
@@ -196,12 +205,15 @@ v21, v23) — через `_bg_restart_or_defer`.
 2. Тик идёт как обычно, кроме: AI-проба, UDP- и FD-залип не оцениваются (решит следующий тик); фоновые
    рестарты откладываются (`_APPLY_NEED=1`).
 3. Итог после блока Apply: рестарт уже был (routing пересобран) — `OK routing=changed restart=1`; нужен
-   (подменён `04_outbounds` или `_APPLY_NEED`) — `xray_test_live` → `_xk_restart` + `health_check` →
+   (подменён `04_outbounds`, `_APPLY_NEED` или `WD_APPLY_FORCE`) — `xray_test_live` → `_xk_restart` + `health_check`
+   + `traffic_check` (`_apply_health`) →
    `OK routing=same restart=1`; не нужен (только config) — `OK routing=same restart=0`. Кандидат отклонён
    (`antiflap` / `blocked` / `generate` / `routing_mv` / `xraytest`) — откат файлов, без рестарта
    (`FAIL … restart=0`; был отложенный — один рестарт, `deferred=1`); `health_check` провален — откат файлов и
-   routing, откатный рестарт, `ROLLBACK reason=health restart=2 after=ok|fail` (при `after=fail` третьего
-   рестарта нет — только алерт). FAIL / ROLLBACK выходят
+   routing, откатный рестарт, `ROLLBACK reason=health|traffic restart=2 after=ok|fail` (при `after=fail`
+   третьего рестарта нет — только алерт); файл, изменённый ПОСЛЕ подмены (md5 в `/tmp/xkeen_apply.<id>.swapped`),
+   не откатывается. Force без подменённых файлов: провал — `FAIL … nofiles=1` (откатывать нечего), при
+   пересборке routing — откат к `.lastgood`, как в обычном тике. FAIL / ROLLBACK выходят
    **до Save state** (состояние от отвергнутых файлов не пишется).
 
 Строки лога — `APPLY <id>: …`. Тест — `tests/test_apply_once_offline.py`.

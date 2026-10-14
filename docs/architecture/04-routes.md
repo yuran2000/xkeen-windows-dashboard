@@ -32,12 +32,12 @@
 
 | Путь | Функция | Параметры | Роутер |
 |---|---|---|---|
-| `/api/xkeen/add` | `api_xkeen_add` | `payload` (vless:// или JSON), `tag`, `overwrite`, `sub_url`, `note` | W: `04_outbounds.json` ⟳ откат, `outbound_meta.json`, IP в template |
+| `/api/xkeen/add` | `api_xkeen_add` | `payload` (vless:// или JSON), `tag`, `overwrite`, `sub_url`, `note` | W: `04_outbounds.json` + IP в template — ⟳ один (§6.7; нет — прежний путь с откатом), `outbound_meta.json` |
 | `/api/xkeen/remove` | `api_xkeen_remove` | `tag` | то же |
 | `/api/xkeen/remove-bulk` | `api_xkeen_remove_bulk` | `tags` (одна транзакция, `skipped`) | то же |
 | `/api/xkeen/remove-subscription` | `api_xkeen_remove_subscription` | `key` (sub_url или pbk) | WD, W: `04_outbounds.json`, template, `subscription_meta.json`; ⟳ один — режим применения watchdog (`keenetic_apply_staged`, §6.7); до ~8 мин ответа |
 | `/api/xkeen/subscription-preview` | `api_xkeen_subscription_preview` | `url` (ничего не пишет) | R + HTTP с ПК |
-| `/api/xkeen/subscription-sync` | `api_xkeen_subscription_sync` | `url`, `add_new`, `remove_orphans`, `update_expires`, `overwrite_expires`, `add_tags` | W: `04_outbounds.json` ⟳ откат, WD, обе meta |
+| `/api/xkeen/subscription-sync` | `api_xkeen_subscription_sync` | `url`, `add_new`, `remove_orphans`, `update_expires`, `overwrite_expires`, `add_tags` | W: `04_outbounds.json` + чистка цепочек + IP template — ⟳ один (§6.7), обе meta |
 | `/api/xkeen/meta` | `api_xkeen_meta` | `tag` + имя/заметка | W: `outbound_meta.json` (без бэкапа) |
 | `/api/xkeen/sub-meta` | `api_xkeen_sub_meta` | `pbk` (историческое имя ключа группы), `name`, `note`, `expires_at`, `sub_url` | W: `subscription_meta.json` (без бэкапа) |
 | `/api/xkeen/orphan-sub-meta` | `api_xkeen_orphan_sub_meta` | — | R |
@@ -86,14 +86,14 @@
 | Путь | Методы | Функция | Что делает | Роутер |
 |---|---|---|---|---|
 | `/api/xkeen/routing-template-rules` | GET | `api_xkeen_routing_template_rules` | базовые правила template | R |
-| `/api/xkeen/sync-template-ips` | POST | `api_xkeen_sync_template_ips` | preview; `apply=1`; `restart=1` | W: template; ⟳ при `restart=1` |
-| `/api/keenetic/sync-structure` | POST | `api_keenetic_sync_structure` | «⚙ Применить структуру» | W ⟳ откат |
+| `/api/xkeen/sync-template-ips` | POST | `api_xkeen_sync_template_ips` | preview; `apply=1`; `restart=1` | W: template; ⟳ один при `restart=1` (применение с force) |
+| `/api/keenetic/sync-structure` | POST | `api_keenetic_sync_structure` | «⚙ Применить структуру» | W ⟳ один (применение с force), откат |
 | `/api/keenetic/bootstrap-preview` | GET | `api_keenetic_bootstrap_preview` | план развёртывания | R |
 | `/api/keenetic/bootstrap-apply` | POST | `api_keenetic_bootstrap_apply` | `{keys, overwrite_existing}` | W, прогон watchdog, ⟳ |
 | `/api/xkeen/backup` | GET | `api_xkeen_backup` | снапшот v7 файлом | R |
 | `/api/xkeen/backup-to-disk` | POST | `api_xkeen_backup_to_disk` | снапшот в `<base>/backups/` | R |
 | `/api/xkeen/migration-backup` | POST | `api_xkeen_migration_backup` | tar `/opt` → `scp -O` | W: временный архив |
-| `/api/xkeen/restore` | POST | `api_xkeen_restore` | файл `snapshot` (v7/v6) | W ⟳ |
+| `/api/xkeen/restore` | POST | `api_xkeen_restore` | файл `snapshot` (v7/v6) | W ⟳ один (применение с force) |
 | `/api/keenetic/settings` | GET,POST | `api_keenetic_settings` | override'ы (пусто = снять) | — |
 | `/api/keenetic/test-connection` | POST | `api_keenetic_test_connection` | SSH с переданными параметрами | R |
 | `/api/keenetic/tg-settings` | GET,POST | `api_keenetic_tg_settings` | `{token, chat_id}` | R / WD |

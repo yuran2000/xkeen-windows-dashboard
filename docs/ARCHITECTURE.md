@@ -268,7 +268,12 @@ Windows-клиент включает свой kill-switch), `build_wg_client_co
   (md5 **до** чтения файлов) → `<файл>.applynew.<id>` (`_apply_new_id`; config `stage_id`, bulk, template) →
   `keenetic_apply_staged(id, fp)` (манифест → `WD_APPLY=<id> nohup watchdog.sh` → опрос итога до
   `APPLY_POLL_TIMEOUT`, `_parse_apply_result`; итога нет — `pending`, ничего не трогается) → при OK
-  `subscription_meta` по свежему чтению; сбой подготовки — `keenetic_unstage(id)`. Откат — на watchdog. Зачем:
+  `subscription_meta` по свежему чтению; сбой подготовки — `keenetic_unstage(id)`. Откат — на watchdog. Общая
+  обвязка для прочих операций — `keenetic_apply_begin` (пути, версия, отпечатки ДО чтения; `unsupported` — прежний
+  путь) → `keenetic_apply_commit(ctx, new_outbounds, config_updates, new_template, sync_template_ips, force)` →
+  `_apply_note` / `_apply_fail_result`; на ней добавление / удаление (одного, нескольких) outbound'ов, синк
+  подписки, синк IP template с рестартом, restore и «Применить структуру» (force). Одна такая операция за раз —
+  `_APPLY_LOCK` (RLock) + `_apply_locked` / `_apply_locked_route` (занято → `busy`). Зачем:
   панель + тик watchdog давали два рестарта за 26 с, xray остался без трафика (14.10.2026).
 - `keenetic_add_outbound` — вставка перед `direct`, бэкап → запись → `xkeen -restart` → проверка
   **процесса** xray (код возврата рестарта ненадёжен) → откат.
@@ -417,7 +422,7 @@ fix_explain)`):
 | Путь | Пишет | Читает / примечание |
 |---|---|---|
 | `/opt/etc/xray/configs/01_log.json`, `02_dns.json`, `06_policy.json` | restore | снапшот |
-| `…/configs/03_inbounds.json` | `keenetic_ensure_socks_local` (`socks-local` :10808); watchdog: `socks-ai-check` :10818, `socks-deep-pri/yt/fgn` :10819–10821 | снапшот |
+| `…/configs/03_inbounds.json` | `keenetic_ensure_socks_local` (`socks-local` :10808); watchdog: `socks-ai-check` :10818, `socks-deep-pri/yt/fgn` :10819–10821, `socks-health` :10822 (v36) | снапшот |
 | `…/configs/04_outbounds.json` | add/remove/sync/bootstrap/auto-fix (`.bak-<ts>`, `.bak-pre-sync-<ts>`) | панель, watchdog |
 | `…/configs/05_routing.json` | **только watchdog** (`.new` → проверки → `mv`; `.lastgood`, `.new.bad-<ts>`) | панель (default, DAT) |
 | `/opt/etc/xray/configs.bak/05_routing.template.json` | синк IP, `keenetic_ensure_socks_route`, sync-structure, bootstrap (`.bak-*`, `.syncbak-<ts>`) | watchdog (`TEMPL`), панель |
@@ -425,7 +430,7 @@ fix_explain)`):
 | `/opt/etc/xray/watchdog.sh` | `keenetic_ensure_watchdog_current` (`.vnew` → `sh -n` → `.bak-<ts>` → `mv`), sync-structure, bootstrap, restore | cron, `_structure_drift_status` |
 | `/opt/etc/xray/watchdog.config` | **только** `keenetic_write_watchdog_config`, bootstrap, restore | панель, watchdog, `sub_expiry_notifier.py` |
 | `/opt/etc/xray/watchdog.state`, `watchdog.aiprobe` | **только watchdog** | `keenetic_get_watchdog`, header-status |
-| `/opt/etc/xray/watchdog.udpstall`, `watchdog.fdstall`, `tg_outbox` | watchdog | панель не читает |
+| `/opt/etc/xray/watchdog.udpstall`, `watchdog.fdstall`, `watchdog.trafficheal`, `tg_outbox` | watchdog | панель не читает |
 | `/opt/etc/xray/outbound_meta.json`, `subscription_meta.json`, `domain_notes.json` | панель (sidecar; xray не читает) | панель, уведомитель |
 | `/opt/etc/xray/dat/*.dat` | `xkeen -ug` (cron; обновляет `geoip_v2fly.dat`, не `geoip.dat`), auto-fix `install_extended_geoip` (`geoip.dat` → симлинк или скачанный файл) | xray, панель (`_list_remote_dat` дедуплицирует симлинки по `readlink -f`) |
 | `/opt/var/log/xray/watchdog.log`, `error.log` | watchdog, xray | `keenetic_tail_log(n=30)`, header-status |
@@ -697,7 +702,8 @@ GeoIP-категории»: неизвестно / расширенная и с�
 | Тест | Покрывает |
 |---|---|
 | `test_api_offline.py` | kill-switch, backup/restore, bootstrap, diagnose + auto-fix, 404/405 ≠ 500, `keys_order ⊆ DEFAULT_WATCHDOG_CONFIG` |
-| `test_apply_once_offline.py` | режим применения (v35): куски `.cur` в `sh` — атомарный lock (три претендента, pid чужого процесса), пролог (md5 против манифеста, `sh -n` config, подмена `*.applynew.<id>`, чужие id не трогаются, ловушка падения), итог (ровно один рестарт; без рестарта, если подменён только config; отложенный рестарт тика; откат файлов и routing; FAIL до Save state), `_xk_restart` (ждёт чужой и свой детач-рестарт), `_bg_restart_or_defer`; статика (v35, config после lock, фоновые рестарты под охраной); `keenetic_apply_staged` (манифест до запуска, OK/ROLLBACK/FAIL, pending); `keenetic_remove_subscription` (отпечатки до чтения, подготовка под id, одно применение, мета по свежему чтению, старый watchdog / пути — отказ, второй запрос — «занято»); `keenetic_write_watchdog_config(stage_id)` (нет `sh` — SKIP sh-части) |
+| `test_apply_once_offline.py` | режим применения (v35+): куски `.cur` в `sh` — lock, пролог (манифест, `sh -n`, подмена, ловушка падения), итог (один рестарт, откаты, force), `_xk_restart`; панель — `keenetic_apply_staged`, удаление подписки, `stage_id` (подробно — шапка теста) |
+| `test_apply_ops_offline.py` | операции на «одном рестарте» (v36): проба трафика в `sh`, `keenetic_apply_begin`/`_commit`, добавление/удаление, синк подписки, template, restore, структура, общий лок (подробно — шапка теста) |
 | `test_backup_paths.py` | `STATIC_FILES`, `is_restorable`, `needs_exec_bit`, `build_snapshot_command` |
 | `test_geoip_status.py` | `keenetic_geoip_dat_status` (+ фоновая проверка `telegram`), все состояния секции GeoIP, auto-fix `install_extended_geoip` (симлинк, скачивание, авто-откат, ротация бэкапов), категории в диагностике |
 | `test_killswitch.py` | генератор хука, разбор статуса/утечек |
