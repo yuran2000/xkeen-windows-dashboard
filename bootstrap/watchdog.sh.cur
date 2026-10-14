@@ -1,4 +1,19 @@
 #!/bin/sh
+# XKeen failover watchdog v35 (2026-10-14, применение изменений панели одним рестартом):
+#   • Режим применения (env WD_APPLY=<id>, запускает панель): сторож берёт lock (ждёт текущий тик до
+#     WD_APPLY_WAIT с), подменяет подготовленные панелью файлы *.applynew (watchdog.config,
+#     04_outbounds.json, routing-template; прежние → *.bak-apply-<id>), проходит обычный тик и делает
+#     РОВНО ОДИН рестарт: при пересборке routing — свой, иначе — отдельный ради новых outbound'ов.
+#     Кандидат отклонён / xray -test / health-check провалены — файлы панели откатываются. Итог —
+#     строка в /tmp/xkeen_apply.<id>.res (OK | ROLLBACK | FAIL). Ветки «рестарт в фоне и exit»
+#     (self-heal inbound'ов, UDP/FD-залип, глухой AI) в этом режиме рестарт не делают — его сделает
+#     применение. Причина: удаление подписки 14.10 дало два рестарта за 26 с (панель + тик из-за
+#     нового template), xray остался без трафика на 5 минут.
+#   • `xkeen -restart` в XKeen 2.0 без терминала уходит в фон (start-stop-daemon) и сразу
+#     возвращает управление — health_check мерил СТАРЫЙ xray. _xk_restart ждёт конца фонового
+#     рестарта и нового pid xray (≤ 90 с).
+#   • Lock атомарный (noclobber): проверка «занят?» и запись pid больше не разнесены во времени.
+#
 # XKeen failover watchdog v34 (2026-10-11, чистка state):
 #   • Убраны поля DEEP_CTR / DEEP_TS (сквозная проба v27, заменена в v29 на D{PRI,YT,FGN}_*): их
 #     никто не читал, сторож лишь переносил их из тика в тик. Старые значения в state просто
@@ -280,8 +295,7 @@
 # Старые шаблоны 05_routing.{primary,failover}.json больше не нужны (но сохранены для отката).
 
 CFG=/opt/etc/xray/watchdog.config
-[ -f "$CFG" ] || { echo "$(date '+%F %T') config $CFG not found" >> /opt/var/log/xray/watchdog.log; exit 1; }
-. "$CFG"
+# v35: config проверяется и читается ПОСЛЕ lock (ниже) — в режиме применения его подменяет панель.
 
 CONFIG_DIR=/opt/etc/xray/configs
 TEMPL=/opt/etc/xray/configs.bak/05_routing.template.json
@@ -302,15 +316,169 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 # Тик теперь может идти дольше (health-check + возможный откат + до 2 рестартов). cron каждую
 # минуту мог бы запустить второй экземпляр поверх — это опасно во время xkeen -restart.
 # Берём lock; если живой процесс уже держит его — тихо выходим. Stale-lock (мёртвый pid) снимаем.
+# v35: создание файла атомарное (noclobber, O_EXCL) — два экземпляра не возьмут lock одновременно.
 LOCK=/tmp/xkeen_watchdog.lock
-if [ -f "$LOCK" ]; then
+_wd_lock_try() {
+  ( set -C; echo $$ > "$LOCK" ) 2>/dev/null && return 0
   _oldpid=$(cat "$LOCK" 2>/dev/null)
+  # Пустой файл — другой экземпляр как раз пишет pid: даём ему секунду.
+  [ -z "$_oldpid" ] && { sleep 1; _oldpid=$(cat "$LOCK" 2>/dev/null); }
   if [ -n "$_oldpid" ] && kill -0 "$_oldpid" 2>/dev/null; then
-    exit 0
+    # pid жив, но это не сторож (pid переиспользован после падения) — lock брошенный.
+    if [ -r "/proc/$_oldpid/cmdline" ] && ! tr '\0' ' ' < "/proc/$_oldpid/cmdline" 2>/dev/null | grep -q watchdog; then
+      :
+    else
+      return 1
+    fi
   fi
+  rm -f "$LOCK"
+  ( set -C; echo $$ > "$LOCK" ) 2>/dev/null
+}
+
+# v35: режим применения изменений панели (см. заголовок). Id — только [A-Za-z0-9_-].
+# Подготовленный файл — «<живой>.applynew.<id>»: применяется только СВОЙ (чужой застрявший — никогда).
+# Манифест /tmp/xkeen_apply.<id>.manifest — строки «<живой путь> <md5 живого при подготовке | ->»:
+# живой файл с тех пор изменился (сохранение в другой вкладке, другая операция) — отказ, ничего не
+# подменяется (иначе снимок панели затёр бы чужую правку).
+WD_APPLY_ID="${WD_APPLY:-}"
+case "$WD_APPLY_ID" in *[!A-Za-z0-9_-]*) WD_APPLY_ID="" ;; esac
+APPLY_RES="/tmp/xkeen_apply.$WD_APPLY_ID.res"
+APPLY_MANIFEST="/tmp/xkeen_apply.$WD_APPLY_ID.manifest"
+APPLY_STAGE_LIST="$CFG /opt/etc/xray/configs/04_outbounds.json /opt/etc/xray/configs.bak/05_routing.template.json"
+APPLY_FILES=""
+_apply_result() {
+  echo "$*" > "$APPLY_RES"
+  log "APPLY $WD_APPLY_ID: $*"
+  rm -f "$APPLY_MANIFEST"
+}
+_apply_unstage() {
+  for _x in $APPLY_STAGE_LIST; do rm -f "$_x.applynew.$WD_APPLY_ID"; done
+}
+_md5_or_dash() {
+  if [ -f "$1" ]; then md5sum < "$1" 2>/dev/null | awk '{print $1}'; else echo "-"; fi
+}
+# Вернуть файлы, подменённые применением, и живой routing к копиям *.bak-apply-<id>.
+APPLY_ROUTING="$CONFIG_DIR/05_routing.json"
+_apply_restore() {
+  for _af in $APPLY_FILES $APPLY_ROUTING; do
+    [ -f "$_af.bak-apply-$WD_APPLY_ID" ] && cp "$_af.bak-apply-$WD_APPLY_ID" "$_af"
+  done
+  [ -n "$APPLY_FILES" ] && log "APPLY $WD_APPLY_ID: файлы панели и routing откачены ($APPLY_FILES)"
+}
+# Тик применения упал (ошибка оболочки, kill) до итога — вернуть файлы и сообщить панели.
+_apply_on_exit() {
+  trap '' INT TERM HUP
+  if [ -n "$WD_APPLY_ID" ] && [ ! -f "$APPLY_RES" ]; then
+    _apply_restore
+    _apply_unstage
+    # Рестарт уже шёл — xray мог подняться на новых файлах: перезапустить на возвращённых.
+    if [ "$_APPLY_DONE" = "1" ] && command -v _xk_restart >/dev/null 2>&1; then
+      _xk_restart
+      _apply_result "FAIL reason=crash restart=2"
+    else
+      _apply_result "FAIL reason=crash restart=0"
+    fi
+  fi
+  rm -f "$LOCK"
+}
+# После успешного применения: копии *.bak-apply-* — не больше 3 последних на файл.
+_apply_prune_baks() {
+  for _af in $APPLY_STAGE_LIST $APPLY_ROUTING; do
+    ls -t "$_af".bak-apply-* 2>/dev/null | tail -n +4 | while read -r _old; do rm -f "$_old"; done
+  done
+}
+
+if [ -n "$WD_APPLY_ID" ]; then
+  _aw=0
+  _aw_max=$(echo "${WD_APPLY_WAIT:-150}" | grep -E '^[0-9]+$' || echo 150)
+  until _wd_lock_try; do
+    _aw=$((_aw+1))
+    if [ "$_aw" -ge "$_aw_max" ]; then
+      _apply_unstage
+      _apply_result "FAIL reason=lock restart=0 wait=$_aw"
+      exit 1
+    fi
+    sleep 1
+  done
+  _APPLY_DONE=0
+  trap '_apply_on_exit' EXIT
+  trap 'exit 1' INT TERM HUP
+  # 1) Сверка: всё подготовленное — из манифеста, и живые файлы не менялись с подготовки.
+  _changed=""
+  for _af in $APPLY_STAGE_LIST; do
+    [ -f "$_af.applynew.$WD_APPLY_ID" ] || continue
+    _exp=$(awk -v p="$_af" '$1==p {print $2; exit}' "$APPLY_MANIFEST" 2>/dev/null)
+    _act=$(_md5_or_dash "$_af")
+    [ -n "$_exp" ] && [ "$_exp" = "$_act" ] || _changed="$_changed $_af"
+  done
+  if [ -n "$_changed" ]; then
+    _apply_unstage
+    _apply_result "FAIL reason=changed restart=0 files=$(echo $_changed | tr ' ' ',')"
+    exit 1
+  fi
+  # config читается оболочкой (. "$CFG") — синтаксическая ошибка уронила бы тик и все следующие.
+  if [ -f "$CFG.applynew.$WD_APPLY_ID" ] && ! sh -n "$CFG.applynew.$WD_APPLY_ID" 2>/dev/null; then
+    _apply_unstage
+    _apply_result "FAIL reason=badconfig restart=0"
+    exit 1
+  fi
+  cp "$APPLY_ROUTING" "$APPLY_ROUTING.bak-apply-$WD_APPLY_ID" 2>/dev/null
+  # 2) Подмена: прежние → *.bak-apply-<id>; сбой — вернуть уже подменённые.
+  for _af in $APPLY_STAGE_LIST; do
+    [ -f "$_af.applynew.$WD_APPLY_ID" ] || continue
+    if { [ -f "$_af" ] && ! cp "$_af" "$_af.bak-apply-$WD_APPLY_ID"; } || ! mv -f "$_af.applynew.$WD_APPLY_ID" "$_af"; then
+      _apply_restore
+      _apply_unstage
+      _apply_result "FAIL reason=stage restart=0"
+      exit 1
+    fi
+    APPLY_FILES="$APPLY_FILES $_af"
+  done
+  log "APPLY $WD_APPLY_ID: начало (lock ждал ${_aw}с, подменены:${APPLY_FILES:- нет})"
+else
+  _wd_lock_try || exit 0
+  trap 'rm -f "$LOCK"' EXIT
 fi
-echo $$ > "$LOCK"
-trap 'rm -f "$LOCK"' EXIT
+
+[ -f "$CFG" ] || { log "config $CFG not found"; exit 1; }
+. "$CFG"
+
+# v35: рестарт XKeen с ожиданием его конца. XKeen 2.0 без терминала сам уходит в фон
+# (start-stop-daemon) и возвращает управление сразу — без ожидания health_check мерил старый xray.
+# Готово = нет процесса «xkeen -restart» и xray запущен с НОВЫМ pid. 1 — не дождались за 90 с.
+# Идёт ли сейчас чужой start/stop/restart XKeen (фоновый рестарт тика, сброс UDP-STALL, кнопка панели).
+_xk_busy() { ps w 2>/dev/null | grep -qE '[x]keen -(restart|start|stop)'; }
+_xk_restart() {
+  local _old _new _i=0
+  # Сначала дождаться чужого (≤ 60 с): свой рестарт поверх идущего = два подряд (14.10).
+  while _xk_busy && [ "$_i" -lt 60 ]; do sleep 1; _i=$((_i+1)); done
+  _i=0
+  _old=$(pidof xray 2>/dev/null)
+  /opt/sbin/xkeen -restart >/dev/null 2>&1
+  sleep 1
+  while [ "$_i" -lt 90 ]; do
+    _new=$(pidof xray 2>/dev/null)
+    if ! _xk_busy && [ -n "$_new" ] && [ "$_new" != "$_old" ]; then
+      return 0
+    fi
+    sleep 1; _i=$((_i+1))
+  done
+  log "WARN: xkeen -restart не закончился за 90с (pid xray: был ${_old:-нет}, стал ${_new:-нет})"
+  return 1
+}
+
+# v35: рестарт «в фоне и выход из тика» для веток self-heal/залипа. В режиме применения рестарт
+# сделает само применение (одним на всё) — здесь только отметка в логе, тик продолжается.
+# 0 — рестарт запущен (вызывающий выходит из тика), 1 — отложен до применения.
+_bg_restart_or_defer() {
+  if [ -n "$WD_APPLY_ID" ]; then
+    _APPLY_NEED=1
+    log "APPLY $WD_APPLY_ID: рестарт «$1» отложен — его сделает применение"
+    return 1
+  fi
+  /opt/sbin/xkeen -restart >/dev/null 2>&1 &
+  return 0
+}
 
 # ---------- Helpers ----------
 
@@ -995,6 +1163,21 @@ validate_routing_xray() {
   return 0
 }
 
+# v35: проверка ЖИВОГО confdir (после подмены 04_outbounds панелью, когда routing не менялся).
+# 0 — рабочий или тест не выполнить (fail-open, как validate_routing_xray), 1 — явная ошибка конфига.
+xray_test_live() {
+  [ -x "$XRAY_BIN" ] || return 0
+  local out rc
+  out=$(XRAY_LOCATION_ASSET="$XRAY_ASSET" "$XRAY_BIN" run -test -confdir "$CONFIG_DIR" 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  if echo "$out" | grep -qiE 'failed to (check code|load|build)|invalid|not found|neither outboundTag'; then
+    log "XRAY-TEST FAIL (живой confdir): $(echo "$out" | grep -iE 'failed to|invalid|not found|neither' | head -2 | tr '\n' ' ')"
+    return 1
+  fi
+  return 0
+}
+
 # ---------- Health-check (v12) ----------
 # LAN-IP роутера (br0). Кэшируем. Несколько способов на случай разных прошивок.
 LAN_IP_CACHE=""
@@ -1030,6 +1213,36 @@ health_check() {
   log "HEALTH FAIL: за $((tries*3))s xray не запущен ИЛИ DNS не резолвится через $lan (github/google/cloudflare)"
   return 1
 }
+
+# v35: применение, убитое после подмены файлов (kill -9, OOM): манифест есть, итога нет, а копии
+# *.bak-apply-<id> уже сделаны — значит оно держало lock, а раз lock теперь у нас, оно мертво.
+# Вернуть файлы, перезапустить на них и написать итог (панель его ждёт). Применение, ещё ждущее
+# lock, копий не делало — его не трогаем. Брошенные >60 мин манифесты/подготовленные файлы — удалить.
+if [ -z "$WD_APPLY_ID" ]; then
+  for _m in /tmp/xkeen_apply.*.manifest; do
+    [ -f "$_m" ] || continue
+    _mid=${_m#/tmp/xkeen_apply.}; _mid=${_mid%.manifest}
+    case "$_mid" in ''|*[!A-Za-z0-9_-]*) continue ;; esac
+    if [ -f "/tmp/xkeen_apply.$_mid.res" ]; then rm -f "$_m"; continue; fi
+    _moved=""
+    for _af in $APPLY_STAGE_LIST $APPLY_ROUTING; do
+      [ -f "$_af.bak-apply-$_mid" ] && _moved="$_moved $_af"
+    done
+    [ -n "$_moved" ] || continue
+    for _af in $_moved; do cp "$_af.bak-apply-$_mid" "$_af"; done
+    for _af in $APPLY_STAGE_LIST; do rm -f "$_af.applynew.$_mid"; done
+    rm -f "$_m"
+    log "APPLY $_mid: применение прервано после подмены — файлы откачены ($_moved), перезапуск на прежних"
+    _xk_restart
+    echo "FAIL reason=killed restart=1" > "/tmp/xkeen_apply.$_mid.res"
+    tg_alert "🛡️ <b>XKeen watchdog</b>: применение изменений из панели прервалось — файлы откачены, xray перезапущен на прежних."
+    . "$CFG"
+  done
+  find /tmp -maxdepth 1 -name 'xkeen_apply.*' -mmin +60 -exec rm -f {} \; 2>/dev/null
+  for _af in $APPLY_STAGE_LIST; do
+    find "$(dirname "$_af")" -maxdepth 1 -name "$(basename "$_af").applynew.*" -mmin +60 -exec rm -f {} \; 2>/dev/null
+  done
+fi
 
 # ---------- Досыл застрявших TG-алертов (v15) ----------
 # В начале каждого тика пробуем дослать всё, что не ушло из-за упавшего канала.
@@ -1079,7 +1292,7 @@ if [ -f "$PORT_EXCLUDE_FILE" ] && ! grep -qxE '^53$' "$PORT_EXCLUDE_FILE" 2>/dev
   cp "$PORT_EXCLUDE_FILE" "$PORT_EXCLUDE_FILE.bak-$(date +%Y%m%d-%H%M%S)" 2>/dev/null
   printf '53\n' >> "$PORT_EXCLUDE_FILE"
   log "port_exclude.lst: +53 (DNS уведён мимо xray-tproxy в ndnproxy) → xkeen -restart"
-  /opt/sbin/xkeen -restart >/dev/null 2>&1 &
+  _bg_restart_or_defer "port_exclude.lst"
 fi
 
 # ---------- v23: авто-очистка YT_GEOIP_CATEGORIES (раздел удалён из UI в v1.0.76) ----------
@@ -1100,7 +1313,7 @@ if [ -f "$_WD_CFG" ]; then
     awk 'BEGIN{done=0} /^YT_GEOIP_CATEGORIES=/ && !done {print "YT_GEOIP_CATEGORIES=\"\""; done=1; next} {print}' \
       "$_WD_CFG" > "$_WD_CFG.tmp-v23" && mv "$_WD_CFG.tmp-v23" "$_WD_CFG"
     log "v23 migration: YT_GEOIP_CATEGORIES очищено (раздел удалён в v1.0.76, было: $_yt_geoip_val) → xkeen -restart"
-    /opt/sbin/xkeen -restart >/dev/null 2>&1 &
+    _bg_restart_or_defer "v23 migration"
   fi
 fi
 
@@ -1198,10 +1411,9 @@ if [ -n "$AI_TAG" ] && [ -f "$_INB_FILE" ] && command -v jq >/dev/null 2>&1; the
     if jq --argjson p "$AI_PROBE_PORT" '.inbounds += [{"tag":"socks-ai-check","listen":"127.0.0.1","port":$p,"protocol":"socks","settings":{"auth":"noauth","udp":false},"sniffing":{"enabled":true,"destOverride":["http","tls"]}}]' "$_INB_FILE" > "$_INB_FILE.tmp-v24" 2>/dev/null; then
       mv "$_INB_FILE.tmp-v24" "$_INB_FILE"
       log "v24: добавлен inbound socks-ai-check на 127.0.0.1:$AI_PROBE_PORT (AI exit-IP probe) → xkeen -restart"
-      /opt/sbin/xkeen -restart >/dev/null 2>&1 &
       # Выходим из тика — даём xray подняться с новым inbound. Следующий тик уже
       # сможет генерить routing с socks-ai-check rule и делать probe.
-      exit 0
+      _bg_restart_or_defer "v24 inbound" && exit 0
     else
       rm -f "$_INB_FILE.tmp-v24" 2>/dev/null
       log "v24 WARN: jq не смог добавить socks-ai-check inbound — пропускаю (probe выключен этот тик)"
@@ -1241,10 +1453,9 @@ if [ "$DEEP_PROBE_ENABLE" = "1" ] && [ -f "$_INB_FILE" ] && command -v jq >/dev/
     done
     if [ "$_deep_ok" = "1" ]; then
       log "v29: добавлены inbound'ы сквозной пробы ($_deep_add) → xkeen -restart"
-      /opt/sbin/xkeen -restart >/dev/null 2>&1 &
       # Выходим из тика — даём xray подняться с новыми inbound'ами. Следующий тик уже
       # сгенерит routing с правилами socks-deep-* и начнёт мерить.
-      exit 0
+      _bg_restart_or_defer "v29 inbound" && exit 0
     fi
   fi
 fi
@@ -1266,12 +1477,12 @@ if [ -n "$AI_TAG" ] && [ -f "$_RT_FILE" ] && [ -f "$_INB_FILE" ] && \
   if jq --arg t "$AI_TAG" '.routing.rules = [{"inboundTag":["socks-ai-check"],"outboundTag":$t,"type":"field"}] + .routing.rules' /tmp/r24h.body > /tmp/r24h.body.new 2>/dev/null; then
     cat /tmp/r24h.head /tmp/r24h.body.new > "$_RT_FILE" 2>/dev/null
     log "v24: добавлено routing-правило socks-ai-check → $AI_TAG в живой 05_routing.json → xkeen -restart"
-    /opt/sbin/xkeen -restart >/dev/null 2>&1 &
     rm -f /tmp/r24h.head /tmp/r24h.body /tmp/r24h.body.new 2>/dev/null
-    exit 0
+    _bg_restart_or_defer "v24 routing" && exit 0
+  else
+    rm -f /tmp/r24h.head /tmp/r24h.body /tmp/r24h.body.new 2>/dev/null
+    log "v24 WARN: jq не смог добавить routing-rule socks-ai-check — probe этот тик не сработает"
   fi
-  rm -f /tmp/r24h.head /tmp/r24h.body /tmp/r24h.body.new 2>/dev/null
-  log "v24 WARN: jq не смог добавить routing-rule socks-ai-check — probe этот тик не сработает"
 fi
 # ---------- /v24 self-heal ----------
 
@@ -1321,7 +1532,8 @@ _do_recover=0
 [ "$_SCTR" -ge "$STALL_FAIL_NEED" ] 2>/dev/null && _do_recover=1
 [ "$_recvq" -ge "$RECVQ_HARD" ] 2>/dev/null && [ "$_SCTR" -ge 1 ] 2>/dev/null && _do_recover=1
 
-if [ "$_do_recover" -eq 1 ] 2>/dev/null; then
+# v35: в режиме применения сброс не делаем — решит следующий обычный тик (счётчик сохранён).
+if [ "$_do_recover" -eq 1 ] 2>/dev/null && [ -z "$WD_APPLY_ID" ]; then
   _now=$(date +%s)
   if [ $((_now - _SLAST)) -ge "$STALL_COOLDOWN" ] 2>/dev/null; then
     echo "0 $_now" > "$STALL_STATE"
@@ -1375,7 +1587,9 @@ fi
 _fd_delta=$((_fd_now - _FD_PREV))
 [ "$_fd_delta" -lt 0 ] 2>/dev/null && _fd_delta=0
 
-if [ "$_fd_delta" -ge "$FD_DELTA_THRESHOLD" ] 2>/dev/null; then
+if [ -n "$WD_APPLY_ID" ]; then
+  : # v35: в режиме применения fd-залип не оцениваем (база счётчика не сдвигается) — решит следующий тик
+elif [ "$_fd_delta" -ge "$FD_DELTA_THRESHOLD" ] 2>/dev/null; then
   _now=$(date +%s)
   if [ $((_now - _FD_LAST)) -ge "$FD_STALL_COOLDOWN" ] 2>/dev/null; then
     _xpid=$(pidof xray 2>/dev/null)
@@ -1413,6 +1627,8 @@ fi
 # такие утечки.
 if [ -n "$AI_TAG" ] && [ -f "$AI_PROBE_STATE.skip" ]; then
   : # skip-marker (для отладки)
+elif [ -n "$WD_APPLY_ID" ]; then
+  : # v35: в режиме применения AI-проба не идёт (её авто-рестарт дал бы второй) — следующий тик
 elif [ -n "$AI_TAG" ]; then
   _AI_TS=0; _AI_PREV_C=""; _AI_LAST_A=0; _AI_EMPTY=0; _AI_DEAF=0
   if [ -f "$AI_PROBE_STATE" ]; then
@@ -2312,6 +2528,8 @@ PREV_FOREIGN=$(grep -o 'EFFECTIVE_FOREIGN=\S*' "$STATE_FILE" 2>/dev/null | cut -
 # Всегда генерим новый routing.json и сравниваем с текущим через md5.
 # Это позволяет триггерить пересборку не только при смене default_tag, но и при изменении
 # AI_DOMAINS / AI_TAG / YT_DOMAINS / YT_TAG / шаблона (юзер правит из дашборда).
+# v35: _APPLY_DONE — рестарт в этом тике уже был; _APPLY_RB — причина отказа/отката режима применения.
+_APPLY_DONE=0; _APPLY_RB=""
 if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFFECTIVE_FOREIGN_TAG" "$IPV6_TAG"; then
   if routing_changed; then
     NEW_MD5=$(md5sum < "$CONFIG_DIR/05_routing.json.new" 2>/dev/null | awk '{print $1}')
@@ -2319,16 +2537,19 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
       # v12 анти-флап: этот кандидат уже ронял health-check. НЕ переприменяем по кругу.
       log "SKIP (анти-флап): кандидат routing уже ронял сеть (md5=$LAST_BAD_MD5) — НЕ применяю, текущий рабочий routing сохранён. Смени настройки в панели."
       rm -f "$CONFIG_DIR/05_routing.json.new"
+      [ -n "$WD_APPLY_ID" ] && _APPLY_RB="antiflap"
     elif ! validate_routing_xray; then
       _ts="$(date +%Y%m%d-%H%M%S)"
       mv "$CONFIG_DIR/05_routing.json.new" "$CONFIG_DIR/05_routing.json.new.bad-${_ts}" 2>/dev/null
       log "BLOCKED: новый routing не прошёл xray -test — оставляю текущий (xray не трогаю). Битый → 05_routing.json.new.bad-${_ts}"
+      [ -n "$WD_APPLY_ID" ] && _APPLY_RB="blocked"
       tg_alert "🛡️ <b>XKeen watchdog</b>: новый routing не прошёл проверку <code>xray -test</code> и НЕ применён — текущая конфигурация сохранена, VPN работает. Вероятно geoip/geosite-категория отсутствует в .dat. Проверь категории в панели."
     elif mv "$CONFIG_DIR/05_routing.json.new" "$CONFIG_DIR/05_routing.json"; then
-      /opt/sbin/xkeen -restart >/dev/null 2>&1
+      _APPLY_DONE=1
       # v12: health-check ПОСЛЕ применения — реально ли живы xray и клиентский DNS.
       # Ловит рантайм-обвалы, которые xray -test пропускает (валидный конфиг, но DNS подвис).
-      if health_check 8; then
+      # v35: и что рестарт вообще закончился новым xray (_xk_restart ждёт до 90 с).
+      if _xk_restart && health_check 8; then
         cp "$CONFIG_DIR/05_routing.json" "$CONFIG_DIR/05_routing.json.lastgood" 2>/dev/null
         LAST_BAD_MD5=""   # успешное применение — снимаем «бракованную» метку
         if [ "$NEW_DEFAULT" != "$CUR_DEFAULT" ] && [ "$_pri_main_chg" = "1" ] && [ "$NEW_DEFAULT" = "$PRIMARY_TAG" ] \
@@ -2388,32 +2609,95 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
         _ts="$(date +%Y%m%d-%H%M%S)"
         cp "$CONFIG_DIR/05_routing.json" "$CONFIG_DIR/05_routing.json.unhealthy-${_ts}" 2>/dev/null
         LAST_BAD_MD5="$NEW_MD5"   # запомнить чтобы не переприменять (анти-флап)
-        if [ -f "$CONFIG_DIR/05_routing.json.lastgood" ]; then
+        # v35: в режиме применения назад идут файлы панели и routing, бывший ДО применения
+        # (точнее lastgood); откатный рестарт поднимет прежнее.
+        if [ -n "$WD_APPLY_ID" ]; then
+          _apply_restore; _APPLY_RB="health"
+        elif [ -f "$CONFIG_DIR/05_routing.json.lastgood" ]; then
           cp "$CONFIG_DIR/05_routing.json.lastgood" "$CONFIG_DIR/05_routing.json"
-          /opt/sbin/xkeen -restart >/dev/null 2>&1
-          if health_check 8; then
+        fi
+        if [ -n "$WD_APPLY_ID" ] || [ -f "$CONFIG_DIR/05_routing.json.lastgood" ]; then
+          if _xk_restart && health_check 8; then
+            _APPLY_AFTER=ok
             log "AUTO-ROLLBACK OK: новый routing уронил DNS/инет → откат на lastgood, сеть восстановлена. Битый кандидат → 05_routing.json.unhealthy-${_ts}"
             tg_alert "🛡️ <b>XKeen watchdog</b>: новая конфигурация уронила DNS/интернет — выполнен <b>авто-откат</b> на последнюю рабочую. Сеть восстановлена. Изменения НЕ применятся повторно, пока не сменишь настройки в панели."
           else
-            log "AUTO-ROLLBACK: после отката health-check всё ещё FAIL — повторный рестарт xray"
-            /opt/sbin/xkeen -restart >/dev/null 2>&1
+            _APPLY_AFTER=fail
+            if [ -n "$WD_APPLY_ID" ]; then
+              # v35: третий рестарт подряд не делаем — итог ROLLBACK after=fail уходит в панель и TG.
+              log "AUTO-ROLLBACK: после отката health-check всё ещё FAIL — нужна ручная проверка (без повторного рестарта)"
+            else
+              log "AUTO-ROLLBACK: после отката health-check всё ещё FAIL — повторный рестарт xray"
+              _xk_restart
+            fi
             tg_alert "🚨 <b>XKeen watchdog</b>: конфигурация уронила сеть, откат выполнен, но DNS пока не отвечает. Нужна ручная проверка роутера."
           fi
         else
           log "AUTO-ROLLBACK: нет 05_routing.json.lastgood — откатывать не на что; повторный рестарт xray"
-          /opt/sbin/xkeen -restart >/dev/null 2>&1
+          _xk_restart
           tg_alert "🚨 <b>XKeen watchdog</b>: новая конфигурация уронила DNS, а рабочей резервной копии нет. Нужна ручная проверка роутера."
         fi
         NEW_DEFAULT="$CUR_DEFAULT"  # не фиксируем смену как успешную в state
       fi
     else
       log "ERROR: не удалось применить новый routing.json"
+      [ -n "$WD_APPLY_ID" ] && _APPLY_RB="routing_mv"
     fi
   else
     rm -f "$CONFIG_DIR/05_routing.json.new"
   fi
 else
   log "ERROR: generate_routing failed"
+  [ -n "$WD_APPLY_ID" ] && _APPLY_RB="generate"
+fi
+
+# ---------- v35: итог режима применения — ровно один рестарт на всё ----------
+# Отказ / откат — выход ДО Save state: состояние от отвергнутых файлов не записывается.
+if [ -n "$WD_APPLY_ID" ]; then
+  # Рестарт нужен, только если подменён 04_outbounds или тик отложил свой (self-heal inbound'ов):
+  # config и template без смены routing xray не читает.
+  _need=0
+  case " $APPLY_FILES " in *" /opt/etc/xray/configs/04_outbounds.json "*) _need=1 ;; esac
+  [ "${_APPLY_NEED:-0}" = "1" ] && _need=1
+  if [ -n "$_APPLY_RB" ] && [ "$_APPLY_DONE" = "0" ]; then
+    # Кандидат отклонён ДО рестарта: вернуть файлы; отложенный тиком рестарт — всё равно сделать.
+    _apply_restore
+    if [ "${_APPLY_NEED:-0}" = "1" ]; then
+      _xk_restart
+      _apply_result "FAIL reason=$_APPLY_RB restart=1 deferred=1"
+    else
+      _apply_result "FAIL reason=$_APPLY_RB restart=0"
+    fi
+    exit 1
+  elif [ -n "$_APPLY_RB" ]; then
+    # health-check после рестарта провален: файлы и routing откачены, откатный рестарт сделан выше.
+    _apply_result "ROLLBACK reason=$_APPLY_RB restart=2 after=${_APPLY_AFTER:-fail}"
+    exit 1
+  elif [ "$_APPLY_DONE" = "1" ]; then
+    _apply_prune_baks
+    _apply_result "OK routing=changed restart=1"
+  elif [ "$_need" = "0" ]; then
+    _apply_prune_baks
+    _apply_result "OK routing=same restart=0"
+  elif ! xray_test_live; then
+    _apply_restore
+    if [ "${_APPLY_NEED:-0}" = "1" ]; then _xk_restart; _r=1; else _r=0; fi
+    _apply_result "FAIL reason=xraytest restart=$_r"
+    exit 1
+  else
+    # routing не изменился — рестарт ради новых outbound'ов / inbound'ов.
+    _APPLY_DONE=1
+    if _xk_restart && health_check 8; then
+      _apply_prune_baks
+      _apply_result "OK routing=same restart=1"
+    else
+      _apply_restore
+      if _xk_restart && health_check 8; then _ar="ok"; else _ar="fail"; fi
+      tg_alert "🛡️ <b>XKeen watchdog</b>: изменения из панели уронили сеть — файлы откачены, xray перезапущен (проверка после отката: $_ar)."
+      _apply_result "ROLLBACK reason=health restart=2 after=$_ar"
+      exit 1
+    fi
+  fi
 fi
 
 # ---------- Failover health check (с 2026-05-15) ----------

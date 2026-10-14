@@ -35,7 +35,7 @@
 | `/api/xkeen/add` | `api_xkeen_add` | `payload` (vless:// или JSON), `tag`, `overwrite`, `sub_url`, `note` | W: `04_outbounds.json` ⟳ откат, `outbound_meta.json`, IP в template |
 | `/api/xkeen/remove` | `api_xkeen_remove` | `tag` | то же |
 | `/api/xkeen/remove-bulk` | `api_xkeen_remove_bulk` | `tags` (одна транзакция, `skipped`) | то же |
-| `/api/xkeen/remove-subscription` | `api_xkeen_remove_subscription` | `key` (sub_url или pbk) | WD, W: `04_outbounds.json` ⟳, `subscription_meta.json` |
+| `/api/xkeen/remove-subscription` | `api_xkeen_remove_subscription` | `key` (sub_url или pbk) | WD, W: `04_outbounds.json`, template, `subscription_meta.json`; ⟳ один — режим применения watchdog (`keenetic_apply_staged`, §6.7); до ~8 мин ответа |
 | `/api/xkeen/subscription-preview` | `api_xkeen_subscription_preview` | `url` (ничего не пишет) | R + HTTP с ПК |
 | `/api/xkeen/subscription-sync` | `api_xkeen_subscription_sync` | `url`, `add_new`, `remove_orphans`, `update_expires`, `overwrite_expires`, `add_tags` | W: `04_outbounds.json` ⟳ откат, WD, обе meta |
 | `/api/xkeen/meta` | `api_xkeen_meta` | `tag` + имя/заметка | W: `outbound_meta.json` (без бэкапа) |

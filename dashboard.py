@@ -3176,9 +3176,11 @@ def keenetic_ensure_watchdog_current():
             "note": "sh -n/swap: " + ((swap.get("stdout", "") + swap.get("stderr", ""))[:200])}
 
 
-def keenetic_write_watchdog_config(updates):
+def keenetic_write_watchdog_config(updates, stage_id=None):
     """Прочитать текущий watchdog.config, применить updates, залить обратно.
-    После заливки запускаем watchdog.sh — он применит изменения."""
+    После заливки запускаем watchdog.sh — он применит изменения. stage_id — записать в
+    watchdog.config.applynew.<stage_id> без прогона: применит режим применения watchdog
+    (keenetic_apply_staged с тем же id)."""
     # v1.0.50: сначала подтянуть свежий watchdog на роутер, если он старее встроенного в панель.
     # Лок вокруг read-modify-write: при двойном «Сохранить» (PRIMARY сразу за FAILOVER) одно
     # сохранение не прочитает старый конфиг и не затрёт правку другого. Запуск watchdog.sh —
@@ -3251,6 +3253,12 @@ def keenetic_write_watchdog_config(updates):
         if "FORCE_MODE" not in cur: cur["FORCE_MODE"] = "auto"
         cur.update(updates)
         new_text = _build_watchdog_config(cur)
+        if stage_id:
+            r = keenetic_ssh(f"cat > /opt/etc/xray/watchdog.config.applynew.{stage_id}", stdin_data=new_text, timeout=10)
+            if not r["ok"]:
+                return {"ok": False, "stderr": f"stage config failed: {r['stderr']}"}
+            return {"ok": True, "stdout": f"watchdog.config подготовлен (watchdog.config.applynew.{stage_id}).",
+                    "apply_stderr": "", "watchdog_sync": _wd_sync}
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         keenetic_ssh(f"cp /opt/etc/xray/watchdog.config /opt/etc/xray/watchdog.config.bak-{ts}")
         r = keenetic_ssh("cat > /opt/etc/xray/watchdog.config", stdin_data=new_text, timeout=10)
@@ -3415,14 +3423,19 @@ def keenetic_remove_outbound(tag):
     return {"ok": True, "stdout": f"Удалён outbound '{tag}'. Осталось {after}. Бэкап: 04_outbounds.json.bak-{ts}"}
 
 
-def keenetic_remove_outbounds_bulk(tags):
+def keenetic_remove_outbounds_bulk(tags, stage_id=None, targets=None):
     """Удалить несколько outbound'ов за одну транзакцию: один read+write+restart.
     Защита: те же правила что и одиночное remove — direct/block нельзя, активные в watchdog нельзя.
+    stage_id — без рестарта и без записи живого файла: новый 04_outbounds.json кладётся в
+    04_outbounds.json.applynew.<stage_id> (применит keenetic_apply_staged), в ответе `new_outbounds` (dict).
+    targets — роли/цепочки для проверки защиты вместо прочитанных с роутера (удаление подписки
+    передаёт цепочки уже без её узлов: подготовленный config ещё не применён).
     Возвращает {ok, removed: [tags], skipped: {tag: reason}, stdout, stderr}."""
     tags = [t for t in (tags or []) if t]
     if not tags:
         return {"ok": False, "stderr": "пустой список tags"}
-    targets = keenetic_get_watchdog_targets(strict=True)
+    if targets is None:
+        targets = keenetic_get_watchdog_targets(strict=True)
     if targets is None:
         return {"ok": False, "stderr": "не удалось прочитать watchdog.config — удаление отменено (защита активных ролей, fail-closed). Повторить позже."}
     primary = targets.get("primary_tag")
@@ -3477,21 +3490,28 @@ def keenetic_remove_outbounds_bulk(tags):
             skipped[t] = "не найден"
     if not removed_actual:
         return {"ok": False, "stderr": "ни один tag не найден в 04_outbounds.json", "skipped": skipped}
+    new_json = json.dumps(cfg_json, indent=4, ensure_ascii=False)
+    if stage_id:
+        r = keenetic_ssh(f"cat > {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.applynew.{stage_id}",
+                         stdin_data=new_json, timeout=15)
+        if not r["ok"]:
+            return {"ok": False, "stderr": f"stage failed: {r['stderr']}", "removed": [], "skipped": skipped}
+        return {"ok": True, "stdout": f"Подготовлено удаление {len(removed_actual)} outbound'ов (04_outbounds.json.applynew.{stage_id}).",
+                "removed": removed_actual, "skipped": skipped, "new_outbounds": cfg_json}
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     bak_cmd = f"cp {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.bak-{ts}"
     bak = keenetic_ssh(bak_cmd)
     if not bak["ok"]:
         return {"ok": False, "stderr": f"backup failed: {bak['stderr']}"}
-    new_json = json.dumps(cfg_json, indent=4, ensure_ascii=False)
     r = keenetic_ssh(f"cat > {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json",
                      stdin_data=new_json, timeout=15)
     if not r["ok"]:
         keenetic_ssh(f"cp {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.bak-{ts} {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json")
         return {"ok": False, "stderr": f"write failed: {r['stderr']}", "removed": [], "skipped": skipped}
-    restart = keenetic_ssh("xkeen -restart", timeout=25)
-    if not restart["ok"]:
+    rst = keenetic_ssh("xkeen -restart", timeout=25)
+    if not rst["ok"]:
         keenetic_ssh(f"cp {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json.bak-{ts} {cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json && xkeen -restart")
-        return {"ok": False, "stderr": f"xkeen restart failed: {restart['stderr']}", "removed": [], "skipped": skipped}
+        return {"ok": False, "stderr": f"xkeen restart failed: {rst['stderr']}", "removed": [], "skipped": skipped}
     return {
         "ok": True,
         "stdout": f"Удалено {len(removed_actual)} outbound'ов. Бэкап: 04_outbounds.json.bak-{ts}",
@@ -3574,7 +3594,148 @@ def _subscription_removal_plan(key, outbounds, targets, subs):
             "meta_keys": meta_keys}
 
 
+# Изменения панели, требующие рестарта xkeen, применяет САМ watchdog (v35) одним рестартом.
+# Раньше удаление подписки давало два рестарта подряд: панель — после записи 04_outbounds, и
+# через ≤1 мин watchdog — потому что синк IP поменял template и routing пересобрался. Два
+# рестарта с интервалом ~26 с оставили xray живым, но без трафика (14.10.2026). Управлять
+# рестартом снаружи надёжно нельзя (тик watchdog и его ветки «рестарт в фоне» не видны панели),
+# поэтому панель только кладёт новые файлы рядом с живыми (`<файл>.applynew.<id>`, APPLY_STAGE_FILES)
+# и манифест `/tmp/xkeen_apply.<id>.manifest` (md5 живых файлов ДО их чтения панелью), затем запускает
+# `WD_APPLY=<id> watchdog.sh`: тот под своим lock сверяет md5 (живой файл изменили — отказ, чужая
+# правка не затирается), подменяет файлы, делает ровно один рестарт с health-check и сам откатывает
+# файлы при провале. Итог — /tmp/xkeen_apply.<id>.res. Чужие (застрявшие) *.applynew.<id> не применяются.
+APPLY_STAGE_FILES = (
+    "/opt/etc/xray/watchdog.config",
+    "/opt/etc/xray/configs/04_outbounds.json",
+    "/opt/etc/xray/configs.bak/05_routing.template.json",
+)
+APPLY_MIN_WATCHDOG = 35          # с этой версии watchdog.sh умеет режим применения
+APPLY_POLL_TIMEOUT = 480         # худший путь: ожидание тика 150 с + тик + рестарт 90 с + откат 90 с
+_REMOVE_SUB_LOCK = _threading.Lock()
+
+
+def _parse_apply_result(text):
+    """Строка итога режима применения watchdog → {status, reason, restart, routing}.
+    status: OK | ROLLBACK | FAIL | "" (итога ещё нет). Чистая функция (тест)."""
+    text = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    status = text.split(" ", 1)[0] if text else ""
+    if status not in ("OK", "ROLLBACK", "FAIL"):
+        status = ""
+    fields = dict(re.findall(r"\b(\w+)=(\S+)", text))
+    return {"status": status, "reason": fields.get("reason", ""), "restart": fields.get("restart", ""),
+            "routing": fields.get("routing", ""), "after": fields.get("after", ""), "raw": text}
+
+
+def _apply_new_id():
+    """Номер операции применения: только [A-Za-z0-9-] (его же проверяет watchdog)."""
+    return datetime.now().strftime("%Y%m%d%H%M%S") + "-" + os.urandom(3).hex()
+
+
+def _apply_paths_supported():
+    """Режим применения знает только стандартные пути XKeen (они же зашиты в watchdog.sh)."""
+    return (f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json" == APPLY_STAGE_FILES[1]
+            and f"{cfg.KEENETIC_XRAY_BAK_DIR}/05_routing.template.json" == APPLY_STAGE_FILES[2])
+
+
+def keenetic_apply_fingerprint():
+    """md5 живых файлов применения ДО того, как панель их прочитает: «<путь> <md5 | ->».
+    None — не прочиталось. Снимать раньше чтения: правка между снимком и чтением даст отказ
+    применения (безопасно), а не тихое затирание."""
+    cmd = "; ".join(f'if [ -f {p} ]; then echo "{p} $(md5sum < {p} | cut -c1-32)"; else echo "{p} -"; fi'
+                    for p in APPLY_STAGE_FILES) + "; echo FP_END"
+    r = keenetic_ssh(cmd, timeout=10)
+    out = r.get("stdout") or ""
+    if "FP_END" not in out:
+        return None
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip() and ln.strip() != "FP_END"]
+    if len(lines) != len(APPLY_STAGE_FILES):
+        return None
+    return "\n".join(lines) + "\n"
+
+
+def keenetic_unstage(run_id):
+    """Убрать СВОИ подготовленные файлы и манифест (безвредно, если их нет)."""
+    return keenetic_ssh("rm -f " + " ".join(f"{p}.applynew.{run_id}" for p in APPLY_STAGE_FILES)
+                        + f" /tmp/xkeen_apply.{run_id}.manifest", timeout=10)
+
+
+def keenetic_apply_staged(run_id, fingerprint, poll_timeout=APPLY_POLL_TIMEOUT, poll_every=3):
+    """Запустить на роутере режим применения watchdog (v35) и дождаться итога.
+    Файлы *.applynew.<run_id> уже подготовлены вызывающим; fingerprint — keenetic_apply_fingerprint(),
+    снятый ДО их подготовки (уходит манифестом). Watchdog ждёт свой текущий тик до 150 с.
+    Возвращает {ok, status, reason, restart, routing, pending, stderr}. pending=True — итога не
+    дождались: применение идёт дальше на роутере, ничего не откатываем и не трогаем."""
+    import time as _t
+    res_path = f"/tmp/xkeen_apply.{run_id}.res"
+    m = keenetic_ssh(f"cat > /tmp/xkeen_apply.{run_id}.manifest", stdin_data=fingerprint, timeout=10)
+    if not m.get("ok"):
+        keenetic_unstage(run_id)
+        return {"ok": False, "status": "FAIL", "reason": "start", "restart": "0", "routing": "", "pending": False,
+                "stderr": "не записался манифест применения (SSH) — подготовленные файлы убраны, ничего не изменено."}
+    st = keenetic_ssh(f"WD_APPLY={run_id} nohup /opt/etc/xray/watchdog.sh >/dev/null 2>&1 & echo APPLY_STARTED",
+                      timeout=15)
+    if "APPLY_STARTED" not in (st.get("stdout") or ""):
+        # Ответа нет — но процесс мог стартовать (таймаут SSH). Его итог появится в .res; файлы
+        # не трогаем, пусть водит он: «не стартовал» здесь = «итог неизвестен».
+        return {"ok": False, "status": "", "reason": "start", "restart": "", "routing": "", "pending": True,
+                "stderr": f"запуск применения не подтвердился (SSH). Итог — в журнале watchdog (строки «APPLY {run_id}»)."}
+    info = _parse_apply_result("")
+    deadline = _t.time() + poll_timeout
+    while _t.time() < deadline:
+        _t.sleep(poll_every)
+        r = keenetic_ssh(f"cat {res_path} 2>/dev/null", timeout=10)
+        info = _parse_apply_result(r.get("stdout"))
+        if info["status"]:
+            break
+    if not info["status"]:
+        return {"ok": False, "status": "", "reason": "", "restart": "", "routing": "", "pending": True,
+                "stderr": f"итог применения не пришёл за {poll_timeout} с — watchdog ещё работает, удаление может пройти. Итог — в журнале watchdog (строки «APPLY {run_id}»); обновить страницу позже."}
+    keenetic_ssh(f"rm -f {res_path}", timeout=10)
+    texts = {
+        "lock": "watchdog был занят дольше 150 с — ничего не изменено, повторить позже.",
+        "stage": "не удалось подменить файлы на роутере — ничего не изменено.",
+        "blocked": "новая конфигурация не прошла xray -test — файлы откачены, xray не перезапускался.",
+        "xraytest": "новая конфигурация не прошла xray -test — файлы откачены, xray не перезапускался.",
+        "antiflap": "новый routing совпал с ранее уронившим сеть (анти-флап) — файлы откачены, xray не перезапускался.",
+        "generate": "watchdog не смог собрать routing — файлы откачены, xray не перезапускался.",
+        "routing_mv": "watchdog не смог записать routing — файлы откачены.",
+        "health": "после перезапуска не прошла проверка сети — файлы откачены, xray перезапущен на прежних.",
+        "changed": "за время ожидания файлы на роутере изменились (другое сохранение) — ничего не применено, повторить.",
+        "badconfig": "подготовленный watchdog.config с ошибкой синтаксиса — ничего не применено.",
+        "crash": "сторож упал во время применения — файлы откачены; проверить «🚑 Восстановление и диагностика».",
+    }
+    ok = info["status"] == "OK"
+    err = "" if ok else (texts.get(info["reason"]) or f"применение не удалось ({info['raw']})")
+    if info["status"] == "ROLLBACK" and info.get("after") == "fail":
+        err += " ⚠ После отката проверка сети тоже не прошла — нужна ручная проверка роутера."
+    return {"ok": ok, "status": info["status"], "reason": info["reason"], "restart": info["restart"],
+            "routing": info["routing"], "pending": False, "stderr": err}
+
+
+def _watchdog_supports_apply(wd_sync):
+    """По ответу keenetic_ensure_watchdog_current: умеет ли watchdog на роутере режим применения."""
+    wd_sync = wd_sync or {}
+    if wd_sync.get("action") == "current":
+        ver = wd_sync.get("remote_ver") or 0
+    elif wd_sync.get("action") == "upgraded":
+        ver = wd_sync.get("to") or 0
+    else:
+        ver = 0
+    return ver >= APPLY_MIN_WATCHDOG
+
+
 def keenetic_remove_subscription(key, dry_run=False):
+    """Обёртка с серверным локом: одно удаление подписки за раз. Повторный запрос во время
+    долгого применения иначе увидел бы ещё не применённое состояние."""
+    if not _REMOVE_SUB_LOCK.acquire(blocking=False):
+        return {"ok": False, "busy": True, "stderr": "Уже идёт удаление подписки — дождаться его итога."}
+    try:
+        return _keenetic_remove_subscription_impl(key, dry_run=dry_run)
+    finally:
+        _REMOVE_SUB_LOCK.release()
+
+
+def _keenetic_remove_subscription_impl(key, dry_run=False):
     """Удалить подписку целиком: все её vless-outbound'ы + записи subscription_meta
     (групповая + pbk-тени) + (через bulk) их outbound_meta. Серверы-ХВОСТ резервной
     цепочки авто-убираются из FAILOVER_TAGS перед сносом. Fail-closed: если хотя бы один
@@ -3598,51 +3759,92 @@ def keenetic_remove_subscription(key, dry_run=False):
     if dry_run:
         return {"ok": True, "dry_run": True, **plan}
     member_tags = plan["member_tags"]
-    # 1. Убрать серверы-хвост из ВСЕХ цепочек резерва ДО сноса (иначе bulk пропустит их как
-    #    «в FAILOVER» / «в цепочке резерва AI»). Одна запись config = один прогон watchdog.
-    removed_from_failover = []
-    removed_from_ai_chain = []
-    removed_from_yt_chain = []
-    removed_from_foreign_chain = []
-    _chain_updates = {}
-    if plan["failover_tail"]:
-        drop = set(plan["failover_tail"])
-        _chain_updates["FAILOVER_TAGS"] = " ".join(t for t in (targets.get("failover_tags") or []) if t not in drop)
-    if plan.get("ai_chain_tail"):
-        drop = set(plan["ai_chain_tail"])
-        _chain_updates["AI_FAILOVER_TAGS"] = " ".join(t for t in (targets.get("ai_failover_tags") or []) if t not in drop)
-    if plan.get("yt_chain_tail"):
-        drop = set(plan["yt_chain_tail"])
-        _chain_updates["YT_FAILOVER_TAGS"] = " ".join(t for t in (targets.get("yt_failover_tags") or []) if t not in drop)
-    if plan.get("foreign_chain_tail"):
-        drop = set(plan["foreign_chain_tail"])
-        _chain_updates["FOREIGN_FAILOVER_TAGS"] = " ".join(t for t in (targets.get("foreign_failover_tags") or []) if t not in drop)
-    if _chain_updates:
-        wd = keenetic_write_watchdog_config(_chain_updates)
-        if not (isinstance(wd, dict) and wd.get("ok")):
-            return {"ok": False, "phase": "failover",
-                    "stderr": "Не удалось убрать серверы из цепочек резерва (watchdog.config) — удаление отменено, ничего не тронуто."}
-        removed_from_failover = list(plan["failover_tail"])
-        removed_from_ai_chain = list(plan.get("ai_chain_tail") or [])
-        removed_from_yt_chain = list(plan.get("yt_chain_tail") or [])
-        removed_from_foreign_chain = list(plan.get("foreign_chain_tail") or [])
-    # 2. Снести серверы (bulk: бэкап 04_outbounds + рестарт + откат + чистка outbound_meta).
+    removed_from_failover = list(plan["failover_tail"])
+    removed_from_ai_chain = list(plan.get("ai_chain_tail") or [])
+    removed_from_yt_chain = list(plan.get("yt_chain_tail") or [])
+    removed_from_foreign_chain = list(plan.get("foreign_chain_tail") or [])
     removed_outbounds = []
+    apply_info = None
     if member_tags:
-        r = keenetic_remove_outbounds_bulk(member_tags)
+        # Всё, что требует рестарта, применяет watchdog (v35) ОДНИМ рестартом: панель только
+        # готовит файлы *.applynew — живые не трогаются, пока watchdog не возьмёт свой lock.
+        if not _apply_paths_supported():
+            return {"ok": False, "phase": "paths",
+                    "stderr": "нестандартные пути XKeen в настройках панели — удаление одним перезапуском не поддержано, ничего не тронуто."}
+        wd_sync = keenetic_ensure_watchdog_current()
+        if not _watchdog_supports_apply(wd_sync):
+            return {"ok": False, "phase": "watchdog",
+                    "stderr": f"watchdog на роутере не обновился до v{APPLY_MIN_WATCHDOG}+ ({wd_sync.get('note') or wd_sync.get('action')}) — удаление отменено, ничего не тронуто."}
+        run_id = _apply_new_id()
+        # md5 живых файлов — ДО их чтения ниже (keenetic_write_watchdog_config / bulk / template).
+        fingerprint = keenetic_apply_fingerprint()
+        if fingerprint is None:
+            return {"ok": False, "phase": "fingerprint",
+                    "stderr": "не удалось снять отпечатки файлов на роутере — удаление отменено, ничего не тронуто."}
+        # 1. Цепочки резерва без узлов подписки (иначе bulk отказал бы «в FAILOVER» / «в цепочке AI»).
+        _chain_updates = {}
+        new_targets = dict(targets)
+        for _key, _tkey, _tail in (("FAILOVER_TAGS", "failover_tags", removed_from_failover),
+                                   ("AI_FAILOVER_TAGS", "ai_failover_tags", removed_from_ai_chain),
+                                   ("YT_FAILOVER_TAGS", "yt_failover_tags", removed_from_yt_chain),
+                                   ("FOREIGN_FAILOVER_TAGS", "foreign_failover_tags", removed_from_foreign_chain)):
+            if _tail:
+                drop = set(_tail)
+                kept = [t for t in (targets.get(_tkey) or []) if t not in drop]
+                _chain_updates[_key] = " ".join(kept)
+                new_targets[_tkey] = kept
+        if _chain_updates:
+            wd = keenetic_write_watchdog_config(_chain_updates, stage_id=run_id)
+            if not (isinstance(wd, dict) and wd.get("ok")):
+                keenetic_unstage(run_id)
+                return {"ok": False, "phase": "failover",
+                        "stderr": "Не удалось подготовить цепочки резерва (watchdog.config) — удаление отменено, ничего не тронуто."}
+        # 2. Новый 04_outbounds.json — подготовленным файлом.
+        r = keenetic_remove_outbounds_bulk(member_tags, stage_id=run_id, targets=new_targets)
         if not r.get("ok"):
-            return {"ok": False, "phase": "outbounds", "removed_from_failover": removed_from_failover,
-                    "stderr": "Не удалил серверы подписки: " + (r.get("stderr") or "")}
+            keenetic_unstage(run_id)
+            return {"ok": False, "phase": "outbounds",
+                    "stderr": "Не удалил серверы подписки: " + (r.get("stderr") or "") + " Ничего не тронуто."}
+        # 3. IP эндпоинтов в template — по новому списку outbound'ов.
+        tplan = _template_ips_plan(r.get("new_outbounds"))
+        tmpl_note = ""
+        if tplan.get("changed"):
+            w = keenetic_ssh(f"cat > {tplan['tmpl_path']}.applynew.{run_id}", stdin_data=tplan["new_tmpl"], timeout=15)
+            if not w.get("ok"):
+                # Без template: устаревшие IP в direct-правиле безвредны, второго рестарта не будет.
+                keenetic_ssh(f"rm -f {tplan['tmpl_path']}.applynew.{run_id}", timeout=10)
+                tmpl_note = "IP-лист template не обновлён (сбой записи) — обновится при следующем синке."
+        elif not tplan.get("ok"):
+            tmpl_note = f"IP-лист template не пересчитан ({tplan.get('error')})."
+        # 4. Применение — один рестарт, откат на стороне watchdog.
+        apply_info = keenetic_apply_staged(run_id, fingerprint)
+        apply_info["template_note"] = tmpl_note
+        apply_info["template_removed"] = tplan.get("removed", []) if tplan.get("changed") and not tmpl_note else []
+        apply_info["template_added"] = tplan.get("added", []) if tplan.get("changed") and not tmpl_note else []
+        if not apply_info.get("ok"):
+            if apply_info.get("pending"):
+                return {"ok": False, "phase": "apply", "apply": apply_info, "removed": [], "pending": True,
+                        "stderr": "Итог удаления пока неизвестен: " + (apply_info.get("stderr") or "")}
+            return {"ok": False, "phase": "apply", "apply": apply_info, "removed": [],
+                    "stderr": "Подписка не удалена: " + (apply_info.get("stderr") or "применение не удалось")}
         removed_outbounds = r.get("removed", []) or []
-        # Если bulk пропустил что-то НЕ по причине «не найден» (гонка: узел стал активен) —
+        # Если bulk пропустил что-то НЕ по причине «не найден» — эти узлы под защитой ролей,
         # подписка ещё жива, метаданные НЕ удаляем.
         survived = {tg: why for tg, why in (r.get("skipped") or {}).items() if why != "не найден"}
         if survived:
             return {"ok": True, "removed": removed_outbounds, "removed_meta": [], "skipped": survived,
-                    "removed_from_failover": removed_from_failover,
-                    "stdout": f"Удалено серверов: {len(removed_outbounds)}. Метаданные не тронуты — часть узлов стала активной во время операции."}
-    # 3. Почистить subscription_meta (с проверяемым бэкапом).
+                    "removed_from_failover": removed_from_failover, "apply": apply_info,
+                    "stdout": f"Удалено серверов: {len(removed_outbounds)} (одним перезапуском XKeen). Метаданные не тронуты — часть узлов под защитой ролей."}
+    else:
+        removed_from_failover = removed_from_ai_chain = removed_from_yt_chain = removed_from_foreign_chain = []
+    # 3. Почистить subscription_meta (с проверяемым бэкапом). После применения прошли минуты —
+    #    перечитать, чтобы не затереть записи, добавленные за это время.
     removed_meta = []
+    if apply_info:
+        _fresh = keenetic_read_sub_meta()
+        if _fresh is not None:
+            subs = _fresh
+            plan["meta_keys"] = _subscription_removal_plan(key, [], targets, subs)["meta_keys"]
     if plan["meta_keys"]:
         new_subs = {k: v for k, v in subs.items() if k not in set(plan["meta_keys"])}
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -3666,11 +3868,18 @@ def keenetic_remove_subscription(key, dry_run=False):
         msg += f" Из цепочки резерва YouTube убрано: {len(removed_from_yt_chain)}."
     if removed_from_foreign_chain:
         msg += f" Из цепочки резерва «Зарубежных сервисов» убрано: {len(removed_from_foreign_chain)}."
+    if apply_info:
+        msg += " Применено одним перезапуском XKeen."
+        if apply_info.get("template_removed") or apply_info.get("template_added"):
+            msg += f" IP эндпоинтов в template: −{len(apply_info.get('template_removed') or [])} / +{len(apply_info.get('template_added') or [])}."
+        if apply_info.get("template_note"):
+            msg += " ⚠ " + apply_info["template_note"]
     return {"ok": True, "removed": removed_outbounds, "removed_meta": removed_meta,
             "removed_from_failover": removed_from_failover,
             "removed_from_ai_chain": removed_from_ai_chain,
             "removed_from_yt_chain": removed_from_yt_chain,
-            "removed_from_foreign_chain": removed_from_foreign_chain, "stdout": msg}
+            "removed_from_foreign_chain": removed_from_foreign_chain,
+            "apply": apply_info, "stdout": msg}
 
 
 def keenetic_find_orphan_sub_meta(outbounds=None, subs=None):
@@ -4908,13 +5117,11 @@ def api_xkeen_remove_subscription():
     key = request.form.get("key", "").strip()
     if not key:
         return jsonify({"ok": False, "stderr": "ключ подписки не передан"})
+    # Синк IP template и рестарт — внутри keenetic_remove_subscription одним применением
+    # (отдельный _auto_sync_template_ips_silent здесь давал второй рестарт от watchdog).
     result = keenetic_remove_subscription(key)
     for tg in result.get("removed", []) or []:
         _OUTBOUND_STATUS_CACHE.pop(tg, None)
-    if result.get("removed"):
-        sync = _auto_sync_template_ips_silent()
-        if sync.get("changed"):
-            result["auto_sync"] = f"🔁 Template auto-sync: +{len(sync.get('added', []))} / −{len(sync.get('removed', []))} IP (watchdog подхватит ≤1 мин)"
     return jsonify(result)
 
 
@@ -7716,15 +7923,35 @@ def _auto_sync_template_ips_silent():
 
     Возвращает: {ok: bool, changed: bool, added: [ips], removed: [ips], error?: str, backup?: path}
     """
-    try:
-        ob_raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json", timeout=10)
-        if not ob_raw:
-            return {"ok": False, "changed": False, "error": "не прочитал outbounds"}
-        ob_data = json.loads(_strip_json_comments(ob_raw))
-    except Exception as ex:
-        return {"ok": False, "changed": False, "error": f"parse outbounds: {ex}"}
+    plan = _template_ips_plan()
+    if not plan.get("ok") or not plan.get("changed"):
+        return {k: v for k, v in plan.items() if k not in ("new_tmpl", "tmpl_path")}
+    tmpl_path = plan["tmpl_path"]
 
-    found_ips, _resolved = _endpoint_ipv4s_from_outbounds(ob_data)
+    import time as _time
+    ts = _time.strftime('%Y%m%d-%H%M%S')
+    bak = f"{tmpl_path}.bak-autosync-{ts}"
+    keenetic_ssh(f"cp {tmpl_path} {bak}", timeout=10)  # silent — best-effort
+    write_r = keenetic_ssh(f"cat > {tmpl_path}", stdin_data=plan["new_tmpl"], timeout=15)
+    if not write_r.get("ok"):
+        return {"ok": False, "changed": False, "error": f"write failed: {write_r.get('stderr', '')[:200]}"}
+
+    return {"ok": True, "changed": True, "added": plan["added"], "removed": plan["removed"], "backup": bak}
+
+
+def _template_ips_plan(ob_data=None):
+    """Чистое чтение: каким станет routing-template после синка IP эндпоинтов с 04_outbounds.json
+    (или с переданным ob_data — ещё не применённым). Ничего не пишет.
+    Возвращает {ok, changed, added, removed, new_tmpl?, tmpl_path?, error?}."""
+    try:
+        if ob_data is None:
+            ob_raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/04_outbounds.json", timeout=10)
+            if not ob_raw:
+                return {"ok": False, "changed": False, "error": "не прочитал outbounds"}
+            ob_data = json.loads(_strip_json_comments(ob_raw))
+        found_ips, _resolved = _endpoint_ipv4s_from_outbounds(ob_data)
+    except Exception as ex:
+        return {"ok": False, "changed": False, "error": f"outbounds: {ex}"}
 
     tmpl_path = f"{cfg.KEENETIC_XRAY_BAK_DIR}/05_routing.template.json"
     tmpl_raw = keenetic_read_file(tmpl_path, timeout=10)
@@ -7741,16 +7968,8 @@ def _auto_sync_template_ips_silent():
 
     if not to_add and not to_remove:
         return {"ok": True, "changed": False, "added": [], "removed": []}
-
-    import time as _time
-    ts = _time.strftime('%Y%m%d-%H%M%S')
-    bak = f"{tmpl_path}.bak-autosync-{ts}"
-    keenetic_ssh(f"cp {tmpl_path} {bak}", timeout=10)  # silent — best-effort
-    write_r = keenetic_ssh(f"cat > {tmpl_path}", stdin_data=new_tmpl, timeout=15)
-    if not write_r.get("ok"):
-        return {"ok": False, "changed": False, "error": f"write failed: {write_r.get('stderr', '')[:200]}"}
-
-    return {"ok": True, "changed": True, "added": to_add, "removed": to_remove, "backup": bak}
+    return {"ok": True, "changed": True, "added": to_add, "removed": to_remove,
+            "new_tmpl": new_tmpl, "tmpl_path": tmpl_path}
 
 
 @app.route("/api/xkeen/set-client-policy", methods=["POST"])
@@ -18009,8 +18228,14 @@ async function bulkRemoveSelected(btn) {
 
 // Удалить подписку целиком (серверы + записи subscription_meta). Кнопка «🗑 Удалить подписку»
 // в шапке группы. Fail-closed на сервере: активные узлы защищены, операция вернёт blocked.
-function removeSubscriptionFromBtn(btn) {
-  removeSubscription(btn.dataset.key, btn.dataset.name, parseInt(btn.dataset.count) || 0);
+async function removeSubscriptionFromBtn(btn) {
+  // Применение идёт до пары минут — кнопка заблокирована, чтобы не запустить второе удаление.
+  btn.disabled = true;
+  try {
+    await removeSubscription(btn.dataset.key, btn.dataset.name, parseInt(btn.dataset.count) || 0);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function removeSubscription(key, name, count) {
@@ -18024,10 +18249,16 @@ async function removeSubscription(key, name, count) {
     `(PRIMARY / AI / YouTube / Зарубежные / IPv6 / голова резерва) — операция откажет.\n\n` +
     `Бэкапы 04_outbounds.json и subscription_meta.json сохранятся на роутере.`
   )) return;
-  flash(true, `🗑 Удаляю подписку «${name}»...`);
+  flash(true, `🗑 Удаляю подписку «${name}»... Изменения применяются одним перезапуском XKeen — до 1–2 минут, страницу не закрывать.`);
   const fd = new FormData();
   fd.append('key', key);
-  const res = await apiCall('/api/xkeen/remove-subscription', fd);
+  let res;
+  try {
+    res = await apiCall('/api/xkeen/remove-subscription', fd);
+  } catch (e) {
+    flash(false, 'Нет ответа от панели', 'Итог удаления — в журнале watchdog (раздел «📋 Лог watchdog», строки APPLY). Обновить страницу через минуту.');
+    return;
+  }
   if (res.ok) {
     const ro = (res.removed || []).length, rm = (res.removed_meta || []).length;
     flash(true, `Подписка «${name}» удалена`, res.stdout || `серверов: ${ro}, записей: ${rm}`);

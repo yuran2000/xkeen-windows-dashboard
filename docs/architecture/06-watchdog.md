@@ -21,8 +21,9 @@ cron */1 → watchdog.sh: . watchdog.config → пробы → state-машин�
 /xkeen → keenetic_get_watchdog_targets() → targets.*   keenetic_get_watchdog() → watchdog.*
 ```
 
-Тики сериализует `/tmp/xkeen_watchdog.lock`, сохранения — `_WATCHDOG_CFG_LOCK`. Запись = внеочередной
-тик ~30 с → связанные изменения писать **одним** вызовом.
+Тики сериализует `/tmp/xkeen_watchdog.lock` (v35 — атомарно, noclobber), сохранения — `_WATCHDOG_CFG_LOCK`.
+Запись = внеочередной тик ~30 с → связанные изменения писать **одним** вызовом. Изменения, требующие
+рестарта xkeen (удаление подписки), — через режим применения (§6.7), а не записью живых файлов.
 
 ### 6.2. Ключи watchdog.config, которыми управляет панель
 
@@ -138,15 +139,23 @@ kill-switch, «📋 Лог watchdog», JS-константы (§8.4). `api_xkeen
 
 ### 6.6. Тик watchdog.sh
 
-Порядок разделов `.cur`: lock → помощники (`_probe_connected`, `probe_tag`, `_num`, `is_ru_tag`, `killswitch_decide`,
+Порядок разделов `.cur`: lock (`_wd_lock_try`; режим применения — пролог §6.7) → `. watchdog.config` →
+`_xk_restart` / `_xk_busy` / `_bg_restart_or_defer` → помощники (`_probe_connected`, `probe_tag`, `_num`, `is_ru_tag`, `killswitch_decide`,
 `_state_field`, `_log_every5`, `deep_probe_check`, `tg_alert`, `generate_routing`, `routing_changed`,
 `validate_routing_xray`, `health_check`) → досыл TG → UDP-залип (v19) → `53` в `port_exclude.lst` (v21)
 → очистка `YT_GEOIP_CATEGORIES` (v23) → self-heal `socks-ai-check` (v24) → параметры v27/v29/v30 →
 self-heal `socks-deep-*` (v29) → fd-залип (v22) → AI-проба (v24/v25) → State → Force-mode → проба
 PRIMARY и state-машина (глухота `DPRI_DEAF` форсирует down) → AI → YT → FOREIGN (kill-switch +
 цепочки) → Apply (`generate_routing <default> <ai> <yt> <foreign> <ipv6>` → `routing_changed` →
-анти-флап → `validate_routing_xray` → `mv` → `xkeen -restart` → `health_check` → `.lastgood` или
-`AUTO-ROLLBACK`) → обход FAILOVER → Save state.
+анти-флап → `validate_routing_xray` → `mv` → `_xk_restart` → `health_check` → `.lastgood` или
+`AUTO-ROLLBACK`) → итог режима применения (§6.7) → обход FAILOVER → Save state.
+
+**`_xk_restart` (v35).** XKeen 2.0 запускает `xkeen -restart` без терминала (cron, ssh, скрипт) **в фоне**
+(`start-stop-daemon`, лог `/opt/var/log/xkeen-detached.log`) и сразу возвращает управление; синхронно — только с
+`XKEEN_FOREGROUND=1`. До v35 `health_check` сразу после рестарта мерил ещё СТАРЫЙ xray. `_xk_restart` ждёт чужой
+start/stop/restart (`_xk_busy`, ≤ 60 с), делает свой и ждёт его конца и нового pid xray (≤ 90 с; нет — код 1, и
+применение считается неудачным). Фоновые рестарты «и выход из тика» (self-heal inbound'ов v24/v29, правило v24,
+v21, v23) — через `_bg_restart_or_defer`.
 
 **Карантин возврата (v29, растущий — v33).** Ушли с основного роли по глухоте (`D*_DEAF`) — `D*_LEFT` = время
 ухода, `D*_QN` += 1; пока не истёк срок `_deep_hold(D*_QN)` (`DEEP_RETURN_HOLD`, ×2 за каждый повторный
@@ -167,5 +176,34 @@ PRIMARY и state-машина (глухота `DPRI_DEAF` форсирует dow
 `__AI_RULE_BLOCK__`, `__YT_RULE_BLOCK__`, `__YT_RULE_GEOIP__`, `__FOREIGN_RULE_BLOCK__`,
 `__FOREIGN_RULE_GEOIP__`, `__IPV6_RULE_BLOCK__` (пусто → правило не генерится). Правила для
 `socks-ai-check` и `socks-deep-*` watchdog вставляет сам.
+
+### 6.7. Режим применения (v35, `WD_APPLY=<id>`)
+
+Запускает панель (`keenetic_apply_staged`, §3.5): `WD_APPLY=<id> nohup /opt/etc/xray/watchdog.sh`. Id — только
+`[A-Za-z0-9_-]`. Файлы: подготовленные `<живой>.applynew.<id>` (список `APPLY_STAGE_LIST` = `watchdog.config`,
+`04_outbounds.json`, routing-template — тот же, что `APPLY_STAGE_FILES` панели), манифест
+`/tmp/xkeen_apply.<id>.manifest` (`<путь> <md5 | ->`), итог `/tmp/xkeen_apply.<id>.res`, копии `*.bak-apply-<id>`
+(по 3 последних на файл, `_apply_prune_baks`; плюс живой `05_routing.json`).
+
+1. Пролог: ждать lock до `WD_APPLY_WAIT` (150 с) → нет — `FAIL reason=lock`, свои `.applynew.<id>` убраны.
+   Сверка md5 живых файлов с манифестом (`_md5_or_dash`) → расхождение — `FAIL reason=changed` (чужая правка
+   не затирается); `sh -n` подготовленного config → `FAIL reason=badconfig`. Копии → подмена (`mv`); сбой —
+   `FAIL reason=stage`. Ловушка `_apply_on_exit` (EXIT/INT/TERM/HUP): итога нет — откат и `FAIL reason=crash`
+   (рестарт уже шёл — ещё один на возвращённых файлах, `restart=2`). Нет `watchdog.config` — выход после lock,
+   итог пишет ловушка. Убитое `kill -9` / OOM применение подбирает обычный тик (блок перед досылом TG):
+   манифест без итога и с копиями `*.bak-apply-<id>` → откат, рестарт, `FAIL reason=killed`; без копий (ещё
+   ждёт lock) — не трогается; брошенные > 60 мин `xkeen_apply.*` и `*.applynew.*` удаляются.
+2. Тик идёт как обычно, кроме: AI-проба, UDP- и FD-залип не оцениваются (решит следующий тик); фоновые
+   рестарты откладываются (`_APPLY_NEED=1`).
+3. Итог после блока Apply: рестарт уже был (routing пересобран) — `OK routing=changed restart=1`; нужен
+   (подменён `04_outbounds` или `_APPLY_NEED`) — `xray_test_live` → `_xk_restart` + `health_check` →
+   `OK routing=same restart=1`; не нужен (только config) — `OK routing=same restart=0`. Кандидат отклонён
+   (`antiflap` / `blocked` / `generate` / `routing_mv` / `xraytest`) — откат файлов, без рестарта
+   (`FAIL … restart=0`; был отложенный — один рестарт, `deferred=1`); `health_check` провален — откат файлов и
+   routing, откатный рестарт, `ROLLBACK reason=health restart=2 after=ok|fail` (при `after=fail` третьего
+   рестарта нет — только алерт). FAIL / ROLLBACK выходят
+   **до Save state** (состояние от отвергнутых файлов не пишется).
+
+Строки лога — `APPLY <id>: …`. Тест — `tests/test_apply_once_offline.py`.
 
 ---

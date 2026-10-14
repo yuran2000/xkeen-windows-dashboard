@@ -258,9 +258,18 @@ Windows-клиент включает свой kill-switch), `build_wg_client_co
   `keenetic_ensure_watchdog_current`, **`keenetic_write_watchdog_config`**, `keenetic_set_watchdog_target`
   (новый PRIMARY → старый встаёт головой `FAILOVER_TAGS`, `PRIMARY_PROBE_URL` переключается),
   `keenetic_force_mode`.
-- Удаление (§7.4): `keenetic_remove_outbound`, `keenetic_remove_outbounds_bulk`,
-  `_subscription_removal_plan` (**чистая** функция), `keenetic_remove_subscription`,
+- Удаление (§7.4): `keenetic_remove_outbound`, `keenetic_remove_outbounds_bulk` (`stage_id` — без
+  рестарта: новый файл в `04_outbounds.json.applynew.<id>`, в ответе `new_outbounds`; `targets` — роли и
+  цепочки для защиты вместо прочитанных), `_subscription_removal_plan` (**чистая** функция),
+  `keenetic_remove_subscription` (серверный лок `_REMOVE_SUB_LOCK` → `_keenetic_remove_subscription_impl`),
   `keenetic_find_orphan_sub_meta`, `keenetic_purge_orphan_sub_meta`.
+- **Один рестарт на всё** — режим применения watchdog (v35, механика — §6.7). Удаление подписки:
+  `_apply_paths_supported` → `_watchdog_supports_apply` (`APPLY_MIN_WATCHDOG`) → `keenetic_apply_fingerprint`
+  (md5 **до** чтения файлов) → `<файл>.applynew.<id>` (`_apply_new_id`; config `stage_id`, bulk, template) →
+  `keenetic_apply_staged(id, fp)` (манифест → `WD_APPLY=<id> nohup watchdog.sh` → опрос итога до
+  `APPLY_POLL_TIMEOUT`, `_parse_apply_result`; итога нет — `pending`, ничего не трогается) → при OK
+  `subscription_meta` по свежему чтению; сбой подготовки — `keenetic_unstage(id)`. Откат — на watchdog. Зачем:
+  панель + тик watchdog давали два рестарта за 26 с, xray остался без трафика (14.10.2026).
 - `keenetic_add_outbound` — вставка перед `direct`, бэкап → запись → `xkeen -restart` → проверка
   **процесса** xray (код возврата рестарта ненадёжен) → откат.
 - socks-local (канал TG-алертов watchdog, `SOCKS_LOCAL_TAG`, `SOCKS_LOCAL_PORT` = 10808):
@@ -327,7 +336,8 @@ sentinel `google`/`private`; sentinel не прошёл → fail-open) с тек
   `__[A-Z0-9_]+__` скрываются — регэксп обязан допускать цифры), `_humanize_regex`,
   `_describe_network_rule`; IP эндпоинтов — `_endpoint_ipv4s_from_outbounds` (домены резолвятся на ПК),
   `_template_ip_arrays`, `_template_replace_ip_arrays` (меняются только `"ip": [...]` из IPv4-литералов),
-  `_auto_sync_template_ips_silent` (без рестарта; после add/remove/bulk/sync и в sync-structure).
+  `_auto_sync_template_ips_silent` (без рестарта; после add/remove/bulk/sync и в sync-structure;
+  расчёт без записи — `_template_ips_plan(ob_data=None)`, им пользуется удаление подписки).
 - `api_keenetic_test_connection` строит argv сам (параметры не применяются).
 - Bootstrap: `BOOTSTRAP_SEARCH_DIRS`, `_bootstrap_find`, `DEFAULT_WATCHDOG_CONFIG` (обычная
   `'''`-строка, без личных данных), `EMPTY_OUTBOUND_META`, `EMPTY_SUBSCRIPTION_META`,
@@ -465,6 +475,7 @@ BusyBox ash, cron раз в минуту); панель пишет его кон
 - 6.4. Как панель показывает состояние
 - 6.5. Автосинк watchdog.sh по номеру версии
 - 6.6. Тик watchdog.sh
+- 6.7. Режим применения (v35, `WD_APPLY`) — изменения панели одним рестартом
 
 ## 7. Каналы и цепочки резерва → [`docs/architecture/07-chains.md`](architecture/07-chains.md)
 
@@ -686,6 +697,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
 | Тест | Покрывает |
 |---|---|
 | `test_api_offline.py` | kill-switch, backup/restore, bootstrap, diagnose + auto-fix, 404/405 ≠ 500, `keys_order ⊆ DEFAULT_WATCHDOG_CONFIG` |
+| `test_apply_once_offline.py` | режим применения (v35): куски `.cur` в `sh` — атомарный lock (три претендента, pid чужого процесса), пролог (md5 против манифеста, `sh -n` config, подмена `*.applynew.<id>`, чужие id не трогаются, ловушка падения), итог (ровно один рестарт; без рестарта, если подменён только config; отложенный рестарт тика; откат файлов и routing; FAIL до Save state), `_xk_restart` (ждёт чужой и свой детач-рестарт), `_bg_restart_or_defer`; статика (v35, config после lock, фоновые рестарты под охраной); `keenetic_apply_staged` (манифест до запуска, OK/ROLLBACK/FAIL, pending); `keenetic_remove_subscription` (отпечатки до чтения, подготовка под id, одно применение, мета по свежему чтению, старый watchdog / пути — отказ, второй запрос — «занято»); `keenetic_write_watchdog_config(stage_id)` (нет `sh` — SKIP sh-части) |
 | `test_backup_paths.py` | `STATIC_FILES`, `is_restorable`, `needs_exec_bit`, `build_snapshot_command` |
 | `test_geoip_status.py` | `keenetic_geoip_dat_status` (+ фоновая проверка `telegram`), все состояния секции GeoIP, auto-fix `install_extended_geoip` (симлинк, скачивание, авто-откат, ротация бэкапов), категории в диагностике |
 | `test_killswitch.py` | генератор хука, разбор статуса/утечек |

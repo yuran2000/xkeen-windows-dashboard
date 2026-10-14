@@ -61,7 +61,8 @@ use_common=1 — иначе при выключении галочки «про�
 2. `keenetic_remove_outbound` (блокирует любое членство) и `keenetic_remove_outbounds_bulk`
    (`*_chain_set`, причина в `skipped`).
 3. `_subscription_removal_plan` (`critical`, `*_chain_tail`) + `keenetic_remove_subscription` (одна
-   запись config, `removed_from_*_chain`); `api_xkeen_subscription_sync` (pre-check, автоочистка).
+   подготовка config `stage_id`, bulk с `targets` без хвостов, `removed_from_*_chain`; применение — ОДНИМ
+   рестартом, режим применения watchdog §6.7); `api_xkeen_subscription_sync` (pre-check, автоочистка).
 4. `xkeen_page`: `in_*_chain`, `*_chain_position`, `is_inactive`, `any_active` групп.
 5. Jinja: бейджи в `failover-chain` и «📋 Все outbounds» (`has_current`, «резерв … №N» +
    `removeFromChannelChain(kind, tag)`), статус kill-switch карточки, условные тексты блокировки.
