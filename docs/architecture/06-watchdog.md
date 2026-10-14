@@ -66,7 +66,8 @@ cron */1 → watchdog.sh: . watchdog.config → пробы → state-машин�
 `generate_204`, `api.telegram.org`), `KILL_FAIL_THRESHOLD`/`KILL_PASS_THRESHOLD` (3/2), `RECVQ_THRESHOLD`,
 `RECVQ_HARD`, `STALL_FAIL_NEED`, `STALL_COOLDOWN`, `CONNTRACK_MIN`, `FD_DELTA_THRESHOLD`,
 `FD_STALL_COOLDOWN`, v37: `XRAY_BUSY_ENABLE` (1), `XRAY_BUSY_CPU` (50, % всех ядер), `XRAY_BUSY_KBIT_PER_PCT` (50),
-`XRAY_BUSY_TICKS` (2), v38: `XRAY_BUSY_CALM_TICKS` (2), `XRAY_BUSY_REMIND_TICKS` (10), `XRAY_BUSY_TG_COOLDOWN` (1800).
+`XRAY_BUSY_TICKS` (2), v38: `XRAY_BUSY_CALM_TICKS` (2), `XRAY_BUSY_REMIND_TICKS` (10), `XRAY_BUSY_TG_COOLDOWN` (1800), v40: `EVIDENCE_ENABLE` (1), `EVIDENCE_COOLDOWN` (1800, для повода repeat), `EVIDENCE_KEEP` (40),
+`EVIDENCE_KEEP_ERRLOG` (15), `EVIDENCE_MAX_PER_HOUR` (6).
 
 ### 6.3. watchdog.state — полный перечень полей
 
@@ -107,7 +108,7 @@ DFGN_CTR= DFGN_TS= DFGN_DEAF= DFGN_LEFT= DFGN_TAG=
 
 Метки `watchdog.log`: `SWITCH`, `FAILOVER-HEALTH`, `AI-`/`YT-`/`FOREIGN-FAILOVER` (+ `-RETURN`),
 `…-KILL-SWITCH` (+ `-CLEAR`), `DEEP-PROBE` (`DEAF`, `RECOVER`), `XRAY-TEST FAIL`, `HEALTH FAIL`,
-`AUTO-ROLLBACK`, `SKIP (анти-флап)`, `UDP-STALL`, `FD-STALL`, `XRAY-BUSY` (+ `BLAME`, v37), `AUTO-FIX`, `WARN`, `ERROR`. Долгие
+`AUTO-ROLLBACK`, `SKIP (анти-флап)`, `UDP-STALL`, `FD-STALL`, `XRAY-BUSY` (+ `BLAME`, v37), `EVIDENCE` (v40), `AUTO-FIX`, `WARN`, `ERROR`. Долгие
 состояния пишутся раз в 5 мин (`_log_every5`), иначе окно «последние 30 строк» забьётся.
 
 ### 6.4. Как панель показывает состояние
@@ -142,7 +143,7 @@ kill-switch, «📋 Лог watchdog», JS-константы (§8.4). `api_xkeen
 
 Порядок разделов `.cur`: lock (`_wd_lock_try`; режим применения — пролог §6.7) → `. watchdog.config` →
 `_xk_restart` / `_xk_busy` / `_bg_restart_or_defer` → помощники (`_probe_connected`, `probe_tag`, `_num`, `is_ru_tag`, `killswitch_decide`,
-`_state_field`, `_log_every5`, `xray_busy_eval`, `deep_probe_check`, `tg_alert`, `generate_routing`, `routing_changed`,
+`_state_field`, `_log_every5`, `xray_busy_eval`, `_ev_run`, `evidence_capture`, `deep_probe_check`, `tg_alert`, `generate_routing`, `routing_changed`,
 `validate_routing_xray`, `health_check`) → досыл TG → UDP-залип (v19) → `53` в `port_exclude.lst` (v21)
 → очистка `YT_GEOIP_CATEGORIES` (v23) → self-heal `socks-ai-check` (v24) → параметры v27/v29/v30 →
 self-heal `socks-deep-*` (v29) → fd-залип (v22) → перегрузка xray (v37, `xray_busy_eval`) → AI-проба (v24/v25) → State → Force-mode → проба
@@ -181,6 +182,39 @@ PRIMARY и state-машина (глухота `DPRI_DEAF` форсирует dow
 в роли YouTube, xray 60–90 % при 0,2–0,3 Мбит/с, исправные Сервер_1/2/3 по очереди «глухие», 48 рестартов; края —
 офлайн-проверки граничных случаев.
 Тест — `tests/test_xray_busy.py`.
+
+**Улики сбоя канала (v40).** `evidence_capture <роль> <тег> <порт> <url> <повод>` снимает состояние в
+`/opt/var/log/xray/evidence/<дата-время>-<роль>-<повод>.txt`, пока сломанный xray ещё жив. Поводы и места: `start` —
+первая пустая сквозная проба эпизода (`deep_probe_check`, `DP_CTR` стал 1; AI-проба, `_AI_EMPTY` стал 1), `deaf` —
+канал признаётся глухим (перед уходом и рестартом), `repeat` — прочие пустые, `ok` — канал ожил после пустых или
+проверен после карантина (`DP_CHK`), `heal` — перед лечебным рестартом `_traffic_ok_or_heal` (роль TRAFFIC, проба
+через `socks-health`). Частота: **один снимок за тик** (`EV_TICK_DONE` — узел у ролей общий); по роли (`.last_<роль>` =
+«ts pid»): `deaf`/`heal` и первый снимок после смены pid xray (провал сразу после рестарта) — от 60 с, `start`/`ok` —
+от 300 с, `repeat` — `EVIDENCE_COOLDOWN`; часы назад — кулдаун истёк; не больше `EVIDENCE_MAX_PER_HOUR` в час
+(`.hour`), кроме `deaf`/`heal` — мигающий канал не вытеснит ротацией снимок инцидента; хранятся `EVIDENCE_KEEP`.
+Время: сетевые проверки ПАРАЛЛЕЛЬНО, каждая со своим пределом (`nslookup` — `_ev_run`, 6 с: команда в фоне БЕЗ
+подоболочки + таймер с выводом в /dev/null; curl — `-m`; ждутся только свои pid, не голый `wait`); на роутере ~6 с
+(здоровый) / ~4 с (провал пробы), худший ≈ 15 с (IP узла неизвестен и DNS молчит). Разделы: хвост `error.log` xray,
+`access.log` по каналу (`> ТЕГ]` — любая стрелка; из 3000 строк); DNS адреса узла через 127.0.0.1 и мимо кэша
+(77.88.8.8; AAAA `nslookup` Entware не умеет), `resolv.conf`, sockopt/mux outbound'а, из конфигов — только пары
+`loglevel/domainStrategy/queryStrategy` (`grep -o`: однострочный json с ключами не попадёт); IP узла: литерал →
+кэш `.ip_<хост>` → DNS роутера → 77.88.8.8 (источник подписан); TCP/TLS мимо xray по имени и ПО IP на все порты
+узла (`--resolve`); `ipset test` наборов исключений XKeen (без IPv6), `ip rule`, маршруты к IP; петля (`accepted
+tcp:IP:` в `access.log` роутера). Проба ВО ВРЕМЯ снимка (curl через вход роли в фоне, через 2 с): сокеты xray
+не-ESTABLISHED, к IP узла с Send-Q; conntrack к IP только ИСХОДНОГО направления (первый `dst=` — IP узла; иначе
+входящее узел→роутер выглядело бы «ЛВС → узел»), РОУТЕР/ЛВС по WAN-адресу, обратный кортеж, mark; SYN/RST
+(`tcpdump -p -c 20` на интерфейсе маршрута к узлу, гасится через 1 с после пробы); этапы TLS повтора; дельта
+`iptables-save -c` вокруг пробы — строки «после», которых не было «до» (`grep -vxFf`: `diff` у BusyBox только
+unified). Затем здоровье процесса (fd, лимит, потоки, conntrack), `dmesg` без шума, рестарты XKeen, state целиком.
+Файл не записался — `EVIDENCE WARN`, а не «сохранено». `evidence_save_errlog <повод>` — копия хвоста `error.log`
+(300 строк) в `errlog-<дата-время>-<повод>.log` перед каждым рестартом сторожа (`_xk_restart`, `_bg_restart_or_defer`,
+fd-залип, UDP-залип, глухой AI), хранятся `EVIDENCE_KEEP_ERRLOG` (не меньше 1). Умолчания — внутри функций (часть
+рестартов раньше блока параметров); пути — переменные (`XRAY_LOG_DIR`, `EV_OUTBOUNDS`, `EV_DETACHED_LOG`,
+`EV_CONNTRACK`, `EV_TMP`) для теста. Kill-switch (`xkeen_ks`) стоит в FORWARD, соединения самого xray идут через
+OUTPUT — поэтому дельта счётчиков, а не список DROP. Ограничения: AAAA; сторона VPS (отказ REALITY в `access.log` VPS
+не виден); момент восстановления узла, пока роль на резерве, не наблюдается (снимок `ok` — при проверке после
+карантина). Повод — 14.10 дважды: после рестарта xray роутер минутами не слал на наш VPS ничего, улик не осталось;
+редакция — по ревью трёх экспертов в два раунда. Тест — `tests/test_evidence_offline.py`.
 
 **Проба трафика (v36).** `traffic_check` — curl через СВОЙ вход `socks-health` (127.0.0.1:`HEALTH_PROBE_PORT`
 10822; заводит self-heal, правило → `direct` ставит `generate_routing`) на `TRAFFIC_PROBE_URLS`: проверяется сам

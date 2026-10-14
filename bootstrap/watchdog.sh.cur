@@ -1,4 +1,18 @@
 #!/bin/sh
+# XKeen failover watchdog v40 (2026-10-14, улики сбоя канала):
+#   • Пустая сквозная проба роли или пустая AI-проба → evidence_capture: снимок в EVIDENCE_DIR
+#     (/opt/var/log/xray/evidence/<дата-время>-<роль>-<повод>.txt) ДО любого лечения — хвост error.log xray (XKeen стирает
+#     его при рестарте), access.log по каналу, DNS и TCP до узла мимо xray, подробный повтор пробы, сокеты xray и
+#     conntrack к IP узла, маршрут, последние рестарты, state. Повод — 14.10 дважды: после рестарта xray роутер
+#     минутами не слал на наш VPS ничего, улик не осталось.
+#   • По ревью трёх экспертов (два раунда): снимки по поводу (start / deaf / repeat / ok / heal), ОДИН за тик, по
+#     роли (deaf/heal/новый pid xray — от 60 с, start/ok — от 300 с, repeat — 1800 с), не больше 6 в час кроме
+#     deaf/heal; снимок восстановления (и после проверки с карантина), снимок перед лечебным рестартом (с пробой),
+#     копия error.log перед каждым рестартом сторожа (errlog-*.log, 15); сетевые проверки ПАРАЛЛЕЛЬНО (≈5 с, худший
+#     ≈15 с); проба во время снимка (сокеты, conntrack только исходного направления, tcpdump -p на интерфейсе
+#     маршрута), DNS через роутер и мимо кэша, IP узла с запасными источниками, TCP по IP на все порты, дельта
+#     iptables-save (grep, не diff — у BusyBox unified), ipset/ip rule/маршрут, петля, здоровье процесса.
+#
 # XKeen failover watchdog v39 (2026-10-14, честный текст ухода по перегрузке):
 #   • YouTube / «Зарубежные» ушли на резерв потому, что их канал обвинён в перегрузке xray (XRAY_BUSY_BLAME
 #     этого тика), — TG и лог называют эту причину («xray перегружал процессор роутера»), а не «отвечает, но
@@ -507,6 +521,7 @@ _xk_restart() {
   while _xk_busy && [ "$_i" -lt 60 ]; do sleep 1; _i=$((_i+1)); done
   _i=0
   _old=$(pidof xray 2>/dev/null)
+  evidence_save_errlog restart   # v40: XKeen сотрёт error.log
   /opt/sbin/xkeen -restart >/dev/null 2>&1
   sleep 1
   while [ "$_i" -lt 90 ]; do
@@ -536,6 +551,7 @@ _bg_restart_or_defer() {
     log "APPLY $WD_APPLY_ID: рестарт «$1» отложен — его сделает применение"
     return 1
   fi
+  evidence_save_errlog "bg-${1:-restart}" 2>/dev/null   # v40
   /opt/sbin/xkeen -restart >/dev/null 2>&1 &
   return 0
 }
@@ -853,6 +869,224 @@ xray_busy_eval() {
   return 0
 }
 
+# v40: улики сбоя канала — снимок состояния, пока сломанный xray ещё жив (ДО лечения). Повод — 14.10 дважды: после
+# рестарта xray роутер минутами не слал на наш VPS ничего (по access.log VPS), а XKeen при следующем рестарте стирает
+# error.log xray — причину не восстановить. Файл EVIDENCE_DIR/<дата-время>-<роль>-<повод>.txt.
+# Вызов: evidence_capture <роль> <тег|""> <порт пробы|""> <url пробы|""> <повод>
+#   повод: start — первая пустая проба эпизода; deaf — канал признан глухим (дальше уход и рестарт); repeat — прочие
+#   пустые; ok — канал снова пропускает трафик (сравнение «сломано / починилось»); heal — перед лечебным рестартом.
+# Частота (по ревью трёх экспертов): ОДИН снимок за тик (узел у ролей общий — второй снимок того же тика дублирует);
+# по роли (.last_<роль> = «ts pid»): deaf/heal и первый снимок после смены pid xray — от 60 с, start/ok — от 300 с,
+# repeat — EVIDENCE_COOLDOWN (1800 с); часы назад — кулдаун истёк; не больше EVIDENCE_MAX_PER_HOUR (6) в час, кроме
+# deaf/heal. Хранятся EVIDENCE_KEEP (40, не меньше 1) последних.
+# Время: все сетевые проверки идут ПАРАЛЛЕЛЬНО, каждая со своим пределом (nslookup ≤ 6 с через _ev_run, curl -m):
+# обычно ~5 с, худший случай ~15 с (DNS узла неизвестен и не отвечает). Пути — переменные (XRAY_LOG_DIR,
+# EV_OUTBOUNDS, EV_DETACHED_LOG, EV_CONNTRACK, EV_TMP): тест подставляет свои файлы.
+# Разделы: DNS A через роутер и мимо его кэша (77.88.8.8; AAAA nslookup Entware не умеет), resolv.conf, sockopt/mux
+# outbound'а (только пары ключ:значение), IP узла: литерал → кэш → DNS роутера → 77.88.8.8; TCP/TLS мимо xray по имени
+# и ПО IP на все порты узла; ipset исключений XKeen, ip rule, маршрут; петля (IP узла среди назначений access.log
+# роутера); проба ВО ВРЕМЯ снимка: сокеты xray не-ESTABLISHED, к IP узла с Send-Q, conntrack к IP (только исходное
+# направление; РОУТЕР/ЛВС по WAN-адресу; ответ, mark), SYN/RST на интерфейсе маршрута к узлу (tcpdump -p -c 20);
+# дельта iptables-save -c вокруг пробы (строки «после», которых не было «до»: diff в BusyBox — unified); здоровье
+# процесса; рестарты; state.
+_ev_run() {
+  # Без подоболочки: $! — сама команда; убийство обёртки `( … )` оставило бы её живой и державшей канал вывода.
+  "$@" & _ev_p=$!
+  # Вывод таймера — в /dev/null: иначе фоновый sleep держит канал, и `$(…)`/`| tail` ждут его.
+  ( sleep "${EV_RUN_LIMIT:-6}"; kill "$_ev_p" 2>/dev/null ) >/dev/null 2>&1 & _ev_k=$!
+  wait "$_ev_p" 2>/dev/null
+  kill "$_ev_k" 2>/dev/null
+  return 0
+}
+# IPv4 из вывода nslookup: ответ сервера — после строки «Name:» (до неё — адрес самого DNS-сервера).
+_ev_ip_from_ns() {
+  awk '/^Name:/ {n=1} n && /^Address/ {for (i=2;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {print $i; exit}}' "$1" 2>/dev/null
+}
+evidence_capture() {
+  : "${EVIDENCE_ENABLE:=1}" "${EVIDENCE_DIR:=/opt/var/log/xray/evidence}"
+  [ "$EVIDENCE_ENABLE" = "1" ] || return 0
+  _ev_role="$1"; _ev_tag="$2"; _ev_port="$3"; _ev_url="$4"; _ev_why="${5:-repeat}"
+  [ "$EV_TICK_DONE" = "1" ] && return 0          # один снимок за тик
+  _ev_now=$(_num "$(date +%s)" 0)
+  [ "$_ev_now" -gt 0 ] || return 0
+  _ev_cool=$(_num "${EVIDENCE_COOLDOWN:-1800}" 1800); _ev_maxh=$(_num "${EVIDENCE_MAX_PER_HOUR:-6}" 6)
+  _ev_pid=$(pidof xray 2>/dev/null | awk '{print $1}')
+  _ev_l=$(cat "$EVIDENCE_DIR/.last_$_ev_role" 2>/dev/null); _ev_lts=$(_num "${_ev_l%% *}" 0); _ev_lpid="${_ev_l#* }"
+  _ev_age=$((_ev_now - _ev_lts))
+  _ev_go=0
+  if [ "$_ev_age" -lt 0 ] || [ "$_ev_age" -ge "$_ev_cool" ]; then _ev_go=1
+  else
+    case "$_ev_why" in
+      deaf|heal) [ "$_ev_age" -ge 60 ] && _ev_go=1 ;;
+      start|ok)  [ "$_ev_age" -ge 300 ] && _ev_go=1 ;;
+    esac
+    [ "$_ev_age" -ge 60 ] && [ -n "$_ev_pid" ] && [ "$_ev_pid" != "$_ev_lpid" ] && _ev_go=1
+  fi
+  [ "$_ev_go" = 1 ] || return 0
+  # Не больше _ev_maxh снимков в час (кроме deaf/heal): мигающий канал не вытеснит ротацией снимок инцидента.
+  _ev_h=$(cat "$EVIDENCE_DIR/.hour" 2>/dev/null); _ev_hts=$(_num "${_ev_h%% *}" 0); _ev_hn=$(_num "${_ev_h#* }" 0)
+  if [ $((_ev_now - _ev_hts)) -ge 3600 ] || [ "$_ev_now" -lt "$_ev_hts" ]; then _ev_hts=$_ev_now; _ev_hn=0; fi
+  case "$_ev_why" in deaf|heal) ;; *) [ "$_ev_hn" -ge "$_ev_maxh" ] && return 0 ;; esac
+  mkdir -p "$EVIDENCE_DIR" 2>/dev/null || return 0
+  if ! echo "$_ev_now $_ev_pid" > "$EVIDENCE_DIR/.last_$_ev_role" 2>/dev/null; then
+    _log_every5 $((_ev_now % 3600)) && log "EVIDENCE WARN: не пишется $EVIDENCE_DIR (место на /opt?) — улики не сохраняются"
+    return 0
+  fi
+  echo "$_ev_hts $((_ev_hn + 1))" > "$EVIDENCE_DIR/.hour" 2>/dev/null
+  EV_TICK_DONE=1
+  _ev_f="$EVIDENCE_DIR/$(date +%Y%m%d-%H%M%S)-$_ev_role-$_ev_why.txt"
+  _ev_log="${XRAY_LOG_DIR:-/opt/var/log/xray}"
+  _ev_ob="${EV_OUTBOUNDS:-/opt/etc/xray/configs/04_outbounds.json}"
+  _ev_ct="${EV_CONNTRACK:-/proc/net/nf_conntrack}"
+  _ev_t="${EV_TMP:-/tmp}/ev.$$"; rm -rf "$_ev_t"; mkdir -p "$_ev_t" 2>/dev/null || _ev_t=/tmp
+  _ev_hp=""
+  [ -n "$_ev_tag" ] && _ev_hp=$(sed 's#^ *//.*##' "$_ev_ob" 2>/dev/null | \
+    jq -r --arg t "$_ev_tag" '.outbounds[] | select(.tag == $t) | (.settings.vnext[0] // .settings.servers[0] // {}) | "\(.address // "") \(.port // "")"' 2>/dev/null | head -1)
+  _ev_host=${_ev_hp% *}; _ev_hport=${_ev_hp#* }
+  _ev_wanif=$(awk 'NR>1 && $2=="00000000" && $8=="00000000" { if (i == "" || $7 + 0 < m) { m = $7 + 0; i = $1 } } END { print i }' /proc/net/route 2>/dev/null)
+  _ev_wan=$(ip -4 addr show "${_ev_wanif:-ppp0}" 2>/dev/null | awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')
+  # --- IP узла: литерал → кэш → DNS роутера → 77.88.8.8 (DNS сразу в фоне, результат нужен и для раздела DNS) ---
+  _ev_ip=""; _ev_ipsrc=""; _ev_ipf=""; _ev_dnsp=""; _ev_bg=""
+  if [ -n "$_ev_host" ]; then
+    _ev_ipf="$EVIDENCE_DIR/.ip_$(echo "$_ev_host" | tr -c 'A-Za-z0-9.-' '_')"
+    # Ждём только СВОИ фоновые задачи (голый `wait` ждал бы и чужие задачи тика).
+    _ev_run nslookup "$_ev_host" 127.0.0.1 > "$_ev_t/dns1" 2>&1 & _ev_dnsp="$!"
+    _ev_run nslookup "$_ev_host" 77.88.8.8 > "$_ev_t/dns2" 2>&1 & _ev_dnsp="$_ev_dnsp $!"
+    curl -sk -o /dev/null -m 5 -w 'connects=%{num_connects} connect=%{time_connect}s code=%{http_code}\n' "https://$_ev_host:$_ev_hport/" > "$_ev_t/tcpname" 2>&1 & _ev_bg="$!"
+    _ev_ip=$(echo "$_ev_host" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'); [ -n "$_ev_ip" ] && _ev_ipsrc="адрес узла"
+    [ -z "$_ev_ip" ] && _ev_ip=$(cat "$_ev_ipf" 2>/dev/null) && [ -n "$_ev_ip" ] && _ev_ipsrc="кэш"
+    if [ -z "$_ev_ip" ]; then
+      wait $_ev_dnsp 2>/dev/null
+      _ev_ip=$(_ev_ip_from_ns "$_ev_t/dns1"); [ -n "$_ev_ip" ] && _ev_ipsrc="DNS роутера"
+      [ -z "$_ev_ip" ] && _ev_ip=$(_ev_ip_from_ns "$_ev_t/dns2") && [ -n "$_ev_ip" ] && _ev_ipsrc="77.88.8.8"
+    fi
+  fi
+  _ev_dev=""
+  [ -n "$_ev_ip" ] && _ev_dev=$(ip route get "$_ev_ip" 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i == "dev") {print $(i+1); exit}}')
+  _ev_dev="${_ev_dev:-${_ev_wanif:-ppp0}}"
+  # --- параллельно: TCP по IP на все порты узла, tcpdump, проба через вход роли ---
+  if [ -n "$_ev_ip" ] && [ -n "$_ev_host" ]; then
+    for _ev_pp in $(sed 's#^ *//.*##' "$_ev_ob" 2>/dev/null | jq -r --arg h "$_ev_host" '.outbounds[] | (.settings.vnext[0] // .settings.servers[0] // {}) | select(.address == $h) | .port' 2>/dev/null | sort -u | head -6); do
+      curl -sk -o /dev/null -m 4 --resolve "$_ev_host:$_ev_pp:$_ev_ip" -w "  $_ev_pp: connects=%{num_connects} connect=%{time_connect}s code=%{http_code}\n" "https://$_ev_host:$_ev_pp/" > "$_ev_t/tcpip.$_ev_pp" 2>&1 & _ev_bg="$_ev_bg $!"
+    done
+  fi
+  iptables-save -c > "$_ev_t/ipt.a" 2>/dev/null
+  _ev_td=""; _ev_tdk=""
+  if [ -n "$_ev_port" ] && [ -n "$_ev_ip" ] && command -v tcpdump >/dev/null 2>&1; then
+    tcpdump -p -ni "$_ev_dev" -c 20 "host $_ev_ip and tcp[tcpflags] & (tcp-syn|tcp-rst) != 0" > "$_ev_t/td" 2>&1 & _ev_td=$!
+    ( sleep 12; kill "$_ev_td" 2>/dev/null ) >/dev/null 2>&1 & _ev_tdk=$!
+  fi
+  _ev_c=""
+  if [ -n "$_ev_port" ] && [ -n "$_ev_url" ]; then
+    curl -sv -o /dev/null -m 8 -w 'итог: code=%{http_code} connect=%{time_connect}s total=%{time_total}s\n' \
+      --socks5-hostname "127.0.0.1:$_ev_port" "$_ev_url" > "$_ev_t/probe" 2>&1 & _ev_c=$!
+    # SYN_SENT / [UNREPLIED] живут секунды — снимаем, пока запрос в пути.
+    sleep 2
+    netstat -tnp 2>/dev/null | awk '/xray/ && $6 != "ESTABLISHED" && $6 != "LISTEN" {a = $5; sub(/:[0-9]+$/, "", a); print $6, a}' | sort | uniq -c | sort -rn | head -10 > "$_ev_t/sock1"
+    if [ -n "$_ev_ip" ]; then
+      netstat -tnp 2>/dev/null | awk -v p="$_ev_ip:" '/xray/ && index($5, p) == 1 {n++; st[$6]++; if ($3 > 0) {q++; s += $3}} END {printf "всего=%d Send-Q>0: %d (%d байт);", n, q, s; for (k in st) printf " %s=%d", k, st[k]; print ""}' > "$_ev_t/sock2"
+      # Только исходное направление: ПЕРВЫЙ dst= в строке — IP узла (иначе входящее VPS→роутер выглядит как «ЛВС → VPS»).
+      grep -F "dst=$_ev_ip " "$_ev_ct" 2>/dev/null | awk -v ip="dst=$_ev_ip" -v w="src=$_ev_wan" '{s = ""; d = ""; dp = ""; r = ""; st = "-"
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^src=/) { if (s == "") s = $i; else if (r == "") r = $i }
+            if ($i ~ /^dst=/ && d == "") d = $i
+            if ($i ~ /^dport=/ && dp == "") dp = $i
+            if ($i ~ /^[A-Z_]+$/ && st == "-" && $i != "ASSURED") st = $i }
+          if (d != ip) next
+          who = (s == w) ? "РОУТЕР" : "ЛВС"; f = ($0 ~ /UNREPLIED/) ? "UNREPLIED" : "ок"
+          m = "-"; if (match($0, /mark=[0-9]+/)) m = substr($0, RSTART, RLENGTH)
+          print who, st, dp, f, "ответ_" r, m }' | sort | uniq -c | sort -rn | head -12 > "$_ev_t/ct"
+    fi
+  fi
+  wait "$_ev_c" 2>/dev/null
+  iptables-save -c > "$_ev_t/ipt.b" 2>/dev/null
+  if [ -n "$_ev_td" ]; then sleep 1; kill "$_ev_td" 2>/dev/null; wait "$_ev_td" 2>/dev/null; kill "$_ev_tdk" 2>/dev/null; fi
+  wait $_ev_dnsp $_ev_bg 2>/dev/null   # свои фоновые проверки (каждая со своим пределом)
+  {
+    echo "== $(date '+%Y-%m-%d %H:%M:%S') роль=$_ev_role повод=$_ev_why канал=$_ev_tag узел=$_ev_host:$_ev_hport проба=127.0.0.1:$_ev_port $_ev_url"
+    echo "xray pid=$(pidof xray 2>/dev/null) (прошлый снимок роли: pid=$_ev_lpid, $_ev_age с назад) возраст=$(awk -v u="$(cut -d. -f1 /proc/uptime)" '{print u - int($22/100)}' "/proc/$_ev_pid/stat" 2>/dev/null)с WAN=$_ev_wanif $_ev_wan"
+    echo "XRAY_BUSY=$XRAY_BUSY pct=$XRAY_BUSY_PCT kbit=$XRAY_BUSY_KBIT"
+    echo; echo "== xray error.log (хвост 80)"; tail -80 "$_ev_log/error.log" 2>/dev/null
+    if [ -n "$_ev_tag" ]; then
+      # Стрелка зависит от пути: правило `->`, по умолчанию `>>`, принудительный `==>` — общий хвост «> ТЕГ]».
+      echo; echo "== access.log: последние 30 по каналу (из 3000 строк)"; tail -3000 "$_ev_log/access.log" 2>/dev/null | grep -F -- "> $_ev_tag]" | tail -30
+    fi
+    echo; echo "== access.log: последние 15 вообще"; tail -15 "$_ev_log/access.log" 2>/dev/null
+    if [ -n "$_ev_host" ]; then
+      echo; echo "== DNS $_ev_host: A через роутер (127.0.0.1)"; cat "$_ev_t/dns1" 2>/dev/null
+      echo "== DNS $_ev_host: A мимо кэша роутера (77.88.8.8)"; grep -vE '^(Server|Address 1: 77\.88)' "$_ev_t/dns2" 2>/dev/null
+      echo "== resolv.conf роутера"; cat /etc/resolv.conf 2>/dev/null
+      echo "== outbound: адрес, sockopt, mux"
+      sed 's#^ *//.*##' "$_ev_ob" 2>/dev/null | jq -c --arg t "$_ev_tag" '.outbounds[] | select(.tag == $t) | {a: (.settings.vnext[0].address // .settings.servers[0].address), s: .streamSettings.sockopt, m: .mux}' 2>/dev/null
+      echo "== loglevel / domainStrategy / queryStrategy в конфигах xray (только пары ключ:значение)"
+      cat "${_ev_ob%/*}"/*.json 2>/dev/null | grep -oE '"(loglevel|domainStrategy|queryStrategy)" *: *"[^"]*"' | sort | uniq -c | head -8
+      [ -n "$_ev_ip" ] && [ -n "$_ev_ipf" ] && [ "$_ev_ipsrc" != "кэш" ] && echo "$_ev_ip" > "$_ev_ipf" 2>/dev/null
+      echo "IP=$_ev_ip (откуда: ${_ev_ipsrc:-не определён})"
+      echo; echo "== TCP/TLS мимо xray по имени до $_ev_host:$_ev_hport"; cat "$_ev_t/tcpname" 2>/dev/null
+      if [ -n "$_ev_ip" ]; then
+        echo "== TCP/TLS мимо xray ПО IP $_ev_ip на все порты узла (DNS исключён)"; cat "$_ev_t"/tcpip.* 2>/dev/null
+        echo "== ipset (исключения XKeen) / ip rule / маршрут к $_ev_ip"
+        for _ev_s in $(ipset list -n 2>/dev/null | grep -E 'exclude|override' | grep -v '6$' | head -6); do
+          echo "  $_ev_s: $(ipset test "$_ev_s" "$_ev_ip" 2>&1 | tail -1)"
+        done
+        ip rule show 2>/dev/null | head -14
+        ip route show table all 2>/dev/null | grep -F "$_ev_ip" | head -6
+        ip route get "$_ev_ip" 2>&1 | head -2
+        echo "== петля: IP узла среди НАЗНАЧЕНИЙ access.log роутера (из 3000 строк)"
+        tail -3000 "$_ev_log/access.log" 2>/dev/null | grep -F "accepted tcp:$_ev_ip:" | tail -8
+      fi
+    fi
+    if [ -n "$_ev_c" ]; then
+      echo; echo "== во время пробы: сокеты xray не-ESTABLISHED (куда стучится)"; cat "$_ev_t/sock1" 2>/dev/null
+      if [ -n "$_ev_ip" ]; then
+        echo "== во время пробы: сокеты xray к $_ev_ip (состояния, Send-Q)"; cat "$_ev_t/sock2" 2>/dev/null
+        echo "== во время пробы: conntrack к $_ev_ip (кто, состояние, порт, ответ, mark)"; cat "$_ev_t/ct" 2>/dev/null
+      fi
+      echo; echo "== повтор пробы подробно (TLS-этапы, ответ, ошибка curl)"
+      # Видно, докуда дошло: оборвалось после «Client hello» — молчит узел; ошибка SOCKS — сам xray.
+      grep -E '^\* |^< HTTP|^итог|^curl' "$_ev_t/probe" 2>/dev/null | \
+        grep -vE 'Newsession Ticket|change cipher|Encrypted Extensions|CERT verify|Certificate \(11\)' | head -20
+      echo; echo "== iptables: строки со счётчиками, изменившимися за время пробы (OUTPUT/POSTROUTING/PREROUTING/xkeen/DROP/REJECT/MARK/TPROXY/REDIRECT)"
+      grep -vxFf "$_ev_t/ipt.a" "$_ev_t/ipt.b" 2>/dev/null | grep -E 'OUTPUT|POSTROUTING|PREROUTING|xkeen|DROP|REJECT|MARK|TPROXY|REDIRECT' | head -30
+      if [ -n "$_ev_td" ]; then
+        echo; echo "== SYN/RST на $_ev_dev к $_ev_ip (tcpdump -p -c 20)"; tail -22 "$_ev_t/td" 2>/dev/null
+      fi
+    fi
+    echo; echo "== процесс и ядро"
+    if [ -n "$_ev_pid" ]; then
+      echo "fd=$(ls "/proc/$_ev_pid/fd" 2>/dev/null | wc -l) $(grep 'open files' "/proc/$_ev_pid/limits" 2>/dev/null | awk '{print "лимит=" $4}') $(grep -E 'Threads|VmRSS' "/proc/$_ev_pid/status" 2>/dev/null | tr -s ' \t' ' ' | tr '\n' ' ')"
+    fi
+    echo "conntrack $(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)/$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)"
+    dmesg 2>/dev/null | grep -vE 'promiscuous mode|channel auto-switch|ACS result' | tail -12
+    echo; echo "== рестарты XKeen"; grep -E '^=== ' "${EV_DETACHED_LOG:-/opt/var/log/xkeen-detached.log}" 2>/dev/null | tail -6
+    echo; echo "== watchdog.state"; tr ' ' '\n' < "$STATE_FILE" 2>/dev/null | tr '\n' ' '; echo
+  } > "$_ev_f" 2>&1
+  [ "$_ev_t" != /tmp ] && rm -rf "$_ev_t"
+  if ! [ -s "$_ev_f" ]; then
+    log "EVIDENCE WARN: снимок ($_ev_role, $_ev_why) не записан → $_ev_f (место на /opt?)"
+    return 0
+  fi
+  _ev_keep=$(_num "${EVIDENCE_KEEP:-40}" 40); [ "$_ev_keep" -ge 1 ] || _ev_keep=1
+  ls -1t "$EVIDENCE_DIR"/*.txt 2>/dev/null | tail -n +$((_ev_keep + 1)) | while read -r _ev_old; do rm -f "$_ev_old"; done
+  log "EVIDENCE: улики ($_ev_role, $_ev_why, канал ${_ev_tag:--}) → $_ev_f"
+  return 0
+}
+
+# v40: копия хвоста error.log xray перед каждым рестартом, который делает сторож (XKeen при рестарте его стирает).
+# Хранятся EVIDENCE_KEEP_ERRLOG (15, не меньше 1) последних. Пусто или выключено — ничего.
+evidence_save_errlog() {
+  : "${EVIDENCE_ENABLE:=1}" "${EVIDENCE_DIR:=/opt/var/log/xray/evidence}"
+  [ "$EVIDENCE_ENABLE" = "1" ] || return 0
+  _ev_el="${XRAY_LOG_DIR:-/opt/var/log/xray}/error.log"
+  [ -s "$_ev_el" ] || return 0
+  mkdir -p "$EVIDENCE_DIR" 2>/dev/null || return 0
+  _ev_why=$(printf '%s' "${1:-restart}" | tr -c 'A-Za-z0-9-' '_')
+  tail -300 "$_ev_el" > "$EVIDENCE_DIR/errlog-$(date +%Y%m%d-%H%M%S)-$_ev_why.log" 2>/dev/null || return 0
+  _ev_keep=$(_num "${EVIDENCE_KEEP_ERRLOG:-15}" 15); [ "$_ev_keep" -ge 1 ] || _ev_keep=1
+  ls -1t "$EVIDENCE_DIR"/errlog-*.log 2>/dev/null | tail -n +$((_ev_keep + 1)) | while read -r _ev_old; do rm -f "$_ev_old"; done
+  return 0
+}
+
 # Проверяет, идёт ли трафик СКВОЗЬ канал роли (а не «отвечает ли порт узла», как probe_tag).
 # Запрос уходит через выделенный socks-inbound, привязанный правилом к ДЕЙСТВУЮЩЕМУ каналу
 # роли, поэтому меряется именно он — включая резерв, если роль уже на него ушла.
@@ -927,6 +1161,9 @@ deep_probe_check() {
   # Успех = получен ЛЮБОЙ http-код (даже 404): значит запрос дошёл насквозь и вернулся.
   _dpr_code=$(curl -s -o /dev/null --max-time 10 --socks5-hostname "127.0.0.1:$_dpr_port" -w '%{http_code}' "$_dpr_url" 2>/dev/null)
   if [ -n "$_dpr_code" ] && [ "$_dpr_code" != "000" ]; then
+    # v40: канал ожил после пустых проб — снимок для сравнения «сломано / починилось».
+    { [ "$DP_CTR" -ge 1 ] 2>/dev/null || [ "$DP_DEAF" = "1" ] || [ "$DP_CHK" = "1" ]; } && \
+      evidence_capture "$_dpr_role" "$_dpr_tag" "$_dpr_port" "$_dpr_url" ok
     if [ "$DP_DEAF" = "1" ]; then
       log "DEEP-PROBE RECOVER ($_dpr_name): канал $_dpr_tag снова пропускает трафик (код $_dpr_code)"
       tg_alert "✅ <b>$_dpr_name снова работает</b>: канал <code>$_dpr_tag</code> пропускает трафик."
@@ -942,6 +1179,11 @@ deep_probe_check() {
     DP_CTR=0; DP_DEAF=0; DP_RES=ok; DP_CHK=0
   else
     DP_CTR=$((DP_CTR + 1)); DP_RES=fail
+    # v40: снимок улик сейчас, пока сломанный xray ещё жив (дальше может быть рестарт — error.log сотрётся).
+    if [ "$DP_CTR" -eq 1 ] 2>/dev/null; then _dpr_ev=start
+    elif [ "$DP_CTR" -ge "$DEEP_PROBE_THRESHOLD" ] 2>/dev/null && [ "$DP_DEAF" != "1" ]; then _dpr_ev=deaf
+    else _dpr_ev=repeat; fi
+    evidence_capture "$_dpr_role" "$_dpr_tag" "$_dpr_port" "$_dpr_url" "$_dpr_ev"
     # v33: идёт проверка после возврата с карантина — следующий замер тоже через минуту.
     [ "$DP_CHK" = "1" ] && DP_TS=$((_dpr_now - DEEP_PROBE_INTERVAL + 60))
     if [ "$DP_CTR" -ge "$DEEP_PROBE_THRESHOLD" ] 2>/dev/null; then
@@ -1568,6 +1810,7 @@ _traffic_ok_or_heal() {
   fi
   echo "$_now" > "$TRAFFIC_HEAL_STATE"
   log "TRAFFIC: лечебный рестарт xray"
+  evidence_capture TRAFFIC "" "$HEALTH_PROBE_PORT" "${TRAFFIC_PROBE_URLS%% *}" heal   # v40: состояние сломанного xray до лечения
   _xk_restart
   if traffic_check; then
     if [ "$TC_RESULT" = "ok" ]; then
@@ -1904,6 +2147,7 @@ if [ "$_do_recover" -eq 1 ] 2>/dev/null && [ -z "$WD_APPLY_ID" ]; then
     # nohup-детачем (как кнопка «Перезапуск со сбросом» в панели): доживает, даже если cron/скрипт
     # прибьют посреди процесса. xkeen -stop временно рвёт удалённый доступ через сам xray, но start
     # гарантированно следует — связь вернётся. Выходим из тика: state-машину не трогаем во время сброса.
+    evidence_save_errlog udpstall   # v40: XKeen сотрёт error.log
     nohup sh -c 'xkeen -stop; sleep 15; xkeen -start' >/tmp/xkeen_udpstall.log 2>&1 &
     exit 0
   else
@@ -1965,6 +2209,7 @@ elif [ "$_fd_delta" -ge "$FD_DELTA_THRESHOLD" ] 2>/dev/null; then
     # Записываем стейт ДО рестарта, чтобы сразу зафиксировать cooldown. После рестарта error.log
     # обычно ротируется/обнуляется XKeen — следующий тик увидит низкий _fd_now и сбросит _FD_PREV.
     echo "$_fd_now $_now" > "$FD_STALL_STATE"
+    evidence_save_errlog fdstall   # v40
     /opt/sbin/xkeen -restart >/tmp/xkeen_fdstall.log 2>&1 &
     exit 0
   else
@@ -1987,6 +2232,13 @@ XRAY_BUSY_CALM_TICKS=$(_num "${XRAY_BUSY_CALM_TICKS:-2}" 2)         # v38: сп�
 XRAY_BUSY_REMIND_TICKS=$(_num "${XRAY_BUSY_REMIND_TICKS:-10}" 10)   # v38: ещё замеров после обвинения → напоминание
 XRAY_BUSY_TG_COOLDOWN=$(_num "${XRAY_BUSY_TG_COOLDOWN:-1800}" 1800) # v38: «🔥» не чаще, с
 XRAY_BUSY_FILE=/tmp/xkeen_watchdog.xraybusy
+# v40: улики сбоя канала (evidence_capture) — на флешке /opt, переживают перезагрузку роутера.
+EVIDENCE_ENABLE="${EVIDENCE_ENABLE:-1}"
+EVIDENCE_COOLDOWN=$(_num "${EVIDENCE_COOLDOWN:-1800}" 1800)   # для repeat; deaf/heal/новый pid — от 60 с, start/ok — от 300 с
+EVIDENCE_KEEP=$(_num "${EVIDENCE_KEEP:-40}" 40)
+EVIDENCE_KEEP_ERRLOG=$(_num "${EVIDENCE_KEEP_ERRLOG:-15}" 15)
+EVIDENCE_MAX_PER_HOUR=$(_num "${EVIDENCE_MAX_PER_HOUR:-6}" 6)   # снимков в час (deaf/heal — сверх)
+EVIDENCE_DIR=/opt/var/log/xray/evidence
 XRAY_BUSY=0; XRAY_BUSY_N=0; XRAY_BUSY_BLAME=""; XRAY_BUSY_PCT=""; XRAY_BUSY_KBIT=""; XRAY_BUSY_OPENED=0; XRAY_BUSY_WIN=0
 [ -z "$WD_APPLY_ID" ] && xray_busy_eval
 # ---------- /v37 ----------
@@ -2025,6 +2277,8 @@ elif [ -n "$AI_TAG" ]; then
     fi
     if [ -n "$_ai_country" ] && [ "${#_ai_country}" -le 4 ]; then
       # v25: канал снова пропускает трафик — если была зафиксирована глухота, recovery-алерт
+      [ "$_AI_EMPTY" -ge 1 ] 2>/dev/null && \
+        evidence_capture AI "$(grep -o 'AI_EFF=[^ ]*' "$STATE_FILE" 2>/dev/null | cut -d= -f2-)" "$AI_PROBE_PORT" "https://ipinfo.io/country" ok
       if [ "$_AI_DEAF" -ge 1 ] 2>/dev/null; then
         tg_alert "✅ <b>AI-канал снова пропускает трафик</b> (exit <code>$_ai_country</code>). Глухота длилась ~$((_AI_EMPTY * AI_PROBE_INTERVAL / 60)) мин."
         log "AI-probe DEAF-RECOVER: канал ожил после $_AI_EMPTY пустых проб (exit=$_ai_country)"
@@ -2082,12 +2336,18 @@ elif [ -n "$AI_TAG" ]; then
         log "AI-probe: пусто, но AI kill-switch активен (blackhole) — глухоту не считаю"
       else
         _AI_EMPTY=$((_AI_EMPTY + 1))
+        # v40, до авто-рестарта: первая пустая — start, порог глухоты — deaf, остальные — repeat (раз в 30 мин)
+        if [ "$_AI_EMPTY" -eq 1 ] 2>/dev/null; then _ai_ev=start
+        elif [ "$_AI_DEAF" -eq 0 ] 2>/dev/null && [ "$_AI_EMPTY" -ge "$AI_DEAF_THRESHOLD" ] 2>/dev/null; then _ai_ev=deaf
+        else _ai_ev=repeat; fi
+        evidence_capture AI "$_ai_eff_now" "$AI_PROBE_PORT" "https://ipinfo.io/country" "$_ai_ev"
         if [ "$_AI_DEAF" -eq 0 ] 2>/dev/null && [ "$_AI_EMPTY" -ge "$AI_DEAF_THRESHOLD" ] 2>/dev/null; then
           _AI_DEAF=1
           if [ "$AI_DEAF_AUTORESTART" = "1" ]; then
             tg_alert "🕳 <b>AI-канал глух</b>: проба через <code>$AI_TAG</code> не проходит уже ~$((_AI_EMPTY * AI_PROBE_INTERVAL / 60)) мин (сервер по TCP отвечает — похоже, залип туннель). Перезапускаю xray автоматически. Если повторится — смени AI-узел в панели (вкладка «🧠 AI»)."
             printf '%s|%s|%s|%s|%s\n' "$_ai_now" "$_AI_PREV_C" "$_AI_LAST_A" "$_AI_EMPTY" "$_AI_DEAF" > "$AI_PROBE_STATE"
             log "AI-probe DEAF: $_AI_EMPTY пустых подряд → xkeen -restart (авто-лечение залипшего туннеля)"
+            evidence_save_errlog ai-deaf   # v40
             /opt/sbin/xkeen -restart >/dev/null 2>&1 &
             exit 0
           fi
