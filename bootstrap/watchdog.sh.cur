@@ -1,4 +1,17 @@
 #!/bin/sh
+# XKeen failover watchdog v38 (2026-10-14, несколько pid xray во время рестарта):
+#   • Пока старый xray не ушёл, `pidof xray` отдаёт ДВА pid («новый старый», видели 14.10). _xk_restart
+#     считал рестарт законченным, едва строка pidof отличалась от прежней, — теперь готово = есть pid, которого
+#     не было, И хотя бы один старый ушёл (посторонний постоянный xray не мешает). Fd-залип берёт один pid
+#     (раньше /proc/«a b»/fd давал счётчик 0 в логе).
+#   • Проверки v37: внеочередной тик панели (< 20 с) больше не сбрасывает эпизод перегрузки без
+#     снимка (было: второй «виновник» — исправный резерв); тик после рестарта xray при открытом эпизоде не
+#     считает пробы; пустая проба в минуте, оказавшейся перегруженной, отменяется (одна, при открытии эпизода);
+#     разрыв > 600 с забывает снимок; без снимка — честный TG «не определить»; маршрут по умолчанию — с
+#     наименьшей метрикой; файл эпизода — строго 14 полей; гистерезис закрытия (2 спокойных), до обвинения
+#     спокойный замер рвёт серию; обвинение с действием сообщается всегда, прочие TG — с кулдауном, «✅» —
+#     только после отправленного «🔥»; одно напоминание, если перегрузка держится после обвинения.
+#
 # XKeen failover watchdog v37 (2026-10-14, «xray перегружен сам» — не винить исправные каналы):
 #   • Между тиками меряется доля процессора процесса xray (от всех ядер) и трафик интерфейса
 #     маршрута по умолчанию. Доля ≥ XRAY_BUSY_CPU (50 %) при трафике меньше доля × XRAY_BUSY_KBIT_PER_PCT
@@ -493,7 +506,14 @@ _xk_restart() {
   sleep 1
   while [ "$_i" -lt 90 ]; do
     _new=$(pidof xray 2>/dev/null)
-    if ! _xk_busy && [ -n "$_new" ] && [ "$_new" != "$_old" ]; then
+    # v38: пока старый xray не ушёл, pidof отдаёт ДВА pid («новый старый», видели 14.10) — строка уже
+    # «не равна старой», но рестарт не закончен. Готово = есть pid, которого не было, И хотя бы один старый
+    # ушёл (старых не было — достаточно нового). Посторонний постоянный xray (есть и до, и после) не мешает.
+    _xk_has_new=0; _xk_gone=0
+    [ -z "$_old" ] && _xk_gone=1
+    for _p in $_new; do case " $_old " in *" $_p "*) ;; *) _xk_has_new=1 ;; esac; done
+    for _p in $_old; do case " $_new " in *" $_p "*) ;; *) _xk_gone=1 ;; esac; done
+    if ! _xk_busy && [ "$_xk_has_new" = 1 ] && [ "$_xk_gone" = 1 ]; then
       return 0
     fi
     sleep 1; _i=$((_i+1))
@@ -660,60 +680,99 @@ _deep_hold() {
 # xray молотить процессор вхолостую; тогда сквозные пробы ВСЕХ каналов не успевают пройти, и сторож
 # по очереди признавал глухими исправные каналы, перезапуская xray на каждом шаге.
 # Замер — между тиками: доля процессора процесса xray от всех ядер (/proc/<pid>/stat против строки
-# cpu в /proc/stat — не зависит от HZ и числа ядер) и трафик интерфейса маршрута по умолчанию
-# (/proc/net/route → /proc/net/dev; нет маршрута — самый нагруженный интерфейс, кроме lo).
-# Перегружен = доля ≥ XRAY_BUSY_CPU % и трафик < доля × XRAY_BUSY_KBIT_PER_PCT кбит/с (рабочая
-# нагрузка — сотни кбит/с на процент, холостая — единицы). Арифметика в awk: счётчики jiffies и
-# байт не помещаются в 32-битную арифметику ash. Перезапуск xray (другой pid) — замера нет.
-# Файл XRAY_BUSY_FILE (одна строка):
-#   ts pid xray_jiffies total_jiffies wan_bytes busy_n blamed calm_pri calm_ai calm_yt calm_fgn
-# calm_* — каналы ролей на последнем спокойном замере («-» — пусто / ещё не было). Перегрузка держится
-# XRAY_BUSY_TICKS замеров подряд — виноватыми считаются роли PRI/YT/FGN, чей канал сменился со
-# спокойного замера (XRAY_BUSY_BLAME = «PRI=тег YT=тег», один раз за эпизод: blamed=1); не сменился
-# никто — только сообщение. Результат: XRAY_BUSY 0/1, XRAY_BUSY_N, XRAY_BUSY_PCT, XRAY_BUSY_KBIT.
+# cpu в /proc/stat — не зависит от HZ и числа ядер) и трафик интерфейса маршрута по умолчанию с
+# наименьшей метрикой (/proc/net/route → /proc/net/dev; нет маршрута — самый нагруженный интерфейс,
+# кроме lo; нет и его — замера нет). Перегружен = доля ≥ XRAY_BUSY_CPU % и трафик < доля ×
+# XRAY_BUSY_KBIT_PER_PCT кбит/с (рабочая нагрузка — сотни кбит/с на процент, холостая — единицы).
+# Арифметика в awk: счётчики jiffies и байт не помещаются в 32-битную арифметику ash.
+# Файл XRAY_BUSY_FILE — одна строка из 14 полей (иначе считается отсутствующим, всё с нуля):
+#   ts pid xray_j total_j wan_bytes busy_n blamed flags calm_pri calm_ai calm_yt calm_fgn calm_n tg_ts
+# busy_n — перегруженных замеров подряд (до обвинения спокойный замер обнуляет); blamed — 0 / 1 (виновник
+# искался) / 2 (было напоминание); flags — бит 1: «🔥» этого эпизода отправлен, бит 2: виновник назван и
+# признан неисправным; calm_n — спокойных подряд внутри эпизода; calm_* — каналы ролей на последнем замере
+# ВНЕ эпизода («-» — нет). Эпизод открыт, пока busy_n/blamed/calm_n не нули; закрывают XRAY_BUSY_CALM_TICKS
+# (2) спокойных подряд (гистерезис). XRAY_BUSY_TICKS (2) перегруженных подряд — виноватыми считаются роли
+# PRI/YT/FGN, чей канал сменился со спокойного снимка (XRAY_BUSY_BLAME = «PRI=тег YT=тег»), один раз за эпизод.
+# TG: обвинение с действием — всегда; «не вижу виновника» / «только AI» / напоминание (ещё
+# XRAY_BUSY_REMIND_TICKS замеров после обвинения) — не чаще XRAY_BUSY_TG_COOLDOWN; «✅» — только если «🔥»
+# этого эпизода был отправлен.
+# Края (v38, ревью): внеочередной тик того же xray (< 20 с, «Сохранить» в панели) — замера нет, база не
+# сдвигается; перезапуск xray (другой pid) или нечитаемый замер — решения нет, без обвинения счёт с нуля;
+# разрыв > 600 с или часы назад — эпизод и снимок забываются (при любом pid). На тиках без замера открытый
+# эпизод держит XRAY_BUSY=1 (пробы не считаются); xray не запущен — XRAY_BUSY=0 (давить пробы незачем).
+# Результат: XRAY_BUSY 0/1, XRAY_BUSY_N, XRAY_BUSY_PCT, XRAY_BUSY_KBIT, XRAY_BUSY_BLAME, XRAY_BUSY_OPENED
+# (1 — эпизод открылся этим замером) и XRAY_BUSY_WIN (начало измеренного окна, для deep_probe_check).
 xray_busy_eval() {
   XRAY_BUSY=0; XRAY_BUSY_N=0; XRAY_BUSY_BLAME=""; XRAY_BUSY_PCT=""; XRAY_BUSY_KBIT=""
+  XRAY_BUSY_OPENED=0; XRAY_BUSY_WIN=0
   [ "$XRAY_BUSY_ENABLE" = "1" ] || return 0
   _xb_proc="${XB_PROC:-/proc}"
+  _xb_now=$(_num "$(date +%s)" 0)
+  [ "$_xb_now" -gt 0 ] || return 0
+  # --- прошлый замер и эпизод (строго 14 полей, числа на месте — иначе как будто файла нет) ---
+  _xb_p_ts=0; _xb_p_pid=""; _xb_p_xj=""; _xb_p_tj=""; _xb_p_wb=""; _xb_n=0; _xb_bl=0; _xb_fl=0
+  _xb_c_pri="-"; _xb_c_ai="-"; _xb_c_yt="-"; _xb_c_fgn="-"; _xb_cn=0; _xb_tg=0
+  _xb_line=$(head -1 "$XRAY_BUSY_FILE" 2>/dev/null | tr -d '\r')
+  set -- $_xb_line
+  if [ "$#" -eq 14 ]; then
+    case "$1$2$3$4$5$6$7$8${13}${14}" in
+      *[!0-9]*) ;;
+      *) _xb_p_ts=$1; _xb_p_pid=$2; _xb_p_xj=$3; _xb_p_tj=$4; _xb_p_wb=$5; _xb_n=$6; _xb_bl=$7; _xb_fl=$8
+         _xb_c_pri=$9; _xb_c_ai=${10}; _xb_c_yt=${11}; _xb_c_fgn=${12}; _xb_cn=${13}; _xb_tg=${14} ;;
+    esac
+  fi
   _xb_pid=$(pidof xray 2>/dev/null | awk '{print $1}')
-  [ -n "$_xb_pid" ] || return 0
-  _xb_now=$(date +%s)
+  [ -n "$_xb_pid" ] || return 0          # xray не запущен: мерить нечего, пробы давить незачем
+  _xb_dt=$((_xb_now - _xb_p_ts))
+  if [ "$_xb_p_ts" -gt 0 ] && { [ "$_xb_dt" -gt 600 ] || [ "$_xb_dt" -lt 0 ]; }; then
+    # cron стоял или часы перевели назад — по устаревшему снимку виновник был бы случайным (при любом pid).
+    _xb_n=0; _xb_bl=0; _xb_fl=0; _xb_cn=0; _xb_c_pri="-"; _xb_c_ai="-"; _xb_c_yt="-"; _xb_c_fgn="-"
+  fi
+  _xb_ep=0; [ $((_xb_n + _xb_bl + _xb_cn)) -gt 0 ] && _xb_ep=1   # эпизод открыт до этого тика
+  # --- текущий замер ---
   _xb_xj=$(awk '{printf "%.0f", $14 + $15}' "$_xb_proc/$_xb_pid/stat" 2>/dev/null)
   _xb_tj=$(awk '/^cpu /{s=0; for(i=2;i<=NF;i++) s+=$i; printf "%.0f", s; exit}' "$_xb_proc/stat" 2>/dev/null)
-  _xb_if=$(awk 'NR>1 && $2=="00000000" {print $1; exit}' "$_xb_proc/net/route" 2>/dev/null)
+  _xb_if=$(awk 'NR>1 && $2=="00000000" && $8=="00000000" { if (i == "" || $7 + 0 < m) { m = $7 + 0; i = $1 } }
+    END { print i }' "$_xb_proc/net/route" 2>/dev/null)
   _xb_wb=$(sed 's/:/ /' "$_xb_proc/net/dev" 2>/dev/null | awk -v i="$_xb_if" '
-    NR>2 { b = $2 + $10; if ($1 == i) { v = b; f = 1 } if ($1 != "lo" && b > m) m = b }
-    END { if (!f) v = m; printf "%.0f", v + 0 }')
-  if [ -z "$_xb_xj" ] || [ -z "$_xb_tj" ] || [ -z "$_xb_wb" ]; then
+    NR>2 && $1 != "lo" { b = $2 + $10; if ($1 == i) { v = b; f = 1 } if (!g || b > m) { m = b; g = 1 } }
+    END { if (!f && g) { v = m; f = 1 } if (f) printf "%.0f", v }')
+  # Внеочередной тик того же xray: короткое окно не мерим и базу не сдвигаем.
+  if [ "$_xb_pid" = "$_xb_p_pid" ] && [ "$_xb_dt" -ge 0 ] && [ "$_xb_dt" -lt 20 ]; then
+    [ "$_xb_ep" = 1 ] && XRAY_BUSY=1
+    XRAY_BUSY_N="$_xb_n"
     return 0
   fi
   _xb_t_pri=$(awk '{print $3; exit}' "$STATE_FILE" 2>/dev/null)
   _xb_t_ai=$(_state_field AI_EFF ""); _xb_t_yt=$(_state_field YT_EFF ""); _xb_t_fgn=$(_state_field FGN_EFF "")
-  _xb_p_ts=""; _xb_p_pid=""; _xb_p_xj=""; _xb_p_tj=""; _xb_p_wb=""; _xb_n=0; _xb_bl=0
-  _xb_c_pri="-"; _xb_c_ai="-"; _xb_c_yt="-"; _xb_c_fgn="-"
-  [ -f "$XRAY_BUSY_FILE" ] && read _xb_p_ts _xb_p_pid _xb_p_xj _xb_p_tj _xb_p_wb _xb_n _xb_bl \
-    _xb_c_pri _xb_c_ai _xb_c_yt _xb_c_fgn < "$XRAY_BUSY_FILE" 2>/dev/null
-  _xb_n=$(_num "$_xb_n" 0); _xb_bl=$(_num "$_xb_bl" 0)
-  _xb_dt=$(( _xb_now - $(_num "$_xb_p_ts" 0) ))
   _xb_m=""
-  if [ "$_xb_pid" = "$_xb_p_pid" ] && [ "$_xb_dt" -ge 20 ] && [ "$_xb_dt" -le 600 ]; then
+  if [ -n "$_xb_xj" ] && [ -n "$_xb_tj" ] && [ -n "$_xb_wb" ] && [ "$_xb_pid" = "$_xb_p_pid" ] && \
+     [ "$_xb_dt" -ge 20 ] && [ "$_xb_dt" -le 600 ]; then
+    # Счётчики пошли назад (переподключение ppp0, смена интерфейса) — замера нет: «0 кбит/с» был бы ложью.
     _xb_m=$(awk -v xj="$_xb_xj" -v pxj="$_xb_p_xj" -v tj="$_xb_tj" -v ptj="$_xb_p_tj" \
                 -v wb="$_xb_wb" -v pwb="$_xb_p_wb" -v dt="$_xb_dt" 'BEGIN {
-      d = tj - ptj; if (d <= 0 || xj < pxj) exit
-      k = (wb - pwb) * 8 / dt / 1000; if (k < 0) k = 0
-      printf "%d %d", (xj - pxj) * 100 / d + 0.5, k + 0.5 }')
+      d = tj - ptj; if (d <= 0 || xj < pxj || wb < pwb) exit
+      printf "%d %d", (xj - pxj) * 100 / d + 0.5, (wb - pwb) * 8 / dt / 1000 + 0.5 }')
+  elif [ -n "$_xb_p_pid" ] && [ "$_xb_pid" != "$_xb_p_pid" ] && [ "$_xb_bl" = "0" ]; then
+    # Перезапуск xray без названного виновника — счёт перегруженных с нуля (снимок остаётся): иначе
+    # одиночный ложный замер до рестарта и один после дали бы обвинение.
+    _xb_n=0
   fi
   if [ -n "$_xb_m" ]; then
-    XRAY_BUSY_PCT=${_xb_m% *}; XRAY_BUSY_KBIT=${_xb_m#* }
+    XRAY_BUSY_PCT=${_xb_m% *}; XRAY_BUSY_KBIT=${_xb_m#* }; XRAY_BUSY_WIN="$_xb_p_ts"
+    _xb_now_tags="Сейчас: основной <code>${_xb_t_pri:--}</code>, YouTube <code>${_xb_t_yt:--}</code>, заграничный <code>${_xb_t_fgn:--}</code>, AI <code>${_xb_t_ai:--}</code>."
+    _xb_cool=0; [ $((_xb_now - _xb_tg)) -ge "$XRAY_BUSY_TG_COOLDOWN" ] && _xb_cool=1
     if [ "$XRAY_BUSY_PCT" -ge "$XRAY_BUSY_CPU" ] && \
        [ "$XRAY_BUSY_KBIT" -lt $((XRAY_BUSY_PCT * XRAY_BUSY_KBIT_PER_PCT)) ]; then
-      XRAY_BUSY=1; _xb_n=$((_xb_n + 1))
-      if [ "$_xb_n" -eq 1 ]; then
+      XRAY_BUSY=1; _xb_n=$((_xb_n + 1)); _xb_cn=0
+      [ "$_xb_ep" = 0 ] && XRAY_BUSY_OPENED=1
+      if [ "$_xb_ep" = 0 ]; then
         log "XRAY-BUSY: xray занимает ${XRAY_BUSY_PCT}% процессора роутера при трафике ${XRAY_BUSY_KBIT} кбит/с — сквозные пробы каналов не считаю, пока не спадёт"
       elif _log_every5 $(( (_xb_n - 1) * 60 )); then
         log "XRAY-BUSY: всё ещё ${XRAY_BUSY_PCT}% процессора при ${XRAY_BUSY_KBIT} кбит/с (замеров подряд: $_xb_n)"
       fi
-      if [ "$_xb_n" -ge "$XRAY_BUSY_TICKS" ] && [ "$_xb_bl" != "1" ]; then
+      _xb_head="🔥 <b>xray перегружен</b>: занимает ${XRAY_BUSY_PCT}% процессора роутера почти без трафика ($XRAY_BUSY_KBIT кбит/с) — сквозные пробы каналов не проходят."
+      if [ "$_xb_n" -ge "$XRAY_BUSY_TICKS" ] && [ "$_xb_bl" = "0" ]; then
         _xb_bl=1; _xb_what=""; _xb_tags=""
         for _xb_r in PRI YT FGN AI; do
           case "$_xb_r" in
@@ -731,32 +790,61 @@ xray_busy_eval() {
           XRAY_BUSY_BLAME="$XRAY_BUSY_BLAME${XRAY_BUSY_BLAME:+ }$_xb_r=$_xb_t"
           _xb_tags="$_xb_tags${_xb_tags:+, }<code>$_xb_t</code>"
         done
-        _xb_head="🔥 <b>xray перегружен</b>: занимает ${XRAY_BUSY_PCT}% процессора роутера почти без трафика ($XRAY_BUSY_KBIT кбит/с) — сквозные пробы каналов не проходят."
+        _xb_msg=""
         if [ -n "$XRAY_BUSY_BLAME" ]; then
-          log "XRAY-BUSY BLAME: перегрузка началась после смены: $(printf '%s' "$_xb_what" | sed 's#</*code>##g') — ухожу с $XRAY_BUSY_BLAME"
-          tg_alert "$_xb_head Началось после смены: $_xb_what. Ухожу с $_xb_tags как с неисправного; исправные каналы глухими не считаю."
+          log "XRAY-BUSY BLAME: перегрузка началась после смены: $(printf '%s' "$_xb_what" | sed 's#</*code>##g') — признаю неисправным $XRAY_BUSY_BLAME"
+          # Обвинение ведёт к действию (уход с канала) — сообщаем всегда, без кулдауна.
+          tg_alert "$_xb_head Началось после смены: $_xb_what. Признаю $_xb_tags неисправным — уйду с него по цепочке резерва, если есть куда; исправные каналы глухими не считаю."
+          _xb_fl=$((_xb_fl | 3)); _xb_tg="$_xb_now"
         elif [ -n "$_xb_what" ]; then
           log "XRAY-BUSY: перегрузка началась после смены AI-канала ($(printf '%s' "$_xb_what" | sed 's#</*code>##g')) — каналы не переключаю"
-          tg_alert "$_xb_head Началось после смены: $_xb_what. Каналы не переключаю — смени AI-узел в панели, если не спадёт."
+          _xb_msg="$_xb_head Началось после смены: $_xb_what. Каналы не переключаю — смени AI-узел в панели, если не спадёт."
+        elif [ "$_xb_c_pri$_xb_c_ai$_xb_c_yt$_xb_c_fgn" = "----" ]; then
+          log "XRAY-BUSY: спокойного замера до перегрузки нет — виновника не определить, каналы не переключаю"
+          _xb_msg="$_xb_head Спокойного замера до перегрузки нет (перезагрузка роутера, первый запуск или долгая пауза сторожа) — какой канал виноват, не определить; переключений не делаю. $_xb_now_tags"
         else
           log "XRAY-BUSY: каналы перед перегрузкой не менялись — виновника не вижу, каналы не переключаю"
-          tg_alert "$_xb_head Каналы перед этим не менялись — виновника не вижу, переключений не делаю. Сейчас: основной <code>${_xb_t_pri:--}</code>, YouTube <code>${_xb_t_yt:--}</code>, заграничный <code>${_xb_t_fgn:--}</code>, AI <code>${_xb_t_ai:--}</code>."
+          _xb_msg="$_xb_head Каналы перед этим не менялись — виновника не вижу, переключений не делаю. $_xb_now_tags"
+        fi
+        if [ -n "$_xb_msg" ]; then
+          if [ "$_xb_cool" = 1 ]; then tg_alert "$_xb_msg"; _xb_fl=$((_xb_fl | 1)); _xb_tg="$_xb_now"
+          else log "XRAY-BUSY: TG не шлю — прошлый был $((_xb_now - _xb_tg)) с назад (кулдаун $XRAY_BUSY_TG_COOLDOWN с)"; fi
+        fi
+      elif [ "$_xb_bl" = "1" ] && [ "$_xb_n" -ge $((XRAY_BUSY_TICKS + XRAY_BUSY_REMIND_TICKS)) ]; then
+        # Перегрузка держится и после обвинения — одно напоминание за эпизод (с кулдауном).
+        _xb_bl=2
+        if [ $((_xb_fl & 2)) -ne 0 ]; then _xb_after=", в том числе после ухода с виновника"; else _xb_after=""; fi
+        log "XRAY-BUSY: перегрузка держится $_xb_n замеров подряд$_xb_after — сквозные пробы стоят"
+        # После обвинения с действием — мимо кулдауна: иначе не узнать, что уход с виновника не помог.
+        if [ "$_xb_cool" = 1 ] || [ $((_xb_fl & 2)) -ne 0 ]; then
+          tg_alert "$_xb_head Держится уже ~$_xb_n мин$_xb_after. Сквозные пробы и переключения по ним стоят, пока не спадёт. $_xb_now_tags Если не пройдёт — перезапусти xray или смени узлы в панели."
+          _xb_fl=$((_xb_fl | 1)); _xb_tg="$_xb_now"
         fi
       fi
     else
-      if [ "$_xb_n" -gt 0 ]; then
-        log "XRAY-BUSY: нагрузка спала — ${XRAY_BUSY_PCT}% процессора при ${XRAY_BUSY_KBIT} кбит/с"
-        [ "$_xb_bl" = "1" ] && tg_alert "✅ <b>xray разгрузился</b>: ${XRAY_BUSY_PCT}% процессора при трафике $XRAY_BUSY_KBIT кбит/с. Сквозные пробы каналов снова в счёт."
+      if [ "$_xb_ep" = 1 ]; then
+        _xb_cn=$((_xb_cn + 1))
+        # До обвинения спокойный замер обрывает серию «перегружен подряд» (виноватого — только по подряд идущим).
+        [ "$_xb_bl" = "0" ] && _xb_n=0
+        if [ "$_xb_cn" -ge "$XRAY_BUSY_CALM_TICKS" ]; then
+          log "XRAY-BUSY: нагрузка спала — ${XRAY_BUSY_PCT}% процессора при ${XRAY_BUSY_KBIT} кбит/с"
+          [ $((_xb_fl & 1)) -ne 0 ] && tg_alert "✅ <b>xray разгрузился</b>: ${XRAY_BUSY_PCT}% процессора при трафике $XRAY_BUSY_KBIT кбит/с. Сквозные пробы каналов снова в счёт."
+          _xb_n=0; _xb_bl=0; _xb_fl=0; _xb_cn=0
+        fi
       fi
-      _xb_n=0; _xb_bl=0
-      _xb_c_pri="${_xb_t_pri:--}"; _xb_c_ai="${_xb_t_ai:--}"; _xb_c_yt="${_xb_t_yt:--}"; _xb_c_fgn="${_xb_t_fgn:--}"
+      # Снимок «спокойных» каналов — только вне эпизода: внутри него текущие каналы могут быть уже резервом.
+      if [ $((_xb_n + _xb_bl + _xb_cn)) -eq 0 ]; then
+        _xb_c_pri="${_xb_t_pri:--}"; _xb_c_ai="${_xb_t_ai:--}"; _xb_c_yt="${_xb_t_yt:--}"; _xb_c_fgn="${_xb_t_fgn:--}"
+      fi
     fi
-  elif [ "$_xb_n" -gt 0 ] && [ "$_xb_pid" = "$_xb_p_pid" ]; then
-    # Тот же xray, но замер не годится (большой разрыв между тиками) — эпизод не продолжаем.
-    _xb_n=0; _xb_bl=0
+  elif [ "$_xb_ep" = 1 ]; then
+    # Замера нет (рестарт xray, счётчики назад, нечитаемо), а эпизод открыт — пробы этого тика не считаем.
+    XRAY_BUSY=1
   fi
   XRAY_BUSY_N="$_xb_n"
-  echo "$_xb_now $_xb_pid $_xb_xj $_xb_tj $_xb_wb $_xb_n $_xb_bl $_xb_c_pri $_xb_c_ai $_xb_c_yt $_xb_c_fgn" > "$XRAY_BUSY_FILE"
+  if [ -n "$_xb_xj" ] && [ -n "$_xb_tj" ] && [ -n "$_xb_wb" ]; then
+    echo "$_xb_now $_xb_pid $_xb_xj $_xb_tj $_xb_wb $_xb_n $_xb_bl $_xb_fl ${_xb_c_pri:--} ${_xb_c_ai:--} ${_xb_c_yt:--} ${_xb_c_fgn:--} $_xb_cn $_xb_tg" > "$XRAY_BUSY_FILE"
+  fi
   return 0
 }
 
@@ -820,6 +908,13 @@ deep_probe_check() {
         return 0 ;;
     esac
     [ "$XRAY_BUSY_N" = "1" ] && log "DEEP-PROBE ($_dpr_name): замер через $_dpr_tag пропущен — xray перегружен"
+    # Эпизод открылся этим замером: пустая проба, сделанная в только что измеренной (перегруженной) минуте, —
+    # её след, отменяем ровно её. Больше ничего не трогаем: обнуление на каждом перегруженном тике не дало бы
+    # признать по-настоящему глухой канал при коротких повторяющихся перегрузках (ревью, 2-й раунд).
+    if [ "$XRAY_BUSY_OPENED" = "1" ] && [ "$DP_RES" = "fail" ] && [ "$DP_CTR" -gt 0 ] 2>/dev/null && \
+       [ "$DP_TS" -ge "$XRAY_BUSY_WIN" ] 2>/dev/null; then
+      DP_CTR=$((DP_CTR - 1))
+    fi
     return 0
   fi
   [ $((_dpr_now - DP_TS)) -ge "$DEEP_PROBE_INTERVAL" ] 2>/dev/null || return 0
@@ -1854,7 +1949,7 @@ if [ -n "$WD_APPLY_ID" ]; then
 elif [ "$_fd_delta" -ge "$FD_DELTA_THRESHOLD" ] 2>/dev/null; then
   _now=$(date +%s)
   if [ $((_now - _FD_LAST)) -ge "$FD_STALL_COOLDOWN" ] 2>/dev/null; then
-    _xpid=$(pidof xray 2>/dev/null)
+    _xpid=$(pidof xray 2>/dev/null | awk '{print $1}')   # v38: один pid, иначе /proc/«a b»/fd
     _fdcount=0; _fdlimit="?"
     if [ -n "$_xpid" ]; then
       _fdcount=$(ls "/proc/$_xpid/fd" 2>/dev/null | wc -l)
@@ -1883,8 +1978,11 @@ XRAY_BUSY_ENABLE="${XRAY_BUSY_ENABLE:-1}"
 XRAY_BUSY_CPU=$(_num "${XRAY_BUSY_CPU:-50}" 50)                     # % всех ядер роутера
 XRAY_BUSY_KBIT_PER_PCT=$(_num "${XRAY_BUSY_KBIT_PER_PCT:-50}" 50)   # трафик меньше доля×N кбит/с = холостая нагрузка
 XRAY_BUSY_TICKS=$(_num "${XRAY_BUSY_TICKS:-2}" 2)                   # замеров подряд до поиска виновника
+XRAY_BUSY_CALM_TICKS=$(_num "${XRAY_BUSY_CALM_TICKS:-2}" 2)         # v38: спокойных подряд до закрытия эпизода
+XRAY_BUSY_REMIND_TICKS=$(_num "${XRAY_BUSY_REMIND_TICKS:-10}" 10)   # v38: ещё замеров после обвинения → напоминание
+XRAY_BUSY_TG_COOLDOWN=$(_num "${XRAY_BUSY_TG_COOLDOWN:-1800}" 1800) # v38: «🔥» не чаще, с
 XRAY_BUSY_FILE=/tmp/xkeen_watchdog.xraybusy
-XRAY_BUSY=0; XRAY_BUSY_N=0; XRAY_BUSY_BLAME=""; XRAY_BUSY_PCT=""; XRAY_BUSY_KBIT=""
+XRAY_BUSY=0; XRAY_BUSY_N=0; XRAY_BUSY_BLAME=""; XRAY_BUSY_PCT=""; XRAY_BUSY_KBIT=""; XRAY_BUSY_OPENED=0; XRAY_BUSY_WIN=0
 [ -z "$WD_APPLY_ID" ] && xray_busy_eval
 # ---------- /v37 ----------
 
@@ -1972,7 +2070,7 @@ elif [ -n "$AI_TAG" ]; then
       if [ "$XRAY_BUSY" = "1" ]; then
         # v37: xray перегружен сам — пустая проба не про AI-канал. Не считаем.
         printf '%s|%s|%s|%s|%s\n' "$_ai_now" "$_AI_PREV_C" "$_AI_LAST_A" "$_AI_EMPTY" "$_AI_DEAF" > "$AI_PROBE_STATE"
-        log "AI-probe: пусто, но xray перегружен (${XRAY_BUSY_PCT}% процессора) — глухоту не считаю"
+        log "AI-probe: пусто, но xray перегружен${XRAY_BUSY_PCT:+ (${XRAY_BUSY_PCT}% процессора)} — глухоту не считаю"
       elif [ "$_ai_skip" = "1" ]; then
         # AI kill-switch активен → AI-трафик в blackhole, пустая проба ОЖИДАЕМА. Не считаем.
         printf '%s|%s|%s|%s|%s\n' "$_ai_now" "$_AI_PREV_C" "$_AI_LAST_A" "$_AI_EMPTY" "$_AI_DEAF" > "$AI_PROBE_STATE"

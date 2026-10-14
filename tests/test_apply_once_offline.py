@@ -394,6 +394,32 @@ else:
     check("_xk_restart: идёт чужой рестарт → сначала ждёт его, потом свой",
           rfile(f"{t}/rc") == "rc=0" and took >= 3.5 and (rfile(f"{t}/calls") or "").count("call") == 1,
           (rfile(f"{t}/rc"), took))
+    # v38: во время рестарта pidof отдаёт два pid («новый старый») — это ещё не конец рестарта.
+    wfile(f"{t}/pid", "100\n")
+    wfile(f"{t}/fakexk", f"echo call >> {tp}/calls\n"
+                         f"( sleep 1; echo '101 100' > {tp}/pid; sleep 3; echo 101 > {tp}/pid ) >/dev/null 2>&1 &\n")
+    t0 = time.time()
+    subprocess.run([sh, f"{tp}/x.sh"], timeout=60)
+    took = time.time() - t0
+    check("_xk_restart: два pid (новый + старый) — ждёт, пока старый уйдёт",
+          rfile(f"{t}/rc") == "rc=0" and took >= 3.8, (rfile(f"{t}/rc"), took))
+    wfile(f"{t}/pid", "100 200\n")
+    wfile(f"{t}/fakexk", f"( sleep 1; echo 200 > {tp}/pid ) >/dev/null 2>&1 &\n")
+    subprocess.run([sh, f"{tp}/x.sh"], timeout=60)
+    check("_xk_restart: остался один из СТАРЫХ pid — не новый xray, код 1",
+          rfile(f"{t}/rc") == "rc=1", rfile(f"{t}/rc"))
+    wfile(f"{t}/pid", "100 555\n")
+    wfile(f"{t}/fakexk", f"( sleep 1; echo '101 100 555' > {tp}/pid; sleep 2; echo '101 555' > {tp}/pid ) >/dev/null 2>&1 &\n")
+    t0 = time.time()
+    subprocess.run([sh, f"{tp}/x.sh"], timeout=60)
+    took = time.time() - t0
+    check("_xk_restart: посторонний постоянный xray (555) не мешает — готово, когда ушёл старый 100",
+          rfile(f"{t}/rc") == "rc=0" and 2.8 <= took < 15, (rfile(f"{t}/rc"), took))
+    wfile(f"{t}/pid", "\n")
+    wfile(f"{t}/fakexk", f"( sleep 1; echo 101 > {tp}/pid ) >/dev/null 2>&1 &\n")
+    subprocess.run([sh, f"{tp}/x.sh"], timeout=60)
+    check("_xk_restart: xray не работал — достаточно появления нового pid", rfile(f"{t}/rc") == "rc=0", rfile(f"{t}/rc"))
+    wfile(f"{t}/pid", "100\n")
     wfile(f"{t}/fakexk", "true\n")
     subprocess.run([sh, f"{tp}/x.sh"], timeout=60)
     check("_xk_restart: xray не перезапустился → код 1 и запись в лог",
