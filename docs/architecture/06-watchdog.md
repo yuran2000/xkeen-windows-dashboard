@@ -65,7 +65,8 @@ cron */1 → watchdog.sh: . watchdog.config → пробы → state-машин�
 `DEEP_RETURN_HOLD_MAX` (86400, потолок растущего карантина, v33), `DEEP_PROBE_PORT_PRI/YT/FGN` (10819–10821), `DEEP_PROBE_URL_PRI/YT/FGN` (cloudflare trace, youtube
 `generate_204`, `api.telegram.org`), `KILL_FAIL_THRESHOLD`/`KILL_PASS_THRESHOLD` (3/2), `RECVQ_THRESHOLD`,
 `RECVQ_HARD`, `STALL_FAIL_NEED`, `STALL_COOLDOWN`, `CONNTRACK_MIN`, `FD_DELTA_THRESHOLD`,
-`FD_STALL_COOLDOWN`.
+`FD_STALL_COOLDOWN`, v37: `XRAY_BUSY_ENABLE` (1), `XRAY_BUSY_CPU` (50, % всех ядер), `XRAY_BUSY_KBIT_PER_PCT` (50),
+`XRAY_BUSY_TICKS` (2).
 
 ### 6.3. watchdog.state — полный перечень полей
 
@@ -106,7 +107,7 @@ DFGN_CTR= DFGN_TS= DFGN_DEAF= DFGN_LEFT= DFGN_TAG=
 
 Метки `watchdog.log`: `SWITCH`, `FAILOVER-HEALTH`, `AI-`/`YT-`/`FOREIGN-FAILOVER` (+ `-RETURN`),
 `…-KILL-SWITCH` (+ `-CLEAR`), `DEEP-PROBE` (`DEAF`, `RECOVER`), `XRAY-TEST FAIL`, `HEALTH FAIL`,
-`AUTO-ROLLBACK`, `SKIP (анти-флап)`, `UDP-STALL`, `FD-STALL`, `AUTO-FIX`, `WARN`, `ERROR`. Долгие
+`AUTO-ROLLBACK`, `SKIP (анти-флап)`, `UDP-STALL`, `FD-STALL`, `XRAY-BUSY` (+ `BLAME`, v37), `AUTO-FIX`, `WARN`, `ERROR`. Долгие
 состояния пишутся раз в 5 мин (`_log_every5`), иначе окно «последние 30 строк» забьётся.
 
 ### 6.4. Как панель показывает состояние
@@ -141,14 +142,30 @@ kill-switch, «📋 Лог watchdog», JS-константы (§8.4). `api_xkeen
 
 Порядок разделов `.cur`: lock (`_wd_lock_try`; режим применения — пролог §6.7) → `. watchdog.config` →
 `_xk_restart` / `_xk_busy` / `_bg_restart_or_defer` → помощники (`_probe_connected`, `probe_tag`, `_num`, `is_ru_tag`, `killswitch_decide`,
-`_state_field`, `_log_every5`, `deep_probe_check`, `tg_alert`, `generate_routing`, `routing_changed`,
+`_state_field`, `_log_every5`, `xray_busy_eval`, `deep_probe_check`, `tg_alert`, `generate_routing`, `routing_changed`,
 `validate_routing_xray`, `health_check`) → досыл TG → UDP-залип (v19) → `53` в `port_exclude.lst` (v21)
 → очистка `YT_GEOIP_CATEGORIES` (v23) → self-heal `socks-ai-check` (v24) → параметры v27/v29/v30 →
-self-heal `socks-deep-*` (v29) → fd-залип (v22) → AI-проба (v24/v25) → State → Force-mode → проба
+self-heal `socks-deep-*` (v29) → fd-залип (v22) → перегрузка xray (v37, `xray_busy_eval`) → AI-проба (v24/v25) → State → Force-mode → проба
 PRIMARY и state-машина (глухота `DPRI_DEAF` форсирует down) → AI → YT → FOREIGN (kill-switch +
 цепочки) → Apply (`generate_routing <default> <ai> <yt> <foreign> <ipv6>` → `routing_changed` →
 анти-флап → `validate_routing_xray` → `mv` → `_xk_restart` → `health_check` → `.lastgood` или
 `AUTO-ROLLBACK`) → итог режима применения (§6.7) → обход FAILOVER → Save state.
+
+**Перегрузка xray (v37).** `xray_busy_eval` между тиками меряет долю процессора процесса xray от всех ядер
+(`/proc/<pid>/stat` против строки `cpu` в `/proc/stat` — не зависит от HZ и числа ядер) и трафик интерфейса
+маршрута по умолчанию (`/proc/net/route` → `/proc/net/dev`; нет маршрута — самый нагруженный, кроме `lo`);
+арифметика в awk (счётчики не помещаются в 32 бита ash). Перегружен = доля ≥ `XRAY_BUSY_CPU` и трафик <
+доля × `XRAY_BUSY_KBIT_PER_PCT` кбит/с (рабочая нагрузка — сотни кбит/с на процент, холостая — единицы).
+Другой pid (рестарт) — замера нет. Файл эпизода `/tmp/xkeen_watchdog.xraybusy`: `ts pid xray_j total_j
+wan_bytes busy_n blamed calm_pri calm_ai calm_yt calm_fgn` (`calm_*` — каналы ролей на последнем спокойном
+замере, `-` — нет). Пока перегружен (`XRAY_BUSY=1`): `deep_probe_check` не меряет и счётчики не трогает,
+AI-проба не считает пустоту. `XRAY_BUSY_TICKS` замеров подряд — виноватыми считаются роли PRI/YT/FGN, чей
+канал сменился со спокойного замера (`XRAY_BUSY_BLAME` = `PRI=тег YT=тег`, один раз за эпизод):
+`deep_probe_check` сразу ставит им `DP_DEAF=1` — дальше обычный уход по цепочке и растущий карантин; один TG
+«🔥 xray перегружен … ухожу с …». Сменился только AI или никто — TG без переключений. Спала — лог и «✅ xray
+разгрузился» (если был TG). Режим применения не оценивает. Повод — 14.10: ws-узел в роли YouTube, xray
+60–90 % при 0,2–0,3 Мбит/с, исправные Сервер_1/2/3 по очереди «глухие», 48 рестартов. Тест —
+`tests/test_xray_busy.py`.
 
 **Проба трафика (v36).** `traffic_check` — curl через СВОЙ вход `socks-health` (127.0.0.1:`HEALTH_PROBE_PORT`
 10822; заводит self-heal, правило → `direct` ставит `generate_routing`) на `TRAFFIC_PROBE_URLS`: проверяется сам
