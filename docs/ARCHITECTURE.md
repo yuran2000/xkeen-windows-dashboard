@@ -316,7 +316,11 @@ Windows-клиент включает свой kill-switch), `build_wg_client_co
 правка плодит устройства и съедает лимит**), `_parse_happ_multiprofile_json`, `_parse_sub_userinfo`,
 `_parse_profile_title`, `_normalize_outbound_tag` (`_SHELL_UNSAFE_RE` → `_`), `_uniquify_parsed_tags`
 (preview и sync обязаны давать одинаковые теги), `_parse_vless_url_dict`, `_build_vless_outbound_dict`;
-preview ничего не пишет (эвристика `_ANTI_DPI_KEYWORDS` намеренно отличается от страницы); sync —
+preview ничего не пишет (эвристика `_ANTI_DPI_KEYWORDS` намеренно отличается от страницы) и сравнивает у совпавших
+тегов, кроме адреса/pbk/SNI, **отпечаток TLS** так, как его запишет sync: `_outbound_fp` (на роутере) +
+`_fp_change_info` (`old_fp`/`new_fp`/`fp_change`/`fp_lottery_*`; `changed` = `host_change` или `fp_change`);
+`_FP_LOTTERY` (`randomized` — случайный ClientHello на каждый запуск xray, часть запусков REALITY-сервер отвергает
+alert 47) → предупреждение 🎲 в `previewSubscription`, у новых серверов — `fp`/`fp_lottery`; sync —
 pre-check критических ролей → update/add/remove → `.bak-pre-sync-<ts>` → рестарт с откатом → одна
 запись config с чисткой цепочек → обе meta. Orphan — только outbound с `meta.sub_url == url`.
 Бэкапы: `XKEEN_BACKUP_FILES`, restore валидирует **до записи** (JSON локально, `*.sh` — `sh -n` на
@@ -717,6 +721,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
 | `test_template_ips.py` | `.cur`-template (версия, два IPv4-массива), синк IP эндпоинтов |
 | `test_wg_clients_offline.py` | выдача WG на имитации Keenetic (RCI, ACL, NAT, маршруты, save, хуки): режимы, ЛВС и подмена адреса, ручной путь, s2s, линки, отзыв (метка save, возврат NAT/маршрута, чужие пиры, заворот), форма правил созданного вручную (`prefill_from_acl`: пресеты, диапазоны в обоих форматах RCI, предупреждения, свой .1 в xray, обратимость), гонка за индекс, откат, битый/занятый реестр, X25519 = RFC 7748, рендер `/xkeen` |
 | `test_csrf_offline.py` | `_csrf_origin_guard`: чужой Origin/Referer/`null`/другой порт → 403 до обработчика, свой хост, без заголовков и GET — проходят, `TRUSTED_ORIGINS`, `SameSite=Lax` |
+| `test_sub_preview_fp_offline.py` | предпросмотр подписки видит смену отпечатка TLS: `_outbound_fp`, `_fp_change_info` (reality/tls/none, поле не задано), ответ preview на моках (`fp_change`, `host_change`, `changed`, `fp_lottery_*`, `fp` новых серверов), вывод отпечатка и 🎲 в JS |
 | `test_ui_impersonal.py` | тексты интерфейса и сообщений без обращения на «ты»/«вы»: местоимения, повелительные формы, 2-е лицо (`-ешь`/`-ишь`) во всех строках, кроме комментариев Python |
 | `test_v29_ui_offline.py` | цепочка «Зарубежных» (`allow_ru`/`use_common`), `watchdog-settings`, `fields`/`deep`, quick-fail ⊇ ключей, рендер обоими путями |
 

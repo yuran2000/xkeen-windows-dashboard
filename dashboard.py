@@ -5935,6 +5935,37 @@ def _parse_vless_url_dict(url):
         return None
 
 
+# Отпечатки TLS, при которых uTLS собирает СЛУЧАЙНЫЙ ClientHello один раз на запуск xray: часть
+# вариантов REALITY-сервер отвергает (TLS alert 47 illegal_parameter), и outbound глух до
+# следующего рестарта (замер на роутере: randomized — 6 живых запусков из 8, chrome — 8 из 8).
+_FP_LOTTERY = ("randomized",)
+
+
+def _outbound_fp(o):
+    """Отпечаток TLS/REALITY outbound'а на роутере ('' — нет TLS или поле не задано)."""
+    ss = o.get("streamSettings", {}) or {}
+    sec = ss.get("security", "")
+    if sec == "reality":
+        return ((ss.get("realitySettings", {}) or {}).get("fingerprint") or "").strip()
+    if sec == "tls":
+        return ((ss.get("tlsSettings", {}) or {}).get("fingerprint") or "").strip()
+    return ""
+
+
+def _fp_change_info(parsed, old_fp):
+    """Сравнение отпечатка: что на роутере (old_fp) и что запишет sync — так же, как
+    `_build_vless_outbound_dict` (fp берётся только для security reality/tls)."""
+    new_fp = (parsed.get("fp") or "").strip() if parsed.get("security") in ("reality", "tls") else ""
+    old_fp = (old_fp or "").strip()
+    return {
+        "old_fp": old_fp,
+        "new_fp": new_fp,
+        "fp_change": bool(new_fp and new_fp != old_fp),
+        "fp_lottery_old": old_fp in _FP_LOTTERY,
+        "fp_lottery_new": new_fp in _FP_LOTTERY,
+    }
+
+
 @app.route("/api/xkeen/subscription-preview", methods=["POST"])
 @requires_auth
 def api_xkeen_subscription_preview():
@@ -5975,6 +6006,7 @@ def api_xkeen_subscription_preview():
             "port": v.get("port", 0),
             "pbk":  rs.get("publicKey", ""),
             "sni":  rs.get("serverName", ""),
+            "fp":   _outbound_fp(o),
         }
     local_by_tag = {o.get("tag"): _extract_full(o)
                     for o in cur_outbounds if o.get("protocol") == "vless"}
@@ -6014,12 +6046,18 @@ def api_xkeen_subscription_preview():
             different_provider = pbk_change  # pbk = Reality identity провайдера, главный сигнал
             critical_role = _critical_roles.get(p["tag"])
             failover_pos = _failover_pos.get(p["tag"])
+            host_change = (p["host"], p["port"]) != (local.get("host"), local.get("port"))
+            # Отпечаток TLS тоже переписывается sync'ом — без сравнения его смена была невидима
+            # (preview показывал «нет», а роутер месяцами жил со старым randomized).
+            fp_info = _fp_change_info(p, local.get("fp"))
             matches.append({
                 "tag": p["tag"],
                 "sub_host": f"{p['host']}:{p['port']}",
                 "sub_uuid": p["uuid"][:8] + "…",
                 "local_host": f"{local.get('host','?')}:{local.get('port','?')}",
-                "changed": (p["host"], p["port"]) != (local.get("host"), local.get("port")),
+                "changed": host_change or fp_info["fp_change"],
+                "host_change": host_change,
+                **fp_info,
                 "pbk_change": pbk_change,
                 "sni_change": sni_change,
                 "different_provider": different_provider,
@@ -6073,11 +6111,14 @@ def api_xkeen_subscription_preview():
         tag_lower = (p["tag"] or "").lower()
         tag_keyword = any(kw in tag_lower for kw in _ANTI_DPI_KEYWORDS)
         is_anti_dpi = sni_camouflage or tag_keyword
+        new_fp = _fp_change_info(p, "")["new_fp"]
         orphans_in_sub.append({
             "tag": p["tag"],
             "host": f"{host}:{p['port']}",
             "sni": sni,
             "is_anti_dpi": is_anti_dpi,
+            "fp": new_fp,
+            "fp_lottery": new_fp in _FP_LOTTERY,
         })
     # «orphans_local» = outbound'ы которые ПРИНАДЛЕЖАТ ИМЕННО ЭТОЙ ПОДПИСКЕ
     # (meta.sub_url == sub_url), но в свежескачанной выгрузке их нет — т.е. провайдер их убрал.
@@ -18088,6 +18129,21 @@ async function previewSubscription() {
     </div>`;
   }
 
+  // Отпечаток TLS randomized: случайный ClientHello на каждый запуск xray — часть запусков
+  // REALITY-сервер отвергает, и outbound глух до следующего рестарта.
+  const fpLotteryNew = (res.matches || []).filter(m => m.fp_lottery_new).length
+                     + (res.orphans_in_sub || []).filter(o => o.fp_lottery).length;
+  const fpLotteryFixed = (res.matches || []).filter(m => m.fp_lottery_old && !m.fp_lottery_new && m.fp_change);
+  if (fpLotteryNew > 0) {
+    html += `<div style="background:#fff4d6; border:2px solid #996600; border-radius:6px; padding:10px; margin-bottom:12px;">
+      <strong style="color:#996600;">🎲 В подписке отпечаток TLS <span class="mono">randomized</span> у ${fpLotteryNew} ${fpLotteryNew === 1 ? 'сервера' : 'серверов'}</strong>
+      <p style="color:#996600; font-size:0.85em; margin:6px 0 0;">Случайный отпечаток собирается заново при каждом запуске xray, и часть вариантов сервер REALITY отвергает: после такого рестарта канал не пропускает трафик до следующего перезапуска. Надёжнее <span class="mono">chrome</span> или <span class="mono">firefox</span> — отпечаток задаётся на стороне сервера подписки.</p>
+    </div>`;
+  }
+  if (fpLotteryFixed.length > 0) {
+    html += `<p style="color:#2a7; font-size:0.9em; margin:0 0 10px;">✅ Синхронизация заменит отпечаток <span class="mono">randomized</span> у ${fpLotteryFixed.length} ${fpLotteryFixed.length === 1 ? 'сервера' : 'серверов'}: ${fpLotteryFixed.map(m => escapeHtml(m.tag) + ' → ' + escapeHtml(m.new_fp)).join(', ')}.</p>`;
+  }
+
   // Совпадения. Информационный бейдж 🎯/🔗 рядом с tag'ом если этот outbound выбран
   // в одной из 6 уникальных dropdown-ролей или в хвосте FAILOVER. UPDATE не ломает роль
   // (меняются только UUID/Reality-ключи, tag остаётся), так что бейдж только информирует —
@@ -18096,7 +18152,12 @@ async function previewSubscription() {
     html += `<strong style="color:#2a7;">✅ Будут обновлены (${res.matches.length}):</strong><table style="margin-top:6px; font-size:0.85em;">`;
     html += `<tr><th>tag</th><th>host:port в подписке</th><th>host:port на роутере</th><th>изменится?</th><th>pbk / SNI</th></tr>`;
     res.matches.forEach(m => {
-      const chg = m.changed ? '<span style="color:#e80;">⚠️ да</span>' : '<span style="color:#888;">нет</span>';
+      const chgParts = [];
+      if (m.host_change) chgParts.push('адрес');
+      if (m.fp_change) chgParts.push('отпечаток');
+      const chg = m.changed
+        ? `<span style="color:#e80;">⚠️ да${chgParts.length ? ' (' + chgParts.join(', ') + ')' : ''}</span>`
+        : '<span style="color:#888;">нет</span>';
       let identity = '';
       const rowStyle = m.different_provider ? 'background:#fff0f0;' : '';
       if (m.different_provider) {
@@ -18105,6 +18166,12 @@ async function previewSubscription() {
         identity = `<span style="color:#e80;" title="SNI меняется, но pbk тот же"><small>SNI: ${m.old_sni||'—'} → ${m.new_sni||'—'}</small></span>`;
       } else {
         identity = '<span style="color:#2a7;" title="Тот же провайдер">✓ тот же</span>';
+      }
+      if (m.fp_change) {
+        const fpColor = m.fp_lottery_new ? '#c33' : '#e80';
+        identity += `<br><small style="color:${fpColor};" title="Отпечаток TLS (fingerprint): sync перепишет его значением из подписки">отпечаток: ${escapeHtml(m.old_fp || '—')} → ${escapeHtml(m.new_fp || '—')}${m.fp_lottery_new ? ' 🎲' : ''}</small>`;
+      } else if (m.fp_lottery_new) {
+        identity += `<br><small style="color:#c33;" title="Случайный отпечаток: часть запусков xray сервер REALITY отвергает">отпечаток: randomized 🎲</small>`;
       }
       // Информационный бейдж роли. Backtick (template literal) ОБЯЗАТЕЛЬНО — внутри title
       // встречается апостроф (`dropdown'е`), single-quoted строка бы оборвалась и SyntaxError
@@ -18163,7 +18230,8 @@ async function previewSubscription() {
         mask = `<span style="color:#888;">—</span>`;
       }
       const sniDisplay = o.sni ? escapeHtml(o.sni) : '—';
-      html += `<tr><td style="padding:3px 8px;text-align:center;">${cb}</td><td class="mono" style="padding:3px 8px;">${escapeHtml(o.tag)}</td><td class="mono" style="padding:3px 8px;">${escapeHtml(o.host)}</td><td class="mono" style="padding:3px 8px;color:#555;">${sniDisplay}</td><td style="padding:3px 8px;text-align:center;font-size:0.85em;">${mask}</td></tr>`;
+      const fpBadge = o.fp_lottery ? ` <span title="Отпечаток TLS randomized: часть запусков xray сервер REALITY отвергает" style="color:#c33;">🎲</span>` : '';
+      html += `<tr><td style="padding:3px 8px;text-align:center;">${cb}</td><td class="mono" style="padding:3px 8px;">${escapeHtml(o.tag)}${fpBadge}</td><td class="mono" style="padding:3px 8px;">${escapeHtml(o.host)}</td><td class="mono" style="padding:3px 8px;color:#555;">${sniDisplay}</td><td style="padding:3px 8px;text-align:center;font-size:0.85em;">${mask}</td></tr>`;
     });
     html += `</tbody></table>`;
   }
