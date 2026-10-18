@@ -8748,6 +8748,139 @@ DEFAULT_OUTBOUNDS_JSON = """{
 WATCHDOG_CRON_LINE = "*/1 * * * * /opt/etc/xray/watchdog.sh"
 
 
+# ============== ПОЛИТИКА XKEEN И TCPDUMP (BOOTSTRAP) ==============
+# Политика доступа Keenetic, по метке которой XKeen ловит трафик клиентов. XKeen ищет её по
+# description (без учёта регистра), имя — служебное PolicyN. Без политики XKeen проксирует ВСЁ
+# устройство, а kill-switch ставить не к чему (он привязан к её метке).
+XKEEN_POLICY_DESC = "XKeen"
+XKEEN_PROXY_SH = "/opt/etc/ndm/netfilter.d/proxy.sh"   # генерирует XKeen при старте, несёт policy_mark
+_MAC_STRICT_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+_IFACE_NAME_RE = re.compile(r"^[A-Za-z0-9/._-]+$")
+
+
+def _xkeen_policy_plan(policies, ifaces, hotspot, host_policies):
+    """Чистая функция: план создания политики XKeen на роутере, где её ещё нет.
+
+    policies — RCI `show/ip/policy`, ifaces — RCI `show/interface`, hotspot — RCI `show/ip/hotspot`,
+    host_policies — {mac: PolicyN} из running-config (`_parse_host_policies`).
+    Чтобы поведение не изменилось (без политики XKeen проксирует всех), к новой политике
+    привязываются устройства домашних сегментов (мосты с security-level private): активные — по
+    сегменту, офлайн (сегмент неизвестен) — если зарегистрированы. Гостевые сегменты и устройства с
+    другой политикой не трогаются. Новые устройства, появившиеся позже, идут напрямую.
+    → {"error": текст} | {"policy_id", "wan", "bind": [mac], "skipped_other": n, "skipped_guest": n}"""
+    if not isinstance(policies, dict) or not isinstance(ifaces, dict):
+        return {"error": "не прочитаны политики или интерфейсы Keenetic (RCI)"}
+    wan = next((k for k, v in ifaces.items() if isinstance(v, dict) and v.get("defaultgw") is True), None)
+    if not wan or not _IFACE_NAME_RE.match(wan):
+        return {"error": "не найден интерфейс выхода в интернет (defaultgw в RCI show/interface)"}
+    policy_id = next((f"Policy{n}" for n in range(64) if f"Policy{n}" not in policies), None)
+    if not policy_id:
+        return {"error": "нет свободного имени политики (Policy0–Policy63)"}
+    home = {k for k, v in ifaces.items()
+            if isinstance(v, dict) and v.get("type") == "Bridge" and v.get("security-level") == "private"}
+    hosts = hotspot.get("host") if isinstance(hotspot, dict) else None
+    host_policies = host_policies or {}
+    bind, skipped_other, skipped_guest = [], 0, 0
+    for h in hosts if isinstance(hosts, list) else []:
+        if not isinstance(h, dict):
+            continue
+        mac = str(h.get("mac") or "").strip().lower()
+        if not _MAC_STRICT_RE.match(mac) or mac in bind:
+            continue
+        if host_policies.get(mac):
+            skipped_other += 1
+            continue
+        iface = h.get("interface")
+        iface_id = iface.get("id") if isinstance(iface, dict) else None
+        if iface_id:
+            if iface_id not in home:
+                skipped_guest += 1
+                continue
+        elif h.get("registered") is not True:
+            continue
+        bind.append(mac)
+    return {"policy_id": policy_id, "wan": wan, "bind": bind,
+            "skipped_other": skipped_other, "skipped_guest": skipped_guest}
+
+
+def keenetic_ensure_xkeen_policy(poll_sec=60, poll_every=5):
+    """Создать политику XKeen, если её нет (существующую и её привязки не трогает):
+    `ip policy PolicyN` + description + `permit global <WAN>` → привязка устройств домашних сегментов
+    (`_xkeen_policy_plan`) → `system configuration save` → `xkeen -restart` и ожидание, пока XKeen
+    впишет метку политики в proxy.sh (метку он берёт только при старте).
+    → {ok, action: current|created|fail, detail}"""
+    pol = _keenetic_rci("show/ip/policy", timeout=15)
+    if not isinstance(pol, dict):
+        return {"ok": False, "action": "fail", "detail": "RCI show/ip/policy не прочитан"}
+    found = xkeen_killswitch.parse_policy(pol, XKEEN_POLICY_DESC)
+    if found:
+        return {"ok": True, "action": "current",
+                "detail": f"политика уже есть ({found['id']}) — привязки устройств не менялись"}
+    ifaces = _keenetic_rci("show/interface", timeout=15)
+    hotspot = _keenetic_rci("show/ip/hotspot", timeout=20)
+    r_rc = keenetic_ssh('ndmc -c "show running-config" 2>&1 | grep -E "^[[:space:]]*host [0-9a-fA-F:]+ policy"; '
+                        'echo __RC_END__', timeout=45)
+    if "__RC_END__" not in (r_rc.get("stdout") or ""):
+        return {"ok": False, "action": "fail", "detail": "running-config не прочитан — привязки устройств неизвестны"}
+    plan = _xkeen_policy_plan(pol, ifaces, hotspot, _parse_host_policies(r_rc["stdout"]))
+    if plan.get("error"):
+        return {"ok": False, "action": "fail", "detail": plan["error"]}
+    pid, wan = plan["policy_id"], plan["wan"]
+    lines = [f'ndmc -c "ip policy {pid}"',
+             f'ndmc -c "ip policy {pid} description {XKEEN_POLICY_DESC}"',
+             f'ndmc -c "ip policy {pid} permit global {wan}"']
+    lines += [f'ndmc -c "ip hotspot host {mac} policy {pid}"' for mac in plan["bind"]]
+    lines.append('ndmc -c "system configuration save"')
+    script = "".join(f"{ln} 2>&1\n" for ln in lines) + "echo POLICY_SCRIPT_END\n"
+    r = keenetic_ssh("sh", stdin_data=script, timeout=120)
+    out = r.get("stdout") or ""
+    errors = [ln.strip() for ln in out.splitlines() if "error[" in ln.lower()]
+    created = xkeen_killswitch.parse_policy(_keenetic_rci("show/ip/policy", timeout=15), XKEEN_POLICY_DESC)
+    if "POLICY_SCRIPT_END" not in out or not created:
+        return {"ok": False, "action": "fail",
+                "detail": "политика не создалась" + (": " + "; ".join(errors[:3]) if errors else "")}
+    detail = (f"создана {created['id']} (описание {XKEEN_POLICY_DESC}, выход {wan}), "
+              f"привязано устройств домашней сети: {len(plan['bind'])}")
+    if plan["skipped_other"]:
+        detail += f", с другой политикой оставлено как есть: {plan['skipped_other']}"
+    if plan["skipped_guest"]:
+        detail += f", гостевых не тронуто: {plan['skipped_guest']}"
+    if errors:
+        detail += f"; ошибок Keenetic: {len(errors)} ({errors[0][:120]})"
+    keenetic_ssh("xkeen -restart >/dev/null 2>&1", timeout=90)
+    want = created["mark"].lower()
+    picked = False
+    deadline = _time_mod.time() + poll_sec
+    while True:
+        rm = keenetic_ssh(f"grep -m1 '^policy_mark=' {XKEEN_PROXY_SH} 2>/dev/null", timeout=10)
+        if want in (rm.get("stdout") or "").lower():
+            picked = True
+            break
+        if _time_mod.time() >= deadline:
+            break
+        _time_mod.sleep(poll_every)
+    detail += ("; XKeen перезапущен и подхватил метку политики" if picked
+               else "; ⚠ XKeen ещё не подхватил метку политики — перезапустить XKeen в «🛠 Управление XKeen»")
+    detail += ". Новые устройства, подключённые позже, идут напрямую — добавлять их в «👥 Клиенты»"
+    return {"ok": True, "action": "created", "detail": detail}
+
+
+def keenetic_ensure_tcpdump():
+    """Поставить tcpdump из Entware, если его нет. Необязательный компонент: watchdog пишет им
+    перехват пакетов в улики сбоя канала, без него улики беднее, но всё работает.
+    → {ok, action: current|installed|fail, detail}"""
+    r = keenetic_ssh("command -v tcpdump >/dev/null 2>&1 && echo HAS_TCPDUMP", timeout=8)
+    if "HAS_TCPDUMP" in (r.get("stdout") or ""):
+        return {"ok": True, "action": "current", "detail": "уже установлен"}
+    r = keenetic_ssh("opkg update >/dev/null 2>&1; opkg install tcpdump 2>&1 | tail -3; "
+                     "command -v tcpdump >/dev/null 2>&1 && echo TCPDUMP_OK", timeout=240)
+    out = r.get("stdout") or ""
+    if "TCPDUMP_OK" in out:
+        return {"ok": True, "action": "installed", "detail": "установлен (opkg install tcpdump)"}
+    return {"ok": False, "action": "fail",
+            "detail": "не установился: " + (out.replace("\n", " ").strip()[:200] or (r.get("stderr") or "")[:200])}
+
+
 def _bootstrap_collect_state():
     """Опросить роутер: есть ли xkeen, какие файлы уже лежат, есть ли cron-entry.
     Возвращает dict: items=[{key, label, remote_path, remote_size, local_size, action, note}],
@@ -8947,6 +9080,41 @@ def _bootstrap_collect_state():
         "action": "keep" if log_exists else "create",
     })
 
+    # Политика XKeen в Keenetic — не файл, а конфигурация роутера. Есть → keep (не трогается даже
+    # с галочкой «Перезаписать»: привязки устройств — выбор пользователя).
+    pol = _keenetic_rci("show/ip/policy", timeout=15)
+    pol_found = xkeen_killswitch.parse_policy(pol, XKEEN_POLICY_DESC) if isinstance(pol, dict) else None
+    state["items"].append({
+        "key": "xkeen_policy",
+        "label": ("Политика XKeen в Keenetic (по ней XKeen выбирает, чей трафик идёт через VPN). "
+                  "Создаётся с привязкой всех устройств домашней сети; гостевая сеть и устройства "
+                  "с другой политикой не трогаются, новые устройства — через «👥 Клиенты»"),
+        "remote_path": "Keenetic → ip policy (description " + XKEEN_POLICY_DESC + ")",
+        "local_path": None,
+        "mode": "policy",
+        "source": (f"найдена: {pol_found['id']}" if pol_found else
+                   ("ndmc: ip policy + ip hotspot host … policy + перезапуск XKeen" if isinstance(pol, dict)
+                    else "политики не прочитаны — проверка при развёртывании")),
+        "remote_size": 1 if pol_found else None,
+        "local_size": 0,
+        "action": "keep" if pol_found else "create",
+    })
+
+    # tcpdump — необязательный пакет Entware: перехват пакетов в уликах сбоя канала (watchdog v40+).
+    r = keenetic_ssh("command -v tcpdump >/dev/null 2>&1 && echo HAS_TCPDUMP", timeout=8)
+    has_tcpdump = "HAS_TCPDUMP" in (r.get("stdout") or "")
+    state["items"].append({
+        "key": "tcpdump",
+        "label": "tcpdump (необязательно): перехват пакетов в уликах сбоя канала у watchdog",
+        "remote_path": "opkg → tcpdump",
+        "local_path": None,
+        "mode": "opkg",
+        "source": "opkg install tcpdump",
+        "remote_size": 1 if has_tcpdump else None,
+        "local_size": 0,
+        "action": "keep" if has_tcpdump else "create",
+    })
+
     # v1.1.0: kill-switch политики XKeen — хук netfilter.d + cron, генерируется панелью по метке
     # политики XKeen и портам перехвата (не файл baseline). Уже стоит → keep (при галочке
     # «Перезаписать» перегенерируется под актуальные параметры).
@@ -9041,6 +9209,26 @@ def _bootstrap_deploy_item(item, overwrite_existing):
         if act == "current":
             return {"ok": True, "msg": "kill-switch уже актуален — пропущено", "action_taken": "skip"}
         return {"ok": False, "msg": f"kill-switch: {ks.get('detail', '')}", "action_taken": "fail"}
+
+    # Политика XKeen — создаётся только если её нет; существующая не трогается и с «Перезаписать».
+    elif key == "xkeen_policy":
+        try:
+            p = keenetic_ensure_xkeen_policy()
+        except Exception as ex:
+            return {"ok": False, "msg": f"политика XKeen: {ex}", "action_taken": "fail"}
+        act = {"created": "create", "current": "skip"}.get(p.get("action"), "fail")
+        return {"ok": bool(p.get("ok")), "msg": p.get("detail", ""), "action_taken": act}
+
+    # tcpdump — необязательный: неудача не валит развёртывание (watchdog работает и без него).
+    elif key == "tcpdump":
+        try:
+            t = keenetic_ensure_tcpdump()
+        except Exception as ex:
+            t = {"ok": False, "action": "fail", "detail": str(ex)}
+        if t.get("ok"):
+            return {"ok": True, "msg": t.get("detail", ""),
+                    "action_taken": "create" if t.get("action") == "installed" else "skip"}
+        return {"ok": True, "msg": "⚠ необязательный компонент " + t.get("detail", ""), "action_taken": "skip"}
 
     # Скип уже существующего, если не выбрано перезаписать
     elif item["action"] == "keep" and not overwrite_existing:
@@ -9437,11 +9625,12 @@ def api_keenetic_bootstrap_apply():
     # со ссылками на эти tag'и. Если watchdog запустится раньше — xray упадёт с
     # «outbound tag 'direct' not found». Потом routing_template и watchdog.sh.
     # Cron — последним.
-    # Kill-switch — последним: ему нужна политика XKeen в Keenetic (метка), к XKeen-файлам
-    # он не привязан.
+    # Политика XKeen — перед kill-switch: ему нужна её метка; создание перезапускает XKeen.
+    # Kill-switch — после неё, к XKeen-файлам он не привязан. tcpdump — последним (необязательный,
+    # opkg update может идти минуту).
     order = ["log_dir", "watchdog_config", "outbound_meta", "subscription_meta",
              "domain_notes", "outbounds_defaults", "routing_template", "watchdog_sh", "cron_entry",
-             "killswitch"]
+             "xkeen_policy", "killswitch", "tcpdump"]
     items_by_key = {it["key"]: it for it in state["items"]}
 
     for key in order:
@@ -16188,6 +16377,9 @@ ls -la /opt/etc/xray/configs/
             <li><code>outbound_meta.json</code>, <code>subscription_meta.json</code> ← пустые JSON если их нет</li>
             <li>Cron-запись <code>*/1 * * * * /opt/etc/xray/watchdog.sh</code></li>
             <li>Лог-директория <code>/opt/var/log/xray/</code></li>
+            <li>Политика <code>XKeen</code> в Keenetic, если её нет: создаётся с выходом через провайдера, к ней привязываются все устройства домашней сети (гостевая сеть и устройства с другой политикой не трогаются), XKeen перезапускается и подхватывает её метку — шаг 8 делать не нужно</li>
+            <li>Kill-switch политики XKeen (хук <code>netfilter.d</code> + cron)</li>
+            <li><code>tcpdump</code> из Entware (необязательно — для улик сбоя канала у watchdog)</li>
           </ul>
 
           <div style="background:#fff3cd; border-left: 3px solid #f0c200; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
@@ -16197,9 +16389,12 @@ ls -la /opt/etc/xray/configs/
       </details>
 
       <details open style="margin: 10px 0; padding: 10px 14px; background: #fff8e7; border-left: 4px solid #e80; border-radius: 4px;">
-        <summary style="cursor: pointer; font-weight: 700; color: #7a5500;">🌐 Шаг 8. Создать политику «XKeen» в Keenetic Web UI + привязать клиентов (ВРУЧНУЮ!)</summary>
+        <summary style="cursor: pointer; font-weight: 700; color: #7a5500;">🌐 Шаг 8. Политика «XKeen» в Keenetic — панель создаёт её на шаге 7 (ниже — ручной путь на всякий случай)</summary>
         <div style="margin-top: 8px;">
-          <p>XKeen-installer создаёт всё на стороне Entware (xray, конфиги, iptables-правила) — но <strong>политика доступа в Keenetic Web UI НЕ добавляется автоматически</strong>. Без неё ни один клиент не получит метку fwmark, без fwmark XKeen-iptables не сработает, и трафик пойдёт мимо xray.</p>
+          <div style="background:#eefbe5; border-left: 3px solid #2a7; padding: 8px 12px; margin: 8px 0; font-size: 0.9em;">
+            ✅ <strong>Обычно этот шаг делать не нужно</strong>: «🚀 Развернуть на чистом XKeen» (шаг 7) сам создаёт политику <code>XKeen</code>, привязывает к ней все устройства домашней сети и перезапускает XKeen. Устройства, подключённые позже, идут напрямую — их добавлять в «👥 Клиенты». Ручной путь ниже — если политику нужно настроить иначе или развёртывание её не создало.
+          </div>
+          <p>XKeen-installer создаёт всё на стороне Entware (xray, конфиги, iptables-правила) — но <strong>политика доступа в Keenetic Web UI им НЕ добавляется</strong>. Без неё ни один клиент не получит метку fwmark, без fwmark XKeen-iptables не сработает, и трафик пойдёт мимо xray.</p>
 
           <div style="background:#fde8e8; border-left: 3px solid #c33; padding: 10px 14px; margin: 10px 0; font-size: 0.92em;">
             🔴 <strong>Имя политики должно быть СТРОГО <code>XKeen</code></strong> (case-sensitive, без пробелов, без префиксов/суффиксов). XKeen-installer ищет политику по <em>description</em> ровно «XKeen» — при другом имени fwmark не подцепится и xray-перехват не сработает. Внутреннее имя политики у Keenetic своё (Policy0/Policy1/Policy2…) — его не править, оно генерируется автоматически.

@@ -1,0 +1,25 @@
+# §10.3. Офлайн-тесты `tests/`
+
+> Часть документа [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md) (§10.3). Скрипты без pytest: печатают `<имя>: OK`, при провале код 1; запуск по одному: `.venv\Scripts\python.exe tests\<файл>.py` (из POSIX-оболочки — с `PYTHONUTF8=1`). Новый тест — строка здесь в том же коммите.
+
+| Тест | Покрывает |
+|---|---|
+| `test_api_offline.py` | kill-switch, backup/restore, bootstrap, diagnose + auto-fix, 404/405 ≠ 500, `keys_order ⊆ DEFAULT_WATCHDOG_CONFIG` |
+| `test_apply_once_offline.py` | режим применения (v35+): куски `.cur` в `sh` — lock, пролог (манифест, `sh -n`, подмена, ловушка падения), итог (один рестарт, откаты, force), `_xk_restart`; панель — `keenetic_apply_staged`, удаление подписки, `stage_id` (подробно — шапка теста) |
+| `test_apply_ops_offline.py` | операции на «одном рестарте» (v36): проба трафика в `sh`, `keenetic_apply_begin`/`_commit`, добавление/удаление, синк подписки, template, restore, структура, общий лок (подробно — шапка теста) |
+| `test_bootstrap_policy_offline.py` | bootstrap: политика XKeen и tcpdump — `_xkeen_policy_plan` (свободное имя, WAN, дом/гость/офлайн/чужая политика, мусор в MAC), `keenetic_ensure_xkeen_policy` на подменах (скрипт ndmc через stdin, сохранение после привязок, перезапуск XKeen и ожидание метки, отказы без изменений), `keenetic_ensure_tcpdump`, пункты плана и порядок применения, существующая политика не трогается с «Перезаписать», справка шагов 7–8 |
+| `test_backup_paths.py` | `STATIC_FILES`, `is_restorable`, `needs_exec_bit`, `build_snapshot_command` |
+| `test_geoip_status.py` | `keenetic_geoip_dat_status` (+ фоновая проверка `telegram`), все состояния секции GeoIP, auto-fix `install_extended_geoip` (симлинк, скачивание, авто-откат, ротация бэкапов), категории в диагностике |
+| `test_killswitch.py` | генератор хука, разбор статуса/утечек |
+| `test_deep_quarantine.py` | карантин возврата из `.cur` в `sh` с подменными curl/date (v33): `_deep_hold` (удвоение, потолок), `deep_probe_check` — проверка основного через минуту после возврата, сброс `D*_QN` успехом только на основном, глухота после двух пустых проверок, state v32 без новых полей (нет `sh` — SKIP) |
+| `test_xray_busy.py` | перегрузка xray (v37) из `.cur` в `sh` с подменными `/proc` (`XB_PROC`), pidof, date, curl: доля процессора и трафик между тиками, новый pid — без замера, виновник по смене канала роли (один TG за эпизод), «разгрузился», рабочая нагрузка не перегрузка, счётчики за 32 бита, `deep_probe_check` при перегрузке — виновнику глухота без curl, остальным замер не идёт (нет `sh` — SKIP) |
+| `test_evidence_offline.py` | улики сбоя канала (v40) из `.cur` в `sh`: подменные date/pidof/jq (фильтры записываются и проверяются)/nslookup (старый и новый формат BusyBox)/curl/netstat/ip/ipset, iptables-save с растущим счётчиком и tcpdump — скрипты в PATH; настоящие файлы журналов и conntrack (`XRAY_LOG_DIR`/`EV_OUTBOUNDS`/`EV_DETACHED_LOG`/`EV_CONNTRACK`): разделы, conntrack только исходного направления, дельта iptables, один снимок за тик, частота по роли, лимит в час, источники IP, outbound без адреса, heal, ротация и KEEP=0, ложное «сохранено», копии error.log, зависший nslookup, секреты не попадают, места вызова (нет `sh` — SKIP) |
+| `test_panel_misc_offline.py` | порт и задача экземпляра (рестарт, здоровье), галки `*_fail_block` как в watchdog, kill-switch в «Обслуживании» |
+| `test_probe_tag.py` | `probe_tag`/`_probe_connected` из `.cur` в `sh` с подменным curl: таймаут при установленном TCP = жив, без соединения = мёртв (нет `sh` — SKIP) |
+| `test_wg_disconnect_offline.py` | снятие заворота WG и очистка осиротевшего хука: успех только при удалённых правилах, файле хука и строке cron; живой интерфейс очисткой не снимается |
+| `test_template_ips.py` | `.cur`-template (версия, два IPv4-массива), синк IP эндпоинтов |
+| `test_wg_clients_offline.py` | выдача WG на имитации Keenetic (RCI, ACL, NAT, маршруты, save, хуки): режимы, ЛВС и подмена адреса, ручной путь, s2s, линки, отзыв (метка save, возврат NAT/маршрута, чужие пиры, заворот), форма правил созданного вручную (`prefill_from_acl`: пресеты, диапазоны в обоих форматах RCI, предупреждения, свой .1 в xray, обратимость), гонка за индекс, откат, битый/занятый реестр, X25519 = RFC 7748, рендер `/xkeen` |
+| `test_csrf_offline.py` | `_csrf_origin_guard`: чужой Origin/Referer/`null`/другой порт → 403 до обработчика, свой хост, без заголовков и GET — проходят, `TRUSTED_ORIGINS`, `SameSite=Lax` |
+| `test_sub_preview_fp_offline.py` | предпросмотр подписки видит смену отпечатка TLS: `_outbound_fp`, `_fp_change_info` (reality/tls/none, поле не задано), ответ preview на моках (`fp_change`, `host_change`, `changed`, `fp_lottery_*`, `fp` новых серверов), вывод отпечатка и 🎲 в JS |
+| `test_ui_impersonal.py` | тексты интерфейса и сообщений без обращения на «ты»/«вы»: местоимения, повелительные формы, 2-е лицо (`-ешь`/`-ишь`) во всех строках, кроме комментариев Python |
+| `test_v29_ui_offline.py` | цепочка «Зарубежных» (`allow_ru`/`use_common`), `watchdog-settings`, `fields`/`deep`, quick-fail ⊇ ключей, рендер обоими путями |

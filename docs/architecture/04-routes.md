@@ -89,7 +89,7 @@
 | `/api/xkeen/sync-template-ips` | POST | `api_xkeen_sync_template_ips` | preview; `apply=1`; `restart=1` | W: template; ⟳ один при `restart=1` (применение с force) |
 | `/api/keenetic/sync-structure` | POST | `api_keenetic_sync_structure` | «⚙ Применить структуру» | W ⟳ один (применение с force), откат |
 | `/api/keenetic/bootstrap-preview` | GET | `api_keenetic_bootstrap_preview` | план развёртывания | R |
-| `/api/keenetic/bootstrap-apply` | POST | `api_keenetic_bootstrap_apply` | `{keys, overwrite_existing}` | W, прогон watchdog, ⟳ |
+| `/api/keenetic/bootstrap-apply` | POST | `api_keenetic_bootstrap_apply` | `{keys, overwrite_existing}`; ключи `xkeen_policy` (создать политику XKeen и привязать устройства дома), `tcpdump` (opkg) | W, `ndm` (политика, save), прогон watchdog, ⟳ |
 | `/api/xkeen/backup` | GET | `api_xkeen_backup` | снапшот v7 файлом | R |
 | `/api/xkeen/backup-to-disk` | POST | `api_xkeen_backup_to_disk` | снапшот в `<base>/backups/` | R |
 | `/api/xkeen/migration-backup` | POST | `api_xkeen_migration_backup` | tar `/opt` → `scp -O` | W: временный архив |
