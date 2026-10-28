@@ -69,7 +69,7 @@ cron */1 → watchdog.sh: . watchdog.config → пробы → state-машин�
 `FD_STALL_COOLDOWN`, v37: `XRAY_BUSY_ENABLE` (1), `XRAY_BUSY_CPU` (50, % всех ядер), `XRAY_BUSY_KBIT_PER_PCT` (50),
 `XRAY_BUSY_TICKS` (2), v38: `XRAY_BUSY_CALM_TICKS` (2), `XRAY_BUSY_REMIND_TICKS` (10), `XRAY_BUSY_TG_COOLDOWN` (1800), v40: `EVIDENCE_ENABLE` (1), `EVIDENCE_COOLDOWN` (1800, для повода repeat), `EVIDENCE_KEEP` (40),
 `EVIDENCE_KEEP_ERRLOG` (15), `EVIDENCE_MAX_PER_HOUR` (6), v41: `YT_SPEED_RECHECK` (120), `YT_SPEED_SETTLE` (120),
-`YT_SPEED_THRESHOLD` (2), `YT_SPEED_RATIO` (3), `YT_SPEED_BYTES` (2000000), `YT_SPEED_TIME` (15), `YT_SPEED_URL` (dl.google.com).
+`YT_SPEED_THRESHOLD` (2), `YT_SPEED_RATIO` (2; v41–v42 — 3), `YT_SPEED_BYTES` (2000000), `YT_SPEED_TIME` (15), `YT_SPEED_URL` (dl.google.com).
 
 ### 6.3. watchdog.state — полный перечень полей
 
