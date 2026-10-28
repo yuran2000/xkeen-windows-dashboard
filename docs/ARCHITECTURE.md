@@ -363,7 +363,9 @@ sentinel `google`/`private`; sentinel не прошёл → fail-open) с тек
   ожидание `policy_mark` в `XKEEN_PROXY_SH`). Есть политика — не трогается и с «Перезаписать». `tcpdump` —
   `keenetic_ensure_tcpdump` (`opkg install`), необязательный: неудача — предупреждение, развёртывание не валит.
 - `DEEP_PROBE_LIMITS`, `_deep_probe_settings_from_config`, `_validate_deep_probe_settings` (чистая
-  функция → `(updates, error)`), `api_keenetic_tg_test` (сообщение **с роутера** через socks-local).
+  функция → `(updates, error)`; с v41 — и поля `yt_speed_*` скорости канала YouTube), `api_keenetic_tg_test`
+  (сообщение **с роутера** через socks-local). Разовый замер скорости канала YouTube — `YT_SPEED_TEST_URL`,
+  `YT_SPEED_TEST_PORT`, `_parse_yt_speed_test` (чистая), `api_xkeen_yt_speed_test` (§7.7).
 
 ### 3.10. `УПРАВЛЕНИЕ XKEEN`, `СКАНИРОВАНИЕ … DAT`, `SELF-HEALING / DIAGNOSE / AUTO-REPAIR`
 
@@ -413,7 +415,7 @@ fix_explain)`):
 
 ## 4. Реестр маршрутов → [`docs/architecture/04-routes.md`](architecture/04-routes.md)
 
-Все `@app.route` (91) по группам: метод, функция, что делает, что трогает на роутере (`—` / `R` / `W` / `⟳` /
+Все `@app.route` (92) по группам: метод, функция, что делает, что трогает на роутере (`—` / `R` / `W` / `⟳` /
 `WD` / `ndm`). Подразделы:
 - 4.1. Страницы, служебные, состояние
 - 4.2. Outbound'ы, подписки, мета (все POST, кроме GET `orphan-sub-meta`)
@@ -504,6 +506,7 @@ BusyBox ash, cron раз в минуту); панель пишет его кон
 - 7.4. Где учитывается членство в цепочках (менять синхронно)
 - 7.5. Три разных «жив»
 - 7.6. Сквозная проба (DEEP_PROBE, watchdog v29+)
+- 7.7. Скорость канала YouTube (watchdog v41)
 
 ## 8. Фронтенд `/xkeen` (`XKEEN_TEMPLATE`)
 
@@ -576,6 +579,8 @@ GeoIP-категории»: неизвестно / расширенная и с�
   `autoMatchPresets`, `injectSectionControls`.
 - Обслуживание: `xkeenCmd`, `runDiagnose`, `applyFixByIdx`, `installExtendedGeoip`, `ksRefresh`,
   `tgSave`, `tgTest`, `repairTgChannel`, `saveDeepProbeSettings`, `syncStructure`, `bootstrapApply`.
+- Скорость канала YouTube (v41, блок `yt-speed-box` в карточке YouTube): `ytSpeedTest` (кнопка «⚡ Замер
+  скорости»), `saveYTSpeedSettings` (поля `yt-speed-enable`, `yt-speed-min`, `yt-speed-interval`).
 - WG (отдельный `<script>` после раздела, IIFE `initWg`): `loadClients` (`wg-clients`), `issue`,
   `revoke`, `loadRouter` (`wg-router`), `xrayToggle`, `renderOrphans`/`cleanupOrphan`, `openRules`/
   `applyRules` (диалог `wgRulesDlg` переносится в `<body>`: базовая страница раздела скрыта, пока открыт
@@ -711,7 +716,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
 **10.3. Тесты `tests/`** — скрипты без pytest (печатают `<имя>: OK`, при провале код 1); запуск по одному:
 `.venv\Scripts\python.exe tests\<файл>.py` (из POSIX-оболочки — с `PYTHONUTF8=1`).
 
-Таблица «тест → что покрывает» (19 файлов) — [`docs/architecture/10-tests.md`](architecture/10-tests.md).
+Таблица «тест → что покрывает» (21 файл) — [`docs/architecture/10-tests.md`](architecture/10-tests.md).
 
 Новая функциональность = новые проверки по тому же образцу (подмена `D.*` **до** создания `test_client`).
 

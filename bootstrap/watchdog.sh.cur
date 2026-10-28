@@ -1,4 +1,15 @@
 #!/bin/sh
+# XKeen failover watchdog v41 (2026-10-28, уход YouTube с МЕДЛЕННОГО канала):
+#   • yt_speed_check: раз в YT_SPEED_INTERVAL (900 с) качает YT_SPEED_BYTES (2 МБ, Range) с YT_SPEED_URL
+#     (dl.google.com) через socks-deep-yt — то есть через ДЕЙСТВУЮЩИЙ канал YouTube. Медленнее YT_SPEED_MIN_KBPS
+#     (300 КБ/с) — тот же файл мимо xray: интернет сам не медленный (напрямую ≥ YT_SPEED_MIN_KBPS и ≥ YT_SPEED_RATIO
+#     × скорость канала) → замер засчитан, иначе канал не винится. Повтор медленного — через YT_SPEED_RECHECK (120 с);
+#     YT_SPEED_THRESHOLD (2) подряд → латч YT_SLOW → обычный уход по цепочке YouTube и карантин возврата (как у
+#     глухого), TG называет причину и скорость. Ушли с медленного резерва — он в YT_SLOWQ на DEEP_RETURN_HOLD:
+#     цепочка его пропускает (иначе качели между двумя медленными резервами с рестартом xray на каждом шаге).
+#   • Выключено по умолчанию (YT_SPEED_ENABLE=0); замер не идёт при перегрузке xray, глухом канале и в режиме
+#     применения. Повод — 28.10: Provider-X Sweden/USA отвечали за 54 мс и проходили сквозную пробу, а качали 11–22 КБ/с.
+#
 # XKeen failover watchdog v40 (2026-10-14, улики сбоя канала):
 #   • Пустая сквозная проба роли или пустая AI-проба → evidence_capture: снимок в EVIDENCE_DIR
 #     (/opt/var/log/xray/evidence/<дата-время>-<роль>-<повод>.txt) ДО любого лечения — хвост error.log xray (XKeen стирает
@@ -1210,6 +1221,109 @@ deep_probe_check() {
   return 0
 }
 
+# v41: скорость скачивания YT_SPEED_BYTES с YT_SPEED_URL, КБ/с. $1 — socks «host:port» или пусто (мимо xray:
+# собственный трафик роутера политикой XKeen не перехватывается). Печатает «КБ/с скачано_байт»; скачано 0 —
+# замер не удался (нет соединения, отказ сервера). Таймаут curl (код 28) — нормальный исход медленного канала:
+# speed_download и size_download curl печатает и тогда.
+_yt_speed_kbps() {
+  if [ -n "$1" ]; then
+    _ysk=$(curl -s -o /dev/null -r "0-$((YT_SPEED_BYTES - 1))" -m "$YT_SPEED_TIME" --socks5-hostname "$1" \
+      -w '%{speed_download} %{size_download}' "$YT_SPEED_URL" 2>/dev/null)
+  else
+    _ysk=$(curl -s -o /dev/null -r "0-$((YT_SPEED_BYTES - 1))" -m "$YT_SPEED_TIME" \
+      -w '%{speed_download} %{size_download}' "$YT_SPEED_URL" 2>/dev/null)
+  fi
+  _ysk_sp=$(_num "$(printf '%s' "$_ysk" | awk '{print $1}' | cut -d. -f1)" 0)
+  _ysk_sz=$(_num "$(printf '%s' "$_ysk" | awk '{print $2}' | cut -d. -f1)" 0)
+  printf '%s %s' "$((_ysk_sp / 1024))" "$_ysk_sz"
+}
+
+# v41: скорость ДЕЙСТВУЮЩЕГО канала YouTube (через socks-deep-yt). Вызов: yt_speed_check <тег> <глух 0/1>.
+# Состояние (вызывающий кладёт в state): YT_SPD — КБ/с последнего замера (0 и YT_SPD_TS=0 — замера не было),
+# YT_SPD_TS, YT_SPD_TAG — тег замера, YT_SPD_CTR — медленных подряд, YT_SLOW — латч «канал медленный» (держится
+# до быстрого замера или смены канала), YT_SPD_DIR — КБ/с мимо xray при последнем медленном замере.
+# Медленный замер засчитывается, только если интернет сам не медленный: напрямую ≥ YT_SPEED_MIN_KBPS и
+# ≥ YT_SPEED_RATIO × скорость канала (иначе тормозит всё — менять канал бесполезно). Проба делит канал с
+# видео, которое смотрят в этот момент: поэтому порог низкий и нужно YT_SPEED_THRESHOLD медленных подряд.
+yt_speed_check() {
+  _ys_tag="$1"; _ys_deaf="$2"; _ys_now=$(date +%s)
+  YT_SPD=$(_num "$(_state_field YT_SPD 0)" 0)
+  YT_SPD_TS=$(_num "$(_state_field YT_SPD_TS 0)" 0)
+  YT_SPD_TAG=$(_state_field YT_SPD_TAG "")
+  YT_SPD_CTR=$(_num "$(_state_field YT_SPD_CTR 0)" 0)
+  YT_SLOW=$(_num "$(_state_field YT_SLOW 0)" 0)
+  YT_SPD_DIR=$(_num "$(_state_field YT_SPD_DIR 0)" 0)
+  if [ "$YT_SPEED_ENABLE" != "1" ]; then
+    YT_SPD_CTR=0; YT_SLOW=0
+    return 0
+  fi
+  case "$_ys_tag" in
+    ""|block|direct) YT_SPD_CTR=0; YT_SLOW=0; YT_SPD=0; YT_SPD_TS=0; YT_SPD_TAG="$_ys_tag"; return 0 ;;
+  esac
+  # Канал сменился — прошлые замеры о другом узле. Первый замер нового — через YT_SPEED_SETTLE.
+  if [ "$_ys_tag" != "$YT_SPD_TAG" ]; then
+    YT_SPD_CTR=0; YT_SLOW=0; YT_SPD=0; YT_SPD_TAG="$_ys_tag"
+    YT_SPD_TS=$((_ys_now - YT_SPEED_INTERVAL + YT_SPEED_SETTLE))
+    return 0
+  fi
+  # Глухой канал уводит сквозная проба; при перегрузке xray и в режиме применения замер ничего не скажет.
+  [ "$_ys_deaf" = "1" ] && return 0
+  [ "$XRAY_BUSY" = "1" ] && return 0
+  [ -n "$WD_APPLY_ID" ] && return 0
+  _ys_due="$YT_SPEED_INTERVAL"
+  [ "$YT_SPD_CTR" -gt 0 ] 2>/dev/null && _ys_due="$YT_SPEED_RECHECK"
+  [ $((_ys_now - YT_SPD_TS)) -ge "$_ys_due" ] 2>/dev/null || return 0
+  YT_SPD_TS="$_ys_now"
+  set -- $(_yt_speed_kbps "127.0.0.1:$DEEP_PROBE_PORT_YT")
+  _ys_kb="${1:-0}"; _ys_sz="${2:-0}"
+  if [ "$_ys_sz" -eq 0 ] 2>/dev/null; then
+    log "YT-SPEED: замер через $_ys_tag не удался (ничего не скачано) — не считаю"
+    return 0
+  fi
+  YT_SPD="$_ys_kb"
+  if [ "$_ys_kb" -ge "$YT_SPEED_MIN_KBPS" ] 2>/dev/null; then
+    if [ "$YT_SLOW" = "1" ]; then
+      log "YT-SPEED: канал $_ys_tag снова быстрый — $_ys_kb КБ/с"
+    elif [ "$YT_SPD_CTR" -gt 0 ] 2>/dev/null; then
+      log "YT-SPEED: канал $_ys_tag в норме ($_ys_kb КБ/с) — счётчик сброшен"
+    fi
+    YT_SPD_CTR=0; YT_SLOW=0
+    return 0
+  fi
+  set -- $(_yt_speed_kbps "")
+  _ys_dir="${1:-0}"; [ "${2:-0}" -eq 0 ] 2>/dev/null && _ys_dir=0
+  YT_SPD_DIR="$_ys_dir"
+  if [ "$_ys_dir" -lt "$YT_SPEED_MIN_KBPS" ] 2>/dev/null || [ "$_ys_dir" -lt $((_ys_kb * YT_SPEED_RATIO)) ] 2>/dev/null; then
+    log "YT-SPEED: канал $_ys_tag медленный ($_ys_kb КБ/с), но и напрямую интернет не быстрее ($_ys_dir КБ/с) — канал не виню"
+    return 0
+  fi
+  YT_SPD_CTR=$((YT_SPD_CTR + 1))
+  if [ "$YT_SPD_CTR" -ge "$YT_SPEED_THRESHOLD" ] 2>/dev/null; then
+    [ "$YT_SLOW" != "1" ] && log "YT-SPEED SLOW: канал $_ys_tag медленный — $_ys_kb КБ/с при пороге $YT_SPEED_MIN_KBPS, напрямую $_ys_dir КБ/с ($YT_SPD_CTR замера подряд)"
+    YT_SLOW=1
+  else
+    log "YT-SPEED: канал $_ys_tag медленный — $_ys_kb КБ/с при пороге $YT_SPEED_MIN_KBPS, напрямую $_ys_dir КБ/с — подряд $YT_SPD_CTR (порог $YT_SPEED_THRESHOLD), повтор через $((YT_SPEED_RECHECK / 60)) мин"
+  fi
+  return 0
+}
+
+# v41: YT_SLOWQ — «тег:время ухода» через запятую: резервы, с которых YouTube ушёл как с медленных. Цепочка их
+# пропускает базовый срок карантина возврата (_deep_hold 1 = DEEP_RETURN_HOLD; основной защищён своим DYT_LEFT).
+_yt_slowq_prune() {
+  _yq_now=$(date +%s); _yq_out=""; _yq_hold=$(_deep_hold 1)
+  for _yq in $(printf '%s' "$YT_SLOWQ" | tr ',' ' '); do
+    _yq_ts=$(_num "${_yq##*:}" 0)
+    [ $((_yq_now - _yq_ts)) -lt "$_yq_hold" ] 2>/dev/null && _yq_out="$_yq_out${_yq_out:+,}$_yq"
+  done
+  YT_SLOWQ="$_yq_out"
+}
+_yt_slowq_has() {
+  for _yq in $(printf '%s' "$YT_SLOWQ" | tr ',' ' '); do
+    [ "${_yq%:*}" = "$1" ] && return 0
+  done
+  return 1
+}
+
 # Telegram-алерт через локальный SOCKS5-прокси xray (127.0.0.1:10808 → выбранный VPN-outbound),
 # чтобы обойти блокировку api.telegram.org в стране роутера (прямой curl с роутера может не
 # работать, а исходящий трафик роутера XKeen-перехватом НЕ ловится — только LAN).
@@ -1950,6 +2064,21 @@ DEEP_RETURN_HOLD=$(_num "${DEEP_RETURN_HOLD:-1800}" 1800)
 # v33: потолок растущего карантина (каждый повторный уход с основного по глухоте удваивает срок).
 DEEP_RETURN_HOLD_MAX=$(_num "${DEEP_RETURN_HOLD_MAX:-86400}" 86400)
 [ "$DEEP_RETURN_HOLD_MAX" -lt "$DEEP_RETURN_HOLD" ] && DEEP_RETURN_HOLD_MAX="$DEEP_RETURN_HOLD"
+# v41: скорость канала YouTube (yt_speed_check). Сквозная проба ловит только «трафик не идёт»; узел,
+# который отвечает и пропускает 11 КБ/с, для неё жив, а видео стоит. Выключено по умолчанию.
+YT_SPEED_ENABLE=$(_num "${YT_SPEED_ENABLE:-0}" 0)
+YT_SPEED_MIN_KBPS=$(_num "${YT_SPEED_MIN_KBPS:-300}" 300)     # медленнее — «медленный» (300 КБ/с ≈ 720p)
+YT_SPEED_INTERVAL=$(_num "${YT_SPEED_INTERVAL:-900}" 900)     # обычный замер раз в 15 мин (2 МБ трафика)
+YT_SPEED_RECHECK=$(_num "${YT_SPEED_RECHECK:-120}" 120)       # повтор после медленного замера
+YT_SPEED_SETTLE=$(_num "${YT_SPEED_SETTLE:-120}" 120)         # первый замер после смены канала
+YT_SPEED_THRESHOLD=$(_num "${YT_SPEED_THRESHOLD:-2}" 2)       # медленных подряд → канал медленный
+YT_SPEED_RATIO=$(_num "${YT_SPEED_RATIO:-3}" 3)               # напрямую быстрее во столько раз — виноват канал
+YT_SPEED_BYTES=$(_num "${YT_SPEED_BYTES:-2000000}" 2000000)
+YT_SPEED_TIME=$(_num "${YT_SPEED_TIME:-15}" 15)               # предел одного скачивания, с
+YT_SPEED_URL="${YT_SPEED_URL:-https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb}"
+[ "$YT_SPEED_THRESHOLD" -ge 1 ] 2>/dev/null || YT_SPEED_THRESHOLD=1
+[ "$YT_SPEED_RATIO" -ge 1 ] 2>/dev/null || YT_SPEED_RATIO=1
+[ "$YT_SPEED_BYTES" -ge 100000 ] 2>/dev/null || YT_SPEED_BYTES=100000
 # После смены канала роли замер не наследуется: deep_probe_check сравнивает тег, на котором
 # мерил, с действующим, и при расхождении обнуляет счётчики и отсчитывает интервал заново —
 # иначе «свежая» глухота описывала бы ПРЕДЫДУЩИЙ канал и гнала ротацию по цепочке каждую
@@ -2802,9 +2931,21 @@ DYT_QN="$DP_QN"; DYT_CHK="$DP_CHK"
 DYT_LEFT=$(_num "$(_state_field DYT_LEFT 0)" 0)
 [ "$_yt_main_chg" = "1" ] && { DYT_LEFT=0; DYT_QN=0; DYT_CHK=0; }
 _dyt_hold=$(_deep_hold "$DYT_QN")
-# v31: «про то, что уходить некуда, уже предупредили» — живёт, пока длится глухота.
+# v41: скорость действующего канала. Медленный (YT_SLOW) уводится по цепочке так же, как глухой (DYT_DEAF):
+# _yt_bad — «канал непригоден» по любой из двух причин; тексты различают причину.
+YT_SLOWQ=$(_state_field YT_SLOWQ ""); _yt_slowq_prune
+[ "$_yt_main_chg" = "1" ] && YT_SLOWQ=""
+yt_speed_check "$_yt_eff_now" "${DYT_DEAF:-0}"
+_yt_bad=0
+{ [ "${DYT_DEAF:-0}" = "1" ] || [ "$YT_SLOW" = "1" ]; } && _yt_bad=1
+if [ "${DYT_DEAF:-0}" = "1" ]; then
+  _yt_bad_log="глух (трафик сквозь не идёт)"; _yt_bad_tg="не пропускает трафик"
+else
+  _yt_bad_log="медленный ($YT_SPD КБ/с, напрямую $YT_SPD_DIR КБ/с)"; _yt_bad_tg="слишком медленный ($YT_SPD КБ/с при норме от $YT_SPEED_MIN_KBPS)"
+fi
+# v31: «про то, что уходить некуда, уже предупредили» — живёт, пока длится глухота (v41: или медленность).
 DYT_NOALT=$(_num "$(_state_field DYT_NOALT 0)" 0)
-[ "${DYT_DEAF:-0}" = "1" ] || DYT_NOALT=0
+[ "$_yt_bad" = "1" ] || DYT_NOALT=0
 # v27: блок активен, если включён kill-switch ИЛИ задана своя цепочка резерва для YouTube.
 # (Раньше вход зависел только от YT_FAIL_BLOCK.) Для YT, в отличие от AI, RU-узлы РАЗРЕШЕНЫ —
 # «Россия без рекламы» это штатный и желательный выход для YouTube.
@@ -2820,7 +2961,7 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
   [ "$_yt_main_chg" = "1" ] && [ "$_yt_eff_prev" = "$_yt_main_prev" ] && _yt_eff_prev="$YT_TAG"
   # v29: уходим по цепочке не только когда узел не отвечает по TCP (YT_BLOCKED), но и когда
   # действующий канал ГЛУХ — отвечает, а трафик сквозь не пропускает (случай 02.10).
-  if [ "$YT_BLOCKED" = "1" ] || [ "${DYT_DEAF:-0}" = "1" ]; then
+  if [ "$YT_BLOCKED" = "1" ] || [ "$_yt_bad" = "1" ]; then
     # Цепочка YT — тоже список по приоритету (1-й важнее 2-го): перебор с начала, поэтому
     # при оживании более приоритетного возвращаемся вверх. Позиция текущего — дешёвым проходом.
     _yt_prev_idx=0; _yt_i=0
@@ -2848,8 +2989,13 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
       case "$_yt" in ""|direct|block) log "YT-FAILOVER: пропускаю $_yt — это не туннель (direct/block)"; continue ;; esac
       # Действующий канал признан глухим — повторно его не выбираем, иначе застрянем:
       # TCP-проба у глухого узла успешна, и он побеждал бы каждый круг.
-      if [ "${DYT_DEAF:-0}" = "1" ] && [ "$_yt" = "$_yt_eff_prev" ]; then
-        log "YT-FAILOVER: пропускаю $_yt — он признан глухим (трафик сквозь не идёт)"
+      if [ "$_yt_bad" = "1" ] && [ "$_yt" = "$_yt_eff_prev" ]; then
+        log "YT-FAILOVER: пропускаю $_yt — он $_yt_bad_log"
+        continue
+      fi
+      # v41: недавно ушли с него как с медленного — не возвращаемся до конца карантина.
+      if _yt_slowq_has "$_yt"; then
+        log "YT-FAILOVER: пропускаю $_yt — недавно был медленным (карантин $((DEEP_RETURN_HOLD / 60)) мин)"
         continue
       fi
       # RU-узлы для YouTube по умолчанию РАЗРЕШЕНЫ (YT_CHAIN_ALLOW_RU=1) — «Россия без рекламы»
@@ -2870,7 +3016,7 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
       # Ожил более приоритетный, а текущий ещё жив → соблюдаем cooldown (смена = xkeen restart).
       if [ "$_yt_prev_idx" -gt 0 ] 2>/dev/null && [ "$_yt_pick_idx" -lt "$_yt_prev_idx" ] 2>/dev/null \
          && [ $((_yt_now - YT_SW_TS)) -lt "$YT_CHAIN_SWITCH_COOLDOWN" ] 2>/dev/null; then
-        if [ "${DYT_DEAF:-0}" != "1" ] && probe_tag "$_yt_eff_prev" ""; then
+        if [ "$_yt_bad" != "1" ] && probe_tag "$_yt_eff_prev" ""; then
           log "YT-FAILOVER: ожил более приоритетный $_yt_pick, но с последнего переключения прошло $((_yt_now - YT_SW_TS))с (< $YT_CHAIN_SWITCH_COOLDOWN) — остаюсь на живом $_yt_eff_prev"
           _yt_pick="$_yt_eff_prev"
         else
@@ -2883,11 +3029,15 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
         # v29: уход С ОСНОВНОГО по глухоте — заводим карантин на возврат (TCP скажет «жив»
         # мгновенно, а канал может всё ещё не пропускать трафик). Счётчики пробы обнулит сам
         # deep_probe_check на следующем тике: действующий тег роли сменился.
-        if [ "${DYT_DEAF:-0}" = "1" ] && [ "$_yt_pick" != "$YT_TAG" ]; then DYT_LEFT="$_yt_now"; fi
+        if [ "$_yt_bad" = "1" ] && [ "$_yt_pick" != "$YT_TAG" ]; then DYT_LEFT="$_yt_now"; fi
+        # v41: ушли с медленного — в карантин медленных (цепочка его пропустит).
+        if [ "$YT_SLOW" = "1" ] && [ -n "$_yt_eff_prev" ] && ! _yt_slowq_has "$_yt_eff_prev"; then
+          YT_SLOWQ="$YT_SLOWQ${YT_SLOWQ:+,}$_yt_eff_prev:$_yt_now"
+        fi
         # v33: ушли именно С ОСНОВНОГО по глухоте — растущий карантин.
-        if [ "${DYT_DEAF:-0}" = "1" ] && [ "$_yt_eff_prev" = "$YT_TAG" ] && [ "$_yt_pick" != "$YT_TAG" ]; then
+        if [ "$_yt_bad" = "1" ] && [ "$_yt_eff_prev" = "$YT_TAG" ] && [ "$_yt_pick" != "$YT_TAG" ]; then
           DYT_QN=$((DYT_QN + 1)); _dyt_hold=$(_deep_hold "$DYT_QN")
-          [ "$DYT_QN" -gt 1 ] && log "YT: основной $YT_TAG снова глух после возврата (уход подряд №$DYT_QN) — карантин на возврат $((_dyt_hold / 60)) мин"
+          [ "$DYT_QN" -gt 1 ] && log "YT: основной $YT_TAG снова $_yt_bad_log после возврата (уход подряд №$DYT_QN) — карантин на возврат $((_dyt_hold / 60)) мин"
         fi
         if [ "$_yt_pick" = "$YT_TAG" ] && [ "$_yt_main_chg" = "1" ]; then
           log "YT: основной сменён в настройках — YouTube идёт через новый основной $YT_TAG (был $_yt_eff_prev)"
@@ -2898,6 +3048,9 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
           else
             tg_alert "✅ <b>YouTube вернулся на основной канал</b> <code>$YT_TAG</code>."
           fi
+        elif [ "${DYT_DEAF:-0}" != "1" ] && [ "$YT_SLOW" = "1" ]; then
+          log "YT-FAILOVER: канал $_yt_eff_prev $_yt_bad_log → YouTube переключён на $_yt_pick"
+          tg_alert "🐢 <b>YouTube переключён на резерв</b>: канал <code>$_yt_eff_prev</code> отвечает, но качает $YT_SPD КБ/с (норма от $YT_SPEED_MIN_KBPS, напрямую интернет $YT_SPD_DIR КБ/с) → трафик идёт через <code>$_yt_pick</code>."
         elif [ "${DYT_DEAF:-0}" = "1" ]; then
           # v39: глухота назначена перегрузкой xray (XRAY_BUSY_BLAME этого тика) — причина другая, так и пишем.
           case " $XRAY_BUSY_BLAME " in
@@ -2925,7 +3078,7 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
         if [ "$YT_BLOCKED" = "1" ]; then
           log "YT-FAILOVER: основной $YT_TAG и вся цепочка не ответили (круг $YT_CMISS из $YT_CHAIN_ROUNDS) — жду ещё тик, маршрут не меняю"
         else
-          log "YT-FAILOVER: канал ${_yt_eff_prev:-$YT_TAG} глух, живых узлов в цепочке нет (круг $YT_CMISS из $YT_CHAIN_ROUNDS) — жду ещё тик, маршрут не меняю"
+          log "YT-FAILOVER: канал ${_yt_eff_prev:-$YT_TAG} $_yt_bad_log, живых узлов в цепочке нет (круг $YT_CMISS из $YT_CHAIN_ROUNDS) — жду ещё тик, маршрут не меняю"
         fi
       elif [ "${YT_FAIL_BLOCK:-0}" = "1" ] && [ "$YT_BLOCKED" = "1" ]; then
         # v31: block — ТОЛЬКО когда основной мёртв по TCP. Глухой, но отвечающий основной
@@ -2941,12 +3094,12 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
         # Остаёмся на основном (трафик и так никуда не утекает), block не включаем, и одно
         # предупреждение в TG за эпизод глухоты — без xkeen-restart на каждом круге.
         EFFECTIVE_YT_TAG="$YT_TAG"
-        [ -n "$_yt_eff_prev" ] && [ "$_yt_eff_prev" != "$YT_TAG" ] && log "YT: канал $_yt_eff_prev глух, живых узлов в цепочке нет, основной $YT_TAG отвечает по TCP → YouTube на основном"
+        [ -n "$_yt_eff_prev" ] && [ "$_yt_eff_prev" != "$YT_TAG" ] && log "YT: канал $_yt_eff_prev $_yt_bad_log, живых узлов в цепочке нет, основной $YT_TAG отвечает по TCP → YouTube на основном"
         if [ "$DYT_NOALT" != "1" ]; then
           DYT_NOALT=1
-          log "YT: переключиться некуда — канал ${_yt_eff_prev:-$YT_TAG} глух, живых узлов в цепочке нет; остаюсь на основном $YT_TAG (block не включаю: основной отвечает по TCP)"
+          log "YT: переключиться некуда — канал ${_yt_eff_prev:-$YT_TAG} $_yt_bad_log, живых узлов в цепочке нет; остаюсь на основном $YT_TAG (block не включаю: основной отвечает по TCP)"
           if [ "$_yt_has_alt" = "1" ]; then
-            tg_alert "⚠️ <b>YouTube: переключиться некуда</b> — канал <code>${_yt_eff_prev:-$YT_TAG}</code> не пропускает трафик, а живых узлов в цепочке резерва нет. Трафик остаётся на основном <code>$YT_TAG</code>; блокировка не включается, пока он отвечает."
+            tg_alert "⚠️ <b>YouTube: переключиться некуда</b> — канал <code>${_yt_eff_prev:-$YT_TAG}</code> $_yt_bad_tg, а живых (и не медленных) узлов в цепочке резерва нет. Трафик остаётся на основном <code>$YT_TAG</code>; блокировка не включается, пока он отвечает."
           fi
         fi
       else
@@ -3449,4 +3602,4 @@ DPRI_HOLD=$(_deep_hold "$DPRI_QN"); DYT_HOLD=$(_deep_hold "$DYT_QN"); DFGN_HOLD=
 # PRI_MAIN/YT_MAIN/FGN_MAIN выставляются каждый тик (до блоков ролей) — переносить не нужно.
 # AI_EFF — что РЕАЛЬНО применено для AI в этом тике (основной / резерв цепочки / block).
 # Нужен, чтобы (а) не спамить алертами о переключении, (б) AI-probe отличал blackhole от резерва.
-echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR AI_EFF=$EFFECTIVE_AI_TAG AI_CMISS=$AI_CMISS AI_SW_TS=$AI_SW_TS AI_LEFT_TS=$AI_LEFT_TS YT_EFF=$EFFECTIVE_YT_TAG YT_CMISS=$YT_CMISS YT_SW_TS=$YT_SW_TS FGN_EFF=$EFFECTIVE_FOREIGN_TAG FGN_CMISS=$FGN_CMISS FGN_SW_TS=$FGN_SW_TS DPRI_CTR=$DPRI_CTR DPRI_TS=$DPRI_TS DPRI_DEAF=$DPRI_DEAF DPRI_LEFT=$DPRI_LEFT DPRI_TAG=$DPRI_TAG DYT_CTR=$DYT_CTR DYT_TS=$DYT_TS DYT_DEAF=$DYT_DEAF DYT_LEFT=$DYT_LEFT DYT_TAG=$DYT_TAG DFGN_CTR=$DFGN_CTR DFGN_TS=$DFGN_TS DFGN_DEAF=$DFGN_DEAF DFGN_LEFT=$DFGN_LEFT DFGN_TAG=$DFGN_TAG PRI_MAIN=$PRI_MAIN YT_MAIN=$YT_MAIN FGN_MAIN=$FGN_MAIN DPRI_RES=$DPRI_RES DYT_RES=$DYT_RES DFGN_RES=$DFGN_RES PRI_NOALT=$PRI_NOALT DPRI_FSINCE=$DPRI_FSINCE DYT_NOALT=$DYT_NOALT DFGN_NOALT=$DFGN_NOALT DPRI_QN=$DPRI_QN DPRI_CHK=$DPRI_CHK DPRI_HOLD=$DPRI_HOLD DYT_QN=$DYT_QN DYT_CHK=$DYT_CHK DYT_HOLD=$DYT_HOLD DFGN_QN=$DFGN_QN DFGN_CHK=$DFGN_CHK DFGN_HOLD=$DFGN_HOLD" > "$STATE_FILE"
+echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR AI_EFF=$EFFECTIVE_AI_TAG AI_CMISS=$AI_CMISS AI_SW_TS=$AI_SW_TS AI_LEFT_TS=$AI_LEFT_TS YT_EFF=$EFFECTIVE_YT_TAG YT_CMISS=$YT_CMISS YT_SW_TS=$YT_SW_TS FGN_EFF=$EFFECTIVE_FOREIGN_TAG FGN_CMISS=$FGN_CMISS FGN_SW_TS=$FGN_SW_TS DPRI_CTR=$DPRI_CTR DPRI_TS=$DPRI_TS DPRI_DEAF=$DPRI_DEAF DPRI_LEFT=$DPRI_LEFT DPRI_TAG=$DPRI_TAG DYT_CTR=$DYT_CTR DYT_TS=$DYT_TS DYT_DEAF=$DYT_DEAF DYT_LEFT=$DYT_LEFT DYT_TAG=$DYT_TAG DFGN_CTR=$DFGN_CTR DFGN_TS=$DFGN_TS DFGN_DEAF=$DFGN_DEAF DFGN_LEFT=$DFGN_LEFT DFGN_TAG=$DFGN_TAG PRI_MAIN=$PRI_MAIN YT_MAIN=$YT_MAIN FGN_MAIN=$FGN_MAIN DPRI_RES=$DPRI_RES DYT_RES=$DYT_RES DFGN_RES=$DFGN_RES PRI_NOALT=$PRI_NOALT DPRI_FSINCE=$DPRI_FSINCE DYT_NOALT=$DYT_NOALT DFGN_NOALT=$DFGN_NOALT DPRI_QN=$DPRI_QN DPRI_CHK=$DPRI_CHK DPRI_HOLD=$DPRI_HOLD DYT_QN=$DYT_QN DYT_CHK=$DYT_CHK DYT_HOLD=$DYT_HOLD DFGN_QN=$DFGN_QN DFGN_CHK=$DFGN_CHK DFGN_HOLD=$DFGN_HOLD YT_SPD=${YT_SPD:-0} YT_SPD_TS=${YT_SPD_TS:-0} YT_SPD_TAG=$YT_SPD_TAG YT_SPD_CTR=${YT_SPD_CTR:-0} YT_SLOW=${YT_SLOW:-0} YT_SPD_DIR=${YT_SPD_DIR:-0} YT_SLOWQ=$YT_SLOWQ" > "$STATE_FILE"

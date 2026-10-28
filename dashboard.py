@@ -2913,6 +2913,22 @@ def keenetic_get_watchdog(deep_hold_sec=None):
             "qn": _f_int(pfx + "QN"),
             "chk": (fields.get(pfx + "CHK") or "0").strip() == "1",
         }
+    # watchdog v41: скорость канала YouTube (YT_SPD — КБ/с последнего замера, YT_SLOW — латч «медленный»,
+    # YT_SPD_DIR — КБ/с мимо xray при последнем медленном замере, YT_SLOWQ — «тег:время» ушедших как медленные).
+    # Полей нет (сторож до v41) — None.
+    yt_speed = None
+    if "YT_SPD_TS" in fields:
+        _ys_ts = _f_int("YT_SPD_TS")
+        yt_speed = {
+            "kbps": _f_int("YT_SPD"),
+            "ts": _ys_ts,
+            "age_min": max(0, int((_now - _ys_ts) // 60)) if _ys_ts > 0 and _f_int("YT_SPD") > 0 else None,
+            "tag": (fields.get("YT_SPD_TAG") or "").strip() or None,
+            "ctr": _f_int("YT_SPD_CTR"),
+            "slow": (fields.get("YT_SLOW") or "0").strip() == "1",
+            "direct_kbps": _f_int("YT_SPD_DIR"),
+            "slow_tags": [x.rsplit(":", 1)[0] for x in (fields.get("YT_SLOWQ") or "").split(",") if ":" in x],
+        }
     log_lines = keenetic_tail_log(cfg.KEENETIC_WATCHDOG_LOG, n=30)
     # Сквозная AI-проба watchdog (файл watchdog.aiprobe: ts|country|last_alert|empty|stage).
     # Зачем: handshake-проба панели («жив · N мс») меряет достижимость СЕРВЕРА, а не туннеля.
@@ -2945,6 +2961,7 @@ def keenetic_get_watchdog(deep_hold_sec=None):
         # watchdog v29 (при добавлении ключа — продублировать в quick-fail литерал xkeen_page):
         "fields": fields,
         "deep": deep,
+        "yt_speed": yt_speed,
         "fgn_eff": (fields.get("FGN_EFF") or "").strip() or None,
         "yt_eff": (fields.get("YT_EFF") or "").strip() or None,
         "ai_eff": (fields.get("AI_EFF") or "").strip() or None,
@@ -3073,6 +3090,10 @@ def keenetic_get_watchdog_targets(strict=False):
         "deep_probe_interval": _wd_int("DEEP_PROBE_INTERVAL", 180),
         "deep_probe_threshold": _wd_int("DEEP_PROBE_THRESHOLD", 2),
         "deep_return_hold": _wd_int("DEEP_RETURN_HOLD", 1800),
+        # watchdog v41: уход YouTube с медленного канала (пусто = дефолт сторожа: выключено, 300 КБ/с, 900 с).
+        "yt_speed_enable": (cfg_d.get("YT_SPEED_ENABLE") or "").strip() == "1",
+        "yt_speed_min_kbps": _wd_int("YT_SPEED_MIN_KBPS", 300),
+        "yt_speed_interval": _wd_int("YT_SPEED_INTERVAL", 900),
         "ipv6_tag":     cfg_d.get("IPV6_TAG"),
         "ipv6_domains": ipv6_domains_list,
         "direct_domains": direct_domains_list,
@@ -3096,6 +3117,7 @@ def _build_watchdog_config(d):
         "AI_FAILOVER_TAGS", "AI_CHAIN_ALLOW_RU",
         "YT_TAG", "YT_DOMAINS", "YT_EXT_CATEGORIES", "YT_GEOIP_CATEGORIES", "YT_FAIL_BLOCK",
         "YT_FAILOVER_TAGS", "YT_CHAIN_ALLOW_RU",
+        "YT_SPEED_ENABLE", "YT_SPEED_MIN_KBPS", "YT_SPEED_INTERVAL",
         "FOREIGN_TAG", "FOREIGN_DOMAINS", "FOREIGN_EXT_CATEGORIES", "FOREIGN_GEOIP_CATEGORIES", "FOREIGN_FAIL_BLOCK",
         "FOREIGN_FAILOVER_TAGS", "FOREIGN_CHAIN_ALLOW_RU", "FOREIGN_CHAIN_USE_COMMON",
         "IPV6_TAG", "IPV6_DOMAINS",
@@ -3283,6 +3305,10 @@ def keenetic_write_watchdog_config(updates, stage_id=None):
             if not (cur.get("DEEP_PROBE_INTERVAL") or "").strip(): cur["DEEP_PROBE_INTERVAL"] = "180"
             if not (cur.get("DEEP_PROBE_THRESHOLD") or "").strip(): cur["DEEP_PROBE_THRESHOLD"] = "2"
             if not (cur.get("DEEP_RETURN_HOLD") or "").strip(): cur["DEEP_RETURN_HOLD"] = "1800"
+            # watchdog v41: замер скорости канала YouTube (выключен по умолчанию). Числа — явно.
+            if not (cur.get("YT_SPEED_ENABLE") or "").strip(): cur["YT_SPEED_ENABLE"] = "0"
+            if not (cur.get("YT_SPEED_MIN_KBPS") or "").strip(): cur["YT_SPEED_MIN_KBPS"] = "300"
+            if not (cur.get("YT_SPEED_INTERVAL") or "").strip(): cur["YT_SPEED_INTERVAL"] = "900"
         # «🌐 Через IPv6» канал (IPV6_*): домены IPv6-only сайтов → выходной узел с IPv6-egress.
         # Узел обязан: (1) egress IPv6 (freedom не UseIPv4), (2) routeOnly:false на входе (вернуть домен из fake-IP).
         if "IPV6_TAG" not in cur: cur["IPV6_TAG"] = ""
@@ -4594,6 +4620,7 @@ def xkeen_page():
             # watchdog v29: все KEY=VAL из state + сквозные пробы ролей (None = нет данных)
             "fields": {},
             "deep": None,
+            "yt_speed": None,
             "fgn_eff": None,
             "yt_eff": None,
             "ai_eff": None,
@@ -4633,6 +4660,9 @@ def xkeen_page():
             "deep_probe_interval": 180,
             "deep_probe_threshold": 2,
             "deep_return_hold": 1800,
+            "yt_speed_enable": False,
+            "yt_speed_min_kbps": 300,
+            "yt_speed_interval": 900,
             "ipv6_tag": None,
             "ipv6_domains": [],
             "direct_domains": [],
@@ -8711,6 +8741,12 @@ DEEP_PROBE_INTERVAL="180"
 DEEP_PROBE_THRESHOLD="2"
 # карантин возврата на узел после ухода по глухоте, секунд
 DEEP_RETURN_HOLD="1800"
+# 1 = уводить YouTube по цепочке резерва и с медленного канала (замер скорости, watchdog v41)
+YT_SPEED_ENABLE="0"
+# медленнее этого (КБ/с) канал YouTube считается медленным
+YT_SPEED_MIN_KBPS="300"
+# как часто мерить скорость канала YouTube, секунд (замер — 2 МБ трафика)
+YT_SPEED_INTERVAL="900"
 TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 FORCE_MODE="auto"
@@ -9355,6 +9391,8 @@ DEEP_PROBE_LIMITS = {
     "deep_probe_interval":  (60, 900),    # секунд
     "deep_probe_threshold": (1, 5),       # пустых проб подряд
     "deep_return_hold_min": (5, 1440),    # минут (в config — секунды DEEP_RETURN_HOLD)
+    "yt_speed_min_kbps":    (50, 5000),   # КБ/с — медленнее канал YouTube считается медленным (v41)
+    "yt_speed_interval_min": (5, 120),    # минут (в config — секунды YT_SPEED_INTERVAL)
 }
 
 
@@ -9370,12 +9408,16 @@ def _deep_probe_settings_from_config(cur):
         "deep_probe_interval": _i("DEEP_PROBE_INTERVAL", 180),
         "deep_probe_threshold": _i("DEEP_PROBE_THRESHOLD", 2),
         "deep_return_hold_min": max(1, int(round(hold_sec / 60))),
+        "yt_speed_enable": (cur.get("YT_SPEED_ENABLE", "") or "").strip() == "1",
+        "yt_speed_min_kbps": _i("YT_SPEED_MIN_KBPS", 300),
+        "yt_speed_interval_min": max(1, int(round(_i("YT_SPEED_INTERVAL", 900) / 60))),
     }
 
 
 def _validate_deep_probe_settings(data):
     """Проверка JSON {deep_probe_enable, deep_probe_interval, deep_probe_threshold,
-    deep_return_hold_min} → (updates для watchdog.config, error|None). Чистая функция — для
+    deep_return_hold_min, yt_speed_enable, yt_speed_min_kbps, yt_speed_interval_min} → (updates для
+    watchdog.config, error|None). Чистая функция — для
     офлайн-тестов без роутера.
     Поле, которого нет в теле, НЕ трогается: его ключ в config остаётся как был (иначе
     отсутствующий deep_probe_enable молча выключал бы пробу). Не объект / ни одного поля → ошибка."""
@@ -9387,10 +9429,17 @@ def _validate_deep_probe_settings(data):
         if isinstance(en, str):
             en = en.strip().lower() in ("1", "true", "on", "yes")
         updates["DEEP_PROBE_ENABLE"] = "1" if bool(en) else "0"
+    if "yt_speed_enable" in data:
+        en = data.get("yt_speed_enable")
+        if isinstance(en, str):
+            en = en.strip().lower() in ("1", "true", "on", "yes")
+        updates["YT_SPEED_ENABLE"] = "1" if bool(en) else "0"
     names = {
         "deep_probe_interval":  ("Интервал, с", "DEEP_PROBE_INTERVAL", 1),
         "deep_probe_threshold": ("Порог, проб подряд", "DEEP_PROBE_THRESHOLD", 1),
         "deep_return_hold_min": ("Карантин возврата, мин", "DEEP_RETURN_HOLD", 60),
+        "yt_speed_min_kbps": ("Медленнее, КБ/с", "YT_SPEED_MIN_KBPS", 1),
+        "yt_speed_interval_min": ("Замер раз в, мин", "YT_SPEED_INTERVAL", 60),
     }
     for field, (title, cfg_key, mult) in names.items():
         if field not in data:
@@ -9416,7 +9465,8 @@ def _validate_deep_probe_settings(data):
 def api_keenetic_watchdog_settings():
     """GET — текущие настройки сквозной пробы из watchdog.config.
     POST — записать. Body JSON: {deep_probe_enable: bool, deep_probe_interval: int (60…900),
-    deep_probe_threshold: int (1…5), deep_return_hold_min: int (5…1440)}."""
+    deep_probe_threshold: int (1…5), deep_return_hold_min: int (5…1440); v41 — yt_speed_enable: bool,
+    yt_speed_min_kbps: int (50…5000), yt_speed_interval_min: int (5…120)}. Любое поле можно не передавать."""
     if request.method == "GET":
         cur = keenetic_read_watchdog_config()
         if cur is None:
@@ -9434,6 +9484,63 @@ def api_keenetic_watchdog_settings():
     except Exception as ex:
         return jsonify({"ok": False, "error": str(ex)}), 500
     return jsonify({"ok": bool(r.get("ok")), "stderr": r.get("stderr", ""), "stdout": r.get("stdout", "")})
+
+
+# ---- watchdog v41: разовый замер скорости канала YouTube (кнопка «⚡ Замер скорости») ----
+# Тот же замер, что делает сторож (yt_speed_check): 2 МБ с YT_SPEED_TEST_URL через socks-deep-yt (действующий
+# канал YouTube) и мимо xray для сравнения. Ничего не пишет; сторож свои замеры и решения ведёт сам.
+YT_SPEED_TEST_URL = "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+YT_SPEED_TEST_PORT = 10820
+
+
+def _parse_yt_speed_test(out):
+    """Разбор вывода команды замера: строка с `"outboundTag": "<тег>"` (правило socks-deep-yt),
+    `YT <байт/с> <скачано> <код>`, `DIR <байт/с> <скачано>` → {kbps, bytes, code, direct_kbps, direct_bytes,
+    tag}; чего нет — None. Чистая функция (тест)."""
+    res = {"kbps": None, "bytes": None, "code": None, "direct_kbps": None, "direct_bytes": None, "tag": None}
+    for line in (out or "").splitlines():
+        m = re.search(r'"outboundTag"\s*:\s*"([^"]+)"', line)
+        if m and res["tag"] is None:
+            res["tag"] = m.group(1)
+            continue
+        parts = line.strip().split()
+        if len(parts) >= 3 and parts[0] in ("YT", "DIR"):
+            try:
+                sp = int(float(parts[1]))
+                sz = int(float(parts[2]))
+            except ValueError:
+                continue
+            if parts[0] == "YT":
+                res["kbps"], res["bytes"] = sp // 1024, sz
+                res["code"] = parts[3] if len(parts) >= 4 else None
+            else:
+                res["direct_kbps"], res["direct_bytes"] = sp // 1024, sz
+    return res
+
+
+@app.route("/api/xkeen/yt-speed-test", methods=["POST"])
+@requires_auth
+def api_xkeen_yt_speed_test():
+    """Замер скорости действующего канала YouTube с роутера (3–30 с). Ответ: {ok, tag, kbps, bytes, code,
+    direct_kbps, direct_bytes}; ok=False — через канал ничего не скачалось (канал не пропускает трафик или у
+    сторожа нет входа socks-deep-yt — до v29)."""
+    curl_args = f"-s -o /dev/null -r 0-1999999 -m 15"
+    cmd = (
+        "grep -A3 socks-deep-yt /opt/etc/xray/configs/05_routing.json 2>/dev/null | grep outboundTag | head -1; "
+        f"echo YT $(curl {curl_args} --socks5-hostname 127.0.0.1:{YT_SPEED_TEST_PORT} "
+        f"-w '%{{speed_download}} %{{size_download}} %{{http_code}}' {YT_SPEED_TEST_URL} 2>/dev/null); "
+        f"echo DIR $(curl {curl_args} -w '%{{speed_download}} %{{size_download}}' {YT_SPEED_TEST_URL} 2>/dev/null)"
+    )
+    r = keenetic_ssh(cmd, timeout=45)
+    if not (r.get("stdout") or "").strip():
+        return jsonify({"ok": False, "error": "Роутер не ответил по SSH: " + (r.get("stderr") or "")[:200]}), 502
+    res = _parse_yt_speed_test(r.get("stdout") or "")
+    ok = bool(res["bytes"])
+    out = {"ok": ok, **res}
+    if not ok:
+        out["error"] = ("Через канал YouTube ничего не скачалось: канал не пропускает трафик "
+                        "или у сторожа нет входа socks-deep-yt (нужен watchdog v29+).")
+    return jsonify(out)
 
 
 @app.route("/api/keenetic/tg-test", methods=["POST"])
@@ -12713,6 +12820,36 @@ XKEEN_TEMPLATE = r"""<!doctype html>
               <p class="subtitle" style="margin: 6px 0 0; font-size: 0.82em;">Служебные каналы (<code>direct</code>, <code>block</code>) в цепочку не ставятся: watchdog считает их всегда живыми.</p>
             </div>
           </details>
+
+          <!-- watchdog v41: скорость канала YouTube — разовый замер и уход с медленного канала по цепочке -->
+          <details class="chain-box" id="yt-speed-box" data-xk-keep-inline open style="margin-top: 12px; border-top: 1px dashed #ccc; padding-top: 10px;">
+            <summary style="cursor: pointer; font-weight: 600; color: #555; font-size: 0.95em;">⚡ Скорость канала <span style="color: #888; font-weight: 400; font-size: 0.88em;">— {% if targets.yt_speed_enable %}уход с медленного включён{% else %}уход с медленного выключен{% endif %}</span> <a href="#help-watchdog" onclick="openHelpAnchor('help-watchdog'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; font-weight: normal;">❓ помощь</a></summary>
+            <div style="margin-top: 8px;">
+              {% set ys = watchdog.yt_speed %}
+              <div id="yt-speed-now" style="font-size: 0.9em; margin-bottom: 6px;">
+                {% if ys and ys.kbps and ys.age_min is not none %}
+                  Замер сторожа: <strong>{{ ys.kbps }} КБ/с</strong> через <code>{{ ys.tag }}</code> ({{ ys.age_min }} мин назад){% if ys.slow %} — <span style="color: #c33;">🐢 медленный</span>{% elif ys.ctr %} — <span style="color: #e80;">медленный замер, перепроверка через 2 мин</span>{% endif %}
+                {% else %}
+                  <span class="subtitle">Замеров сторожа нет{% if not targets.yt_speed_enable %} — уход с медленного выключен{% endif %}.</span>
+                {% endif %}
+                {% if ys and ys.slow_tags %}<br><span class="subtitle">В карантине как медленные: {% for t in ys.slow_tags %}<code>{{ t }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</span>{% endif %}
+              </div>
+              <button type="button" class="btn btn-sm" style="background: #c33;" id="yt-speed-test-btn" onclick="ytSpeedTest()" title="Скачать 2 МБ с серверов Google через действующий канал YouTube и напрямую, мимо VPN. Ничего не меняет.">⚡ Замер скорости</button>
+              <span id="yt-speed-test-result" style="font-size: 0.88em; margin-left: 6px;"></span>
+              <label style="font-size: 0.85em; display: block; cursor: pointer; margin-top: 10px;">
+                <input type="checkbox" id="yt-speed-enable" {% if targets.yt_speed_enable %}checked{% endif %}>
+                Переключать при низкой скорости
+                <span class="subtitle" style="font-weight: normal;">— уводить YouTube по цепочке резерва, если канал отвечает, но качает медленно</span>
+              </label>
+              <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center; font-size: 0.85em; margin-top: 6px;">
+                <label>Медленнее <input type="number" id="yt-speed-min" min="50" max="5000" step="50" value="{{ targets.yt_speed_min_kbps or 300 }}" style="width: 80px; padding: 4px; border: 1px solid #ccc; border-radius: 4px;"> КБ/с</label>
+                <label>замер раз в <input type="number" id="yt-speed-interval" min="5" max="120" step="5" value="{{ ((targets.yt_speed_interval or 900) / 60)|round|int }}" style="width: 70px; padding: 4px; border: 1px solid #ccc; border-radius: 4px;"> мин</label>
+              </div>
+              <button class="btn" style="margin-top: 8px; background: #c33;" id="yt-speed-save" onclick="saveYTSpeedSettings()" title="Записать в watchdog.config. Действует со следующей проверки сторожа.">💾 Сохранить</button>
+              <span id="yt-speed-status" style="font-size: 0.85em; margin-left: 6px;"></span>
+              <p class="subtitle" style="margin: 6px 0 0; font-size: 0.82em;">Цифра «мс» у сервера — время ответа, а не скорость: сервер может отвечать за 50 мс и качать 10 КБ/с. Сторож качает 2 МБ с серверов Google через канал YouTube; медленнее порога — тот же файл напрямую: если интернет сам быстрый (быстрее порога и хотя бы втрое быстрее канала), замер засчитывается. Два медленных подряд (повтор через 2 мин) — уход на следующий узел цепочки, медленный узел — в карантин на срок карантина возврата. Трафик замеров — около 200 МБ в сутки при замере раз в 15 мин. Нужны непустая цепочка резерва и сторож v41.</p>
+            </div>
+          </details>
         </div>
       </div>
 
@@ -15817,6 +15954,7 @@ another-server.io   # ✏️</pre>
       <p><strong>Что проверяет.</strong> Обычная проверка смотрит, отвечает ли <em>порт</em> узла (handshake). Сквозная проба делает реальный HTTP-запрос <strong>через</strong> выделенный служебный socks-inbound, который watchdog направляет на действующий канал роли: для основного подключения — <code>cloudflare.com/cdn-cgi/trace</code>, для YouTube — <code>youtube.com/generate_204</code>, для «Зарубежных сервисов» — <code>api.telegram.org</code>. У AI-канала своя проба (проверка страны выхода), она описана в разделе «📨 TG-алерты».</p>
       <p><strong>Чем отличается от обычной.</strong> Узел может принимать соединения, но не пропускать трафик — типовая картина после сбоя у провайдера VPN или когда xray на роутере стартовал раньше WAN. Проверка порта тогда зелёная, а сайты не открываются. Сквозная проба ловит именно это: «порт отвечает» ≠ «трафик идёт».</p>
       <p><strong>Пороги.</strong> Пробы идут с интервалом <code>DEEP_PROBE_INTERVAL</code> (по умолчанию 180 с). Если подряд <code>DEEP_PROBE_THRESHOLD</code> проб (по умолчанию 2) остались без ответа — узел признаётся <strong>глухим</strong>, и роль уходит на резерв по своей цепочке (основное подключение — на FAILOVER). Реакция ≈ интервал × порог: при значениях по умолчанию около 6 минут. После ухода действует <strong>карантин возврата</strong> <code>DEEP_RETURN_HOLD</code> (по умолчанию 30 мин): раньше срока на глухой узел не вернут, даже если он ожил — защита от качелей. Настройки — в блоке «🩺 Сквозная проба каналов» в разделе «🎯 Основное и резервное подключение».</p>
+      <p><strong>Медленный канал YouTube (watchdog v41).</strong> Сквозная проба ловит только канал, через который трафик не идёт вовсе. Узел, который отвечает и пропускает 10–20 КБ/с, для неё жив, а видео стоит. Для YouTube есть замер скорости (блок «⚡ Скорость канала» в карточке YouTube, по умолчанию выключен): раз в 15 мин сторож качает 2 МБ с серверов Google через действующий канал. Медленнее порога (300 КБ/с) — тот же файл напрямую, мимо VPN; замер засчитывается, только если интернет сам быстрый (быстрее порога и хотя бы втрое быстрее канала), иначе тормозит всё и менять канал бесполезно. Два медленных подряд (повтор через 2 мин) — YouTube уходит по своей цепочке резерва, как с глухого канала; медленный узел цепочка пропускает весь карантин возврата. Замер делит канал с видео, которое смотрят в этот момент, — поэтому порог низкий и нужны два замера подряд. В логе — строки <code>YT-SPEED …</code>, в Telegram — «🐢 YouTube переключён на резерв» со скоростью канала и скоростью напрямую. Кнопка «⚡ Замер скорости» меряет канал сразу и ничего не меняет.</p>
       <p><strong>Что видно в панели.</strong> Рядом с выбранным каналом роли: «✅ насквозь: отвечает (N мин назад)», «⏳ сквозная проба пуста (N из порога)», «🕳 трафик сквозь канал не идёт» и «⏸ карантин возврата: ещё M мин». Сводка по трём ролям — в том же блоке настроек. Если роутер недоступен или watchdog на нём старее этой функции, панель ничего не утверждает — покажет «нет данных».</p>
       <p><strong>Строки в логе watchdog.</strong> <code>DEEP-PROBE …</code> — события сквозной пробы (узел признан глухим / снова отвечает / карантин); <code>YT-FAILOVER … глух</code> и <code>FOREIGN-FAILOVER …</code> — переключения ролей на резерв по глухоте и возврат. Регулярные успешные пробы в лог не пишутся, чтобы не вытеснять события.</p>
       <p><strong>В Telegram</strong> приходят алерты об уходе роли на резерв по глухоте и о возврате (см. раздел «📨 TG-алерты»).</p>
@@ -21578,6 +21716,68 @@ async function saveDeepProbeSettings(ev) {
     if (btn) btn.disabled = false;
   }
   return false;
+}
+
+// watchdog v41: «⚡ Скорость канала» YouTube — разовый замер (POST /api/xkeen/yt-speed-test) и настройки
+// ухода с медленного канала (POST /api/keenetic/watchdog-settings, только поля yt_speed_*).
+async function ytSpeedTest() {
+  const btn = document.getElementById('yt-speed-test-btn');
+  const out = document.getElementById('yt-speed-test-result');
+  if (btn) btn.disabled = true;
+  if (out) out.textContent = '⏳ качаю 2 МБ через канал YouTube и напрямую (до 30 с)...';
+  try {
+    const res = await fetch('/api/xkeen/yt-speed-test', {method: 'POST'});
+    const j = await res.json();
+    if (!out) return;
+    if (j.ok) {
+      const min = parseInt((document.getElementById('yt-speed-min') || {}).value, 10) || 300;
+      out.innerHTML = (j.kbps < min ? '🐢 ' : '✅ ') + 'канал <code>' + escapeHtml(j.tag || '?') + '</code>: <strong>' +
+        j.kbps + ' КБ/с</strong>' + (j.direct_bytes ? ' · напрямую ' + j.direct_kbps + ' КБ/с' : ' · напрямую не скачалось');
+    } else {
+      out.textContent = '❌ ' + (j.error || 'замер не удался');
+    }
+  } catch (e) {
+    if (out) out.textContent = '❌ ' + e.message;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function saveYTSpeedSettings() {
+  const status = document.getElementById('yt-speed-status');
+  const btn = document.getElementById('yt-speed-save');
+  const num = function (id) { const el = document.getElementById(id); return el ? parseInt(el.value, 10) : NaN; };
+  const body = {
+    yt_speed_enable: !!(document.getElementById('yt-speed-enable') || {}).checked,
+    yt_speed_min_kbps: num('yt-speed-min'),
+    yt_speed_interval_min: num('yt-speed-interval'),
+  };
+  if (isNaN(body.yt_speed_min_kbps) || isNaN(body.yt_speed_interval_min)) {
+    if (status) status.textContent = '❌ порог и интервал — целые числа';
+    return;
+  }
+  if (status) status.textContent = '💾 сохраняю...';
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch('/api/keenetic/watchdog-settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    const j = await res.json();
+    if (j.ok) {
+      if (status) status.textContent = '✅ сохранено · страница обновится';
+      flash(true, 'Настройки скорости канала YouTube сохранены');
+      setTimeout(function () { location.reload(); }, 2000);
+    } else {
+      if (status) status.textContent = '❌ ' + (j.error || j.stderr || 'не сохранено');
+      flash(false, 'Ошибка', j.error || j.stderr || JSON.stringify(j));
+    }
+  } catch (e) {
+    if (status) status.textContent = '❌ ' + e.message;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function tgSave() {

@@ -52,6 +52,7 @@ cron */1 → watchdog.sh: . watchdog.config → пробы → state-машин�
 | `PRIMARY_PROBE_URL` | пусто → TCP-проба; запись без ключа — `https://<vpn-domain>:8444/` | set-target/primary (для `vless-reality` URL, иначе пусто) | — |
 | `FAIL_THRESHOLD`, `PASS_THRESHOLD` | `2`, `3` (`_num`) | только вручную | — |
 | `DEEP_PROBE_ENABLE`, `DEEP_PROBE_INTERVAL`, `DEEP_PROBE_THRESHOLD`, `DEEP_RETURN_HOLD` | `1`, `180` с, `2`, `1800` с — все явно | watchdog-settings | `deep_probe_enable`, `deep_probe_interval`, `deep_probe_threshold`, `deep_return_hold` |
+| `YT_SPEED_ENABLE`, `YT_SPEED_MIN_KBPS`, `YT_SPEED_INTERVAL` (v41) | `0`, `300` КБ/с, `900` с — все явно | watchdog-settings (поля `yt_speed_*`) | `yt_speed_enable`, `yt_speed_min_kbps`, `yt_speed_interval` |
 | `TG_BOT_TOKEN`, `TG_CHAT_ID` | пусто → алерты выключены | tg-settings | — |
 | `FORCE_MODE` | `auto` | watchdog/&lt;mode&gt; | `force_mode` |
 
@@ -67,7 +68,8 @@ cron */1 → watchdog.sh: . watchdog.config → пробы → state-машин�
 `RECVQ_HARD`, `STALL_FAIL_NEED`, `STALL_COOLDOWN`, `CONNTRACK_MIN`, `FD_DELTA_THRESHOLD`,
 `FD_STALL_COOLDOWN`, v37: `XRAY_BUSY_ENABLE` (1), `XRAY_BUSY_CPU` (50, % всех ядер), `XRAY_BUSY_KBIT_PER_PCT` (50),
 `XRAY_BUSY_TICKS` (2), v38: `XRAY_BUSY_CALM_TICKS` (2), `XRAY_BUSY_REMIND_TICKS` (10), `XRAY_BUSY_TG_COOLDOWN` (1800), v40: `EVIDENCE_ENABLE` (1), `EVIDENCE_COOLDOWN` (1800, для повода repeat), `EVIDENCE_KEEP` (40),
-`EVIDENCE_KEEP_ERRLOG` (15), `EVIDENCE_MAX_PER_HOUR` (6).
+`EVIDENCE_KEEP_ERRLOG` (15), `EVIDENCE_MAX_PER_HOUR` (6), v41: `YT_SPEED_RECHECK` (120), `YT_SPEED_SETTLE` (120),
+`YT_SPEED_THRESHOLD` (2), `YT_SPEED_RATIO` (3), `YT_SPEED_BYTES` (2000000), `YT_SPEED_TIME` (15), `YT_SPEED_URL` (dl.google.com).
 
 ### 6.3. watchdog.state — полный перечень полей
 
@@ -81,6 +83,7 @@ DPRI_CTR= DPRI_TS= DPRI_DEAF= DPRI_LEFT= DPRI_TAG= DYT_CTR= DYT_TS= DYT_DEAF= DY
 DFGN_CTR= DFGN_TS= DFGN_DEAF= DFGN_LEFT= DFGN_TAG=
 + v31: D{PRI,YT,FGN}_RES= PRI_MAIN= YT_MAIN= FGN_MAIN= DPRI_FSINCE= PRI_NOALT= DYT_NOALT= DFGN_NOALT=
 + v33: D{PRI,YT,FGN}_QN= D{PRI,YT,FGN}_CHK= D{PRI,YT,FGN}_HOLD=
++ v41: YT_SPD= YT_SPD_TS= YT_SPD_TAG= YT_SPD_CTR= YT_SLOW= YT_SPD_DIR= YT_SLOWQ=
 ```
 (точный порядок — строка `echo "$NEW_STATE …` в `.cur`).
 
@@ -100,6 +103,7 @@ DFGN_CTR= DFGN_TS= DFGN_DEAF= DFGN_LEFT= DFGN_TAG=
 | `D{PRI,YT,FGN}_QN` (v33) | уходов с основного по глухоте подряд без успешной сквозной пробы на нём между ними; растит карантин (`_deep_hold`); сбрасывается успешной пробой на основном и сменой основного в настройках |
 | `D{PRI,YT,FGN}_CHK` (v33) | `1` — роль вернулась на основной после такого ухода и ждёт сквозной проверки: замеры раз в минуту, а не раз в `DEEP_PROBE_INTERVAL`; снимается первым успехом («✅ … проверен») или признанием глухоты |
 | `D{PRI,YT,FGN}_HOLD` (v33) | действующий срок карантина роли, с: `DEEP_RETURN_HOLD`, ×2 за каждый повторный уход, потолок `DEEP_RETURN_HOLD_MAX`; только для панели |
+| `YT_SPD`, `YT_SPD_TS`, `YT_SPD_TAG`, `YT_SPD_CTR`, `YT_SLOW`, `YT_SPD_DIR`, `YT_SLOWQ` (v41) | скорость канала YouTube (§7.7): КБ/с последнего замера (`0` и `_TS=0` — замера не было), время, тег замера, медленных подряд, латч «медленный», КБ/с мимо xray при последнем медленном замере, «тег:время» резервов, ушедших как медленные (карантин медленных); панель — `watchdog.yt_speed` |
 | `PRI_NOALT`, `DYT_NOALT`, `DFGN_NOALT`, `DPRI_FSINCE` (v31) | «предупреждение о том, что уходить некуда, уже отправлено» (один TG за эпизод); с какого момента форсируется failover глухого основного (лог раз в 5 мин) |
 
 Имена не симметричны (kill-switch «Зарубежных» — `FOREIGN_*`, прочее — `FGN_*`/`DFGN_*`) — брать из
@@ -108,7 +112,7 @@ DFGN_CTR= DFGN_TS= DFGN_DEAF= DFGN_LEFT= DFGN_TAG=
 
 Метки `watchdog.log`: `SWITCH`, `FAILOVER-HEALTH`, `AI-`/`YT-`/`FOREIGN-FAILOVER` (+ `-RETURN`),
 `…-KILL-SWITCH` (+ `-CLEAR`), `DEEP-PROBE` (`DEAF`, `RECOVER`), `XRAY-TEST FAIL`, `HEALTH FAIL`,
-`AUTO-ROLLBACK`, `SKIP (анти-флап)`, `UDP-STALL`, `FD-STALL`, `XRAY-BUSY` (+ `BLAME`, v37), `EVIDENCE` (v40), `AUTO-FIX`, `WARN`, `ERROR`. Долгие
+`AUTO-ROLLBACK`, `SKIP (анти-флап)`, `UDP-STALL`, `FD-STALL`, `XRAY-BUSY` (+ `BLAME`, v37), `EVIDENCE` (v40), `YT-SPEED` (+ `SLOW`, v41), `AUTO-FIX`, `WARN`, `ERROR`. Долгие
 состояния пишутся раз в 5 мин (`_log_every5`), иначе окно «последние 30 строк» забьётся.
 
 ### 6.4. Как панель показывает состояние
@@ -119,7 +123,7 @@ watchdog.aiprobe`) + `keenetic_tail_log(…, n=30)` → `state`, `counter`, `cur
 empty, stage, age_min}`/`None`), `fields` (все `KEY=VAL`), `deep` (`{pri, yt, fgn}`: `{ctr, ts, deaf,
 left, tag, age_min, hold_left_min, res, qn, chk}` или `None` у роли без полей — старый watchdog;
 `hold_left_min` считается от `D*_HOLD`, у сторожа до v33 — от `deep_hold_sec`), `fgn_eff`, `yt_eff`,
-`ai_eff`. Те же ключи — в quick-fail литерале. В шаблоне: баннер режима (`.wd-state`), Jinja-статусы
+`ai_eff`, `yt_speed` (v41: `{kbps, ts, age_min, tag, ctr, slow, direct_kbps, slow_tags}` или `None` у сторожа до v41). Те же ключи — в quick-fail литерале. В шаблоне: баннер режима (`.wd-state`), Jinja-статусы
 kill-switch, «📋 Лог watchdog», JS-константы (§8.4). `api_xkeen_state`/`api_xkeen_debug` отдают тот же
 словарь, но страница их не опрашивает — обновление только перезагрузкой.
 
@@ -143,7 +147,8 @@ kill-switch, «📋 Лог watchdog», JS-константы (§8.4). `api_xkeen
 
 Порядок разделов `.cur`: lock (`_wd_lock_try`; режим применения — пролог §6.7) → `. watchdog.config` →
 `_xk_restart` / `_xk_busy` / `_bg_restart_or_defer` → помощники (`_probe_connected`, `probe_tag`, `_num`, `is_ru_tag`, `killswitch_decide`,
-`_state_field`, `_log_every5`, `xray_busy_eval`, `_ev_run`, `evidence_capture`, `deep_probe_check`, `tg_alert`, `generate_routing`, `routing_changed`,
+`_state_field`, `_log_every5`, `xray_busy_eval`, `_ev_run`, `evidence_capture`, `deep_probe_check`, `_yt_speed_kbps`,
+`yt_speed_check`, `_yt_slowq_prune`, `_yt_slowq_has`, `tg_alert`, `generate_routing`, `routing_changed`,
 `validate_routing_xray`, `health_check`) → досыл TG → UDP-залип (v19) → `53` в `port_exclude.lst` (v21)
 → очистка `YT_GEOIP_CATEGORIES` (v23) → self-heal `socks-ai-check` (v24) → параметры v27/v29/v30 →
 self-heal `socks-deep-*` (v29) → fd-залип (v22) → перегрузка xray (v37, `xray_busy_eval`) → AI-проба (v24/v25) → State → Force-mode → проба
