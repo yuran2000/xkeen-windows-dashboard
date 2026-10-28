@@ -1,4 +1,10 @@
 #!/bin/sh
+# XKeen failover watchdog v43 (2026-10-28, скорость YouTube — порог сравнения и текст карантина):
+#   • YT_SPEED_RATIO по умолчанию 2 вместо 3. Роутер сам качает не быстрее 1–1,5 МБ/с (процессор, TLS в curl), и при 3
+#     медленным признавался только канал до ~450 КБ/с — меньше, чем нужно для 1080p. С 2 — примерно до 700 КБ/с.
+#   • Карантин основного YouTube в логе: «с него ушли (глух или медленный)», а не «уходили по глухоте» — уход мог
+#     быть по скорости (первый боевой уход 28.10 22:20: Sweden 66–68 КБ/с → Сервер_1).
+#
 # XKeen failover watchdog v42 (2026-10-28, доставка итога v41):
 #   • Логика v41 без изменений. Номер поднят, потому что v41 попал на боевой роутер раньше последней правки
 #     (_yt_slowq_prune: срок через _deep_hold 1): «Сохранить» в боевой панели раскатывает .cur с поднятой версией
@@ -2982,7 +2988,7 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
     # по-прежнему не идти.
     if [ "$YT_BLOCKED" != "1" ] && [ -n "$_yt_eff_prev" ] && [ "$_yt_eff_prev" != "$YT_TAG" ]; then
       if [ "$DYT_LEFT" -gt 0 ] 2>/dev/null && [ $((_yt_now0 - DYT_LEFT)) -lt "$_dyt_hold" ] 2>/dev/null; then
-        _log_every5 $((_yt_now0 - DYT_LEFT)) && log "YT: основной $YT_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((_dyt_hold - (_yt_now0 - DYT_LEFT)))с"
+        _log_every5 $((_yt_now0 - DYT_LEFT)) && log "YT: основной $YT_TAG отвечает по TCP, но с него ушли (глух или медленный) — карантин ещё $((_dyt_hold - (_yt_now0 - DYT_LEFT)))с"
       elif probe_tag "$YT_TAG" ""; then
         _yt_pick="$YT_TAG"; _yt_pick_idx=0
       fi
@@ -3121,7 +3127,7 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
       # TCP, но по-прежнему не пропускает трафик, и будем прыгать туда-обратно.
       if [ "$DYT_LEFT" -gt 0 ] 2>/dev/null && [ $((_yt_now2 - DYT_LEFT)) -lt "$_dyt_hold" ] 2>/dev/null; then
         EFFECTIVE_YT_TAG="$_yt_eff_prev"
-        _log_every5 $((_yt_now2 - DYT_LEFT)) && log "YT: основной $YT_TAG отвечает по TCP, но уходили по глухоте — карантин ещё $((_dyt_hold - (_yt_now2 - DYT_LEFT)))с, остаюсь на $_yt_eff_prev"
+        _log_every5 $((_yt_now2 - DYT_LEFT)) && log "YT: основной $YT_TAG отвечает по TCP, но с него ушли (глух или медленный) — карантин ещё $((_dyt_hold - (_yt_now2 - DYT_LEFT)))с, остаюсь на $_yt_eff_prev"
       else
         DYT_LEFT=0
         YT_SW_TS="$_yt_now2"
