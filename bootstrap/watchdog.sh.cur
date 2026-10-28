@@ -1,4 +1,9 @@
 #!/bin/sh
+# XKeen failover watchdog v42 (2026-10-28, доставка итога v41):
+#   • Логика v41 без изменений. Номер поднят, потому что v41 попал на боевой роутер раньше последней правки
+#     (_yt_slowq_prune: срок через _deep_hold 1): «Сохранить» в боевой панели раскатывает .cur с поднятой версией
+#     даже посреди правки, а автосинк обновляет только строго меньшую версию.
+#
 # XKeen failover watchdog v41 (2026-10-28, уход YouTube с МЕДЛЕННОГО канала):
 #   • yt_speed_check: раз в YT_SPEED_INTERVAL (900 с) качает YT_SPEED_BYTES (2 МБ, Range) с YT_SPEED_URL
 #     (dl.google.com) через socks-deep-yt — то есть через ДЕЙСТВУЮЩИЙ канал YouTube. Медленнее YT_SPEED_MIN_KBPS
