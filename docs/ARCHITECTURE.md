@@ -22,6 +22,7 @@ Keenetic, `<vpn-domain>` — `cfg.EXTERNAL_DOMAIN`, `<home-domain>` — `cfg.HOM
 | Новый ключ `watchdog.config` | §6.2 (`architecture/06-watchdog.md`) + чек-лист §9.3 |
 | Показать поле `watchdog.state` | §6.3, §6.4 (`architecture/06-watchdog.md`) + чек-лист §9.2 |
 | Логика переключения каналов | `bootstrap/watchdog.sh.cur`, не Python (§6.6); поднять версию (§6.5) |
+| Возврат YouTube после резерва | `yt_return_check`, `yt_return_notify`, `socks-yt-return` → §7.8 (`architecture/07-chains.md`); скорость до возврата, уведомление после успешного Apply |
 | Новая роль / цепочка | §7.1, §7.4 (`architecture/07-chains.md`) |
 | Новый блок или карточка на `/xkeen` | §8.6 |
 | Эндпоинт, пишущий на роутер | §5.2, §9 (fail-closed; бэкап → запись → откат) |
@@ -60,7 +61,7 @@ pythonw не сохраняется. Разработка: `start.bat` (конс
 | `xkeen_snapshot_daily.py` | ежедневная задача (UI предлагает `XkeenSnapshotDaily`) | снапшот v7 в `backups/xkeen-snapshot-ГГГГММДД-ЧЧММСС.json`, хранит 14 ежедневных |
 | `sub_expiry_notifier.py` | ежедневная задача `SubExpiryCheck` | подписки из `subscription_meta.json`, истекающие за `WARNING_THRESHOLD_DAYS` (3) дня → Telegram; путь лога захардкожен |
 
-**Код = git-репозиторий = прод.** Папка установки — клон публичного репозитория; панель исполняет
+**Код = git-репозиторий = прод.** Папка установки — клон репозитория; панель исполняет
 рабочее дерево. Python и шаблоны грузятся при старте → после правки нужен перезапуск.
 `bootstrap/*.cur` читаются при каждом обращении → `watchdog.sh.cur` с поднятой версией уйдёт на роутер
 при первом «Сохранить» в UI, **даже незакоммиченный** (§6.5).
@@ -69,8 +70,7 @@ pythonw не сохраняется. Разработка: `start.bat` (конс
 `api_xkeen_restart_dashboard` (одноразовая задача `XrayDashboardRestarter[-<port>]` от SYSTEM:
 `schtasks /End` → 3 с → `/Run` своей задачи `_dashboard_task_name()` — правило install_service: порт 5000 →
 `XrayDashboard`, иначе `XrayDashboard-<port>` → самоудаление);
-`Restart-Clean.bat` (UAC, порт из конфига); `update.bat` → `update.ps1` (`git pull` с авто-stash, стоп
-задачи, `pip install` при изменении `requirements.txt`, старт). Проверка — `/api/xkeen/dashboard-health`
+`Restart-Clean.bat` (UAC, порт из конфига); `update.bat` → `update.ps1` (получение и проверка исходников через `tools/update_checkout.py`, резервная копия, проверка зависимостей и синтаксиса, стоп задачи, старт). Проверка — `/api/xkeen/dashboard-health`
 (ровно один LISTEN) и версия в шапке.
 
 ---
@@ -87,6 +87,7 @@ pythonw не сохраняется. Разработка: `start.bat` (конс
 | `geosite_scanner.py` | декодер `.dat`: `DatCache`, `detect_dat_type`, `lookup_domain`, `lookup_ip`, `list_categories` |
 | `rkn_checker/` | вендоренный rkn-block-checker для «🔎 Почему не работает сайт» (`rkn_checker/VENDOR.md`) |
 | `xkeen_snapshot_daily.py`, `sub_expiry_notifier.py`, `xkeen_toast_daemon.py` | спутники (§1) |
+| `tools/setup_password.py` | первичное задание пароля с проверкой структуры конфигурации, резервной копией и сохранением уже заданного пароля |
 | `setup_helper.py` | для `install.bat`: `detect-port`, `busy-ports`, `set-port`, `gen-secrets`, `get-port`, `password-is-placeholder` |
 | `config_local.example.py` | шаблон `config_local.py`, все `cfg.*` с комментариями |
 | `requirements.txt` | flask, psutil, qrcode[pil], requests, PySocks, curl-cffi |
@@ -94,6 +95,8 @@ pythonw не сохраняется. Разработка: `start.bat` (конс
 | `bootstrap/05_routing.template.json.cur` | эталонный routing-шаблон |
 | `tests/test_*.py` | офлайн-тесты (§10.3) |
 | `install.bat`, `install_service.bat`/`.ps1`, `start.bat`, `start-bg.bat`, `stop.bat`, `Restart-Clean.bat`, `update.bat`/`.ps1`, `install_toast_alerts.bat`, `uninstall_toast_alerts.bat` | установка, служба, запуск, обновление, toast |
+| `Recover-Update.bat`/`.ps1`, `tools/update_checkout.py` | безопасное обновление и переход старых Git-клонов; `docs/UPDATING.md` |
+| `tools/check_public.py` | проверка публичного состава, без личных сигнатур в Git |
 | `release.ps1`, `release_notes_footer.md` | релиз (§11), футер release notes |
 | `portable/build.bat`, `portable/config.ini.template` | portable-exe (PyInstaller), шаблон `config.ini` |
 | `.github/workflows/release-archives.yml`, `.github/ISSUE_TEMPLATE/*` | архивы-ассеты к релизу, шаблоны issue |
@@ -435,7 +438,7 @@ fix_explain)`):
 | Путь | Пишет | Читает / примечание |
 |---|---|---|
 | `/opt/etc/xray/configs/01_log.json`, `02_dns.json`, `06_policy.json` | restore | снапшот |
-| `…/configs/03_inbounds.json` | `keenetic_ensure_socks_local` (`socks-local` :10808); watchdog: `socks-ai-check` :10818, `socks-deep-pri/yt/fgn` :10819–10821, `socks-health` :10822 (v36) | снапшот |
+| `…/configs/03_inbounds.json` | `keenetic_ensure_socks_local` (`socks-local` :10808); watchdog: `socks-ai-check` :10818, `socks-deep-pri/yt/fgn` :10819–10821, `socks-health` :10822 (v36), `socks-yt-return` :10823 (проба основного YouTube, v44) | снапшот |
 | `…/configs/04_outbounds.json` | add/remove/sync/bootstrap/auto-fix (`.bak-<ts>`, `.bak-pre-sync-<ts>`) | панель, watchdog |
 | `…/configs/05_routing.json` | **только watchdog** (`.new` → проверки → `mv`; `.lastgood`, `.new.bad-<ts>`) | панель (default, DAT) |
 | `/opt/etc/xray/configs.bak/05_routing.template.json` | синк IP, `keenetic_ensure_socks_route`, sync-structure, bootstrap (`.bak-*`, `.syncbak-<ts>`) | watchdog (`TEMPL`), панель |
@@ -507,6 +510,7 @@ BusyBox ash, cron раз в минуту); панель пишет его кон
 - 7.5. Три разных «жив»
 - 7.6. Сквозная проба (DEEP_PROBE, watchdog v29+)
 - 7.7. Скорость канала YouTube (watchdog v41)
+- 7.8. Возврат YouTube на основной после подтверждения скорости (watchdog v44)
 
 ## 8. Фронтенд `/xkeen` (`XKEEN_TEMPLATE`)
 
@@ -716,7 +720,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
 **10.3. Тесты `tests/`** — скрипты без pytest (печатают `<имя>: OK`, при провале код 1); запуск по одному:
 `.venv\Scripts\python.exe tests\<файл>.py` (из POSIX-оболочки — с `PYTHONUTF8=1`).
 
-Таблица «тест → что покрывает» (21 файл) — [`docs/architecture/10-tests.md`](architecture/10-tests.md).
+Таблица «тест → что покрывает» (22 файла) — [`docs/architecture/10-tests.md`](architecture/10-tests.md).
 
 Новая функциональность = новые проверки по тому же образцу (подмена `D.*` **до** создания `test_client`).
 
@@ -730,35 +734,33 @@ headless Chromium (Playwright из `.venv`): 0 `pageerror` и ошибок ко�
 
 ---
 
-## 11. Релиз
+## 11. Подготовка и публикация выпуска
 
-`release.ps1 -Version X.Y.Z -Message "…"` (PowerShell, папка установки; пушит сразу):
-1. Формат `X.Y.Z`; тега `vX.Y.Z` ещё нет.
-2. `[1/7]` регэкспом `_VERSION_FALLBACK = "…"` → новая версия (UTF-8 без BOM).
-3. `[2/7]` `py_compile`; ошибка → `git checkout -- dashboard.py`, выход.
-4. `[3/7]` `git add -A` (**уходит всё незакоммиченное** — сначала `git status`) + sanitize staged diff
-   по шаблону личных данных (ловит лишь несколько шаблонов).
-5. Сообщение `vX.Y.Z: <Message>` и notes (`<Message>` + `release_notes_footer.md`) — во временные UTF-8
-   файлы (PowerShell 5.1 портит кириллицу в аргументах).
-6. `[4/7]` commit `-F`, `[5/7]` `tag -a`, `[6/7]` push `main` и тега, `[7/7]` `gh release create`
-   (репозиторий захардкожен); workflow `release-archives.yml` прикладывает архивы.
+`release.ps1 -Version X.Y.Z -Message "…"` — штатный выпуск; перед ним выполнить §10.
+Параметр `-PrepareOnly` создаёт только локальные коммит, тег и квитанцию в `backups/`,
+без push и GitHub Release. После отдельного решения о публикации `-PublishPrepared`
+проверяет неизменность HEAD, тега, заметок и рабочего дерева и публикует подготовленный выпуск.
+`-PythonExe` позволяет явно выбрать интерпретатор при изолированной подготовке.
 
-`_VERSION_FALLBACK` — единственный источник версии для ZIP, portable и SYSTEM без git; бампать после
-§10. `-Message` уходит в коммит, тег и Release — стерильно, одним абзацем о том, что изменилось для
-пользователя. Изменения на роутере пользователь применяет через «🔬 Диагностика» → «Сохранить» /
-«Починить» или «⚙ Применить структуру».
+Порядок: проверка версии/публичного авторства → изменение `_VERSION_FALLBACK` →
+синтаксис → `git add -A` (включает все незакоммиченные исходники) →
+`tools/check_public.py` → коммит и аннотированный тег → квитанция →
+push main и тега → создание GitHub Release. Ошибка любого этапа останавливает
+дальнейшие операции; подтверждение локальной подготовки не означает доставку.
 
-🔴 **Git identity — репозиторий публичный.** Перед коммитом и пушем:
+Перед реальной публикацией origin обязан указывать на канонический GitHub-репозиторий.
+Полная проверка личных идентификаторов дополняет публичный общий gate локальными правилами:
+`tools/check_public.py --private-patterns <локальный-файл>`. Личные сигнатуры не включать в Git.
+GitHub Actions прикладывает архивы именно отслеживаемых файлов тега;
+`.gitignore` не удаляет из архива уже отслеживаемые файлы.
 
-```
-git config user.email                 # обязан быть <github-user>@users.noreply.github.com
-git log -1 --format='%an <%ae>'       # под кем последний коммит
-```
-
-Локальный identity молча теряется при пере-клонировании, `filter-repo`, `reset --hard` — git берёт
-глобальный профиль; `release.ps1` это **не проверяет**. Если
-не noreply — до коммита `git config user.name <github-user>` и
-`git config user.email <github-user>@users.noreply.github.com`.
+Обновление Windows-исходников — `tools/update_checkout.py` (`apply_update`, `protected`).
+Резервная копия и проверка предшествуют замене; настройки и ключи исключены из
+целевого дерева. При ошибке проверки после замены восстанавливаются прежний HEAD
+и сохранённые локальные файлы. `Recover-Update.ps1` получает helper из проверенного
+origin/main и запрашивает подтверждение перехода со старой истории. Он не
+перезапускает службы. Обычный `update.ps1` проверяет зависимости и синтаксис до
+остановки панели. Пользовательская инструкция — `docs/UPDATING.md`.
 
 ---
 

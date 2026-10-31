@@ -115,6 +115,14 @@ DFGN_CTR= DFGN_TS= DFGN_DEAF= DFGN_LEFT= DFGN_TAG=
 `AUTO-ROLLBACK`, `SKIP (анти-флап)`, `UDP-STALL`, `FD-STALL`, `XRAY-BUSY` (+ `BLAME`, v37), `EVIDENCE` (v40), `YT-SPEED` (+ `SLOW`, v41), `AUTO-FIX`, `WARN`, `ERROR`. Долгие
 состояния пишутся раз в 5 мин (`_log_every5`), иначе окно «последние 30 строк» забьётся.
 
+**v44: возврат YouTube.** В `watchdog.state` добавлены `YT_RETURN_TAG` (основной узел, который
+проверялся отдельно от действующего канала) и `YT_RETURN_TS` (время последней попытки, с эпохи).
+Они ограничивают частоту повторов `yt_return_check` до `YT_SPEED_RECHECK`; результат успешного замера
+между тиками не кэшируется. Поля не заменяют `YT_SPD*`, которые описывают действующий канал.
+Новый маркер лога — `YT-RETURN`. Служебный loopback-порт `YT_RETURN_PROBE_PORT=10823` — константа,
+ключа UI/config нет. Inbound создаётся `yt_return_ensure_inbound`; первым правилом routing
+`socks-yt-return` направляется на настроенный `YT_TAG`. Проверка и уведомления — §7.8.
+
 ### 6.4. Как панель показывает состояние
 
 `keenetic_get_watchdog(deep_hold_sec)` — один SSH (`cat watchdog.state; echo '=AIPROBE='; cat

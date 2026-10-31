@@ -1,83 +1,91 @@
-# release.ps1 - one-shot release for xray-dashboard.
-#
-# Sets the version ONCE and applies it everywhere: bumps the in-code fallback constant
-# _VERSION_FALLBACK in dashboard.py, commits, tags vX.Y.Z, pushes main + tag, and creates
-# the GitHub Release. This guarantees the constant and the git tag can never drift.
-#
-# Why the constant matters: the panel shows its version via `git describe`, but falls back
-# to _VERSION_FALLBACK when git is unavailable - which is the ONLY version source for ZIP
-# downloads, portable (PyInstaller) builds, and the panel running under SYSTEM without git
-# in PATH. If the constant lags the tag, those installs display a stale version.
-#
-# Usage:
-#   .\release.ps1 -Version 1.0.58 -Message "short summary of what changed"
-
+# Prepare or publish one verified release. PowerShell 5.1, ASCII source.
 param(
     [Parameter(Mandatory=$true)][string]$Version,
-    [Parameter(Mandatory=$true)][string]$Message
+    [Parameter(Mandatory=$true)][string]$Message,
+    [switch]$PrepareOnly,
+    [switch]$PublishPrepared,
+    [string]$PythonExe
 )
-$ErrorActionPreference = "Stop"
-$repo = Split-Path -Parent $MyInvocation.MyCommand.Path
-$tag  = "v$Version"
+function Get-SourceHash([string]$Path) {
+    $hash = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($Path)
+    try { return ([BitConverter]::ToString($hash.ComputeHash($stream))).Replace('-','') }
+    finally { $stream.Dispose(); $hash.Dispose() }
+}
 
-# --- preconditions ---
-if ($Version -notmatch '^\d+\.\d+\.\d+$') { Write-Error "Version must be X.Y.Z (e.g. 1.0.58). Got: $Version"; exit 1 }
-if (& git -C $repo tag --list $tag) { Write-Error "Tag $tag already exists. Pick the next version."; exit 1 }
+$ErrorActionPreference = 'Stop'
+$repo = $PSScriptRoot
+$tag = "v$Version"
+if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Version must be X.Y.Z.' }
+if ($PrepareOnly -and $PublishPrepared) { throw 'Choose PrepareOnly or PublishPrepared.' }
+$email = & git -C $repo config user.email
+if ($LASTEXITCODE -ne 0 -or $email -notmatch '@users\.noreply\.github\.com$') { throw 'Configure a public noreply Git identity first.' }
+if (-not $PrepareOnly) {
+    $origin = & git -C $repo remote get-url origin
+    if ($origin -notin @('https://github.com/yuran2000/xkeen-windows-dashboard.git','git@github.com:yuran2000/xkeen-windows-dashboard.git')) {
+        throw 'Publication requires the canonical GitHub origin.'
+    }
+}
+if (-not $PythonExe) { $PythonExe = Join-Path $repo '.venv\Scripts\python.exe' }
+if (-not (Test-Path -LiteralPath $PythonExe)) { throw 'Installation Python not found; use -PythonExe with an explicit interpreter.' }
+$receiptDir = Join-Path $repo 'backups'
+$receiptFile = Join-Path $receiptDir "release-prepared-$Version.json"
+$notesFile = Join-Path $receiptDir "release-notes-$Version.md"
+$utf8 = New-Object Text.UTF8Encoding($false)
 
-# --- 1. bump _VERSION_FALLBACK (UTF-8 without BOM; line endings preserved) ---
-$dash = Join-Path $repo "dashboard.py"
-$content = [System.IO.File]::ReadAllText($dash)
-$pattern = '_VERSION_FALLBACK\s*=\s*"[^"]*"'
-if ($content -notmatch $pattern) { Write-Error "_VERSION_FALLBACK not found in dashboard.py"; exit 1 }
-$new = [regex]::Replace($content, $pattern, "_VERSION_FALLBACK = `"$Version`"")
-[System.IO.File]::WriteAllText($dash, $new, (New-Object System.Text.UTF8Encoding($false)))
-Write-Host "[1/7] _VERSION_FALLBACK -> $Version"
-
-# --- 2. py_compile gate (never push a broken file; roll back the bump on failure) ---
-$py = Join-Path $repo ".venv\Scripts\python.exe"
-if (-not (Test-Path $py)) { $py = "python" }
-& $py -m py_compile $dash
-if ($LASTEXITCODE -ne 0) { & git -C $repo checkout -- dashboard.py; Write-Error "py_compile failed - bump rolled back."; exit 1 }
-Write-Host "[2/7] py_compile OK"
-
-# --- 3. stage all + sanitize gate (block obvious personal data before a public push) ---
-& git -C $repo add -A
-# exclude this script itself: it literally contains the sanitize pattern (would self-match)
-$leak = (& git -C $repo diff --cached -- . ':(exclude)release.ps1') | Select-String -Pattern '-----BEGIN .*PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{30,}'
-if ($leak) { & git -C $repo reset | Out-Null; Write-Error "SANITIZE: possible personal data in staged diff:`n$leak"; exit 1 }
-Write-Host "[3/7] sanitize CLEAN"
-
-# --- prepare UTF-8 message files ---
-# PowerShell 5.1 mangles Cyrillic when passed to git/gh as -m / --title args (cp1251).
-# Writing the message to a UTF-8 (no BOM) file and using -F / --notes-file keeps it clean.
-$msgFile   = Join-Path $env:TEMP "xkdash_commit_$Version.txt"
-$notesFile = Join-Path $env:TEMP "xkdash_notes_$Version.txt"
-$utf8 = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllText($msgFile,   "${tag}: $Message", $utf8)
-# Release notes = the message + a standard "how to update" footer (kept in a UTF-8 .md so this
-# script stays ASCII-only and PowerShell 5.1 can't mangle the Cyrillic footer).
-$footer = ""
-$footerPath = Join-Path $repo "release_notes_footer.md"
-if (Test-Path $footerPath) { $footer = "`n`n" + [System.IO.File]::ReadAllText($footerPath) }
-[System.IO.File]::WriteAllText($notesFile, ($Message + $footer), $utf8)
-
-# --- 4. commit ---
-& git -C $repo commit -F $msgFile
-if ($LASTEXITCODE -ne 0) { Remove-Item $msgFile,$notesFile -ErrorAction SilentlyContinue; Write-Error "commit failed (nothing to commit?)."; exit 1 }
-Write-Host "[4/7] commit done"
-
-# --- 5. annotated tag ---
-& git -C $repo tag -a $tag -F $msgFile
-Write-Host "[5/7] tag $tag"
-
-# --- 6. push main + tag ---
+if ($PublishPrepared) {
+    if (-not (Test-Path -LiteralPath $receiptFile)) { throw 'Prepared release receipt not found.' }
+    $receipt = Get-Content -LiteralPath $receiptFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $head = & git -C $repo rev-parse HEAD
+    $tagHead = & git -C $repo rev-parse "${tag}^{commit}"
+    if ($LASTEXITCODE -ne 0 -or $head -ne $receipt.head -or $tagHead -ne $head -or $receipt.message -ne $Message) {
+        throw 'Prepared release identity changed; publication stopped.'
+    }
+    if (& git -C $repo status --porcelain) { throw 'Working tree changed after preparation.' }
+    if ((Get-SourceHash $notesFile) -ne $receipt.notes_sha256) {
+        throw 'Prepared release notes changed.'
+    }
+    & $PythonExe (Join-Path $repo 'tools\check_public.py')
+    if ($LASTEXITCODE -ne 0) { throw 'Public source check failed.' }
+} else {
+    if (& git -C $repo tag --list $tag) { throw 'Tag already exists; use PublishPrepared for a verified prepared release.' }
+    $dash = Join-Path $repo 'dashboard.py'
+    $original = [IO.File]::ReadAllText($dash)
+    $pattern = '_VERSION_FALLBACK\s*=\s*"[^"]*"'
+    if ([regex]::Matches($original,$pattern).Count -ne 1) { throw 'Expected one version constant.' }
+    $changed = [regex]::Replace($original,$pattern,"_VERSION_FALLBACK = `"$Version`"")
+    [IO.File]::WriteAllText($dash,$changed,$utf8)
+    & $PythonExe -m py_compile $dash
+    if ($LASTEXITCODE -ne 0) { [IO.File]::WriteAllText($dash,$original,$utf8); throw 'Syntax check failed; version restored.' }
+    & git -C $repo add -A
+    if ($LASTEXITCODE -ne 0) { throw 'Staging failed.' }
+    & $PythonExe (Join-Path $repo 'tools\check_public.py')
+    if ($LASTEXITCODE -ne 0) { throw 'Public source check failed; no commit or push performed.' }
+    New-Item -ItemType Directory -Path $receiptDir -Force | Out-Null
+    $messageFile = Join-Path $receiptDir "release-commit-$Version.txt"
+    [IO.File]::WriteAllText($messageFile,"${tag}: $Message",$utf8)
+    & git -C $repo commit -F $messageFile
+    if ($LASTEXITCODE -ne 0) { throw 'Commit failed.' }
+    & git -C $repo tag -a $tag -F $messageFile
+    if ($LASTEXITCODE -ne 0) { throw 'Tag creation failed.' }
+    $notes = $Message
+    $footer = Join-Path $repo 'release_notes_footer.md'
+    if (Test-Path -LiteralPath $footer) { $notes += "`n`n" + [IO.File]::ReadAllText($footer) }
+    [IO.File]::WriteAllText($notesFile,$notes,$utf8)
+    $head = & git -C $repo rev-parse HEAD
+    $receipt = @{version=$Version;tag=$tag;head=$head;message=$Message;notes_sha256=(Get-SourceHash $notesFile);published=$false}
+    [IO.File]::WriteAllText($receiptFile,($receipt | ConvertTo-Json),$utf8)
+}
+if ($PrepareOnly) {
+    Write-Host "Prepared locally: $tag ($head). No push or GitHub Release was performed." -ForegroundColor Green
+    exit 0
+}
 & git -C $repo push origin main
+if ($LASTEXITCODE -ne 0) { throw 'Main push failed; release not created.' }
 & git -C $repo push origin $tag
-Write-Host "[6/7] pushed main + $tag"
-
-# --- 7. GitHub Release (ASCII title = tag; Cyrillic notes via UTF-8 file) ---
-$gh = (Get-Command gh -ErrorAction SilentlyContinue).Source
-if (-not $gh) { $gh = "C:\Program Files\GitHub CLI\gh.exe" }
-& $gh release create $tag --repo yuran2000/xkeen-windows-dashboard --title $tag --notes-file $notesFile
-Remove-Item $msgFile,$notesFile -ErrorAction SilentlyContinue
-Write-Host "[7/7] GitHub Release created: https://github.com/yuran2000/xkeen-windows-dashboard/releases/tag/$tag"
+if ($LASTEXITCODE -ne 0) { throw 'Tag push failed; release not created.' }
+& gh release create $tag --repo yuran2000/xkeen-windows-dashboard --title $tag --notes-file $notesFile
+if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed; check the remote state before retrying.' }
+$receipt.published = $true
+[IO.File]::WriteAllText($receiptFile,($receipt | ConvertTo-Json),$utf8)
+Write-Host "Published: $tag" -ForegroundColor Green

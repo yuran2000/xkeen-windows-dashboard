@@ -1,4 +1,10 @@
 #!/bin/sh
+# XKeen failover watchdog v44 (2026-10-30, скорость основного YouTube до возврата):
+#   • socks-yt-return → настроенный YT_TAG, пока клиенты остаются на резерве. Карантин и
+#     проверка скорости обязательны при автоматическом возврате с включённым YT_SPEED_ENABLE.
+#   • «YouTube работает» — после подтверждения скорости и успешного применения routing;
+#     сквозная проба и YT kill-switch больше не выдают преждевременный/дублирующий успех.
+#
 # XKeen failover watchdog v43 (2026-10-28, скорость YouTube — порог сравнения и текст карантина):
 #   • YT_SPEED_RATIO по умолчанию 2 вместо 3. Роутер сам качает не быстрее 1–1,5 МБ/с (процессор, TLS в curl), и при 3
 #     медленным признавался только канал до ~450 КБ/с — меньше, чем нужно для 1080p. С 2 — примерно до 700 КБ/с.
@@ -1188,16 +1194,24 @@ deep_probe_check() {
       evidence_capture "$_dpr_role" "$_dpr_tag" "$_dpr_port" "$_dpr_url" ok
     if [ "$DP_DEAF" = "1" ]; then
       log "DEEP-PROBE RECOVER ($_dpr_name): канал $_dpr_tag снова пропускает трафик (код $_dpr_code)"
-      tg_alert "✅ <b>$_dpr_name снова работает</b>: канал <code>$_dpr_tag</code> пропускает трафик."
+      if [ "$_dpr_role" = "YT" ]; then
+        tg_alert "ℹ️ <b>YouTube: трафик снова проходит</b> через <code>$_dpr_tag</code>. Сквозная проба не подтверждает скорость."
+      else
+        tg_alert "✅ <b>$_dpr_name снова работает</b>: канал <code>$_dpr_tag</code> пропускает трафик."
+      fi
     elif [ "$DP_CTR" -ge 1 ] 2>/dev/null; then
       log "DEEP-PROBE ($_dpr_name): канал $_dpr_tag ответил (код $_dpr_code) — счётчик сброшен"
     fi
     if [ "$DP_CHK" = "1" ]; then
       log "DEEP-PROBE ($_dpr_name): основной $_dpr_tag после карантина проверен — трафик идёт (код $_dpr_code)"
-      tg_alert "✅ <b>$_dpr_name работает</b>: основной канал <code>$_dpr_tag</code> после карантина проверен насквозь — трафик идёт."
+      if [ "$_dpr_role" != "YT" ]; then
+        tg_alert "✅ <b>$_dpr_name работает</b>: основной канал <code>$_dpr_tag</code> после карантина проверен насквозь — трафик идёт."
+      fi
     fi
     # v33: основной снова пропускает трафик — счёт уходов подряд (растущий карантин) с нуля.
-    [ -n "$_dpr_main" ] && [ "$_dpr_tag" = "$_dpr_main" ] && DP_QN=0
+    if [ "$_dpr_role" != "YT" ] || [ "${YT_SPEED_ENABLE:-0}" != "1" ]; then
+      [ -n "$_dpr_main" ] && [ "$_dpr_tag" = "$_dpr_main" ] && DP_QN=0
+    fi
     DP_CTR=0; DP_DEAF=0; DP_RES=ok; DP_CHK=0
   else
     DP_CTR=$((DP_CTR + 1)); DP_RES=fail
@@ -1233,20 +1247,101 @@ deep_probe_check() {
 }
 
 # v41: скорость скачивания YT_SPEED_BYTES с YT_SPEED_URL, КБ/с. $1 — socks «host:port» или пусто (мимо xray:
-# собственный трафик роутера политикой XKeen не перехватывается). Печатает «КБ/с скачано_байт»; скачано 0 —
+# собственный трафик роутера политикой XKeen не перехватывается). Печатает «КБ/с скачано_байт HTTP-код»; скачано 0 —
 # замер не удался (нет соединения, отказ сервера). Таймаут curl (код 28) — нормальный исход медленного канала:
 # speed_download и size_download curl печатает и тогда.
 _yt_speed_kbps() {
   if [ -n "$1" ]; then
     _ysk=$(curl -s -o /dev/null -r "0-$((YT_SPEED_BYTES - 1))" -m "$YT_SPEED_TIME" --socks5-hostname "$1" \
-      -w '%{speed_download} %{size_download}' "$YT_SPEED_URL" 2>/dev/null)
+      -w '%{speed_download} %{size_download} %{http_code}' "$YT_SPEED_URL" 2>/dev/null)
   else
     _ysk=$(curl -s -o /dev/null -r "0-$((YT_SPEED_BYTES - 1))" -m "$YT_SPEED_TIME" \
-      -w '%{speed_download} %{size_download}' "$YT_SPEED_URL" 2>/dev/null)
+      -w '%{speed_download} %{size_download} %{http_code}' "$YT_SPEED_URL" 2>/dev/null)
   fi
   _ysk_sp=$(_num "$(printf '%s' "$_ysk" | awk '{print $1}' | cut -d. -f1)" 0)
   _ysk_sz=$(_num "$(printf '%s' "$_ysk" | awk '{print $2}' | cut -d. -f1)" 0)
-  printf '%s %s' "$((_ysk_sp / 1024))" "$_ysk_sz"
+  printf '%s %s %s' "$((_ysk_sp / 1024))" "$_ysk_sz" "$(printf '%s' "$_ysk" | awk '{print $3}')"
+}
+
+# Возврат проверяется через отдельный loopback-вход, всегда привязанный к ОСНОВНОМУ,
+# пока реальные клиенты продолжают идти через резерв. Успех не кэшируется между тиками.
+yt_return_ensure_inbound() {
+  [ "$YT_SPEED_ENABLE" = "1" ] || return 0
+  case "$YT_TAG" in ""|direct|block) return 0 ;; esac
+  command -v jq >/dev/null 2>&1 || return 1
+  local _yri_file="$CONFIG_DIR/03_inbounds.json"
+  jq -e '.inbounds[] | select(.tag == "socks-yt-return")' "$_yri_file" >/dev/null 2>&1 && return 0
+  if ! jq -e --argjson p "$YT_RETURN_PROBE_PORT" '[.inbounds[] | select(.port == $p)] | length == 0' \
+       "$_yri_file" >/dev/null 2>&1; then
+    log "YT-RETURN WARN: порт $YT_RETURN_PROBE_PORT занят или inbounds не прочитаны — вход пробы не добавлен"
+    return 1
+  fi
+  cp "$_yri_file" "$_yri_file.bak-yt-return-$(date +%Y%m%d-%H%M%S)" || return 1
+  if jq --argjson p "$YT_RETURN_PROBE_PORT" '.inbounds += [{"tag":"socks-yt-return","listen":"127.0.0.1",
+      "port":$p,"protocol":"socks","settings":{"auth":"noauth","udp":false}}]' \
+      "$_yri_file" > "$_yri_file.tmp-yt-return" && mv "$_yri_file.tmp-yt-return" "$_yri_file"; then
+    log "YT-RETURN: добавлен loopback-вход $YT_RETURN_PROBE_PORT — применится вместе с маршрутом пробы"
+    return 0
+  fi
+  rm -f "$_yri_file.tmp-yt-return"
+  return 1
+}
+
+_yt_return_route_ready() {
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -e --argjson p "$YT_RETURN_PROBE_PORT" '
+    [.inbounds[] | select(.tag == "socks-yt-return")] as $a |
+    ($a|length) == 1 and $a[0].listen == "127.0.0.1" and $a[0].port == $p and
+    $a[0].protocol == "socks"' "$CONFIG_DIR/03_inbounds.json" >/dev/null 2>&1 || return 1
+  # Правило должно быть первым и без дополнительных условий: иначе проба могла бы
+  # измерить резерв или direct. Ошибка чтения/дрейф — отказ от возврата, не успех.
+  sed 's|^[[:space:]]*//.*$||' "$CONFIG_DIR/05_routing.json" | jq -e --arg t "$YT_TAG" '
+    .routing.rules[0] == {"type":"field","inboundTag":["socks-yt-return"],"outboundTag":$t}' >/dev/null 2>&1
+}
+
+yt_return_check() {
+  [ "${YT_SPEED_ENABLE:-0}" = "1" ] || return 0
+  [ "${_yt_main_chg:-0}" = "1" ] && return 0  # явная смена в панели
+  [ "${_yt_return_attempted:-0}" = "1" ] && [ "${YT_RETURN_OK:-0}" = "1" ] && return 0
+  [ "${_yt_return_attempted:-0}" = "1" ] && return 1
+  _yt_return_attempted=1; YT_RETURN_OK=0; YT_RETURN_KBPS=0
+  [ "${XRAY_BUSY:-0}" = "1" ] && return 1
+  [ -n "$WD_APPLY_ID" ] && return 1
+  _yr_now=$(date +%s)
+  if [ "${DYT_LEFT:-0}" -gt 0 ] 2>/dev/null &&
+     [ $((_yr_now - DYT_LEFT)) -lt "${_dyt_hold:-$DEEP_RETURN_HOLD}" ]; then return 1; fi
+  if [ "$YT_RETURN_TAG" = "$YT_TAG" ] && [ "$YT_RETURN_TS" -gt 0 ] 2>/dev/null &&
+     [ $((_yr_now - YT_RETURN_TS)) -ge 0 ] &&
+     [ $((_yr_now - YT_RETURN_TS)) -lt "$YT_SPEED_RECHECK" ]; then return 1; fi
+  YT_RETURN_TAG="$YT_TAG"; YT_RETURN_TS="$_yr_now"
+  if ! _yt_return_route_ready; then
+    log "YT-RETURN: основной $YT_TAG пока не проверен — отдельный маршрут пробы не готов; остаюсь на резерве"
+    return 1
+  fi
+  set -- $(_yt_speed_kbps "127.0.0.1:$YT_RETURN_PROBE_PORT")
+  _yr_kb="${1:-0}"; _yr_sz="${2:-0}"; _yr_http="${3:-000}"
+  case "$_yr_http" in 200|206) ;; *) log "YT-RETURN: основной $YT_TAG не проверен (HTTP $_yr_http) — остаюсь на резерве"; return 1 ;; esac
+  if [ "$_yr_sz" -lt 100000 ] 2>/dev/null || [ "$_yr_kb" -lt "$YT_SPEED_MIN_KBPS" ] 2>/dev/null; then
+    log "YT-RETURN: основной $YT_TAG не подтвердил скорость ($_yr_kb КБ/с, $_yr_sz байт; норма от $YT_SPEED_MIN_KBPS) — остаюсь на резерве"
+    return 1
+  fi
+  YT_RETURN_KBPS="$_yr_kb"; YT_RETURN_OK=1
+  log "YT-RETURN: основной $YT_TAG проверен до возврата — $_yr_kb КБ/с (норма от $YT_SPEED_MIN_KBPS)"
+  return 0
+}
+
+# Вызывается только ПОСЛЕ успешного применения routing и проверки нового xray.
+yt_return_notify() {
+  [ "$EFFECTIVE_YT_TAG" = "$YT_TAG" ] && [ "$PREV_YT" != "$YT_TAG" ] || return 0
+  [ "${_yt_main_chg:-0}" = "1" ] && return 0
+  case "$YT_TAG" in ""|direct|block) return 0 ;; esac
+  if [ "${YT_RETURN_OK:-0}" = "1" ]; then
+    DYT_QN=0; DYT_CHK=0; DYT_LEFT=0
+    tg_alert "✅ <b>YouTube работает на основном канале</b> <code>$YT_TAG</code>: перед возвратом подтверждена скорость $YT_RETURN_KBPS КБ/с (норма от $YT_SPEED_MIN_KBPS), переключение выполнено."
+  else
+    [ "${YT_SPEED_ENABLE:-0}" = "1" ] && return 0
+    tg_alert "↩️ <b>YouTube переведён на основной канал</b> <code>$YT_TAG</code>. Контроль скорости выключен — скорость не подтверждена."
+  fi
 }
 
 # v41: скорость ДЕЙСТВУЮЩЕГО канала YouTube (через socks-deep-yt). Вызов: yt_speed_check <тег> <глух 0/1>.
@@ -1299,6 +1394,7 @@ yt_speed_check() {
       log "YT-SPEED: канал $_ys_tag в норме ($_ys_kb КБ/с) — счётчик сброшен"
     fi
     YT_SPD_CTR=0; YT_SLOW=0
+    [ "$_ys_tag" = "${YT_TAG:-}" ] && DYT_QN=0
     return 0
   fi
   set -- $(_yt_speed_kbps "")
@@ -1723,6 +1819,22 @@ generate_routing() {
     rm -f /tmp/r36.head /tmp/r36.body /tmp/r36.body.new 2>/dev/null
   fi
 
+  # Проба возврата идёт на НАСТРОЕННЫЙ основной, а не на effective YouTube.
+  # Первое точное правило не затрагивает redirect/tproxy и клиентов на резерве.
+  if [ "$YT_SPEED_ENABLE" = "1" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "direct" ] && [ "$YT_TAG" != "block" ] &&
+     grep -q '"socks-yt-return"' "$CONFIG_DIR/03_inbounds.json" 2>/dev/null; then
+    sed -n '1,/^{/p' "$CONFIG_DIR/05_routing.json.new" | sed '$d' > "$CONFIG_DIR/05_routing.json.yt-return-head"
+    if sed 's|^[[:space:]]*//.*$||' "$CONFIG_DIR/05_routing.json.new" | jq --arg t "$YT_TAG" \
+       '.routing.rules = [{"type":"field","inboundTag":["socks-yt-return"],"outboundTag":$t}] + .routing.rules' \
+       > "$CONFIG_DIR/05_routing.json.yt-return-body"; then
+      cat "$CONFIG_DIR/05_routing.json.yt-return-head" "$CONFIG_DIR/05_routing.json.yt-return-body" > "$CONFIG_DIR/05_routing.json.new"
+    else
+      rm -f "$CONFIG_DIR/05_routing.json.yt-return-head" "$CONFIG_DIR/05_routing.json.yt-return-body"
+      return 1
+    fi
+    rm -f "$CONFIG_DIR/05_routing.json.yt-return-head" "$CONFIG_DIR/05_routing.json.yt-return-body"
+  fi
+
   # v9: валидация JSON перед возвратом. Если awk/template/sed где-то сгенерили
   # битый JSON (например trailing comma, пустой outboundTag) — не применять.
   # Сегодня юзер ловил оба этих кейса.
@@ -2087,6 +2199,8 @@ YT_SPEED_RATIO=$(_num "${YT_SPEED_RATIO:-2}" 2)               # напрямую
 YT_SPEED_BYTES=$(_num "${YT_SPEED_BYTES:-2000000}" 2000000)
 YT_SPEED_TIME=$(_num "${YT_SPEED_TIME:-15}" 15)               # предел одного скачивания, с
 YT_SPEED_URL="${YT_SPEED_URL:-https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb}"
+# Служебный loopback-вход пробы основного; не настройка UI и не клиентский прокси.
+YT_RETURN_PROBE_PORT=10823
 [ "$YT_SPEED_THRESHOLD" -ge 1 ] 2>/dev/null || YT_SPEED_THRESHOLD=1
 [ "$YT_SPEED_RATIO" -ge 1 ] 2>/dev/null || YT_SPEED_RATIO=1
 [ "$YT_SPEED_BYTES" -ge 100000 ] 2>/dev/null || YT_SPEED_BYTES=100000
@@ -2187,6 +2301,8 @@ if [ "$DEEP_PROBE_ENABLE" = "1" ] && [ -f "$_INB_FILE" ] && command -v jq >/dev/
   fi
 fi
 # ---------- /v29 self-heal inbound ----------
+
+yt_return_ensure_inbound || :
 
 # ---------- v36: self-heal inbound socks-health (проба трафика самого xray, → direct) ----------
 HEALTH_PROBE_PORT=$(_num "${HEALTH_PROBE_PORT:-10822}" 10822)
@@ -2927,6 +3043,9 @@ if [ "$_yt_main_prev" != "$YT_TAG" ]; then
   log "YT: основной YouTube сменён в настройках ($_yt_main_prev → $YT_TAG)"
 fi
 YT_MAIN="$YT_TAG"
+YT_RETURN_TAG=$(_state_field YT_RETURN_TAG "")
+YT_RETURN_TS=$(_num "$(_state_field YT_RETURN_TS 0)" 0)
+YT_RETURN_OK=0; YT_RETURN_KBPS=0; _yt_return_attempted=0
 _yt_eff_now=$(_state_field YT_EFF "$YT_TAG"); [ -z "$_yt_eff_now" ] && _yt_eff_now="$YT_TAG"
 # Роль сидела на старом основном → с этого тика она на новом: мерить надо его.
 [ "$_yt_main_chg" = "1" ] && [ "$_yt_eff_now" = "$_yt_main_prev" ] && _yt_eff_now="$YT_TAG"
@@ -2989,7 +3108,7 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
     if [ "$YT_BLOCKED" != "1" ] && [ -n "$_yt_eff_prev" ] && [ "$_yt_eff_prev" != "$YT_TAG" ]; then
       if [ "$DYT_LEFT" -gt 0 ] 2>/dev/null && [ $((_yt_now0 - DYT_LEFT)) -lt "$_dyt_hold" ] 2>/dev/null; then
         _log_every5 $((_yt_now0 - DYT_LEFT)) && log "YT: основной $YT_TAG отвечает по TCP, но с него ушли (глух или медленный) — карантин ещё $((_dyt_hold - (_yt_now0 - DYT_LEFT)))с"
-      elif probe_tag "$YT_TAG" ""; then
+      elif probe_tag "$YT_TAG" "" && yt_return_check; then
         _yt_pick="$YT_TAG"; _yt_pick_idx=0
       fi
     fi
@@ -3054,11 +3173,7 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
           log "YT: основной сменён в настройках — YouTube идёт через новый основной $YT_TAG (был $_yt_eff_prev)"
         elif [ "$_yt_pick" = "$YT_TAG" ]; then
           log "YT-FAILOVER-RETURN: резерв $_yt_eff_prev непригоден → YouTube вернулся на основной $YT_TAG"
-          if [ "${DYT_QN:-0}" -gt 0 ] 2>/dev/null; then
-            tg_alert "↩️ <b>YouTube вернулся на основной канал</b> <code>$YT_TAG</code> после карантина. Проверяю, идёт ли трафик насквозь…"
-          else
-            tg_alert "✅ <b>YouTube вернулся на основной канал</b> <code>$YT_TAG</code>."
-          fi
+          # Уведомление — после успешного применения routing, в yt_return_notify.
         elif [ "${DYT_DEAF:-0}" != "1" ] && [ "$YT_SLOW" = "1" ]; then
           log "YT-FAILOVER: канал $_yt_eff_prev $_yt_bad_log → YouTube переключён на $_yt_pick"
           tg_alert "🐢 <b>YouTube переключён на резерв</b>: канал <code>$_yt_eff_prev</code> отвечает, но качает $YT_SPD КБ/с (норма от $YT_SPEED_MIN_KBPS, напрямую интернет $YT_SPD_DIR КБ/с) → трафик идёт через <code>$_yt_pick</code>."
@@ -3100,7 +3215,7 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
           log "YT-KILL-SWITCH: основной $YT_TAG и вся цепочка недоступны $YT_CMISS круга подряд → YouTube в block"
           tg_alert "🚫 <b>YouTube-трафик заблокирован</b>: основной <code>$YT_TAG</code> и вся цепочка резерва не отвечают уже $YT_CMISS круга подряд."
         fi
-      elif [ "$YT_BLOCKED" != "1" ]; then
+      elif [ "$YT_BLOCKED" != "1" ] && { [ "$_yt_eff_prev" = "$YT_TAG" ] || yt_return_check; }; then
         # v31: основной отвечает по TCP, но действующий канал глух, а живых в цепочке нет.
         # Остаёмся на основном (трафик и так никуда не утекает), block не включаем, и одно
         # предупреждение в TG за эпизод глухоты — без xkeen-restart на каждом круге.
@@ -3113,6 +3228,12 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
             tg_alert "⚠️ <b>YouTube: переключиться некуда</b> — канал <code>${_yt_eff_prev:-$YT_TAG}</code> $_yt_bad_tg, а живых (и не медленных) узлов в цепочке резерва нет. Трафик остаётся на основном <code>$YT_TAG</code>; блокировка не включается, пока он отвечает."
           fi
         fi
+      elif [ "$YT_BLOCKED" != "1" ]; then
+        EFFECTIVE_YT_TAG="${_yt_eff_prev:-$YT_TAG}"
+        if [ "$DYT_NOALT" != "1" ]; then
+          DYT_NOALT=1
+          tg_alert "⚠️ <b>YouTube: подходящих резервов нет</b>. Основной <code>$YT_TAG</code> ещё не подтвердил скорость; текущий маршрут <code>$EFFECTIVE_YT_TAG</code> сохранён."
+        fi
       else
         # Галочка выключена (дефолт для YT) — оставляем YT_TAG, как было раньше.
         EFFECTIVE_YT_TAG="$YT_TAG"
@@ -3121,13 +3242,15 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
     fi
   else
     YT_CMISS=0
-    if [ -n "$_yt_eff_prev" ] && [ "$_yt_eff_prev" != "$YT_TAG" ] && [ "$_yt_eff_prev" != "block" ]; then
+    if [ -n "$_yt_eff_prev" ] && [ "$_yt_eff_prev" != "$YT_TAG" ]; then
       _yt_now2=$(date +%s)
       # v29: карантин после ухода по глухоте — иначе вернёмся на узел, который отвечает по
       # TCP, но по-прежнему не пропускает трафик, и будем прыгать туда-обратно.
       if [ "$DYT_LEFT" -gt 0 ] 2>/dev/null && [ $((_yt_now2 - DYT_LEFT)) -lt "$_dyt_hold" ] 2>/dev/null; then
         EFFECTIVE_YT_TAG="$_yt_eff_prev"
         _log_every5 $((_yt_now2 - DYT_LEFT)) && log "YT: основной $YT_TAG отвечает по TCP, но с него ушли (глух или медленный) — карантин ещё $((_dyt_hold - (_yt_now2 - DYT_LEFT)))с, остаюсь на $_yt_eff_prev"
+      elif ! yt_return_check; then
+        EFFECTIVE_YT_TAG="$_yt_eff_prev"
       else
         DYT_LEFT=0
         YT_SW_TS="$_yt_now2"
@@ -3135,17 +3258,20 @@ if [ -n "$YT_DOMAINS" ] && [ -n "$YT_TAG" ] && [ "$YT_TAG" != "block" ] && [ "$_
           log "YT: основной сменён в настройках — YouTube идёт через новый основной $YT_TAG (был $_yt_eff_prev)"
         else
           log "YT-FAILOVER-RETURN: основной $YT_TAG ожил → YouTube вернулся на него (был $_yt_eff_prev)"
-          if [ "${DYT_QN:-0}" -gt 0 ] 2>/dev/null; then
-            tg_alert "↩️ <b>YouTube вернулся на основной канал</b> <code>$YT_TAG</code> после карантина. Проверяю, идёт ли трафик насквозь…"
-          else
-            tg_alert "✅ <b>YouTube вернулся на основной канал</b> <code>$YT_TAG</code>."
-          fi
+          # Уведомление — после успешного применения routing, в yt_return_notify.
         fi
       fi
     fi
   fi
 else
   YT_BLOCKED=0; YT_KCTR=0; YT_CMISS=0
+fi
+
+# Последний предохранитель для редких веток «резервов нет» / выхода из block.
+# Непроверенный основной автоматически не выбирается, даже если все резервы плохие.
+if [ "${YT_SPEED_ENABLE:-0}" = "1" ] && [ "$_yt_main_chg" != "1" ] &&
+   [ -n "$_yt_eff_now" ] && [ "$_yt_eff_now" != "$YT_TAG" ] && [ "$EFFECTIVE_YT_TAG" = "$YT_TAG" ]; then
+  if ! yt_return_check; then EFFECTIVE_YT_TAG="$_yt_eff_now"; fi
 fi
 
 # ---------- FOREIGN kill-switch (канал «Заблокированные в РФ», default ВЫКЛ) ----------
@@ -3374,6 +3500,7 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
         [ -z "$WD_APPLY_ID" ] && { _traffic_ok_or_heal || :; }
         cp "$CONFIG_DIR/05_routing.json" "$CONFIG_DIR/05_routing.json.lastgood" 2>/dev/null
         LAST_BAD_MD5=""   # успешное применение — снимаем «бракованную» метку
+        yt_return_notify
         if [ "$NEW_DEFAULT" != "$CUR_DEFAULT" ] && [ "$_pri_main_chg" = "1" ] && [ "$NEW_DEFAULT" = "$PRIMARY_TAG" ] \
            && [ "$CUR_DEFAULT" = "$_pri_main_prev" ]; then
           # v31: это смена основного канала в панели, а не авария/восстановление — без TG.
@@ -3412,7 +3539,7 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
             tg_alert "📺 <b>XKeen YT kill-switch</b>: канал <code>$YT_TAG</code> недоступен → YouTube/IG/Discord ВРЕМЕННО заблокированы. Восстановится автоматически когда $YT_TAG оживёт."
           elif [ "$PREV_YT" = "block" ] && [ "$EFFECTIVE_YT_TAG" = "$YT_TAG" ]; then
             log "YT-KILL-SWITCH-CLEAR: $YT_TAG восстановился — YouTube-трафик пошёл через него"
-            tg_alert "✅ <b>XKeen YT kill-switch</b>: канал <code>$YT_TAG</code> восстановился, YouTube/IG/Discord снова работают через него."
+            # Возврат уже описан yt_return_notify, без дублирующего «восстановился».
           fi
         fi
         # FOREIGN kill-switch event log + TG-уведомление
@@ -3613,4 +3740,4 @@ DPRI_HOLD=$(_deep_hold "$DPRI_QN"); DYT_HOLD=$(_deep_hold "$DYT_QN"); DFGN_HOLD=
 # PRI_MAIN/YT_MAIN/FGN_MAIN выставляются каждый тик (до блоков ролей) — переносить не нужно.
 # AI_EFF — что РЕАЛЬНО применено для AI в этом тике (основной / резерв цепочки / block).
 # Нужен, чтобы (а) не спамить алертами о переключении, (б) AI-probe отличал blackhole от резерва.
-echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR AI_EFF=$EFFECTIVE_AI_TAG AI_CMISS=$AI_CMISS AI_SW_TS=$AI_SW_TS AI_LEFT_TS=$AI_LEFT_TS YT_EFF=$EFFECTIVE_YT_TAG YT_CMISS=$YT_CMISS YT_SW_TS=$YT_SW_TS FGN_EFF=$EFFECTIVE_FOREIGN_TAG FGN_CMISS=$FGN_CMISS FGN_SW_TS=$FGN_SW_TS DPRI_CTR=$DPRI_CTR DPRI_TS=$DPRI_TS DPRI_DEAF=$DPRI_DEAF DPRI_LEFT=$DPRI_LEFT DPRI_TAG=$DPRI_TAG DYT_CTR=$DYT_CTR DYT_TS=$DYT_TS DYT_DEAF=$DYT_DEAF DYT_LEFT=$DYT_LEFT DYT_TAG=$DYT_TAG DFGN_CTR=$DFGN_CTR DFGN_TS=$DFGN_TS DFGN_DEAF=$DFGN_DEAF DFGN_LEFT=$DFGN_LEFT DFGN_TAG=$DFGN_TAG PRI_MAIN=$PRI_MAIN YT_MAIN=$YT_MAIN FGN_MAIN=$FGN_MAIN DPRI_RES=$DPRI_RES DYT_RES=$DYT_RES DFGN_RES=$DFGN_RES PRI_NOALT=$PRI_NOALT DPRI_FSINCE=$DPRI_FSINCE DYT_NOALT=$DYT_NOALT DFGN_NOALT=$DFGN_NOALT DPRI_QN=$DPRI_QN DPRI_CHK=$DPRI_CHK DPRI_HOLD=$DPRI_HOLD DYT_QN=$DYT_QN DYT_CHK=$DYT_CHK DYT_HOLD=$DYT_HOLD DFGN_QN=$DFGN_QN DFGN_CHK=$DFGN_CHK DFGN_HOLD=$DFGN_HOLD YT_SPD=${YT_SPD:-0} YT_SPD_TS=${YT_SPD_TS:-0} YT_SPD_TAG=$YT_SPD_TAG YT_SPD_CTR=${YT_SPD_CTR:-0} YT_SLOW=${YT_SLOW:-0} YT_SPD_DIR=${YT_SPD_DIR:-0} YT_SLOWQ=$YT_SLOWQ" > "$STATE_FILE"
+echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR AI_EFF=$EFFECTIVE_AI_TAG AI_CMISS=$AI_CMISS AI_SW_TS=$AI_SW_TS AI_LEFT_TS=$AI_LEFT_TS YT_EFF=$EFFECTIVE_YT_TAG YT_CMISS=$YT_CMISS YT_SW_TS=$YT_SW_TS FGN_EFF=$EFFECTIVE_FOREIGN_TAG FGN_CMISS=$FGN_CMISS FGN_SW_TS=$FGN_SW_TS DPRI_CTR=$DPRI_CTR DPRI_TS=$DPRI_TS DPRI_DEAF=$DPRI_DEAF DPRI_LEFT=$DPRI_LEFT DPRI_TAG=$DPRI_TAG DYT_CTR=$DYT_CTR DYT_TS=$DYT_TS DYT_DEAF=$DYT_DEAF DYT_LEFT=$DYT_LEFT DYT_TAG=$DYT_TAG DFGN_CTR=$DFGN_CTR DFGN_TS=$DFGN_TS DFGN_DEAF=$DFGN_DEAF DFGN_LEFT=$DFGN_LEFT DFGN_TAG=$DFGN_TAG PRI_MAIN=$PRI_MAIN YT_MAIN=$YT_MAIN FGN_MAIN=$FGN_MAIN DPRI_RES=$DPRI_RES DYT_RES=$DYT_RES DFGN_RES=$DFGN_RES PRI_NOALT=$PRI_NOALT DPRI_FSINCE=$DPRI_FSINCE DYT_NOALT=$DYT_NOALT DFGN_NOALT=$DFGN_NOALT DPRI_QN=$DPRI_QN DPRI_CHK=$DPRI_CHK DPRI_HOLD=$DPRI_HOLD DYT_QN=$DYT_QN DYT_CHK=$DYT_CHK DYT_HOLD=$DYT_HOLD DFGN_QN=$DFGN_QN DFGN_CHK=$DFGN_CHK DFGN_HOLD=$DFGN_HOLD YT_SPD=${YT_SPD:-0} YT_SPD_TS=${YT_SPD_TS:-0} YT_SPD_TAG=$YT_SPD_TAG YT_SPD_CTR=${YT_SPD_CTR:-0} YT_SLOW=${YT_SLOW:-0} YT_SPD_DIR=${YT_SPD_DIR:-0} YT_SLOWQ=$YT_SLOWQ YT_RETURN_TAG=$YT_RETURN_TAG YT_RETURN_TS=${YT_RETURN_TS:-0}" > "$STATE_FILE"

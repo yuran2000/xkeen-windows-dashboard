@@ -67,3 +67,8 @@ _wg_review*.diff
 wg_clients.json
 wg_clients.json.bak
 wg_clients.json.tmp
+
+# Update recovery marker
+.update-needs-deps
+# Private additional publication checks
+.public-audit-patterns.txt

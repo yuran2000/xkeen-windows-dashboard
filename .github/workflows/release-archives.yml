@@ -8,7 +8,7 @@ name: Attach source archives to release
 # зеркала этих архивов как реальные release-assets.
 #
 # Триггер: при создании (или редактировании) релиза → workflow генерит
-# два архива через `git archive` (уважает .gitignore, без .venv/backups/config_local.py)
+# два архива через `git archive` (только отслеживаемые файлы)
 # и upload'ит их к релизу.
 #
 # Permissions: contents:write — нужно для upload assets к существующему release.
@@ -51,8 +51,8 @@ jobs:
         run: |
           TAG="${{ steps.tagname.outputs.tag }}"
           NAME="${{ steps.tagname.outputs.name }}"
-          # git archive уважает .gitignore автоматически — config_local.py, .venv, backups/,
-          # *.log, .ssh/ и прочие секретные файлы НЕ попадут в архив.
+          # git archive экспортирует отслеживаемые файлы выбранного тега.
+          # Перед релизом состав дерева и отсутствие локальных настроек проверяются отдельно.
           # --prefix создаёт папку внутри архива чтобы при распаковке не засорять CWD.
           git archive --format=zip    --prefix="$NAME/" --output="$NAME.zip"    "$TAG"
           git archive --format=tar.gz --prefix="$NAME/" --output="$NAME.tar.gz" "$TAG"
