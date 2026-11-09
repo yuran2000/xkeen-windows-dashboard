@@ -573,7 +573,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
 `VLESS_META`, `ANTI_DPI_TAGS` (`new Set(...)`), `WINDOW_DOMAIN_NOTES`. Клиентские: `DOMAIN_SECTIONS`,
 `AI_PRESETS`, `YT_PRESETS`, `FOREIGN_PRESETS`, `IPV6_PRESETS`, `DIRECT_PRESETS`, `BLOCK_PRESETS` (это
 `const`, не свойства `window` — доступ через getter'ы `DOMAIN_SECTIONS`), `CHAIN_MAX`,
-`_LATENCY_ROLES`, `_CARDS_THRESHOLD`, `RKN_VERDICTS`, `RKN_CONF`.
+`_LATENCY_ROLES`, `RKN_VERDICTS`, `RKN_CONF`.
 
 ### 8.5. Общие утилиты и ключевые функции
 
@@ -601,7 +601,7 @@ GeoIP-категории»: неизвестно / расширенная и с�
   слоте и известной ЛВС (`setIssueReady`); не прочитался роутер — `loadClients` сам повторяет 2 раза через 4 с
   (`WG.retry`; сразу после рестарта панели первое чтение тонет в залпе запросов страницы), потом «🔄 Повторить».
 - Шапка/UX: `refreshXrayHeaderStatus` (60 с), `refreshDashboardHealth` (15 с), `injectSelectorCounters`,
-  `injectLatencyAndCards`, `_convertSelectorsToCards`, `_xkRemindAssignRole`.
+  `injectSelectorLatency`, `_xkRemindAssignRole`. Выходы всегда выбираются из выпадающих списков.
 
 Главный `DOMContentLoaded` (у редактора цепочек): `refreshPrimaryInfo` → `renderDeepProbeSummary` →
 `refreshFailoverInfo` → AI/YT/Foreign `refresh*Info` + `refresh*ActiveInfo` → `chainRender` ×3 →

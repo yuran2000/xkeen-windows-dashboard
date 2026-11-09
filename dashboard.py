@@ -224,7 +224,7 @@ import ssh_bin
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.4.0"
+_VERSION_FALLBACK = "1.4.1"
 
 
 def _find_git():
@@ -23142,15 +23142,12 @@ function injectSelectorCounters() {
 }
 document.addEventListener('DOMContentLoaded', injectSelectorCounters);
 
-// ───────── UX: latency-бейджи + карточки вместо dropdown (v1.0.81) ─────────
-// 1. Дёргает /api/xkeen/probe-status?force=0 — берёт уже-измеренные значения
+// ───────── Задержка в списках VPN-выходов ─────────
+// Запрашивает /api/xkeen/probe-status?force=0 и берет измеренные значения
 //    из серверного кэша (TTL 60с). Если кэш пуст, бейджи появятся при
 //    следующем рендере после первого probe (кнопка «🔄 Проверить статус»
 //    или background-probe watchdog'а наполняют кэш).
-// 2. Если в селекторе ≤6 опций — рисует grid карточек, скрывает <select>.
-//    Клик по карточке через setTarget() работает как обычный change select.
 const _LATENCY_ROLES = ['primary', 'failover', 'ai', 'yt', 'foreign', 'ipv6'];
-const _CARDS_THRESHOLD = 6;
 
 function _latencyBadge(status) {
   if (!status) return '';
@@ -23176,49 +23173,7 @@ function _applyLatencyToOptions(statuses) {
   }
 }
 
-function _convertSelectorsToCards() {
-  for (const role of _LATENCY_ROLES) {
-    const sel = document.getElementById('select-' + role);
-    if (!sel || sel.dataset.cardified === '1') continue;
-    const opts = Array.from(sel.querySelectorAll('option'));
-    if (opts.length === 0 || opts.length > _CARDS_THRESHOLD) continue;
-
-    const grid = document.createElement('div');
-    grid.className = 'outbound-card-grid';
-    grid.dataset.role = role;
-    grid.style.cssText = 'display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; margin: 4px 0 8px;';
-
-    function paint(card, isSelected) {
-      card.style.border = '2px solid ' + (isSelected ? '#2e7d32' : '#d0d0d0');
-      card.style.background = isSelected ? '#e8f5e9' : '#fff';
-      card.style.fontWeight = isSelected ? '600' : '400';
-      if (isSelected) card.classList.add('outbound-card-selected');
-      else card.classList.remove('outbound-card-selected');
-    }
-
-    for (const opt of opts) {
-      const card = document.createElement('button');
-      card.type = 'button';
-      card.className = 'outbound-card';
-      card.dataset.tag = opt.value;
-      card.style.cssText = 'padding: 10px 12px; border-radius: 6px; cursor: pointer; text-align: left; font-size: 0.88em; line-height: 1.35; transition: all 0.12s; word-break: break-word;';
-      card.textContent = opt.textContent;
-      paint(card, opt.selected);
-      card.addEventListener('click', () => {
-        sel.value = opt.value;
-        sel.dispatchEvent(new Event('change'));
-        for (const c of grid.children) paint(c, c.dataset.tag === opt.value);
-      });
-      grid.appendChild(card);
-    }
-
-    sel.style.display = 'none';
-    sel.parentNode.insertBefore(grid, sel.nextSibling);
-    sel.dataset.cardified = '1';
-  }
-}
-
-async function injectLatencyAndCards() {
+async function injectSelectorLatency() {
   let statuses = {};
   try {
     const res = await fetch('/api/xkeen/probe-status?force=0', { method: 'GET' });
@@ -23226,10 +23181,9 @@ async function injectLatencyAndCards() {
     if (j && j.ok && j.statuses) statuses = j.statuses;
   } catch (e) { /* latency не критичен */ }
   _applyLatencyToOptions(statuses);
-  _convertSelectorsToCards();
 }
 document.addEventListener('DOMContentLoaded', () => {
-  setTimeout(injectLatencyAndCards, 600);
+  setTimeout(injectSelectorLatency, 600);
 });
 </script>
 
