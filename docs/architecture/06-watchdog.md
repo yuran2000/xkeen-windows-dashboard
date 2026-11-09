@@ -50,6 +50,7 @@ cron */1 → watchdog.sh: . watchdog.config → пробы → state-машин�
 | `IPV6_TAG`, `IPV6_DOMAINS` | `""` | set-target/ipv6, set-ipv6-domains | `ipv6_tag`, `ipv6_domains` |
 | `DIRECT_DOMAINS`, `BLOCK_DOMAINS` | `""` | set-direct-/set-block-domains | `direct_domains`, `block_domains` |
 | `RU_VPN_DOMAINS`, `RU_VPN_TAG`, `RU_VPN_SUBDOMAINS` | `""`, `""`, `0` | set-ru-vpn-exceptions | `ru_vpn_domains`, `ru_vpn_tag`, `ru_vpn_subdomains` |
+| `RU_VPN_FAILOVER_TAGS`, `RU_VPN_FAIL_DIRECT` (v46) | `""`, `0` | set-ru-vpn-exceptions | `ru_vpn_failover_tags`, `ru_vpn_fail_direct` |
 | `PRIMARY_PROBE_URL` | пусто → TCP-проба; запись без ключа — `https://<vpn-domain>:8444/` | set-target/primary (для `vless-reality` URL, иначе пусто) | — |
 | `FAIL_THRESHOLD`, `PASS_THRESHOLD` | `2`, `3` (`_num`) | только вручную | — |
 | `DEEP_PROBE_ENABLE`, `DEEP_PROBE_INTERVAL`, `DEEP_PROBE_THRESHOLD`, `DEEP_RETURN_HOLD` | `1`, `180` с, `2`, `1800` с — все явно | watchdog-settings | `deep_probe_enable`, `deep_probe_interval`, `deep_probe_threshold`, `deep_return_hold` |
@@ -269,6 +270,13 @@ Watchdog v45 на отдельной строке `__DIRECT_RULE_BLOCK__` выв
 Генератор проверяет порядок BLOCK/DIRECT/общего .ru и существование VLESS-выхода. При сбое
 транзакция отказывается применять изменения, в обычном тике блокируются выбранные .ru,
 а остальные правила продолжают пересобираться.
+
+С v46 непустой `RU_VPN_FAILOVER_TAGS` включает `ru_vpn_select`. При исчерпании списка
+применяется `block` либо `direct`, если `RU_VPN_FAIL_DIRECT=1`. Между тиками сохраняются
+`RU_VPN_ACTIVE`, `RU_VPN_PENDING`, `RU_VPN_MISS`, `RU_VPN_PASS`. Пороги `FAIL_THRESHOLD` и
+`PASS_THRESHOLD` сглаживают одиночные сбои и возврат. Состояние обновляется после успешного
+применения либо совпадения маршрута. При сохранении из панели цепочка оценивается сразу.
+Комментарий `// XKeen .ru VPN` помечает правило цепочки в routing для панели и проверки сайта.
 
 Плейсхолдеры template: `__DEFAULT_TAG__`, `__BLOCK_RULE_BLOCK__`, `__DIRECT_RULE_BLOCK__`,
 `__AI_RULE_BLOCK__`, `__YT_RULE_BLOCK__`, `__YT_RULE_GEOIP__`, `__FOREIGN_RULE_BLOCK__`,

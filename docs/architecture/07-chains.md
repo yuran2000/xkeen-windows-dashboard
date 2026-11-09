@@ -12,6 +12,7 @@
 | AI | `AI_TAG`, `AI_DOMAINS`, `AI_EXT_CATEGORIES`, `AI_IP_RANGES` | `EFFECTIVE_AI` | `AI_FAIL_BLOCK` (1) | `AI_FAILOVER_TAGS` (нет) | AI-проба страны | `select-ai`, `info-ai`, `info-ai-active`, `ai-chain-*`, `ai-fail-block-toggle` |
 | YouTube | `YT_TAG`, `YT_DOMAINS`, `YT_EXT_CATEGORIES` | `EFFECTIVE_YT` | `YT_FAIL_BLOCK` (0) | `YT_FAILOVER_TAGS` (да) | `DYT_*` | `select-yt`, `info-yt`, `info-yt-active`, `yt-chain-*`, `yt-fail-block-toggle` |
 | Зарубежные сервисы | `FOREIGN_TAG`, `FOREIGN_DOMAINS`, `FOREIGN_EXT_CATEGORIES`, `FOREIGN_GEOIP_CATEGORIES` | `EFFECTIVE_FOREIGN` | `FOREIGN_FAIL_BLOCK` (0) | `FOREIGN_FAILOVER_TAGS` или общая (нет) | `DFGN_*` | `select-foreign`, `info-foreign`, `info-foreign-active`, `foreign-chain-*`, `foreign-chain-use-common`, `foreign-fail-block-toggle` |
+| Домены .ru через VPN | `RU_VPN_TAG`, `RU_VPN_DOMAINS`, `RU_VPN_SUBDOMAINS` | `ru_vpn_active` из routing | блокировка списка при исчерпании цепочки, если `RU_VPN_FAIL_DIRECT=0` | `RU_VPN_FAILOVER_TAGS` (RU разрешены) | — | `ru-vpn-mode`, `ru-chain-list`, `ru-vpn-status` |
 | Через IPv6 | `IPV6_TAG`, `IPV6_DOMAINS` | — | — | — | — | `select-ipv6` |
 | DIRECT / BLOCK | `DIRECT_DOMAINS`, `BLOCK_DOMAINS` | — | — | — | — | секции `ds-direct`, `ds-block` |
 
@@ -41,6 +42,14 @@
   `removeFromChannelChain`).
 - Общая цепочка `FAILOVER_TAGS`: `api_xkeen_set_failover_chain` (`saveFailoverChain`,
   `pingFailoverChain`, `removeDeadFromChain`, `removeFromFailoverChain`, `bulkAddToChain`) и set-target.
+
+У списка .ru настройки сохраняются вместе с доменами через `saveRuVpnExceptions`.
+`ru_vpn_select` сначала проверяет основной VLESS-выход, затем до восьми резервов в сохраненном
+порядке. Уход требует `FAIL_THRESHOLD` неудач текущего выхода, возврат — `PASS_THRESHOLD`
+успехов одного более приоритетного выхода подряд. Проба проверяет
+TCP-порт сервера, поэтому HTTP-отказ сайта и вход в аккаунт остаются отдельной проверкой.
+Общая цепочка FAILOVER здесь не используется. Из подписки нельзя удалить выбранный основной или резервный выход.
+Карточка показывает примененный выход на момент загрузки и позволяет обновить снимок.
 
 ### 7.3. «Общая цепочка» у «Зарубежных» (`FOREIGN_CHAIN_USE_COMMON`)
 

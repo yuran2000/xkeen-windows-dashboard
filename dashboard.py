@@ -2805,7 +2805,7 @@ def keenetic_get_outbounds():
 
 
 def keenetic_get_routing_active():
-    """Парсит активный 05_routing.json. Возвращает dict с key default_outbound."""
+    """Парсит активный 05_routing.json, включая выход помеченного правила .ru."""
     raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/05_routing.json")
     if not raw:
         return None
@@ -2821,7 +2821,35 @@ def keenetic_get_routing_active():
     for r in rules:
         if r.get("inboundTag") and "tproxy" in r["inboundTag"] and not r.get("domain") and not r.get("ip"):
             default_outbound = r.get("outboundTag")
-    return {"default_outbound": default_outbound, "rules_count": len(rules)}
+    ru_vpn_active = None
+    ru_vpn_domains = []
+    marker = "// XKeen .ru VPN "
+    header = raw.partition("\n")[0]
+    if header.startswith(marker):
+        try:
+            tag, domains = json.loads(header[len(marker):])
+            if isinstance(tag, str) and isinstance(domains, list) and domains and any(
+                rule.get("inboundTag") == ["redirect", "tproxy"] and
+                rule.get("outboundTag") == tag and rule.get("domain") == domains
+                for rule in rules
+            ):
+                ru_vpn_active, ru_vpn_domains = tag, domains
+        except (ValueError, TypeError):
+            pass
+    return {
+        "default_outbound": default_outbound, "rules_count": len(rules),
+        "ru_vpn_active": ru_vpn_active, "ru_vpn_domains": ru_vpn_domains,
+    }
+
+
+def _ru_vpn_active_for_targets(routing, targets):
+    tag = routing.get("ru_vpn_active")
+    allowed = {targets.get("ru_vpn_tag"), "block", *(targets.get("ru_vpn_failover_tags") or [])}
+    if targets.get("ru_vpn_fail_direct"):
+        allowed.add("direct")
+    prefix = "domain:" if targets.get("ru_vpn_subdomains") else "full:"
+    domains = [prefix + domain for domain in (targets.get("ru_vpn_domains") or [])]
+    return tag if tag in allowed and domains == routing.get("ru_vpn_domains") else None
 
 
 def keenetic_get_watchdog(deep_hold_sec=None):
@@ -3100,6 +3128,8 @@ def keenetic_get_watchdog_targets(strict=False):
         "ru_vpn_domains": cfg_d.get("RU_VPN_DOMAINS", "").split(),
         "ru_vpn_tag": cfg_d.get("RU_VPN_TAG", ""),
         "ru_vpn_subdomains": cfg_d.get("RU_VPN_SUBDOMAINS") == "1",
+        "ru_vpn_failover_tags": cfg_d.get("RU_VPN_FAILOVER_TAGS", "").split(),
+        "ru_vpn_fail_direct": cfg_d.get("RU_VPN_FAIL_DIRECT") == "1",
         "block_domains":  block_domains_list,
         "force_mode":   cfg_d.get("FORCE_MODE", "auto"),
     }
@@ -3126,6 +3156,7 @@ def _build_watchdog_config(d):
         "IPV6_TAG", "IPV6_DOMAINS",
         "DIRECT_DOMAINS",
         "RU_VPN_DOMAINS", "RU_VPN_TAG", "RU_VPN_SUBDOMAINS",
+        "RU_VPN_FAILOVER_TAGS", "RU_VPN_FAIL_DIRECT",
         "BLOCK_DOMAINS",
         "PRIMARY_PROBE_URL", "FAIL_THRESHOLD", "PASS_THRESHOLD",
         "DEEP_PROBE_ENABLE", "DEEP_PROBE_INTERVAL", "DEEP_PROBE_THRESHOLD", "DEEP_RETURN_HOLD",
@@ -3450,8 +3481,8 @@ def keenetic_remove_outbound(tag):
         return {"ok": False, "stderr": f"tag '{tag}' сейчас канал «Зарубежные сервисы». Сначала сменить его на другой outbound."}
     if tag == targets.get("ipv6_tag"):
         return {"ok": False, "stderr": f"tag '{tag}' сейчас канал «Через IPv6». Сначала сменить его на другой outbound."}
-    if tag == targets.get("ru_vpn_tag"):
-        return {"ok": False, "stderr": "Этот узел используется в исключениях .ru. Сначала выбрать другой выход или очистить список."}
+    if tag == targets.get("ru_vpn_tag") or tag in (targets.get("ru_vpn_failover_tags") or []):
+        return {"ok": False, "stderr": "Этот узел используется в исключениях .ru. Сначала убрать его из настроек .ru."}
     if tag in (targets.get("failover_tags") or []):
         return {"ok": False, "stderr": f"tag '{tag}' в списке FAILOVER. Сначала убрать его оттуда (сменить FAILOVER на другой)."}
     # v1.0.99: цепочки резерва AI/YouTube — та же защита, что и у FAILOVER-цепочки.
@@ -3546,7 +3577,7 @@ def keenetic_remove_outbounds_bulk(tags, stage_id=None, targets=None):
             skipped[t] = "сейчас «Зарубежные сервисы»"
         elif t == ipv6:
             skipped[t] = "сейчас «Через IPv6»"
-        elif t == targets.get("ru_vpn_tag"):
+        elif t == targets.get("ru_vpn_tag") or t in (targets.get("ru_vpn_failover_tags") or []):
             skipped[t] = "выбран для исключений .ru"
         elif t in failover_set:
             skipped[t] = "в списке FAILOVER"
@@ -3656,6 +3687,7 @@ def _subscription_removal_plan(key, outbounds, targets, subs):
         (t.get("ru_vpn_tag"), "Исключения .ru"),
         (t.get("failover_tag"), "голова резервной цепочки"),
     ]
+    critical_roles.extend((tag, "резерв исключений .ru") for tag in (t.get("ru_vpn_failover_tags") or []))
     fchain = set(t.get("failover_tags") or [])
     # v1.0.99: цепочки резерва AI/YouTube — тот же класс, что хвост FAILOVER: удаление не
     # блокируем, но тег обязан уйти из watchdog.config, иначе в аварии цепочка молча
@@ -4679,6 +4711,8 @@ def xkeen_page():
             "ru_vpn_domains": [],
             "ru_vpn_tag": "",
             "ru_vpn_subdomains": False,
+            "ru_vpn_failover_tags": [],
+            "ru_vpn_fail_direct": False,
             "block_domains": [],
             "force_mode": "auto",
         }
@@ -4780,6 +4814,8 @@ def xkeen_page():
             and not o["in_ai_chain"]
             and not o["in_yt_chain"]
             and not o["in_foreign_chain"]
+            and o["tag"] != targets.get("ru_vpn_tag")
+            and o["tag"] not in (targets.get("ru_vpn_failover_tags") or [])
         )
     # Только vless-outbounds можно выбрать как primary/failover
     vless_tags = [o["tag"] for o in outbounds if o["protocol"] == "vless"]
@@ -5205,6 +5241,7 @@ def xkeen_page():
         chain_outbounds=chain_outbounds,
         outbound_groups=outbound_groups,
         routing=routing,
+        ru_vpn_active=_ru_vpn_active_for_targets(routing, targets),
         watchdog=watchdog,
         targets=targets,
         vless_tags=vless_tags,
@@ -6397,6 +6434,8 @@ def api_xkeen_subscription_sync():
             targets.get("ru_vpn_tag"):  "Исключения .ru",
         }
         critical_roles_map.pop(None, None)
+        for tag in targets.get("ru_vpn_failover_tags") or []:
+            critical_roles_map.setdefault(tag, "резерв исключений .ru")
         critical_conflicts = orphans & set(critical_roles_map.keys())
         if critical_conflicts:
             roles_msg = []
@@ -6407,7 +6446,7 @@ def api_xkeen_subscription_sync():
                 "stderr": (
                     "⛔ Удаление отменено: эти outbound'ы выбраны в УНИКАЛЬНЫХ dropdown'ах "
                     "секции «🎯 Основное и резервное подключение». Sync вообще не выполнен — "
-                    "сначала сменить роль через соответствующий dropdown:\n\n"
+                     "сначала сменить выход в его разделе или убрать его из цепочки «Домены .ru через VPN»:\n\n"
                     + "\n".join(roles_msg) +
                     "\n\nПотом снова запустить sync.\n\n"
                     "💡 Подсказка: outbound'ы которые ТОЛЬКО в хвосте FAILOVER-цепочки "
@@ -7104,7 +7143,7 @@ def _normalize_ru_vpn_domain(name):
     return domain if domain.endswith(".ru") else None
 
 
-def _ru_vpn_target_error(tag):
+def _ru_vpn_target_error(tag, reserves):
     template = (keenetic_read_file(TEMPLATE_REMOTE_PATH) or "").split("\n")
     block_slots = [i for i, line in enumerate(template) if line == "__BLOCK_RULE_BLOCK__"]
     direct_slots = [i for i, line in enumerate(template) if line == "__DIRECT_RULE_BLOCK__"]
@@ -7113,9 +7152,9 @@ def _ru_vpn_target_error(tag):
     if not (len(block_slots) == len(direct_slots) == len(ru_rules) == 1
             and block_slots[0] < direct_slots[0] < ru_rules[0]):
         return "Нужен шаблон со штатным порядком «Блокировать», «Напрямую», общее правило .ru."
-    outbounds = keenetic_get_outbounds() or []
-    if not any(o["tag"] == tag and o["protocol"] == "vless" for o in outbounds):
-        return "Выбранный VLESS-выход не найден."
+    available = {o["tag"] for o in (keenetic_get_outbounds() or []) if o["protocol"] == "vless"}
+    if tag not in available or any(reserve not in available for reserve in reserves):
+        return "Один из выбранных VLESS-выходов не найден."
     return None
 
 
@@ -7134,23 +7173,52 @@ def api_xkeen_set_ru_vpn_exceptions():
     if domains and (not tag or tag in ("direct", "block") or _SHELL_UNSAFE_RE.search(tag)):
         return jsonify({"ok": False, "stderr": "Выбрать VPN-выход для исключений .ru."}), 400
 
-    if domains and (error := _ru_vpn_target_error(tag)):
+    mode = request.form.get("ru_chain_mode")
+    reserves = []
+    if domains and mode is None:
+        saved = keenetic_get_watchdog_targets(strict=True)
+        if saved is None:
+            return jsonify({"ok": False, "stderr": "Не удалось прочитать настройки цепочки .ru. Повторить позже."})
+        reserves = saved.get("ru_vpn_failover_tags") or []
+    if domains and mode == "custom":
+        reserves = list(dict.fromkeys(request.form.getlist("ru_reserve")))
+    elif domains and mode not in (None, "single"):
+        return jsonify({"ok": False, "stderr": "Неизвестный режим выхода для .ru."}), 400
+    if tag in reserves and mode is None:
+        return jsonify({"ok": False, "stderr": "Этот выход уже в резерве. Обновить страницу и изменить цепочку .ru вместе с основным выходом."}), 409
+    if (domains and mode == "custom" and not reserves) or len(reserves) > CHANNEL_CHAIN_MAX or any(
+        not reserve or reserve in ("direct", "block", tag) or _SHELL_UNSAFE_RE.search(reserve)
+        for reserve in reserves
+    ):
+        return jsonify({"ok": False, "stderr": "Выбрать до восьми резервных VPN-выходов, отличных от основного."}), 400
+
+    if domains and (error := _ru_vpn_target_error(tag, reserves)):
         return jsonify({"ok": False, "stderr": error})
     ctx = keenetic_apply_begin()
     if not ctx.get("ok"):
         return jsonify({"ok": False, "stderr": ctx.get("reason")})
     wd = ctx["watchdog_sync"]
-    if (wd.get("remote_ver") or wd.get("to") or 0) < 45:
-        return jsonify({"ok": False, "stderr": "Для исключений .ru нужен watchdog v45 или новее."})
+    required_version = 46 if reserves else 45
+    if (wd.get("remote_ver") or wd.get("to") or 0) < required_version:
+        return jsonify({"ok": False, "stderr": f"Для выбранного режима нужен watchdog v{required_version} или новее."})
 
-    if domains and (error := _ru_vpn_target_error(tag)):
+    if domains and mode is None:
+        saved = keenetic_get_watchdog_targets(strict=True)
+        if saved is None or (saved.get("ru_vpn_failover_tags") or []) != reserves:
+            return jsonify({"ok": False, "stderr": "Цепочка .ru изменилась. Обновить страницу перед сохранением."}), 409
+
+    if domains and (error := _ru_vpn_target_error(tag, reserves)):
         return jsonify({"ok": False, "stderr": error})
 
-    info = keenetic_apply_commit(ctx, config_updates={
+    updates = {
         "RU_VPN_DOMAINS": " ".join(dict.fromkeys(domains)),
         "RU_VPN_TAG": tag,
         "RU_VPN_SUBDOMAINS": "1" if domains and request.form.get("subdomains") == "1" else "0",
-    })
+    }
+    if mode is not None or not domains:
+        updates["RU_VPN_FAILOVER_TAGS"] = " ".join(reserves)
+        updates["RU_VPN_FAIL_DIRECT"] = "1" if reserves and request.form.get("ru_fail_direct") == "1" else "0"
+    info = keenetic_apply_commit(ctx, config_updates=updates)
     if not info.get("ok"):
         return jsonify(_apply_fail_result(info, "Исключения .ru"))
     return jsonify({"ok": True, "stdout": "Исключения .ru сохранены. " + _apply_note(info)})
@@ -8809,6 +8877,8 @@ DIRECT_DOMAINS=""
 RU_VPN_DOMAINS=""
 RU_VPN_TAG=""
 RU_VPN_SUBDOMAINS="0"
+RU_VPN_FAILOVER_TAGS=""
+RU_VPN_FAIL_DIRECT="0"
 BLOCK_DOMAINS=""
 PRIMARY_PROBE_URL="https://www.cloudflare.com/cdn-cgi/trace"
 # сколько раз primary должен упасть подряд → switch to failover
@@ -10526,7 +10596,7 @@ def _domain_in_list(host, domain_list, *, include_subdomains=True):
     return None
 
 
-def _channel_for_domain(host, tg):
+def _channel_for_domain(host, tg, ru_vpn_active=None):
     """В какой канал попадёт домен ПО ПРЕСЕТАМ (watchdog.config). Приоритет = как в watchdog:
     BLOCK > DIRECT(список) > исключения .ru > RU-домен(.ru/.su/.рф) > AI > YT > FOREIGN > IPv6 > PRIMARY.
     ⚠ Geo-категории (ext:geosite:...) НЕ учитываются (на хосте панели нет geo-БД) — домен,
@@ -10541,7 +10611,13 @@ def _channel_for_domain(host, tg):
         ru_host = _normalize_ru_vpn_domain(h)
         m = _domain_in_list(ru_host, tg.get("ru_vpn_domains"), include_subdomains=tg.get("ru_vpn_subdomains", False))
         if m:
-            return {"label": "Исключения .ru", "tag": tg["ru_vpn_tag"], "kind": "ru-vpn", "match": m}
+            tag = tg["ru_vpn_tag"]
+            label = "Исключения .ru"
+            if tg.get("ru_vpn_failover_tags"):
+                tag = ru_vpn_active
+                if not tag:
+                    label += " · действующий выход не подтвержден"
+            return {"label": label, "tag": tag, "kind": "ru-vpn", "match": m}
     if _RU_TLD_RE.search(h):
         return {"label": "↪️ Напрямую", "tag": "direct", "kind": "direct", "match": "RU-домен (.ru/.su/.рф)"}
     m = _domain_in_list(h, tg.get("ai_domains"))
@@ -10638,7 +10714,11 @@ def api_diagnose_site():
     # Если роутер недоступен — не критично, послойная проверка всё равно показана.
     try:
         _tg = keenetic_get_watchdog_targets()
-        out["channels"] = {h: _channel_for_domain(h, _tg) for h in urls}
+        channels = {h: _channel_for_domain(h, _tg) for h in urls}
+        if _tg.get("ru_vpn_failover_tags") and any(ch.get("kind") == "ru-vpn" for ch in channels.values()):
+            active = _ru_vpn_active_for_targets(keenetic_get_routing_active() or {}, _tg)
+            channels = {h: _channel_for_domain(h, _tg, active) for h in urls}
+        out["channels"] = channels
     except Exception:  # noqa: BLE001
         out["channels"] = None
 
@@ -13235,13 +13315,15 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   <div class="domain-section" data-xk-sub="🔀 Домены .ru через VPN" data-xk-page-id="ru-vpn">
     <h3 class="domain-section-header">Домены .ru через VPN</h3>
     <div class="domain-section-body" style="padding: 12px 16px;">
-      <p class="subtitle">Выбери сайты в зоне .ru, которые должны идти через VPN. Остальные .ru по базовому правилу идут напрямую.</p>
+      <p class="subtitle">Указать сайты в зоне .ru, которые должны идти через VPN. Остальные .ru по базовому правилу идут напрямую.</p>
       <form id="ru-vpn-exceptions" onsubmit="saveRuVpnExceptions(this); return false;">
         <label for="ru-vpn-domains">Домены .ru, по одному на строку</label>
         <textarea id="ru-vpn-domains" name="domains" rows="4" style="width: 100%;" placeholder="site.ru">{{ targets.ru_vpn_domains | join('\n') }}</textarea>
-        <label><input type="checkbox" name="subdomains" value="1" {% if targets.ru_vpn_subdomains %}checked{% endif %}> Включая поддомены</label>
-        <label for="ru-vpn-tag">VPN-выход</label>
-        <select id="ru-vpn-tag" name="tag">
+        <p><label><input type="checkbox" name="subdomains" value="1" {% if targets.ru_vpn_subdomains %}checked{% endif %}> Включая поддомены</label></p>
+        <div style="display: flex; gap: 8px 16px; align-items: center; flex-wrap: wrap; margin-bottom: 8px;">
+          <div>
+        <label for="ru-vpn-tag">Основной VPN-выход</label>
+        <select id="ru-vpn-tag" name="tag" onchange="renderRuVpnChain()">
           <option value="">— выбрать VPN-выход —</option>
           {% for grp in vless_option_groups %}
             {% for opt in grp.options if not opt.is_direct %}
@@ -13249,8 +13331,45 @@ XKEEN_TEMPLATE = r"""<!doctype html>
             {% endfor %}
           {% endfor %}
         </select>
+          </div>
+          <div>
+        <label for="ru-vpn-mode">Режим VPN-выхода</label>
+        <select id="ru-vpn-mode" name="ru_chain_mode" onchange="renderRuVpnChain()">
+          <option value="single">Один VPN-выход</option>
+          <option value="custom" {% if targets.ru_vpn_failover_tags %}selected{% endif %}>Собственная цепочка</option>
+        </select>
+          </div>
+        </div>
+        <div id="ru-vpn-chain-editor" hidden>
+          <div id="ru-chain-list" class="chain-list"></div>
+          <div style="display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
+            <label for="ru-chain-add">Резервный выход</label>
+            <select id="ru-chain-add">
+              <option value="">— выбрать резерв —</option>
+              {% for grp in vless_option_groups %}
+                {% for opt in grp.options if not opt.is_direct %}
+                  <option value="{{ opt.tag }}">{{ grp.name }} · {{ opt.tag }}</option>
+                {% endfor %}
+              {% endfor %}
+            </select>
+            <button type="button" class="btn btn-sm" onclick="chainAdd('ru')">Добавить резерв</button>
+          </div>
+          <p><label><input type="checkbox" name="ru_fail_direct" value="1" {% if targets.ru_vpn_fail_direct %}checked{% endif %}> Подключаться напрямую, если все VPN-выходы недоступны</label></p>
+          <p class="subtitle">Без этой настройки при недоступности всей цепочки доступ к списку приостанавливается. Watchdog проверяет соединение с VPN-узлом. Доступ к самому сайту проверяется отдельно.</p>
+        </div>
+        {% if targets.ru_vpn_failover_tags %}
+          <p id="ru-vpn-status" class="subtitle" role="status">
+            Маршрут на момент загрузки страницы.
+            {% if ru_vpn_active == 'block' %}Доступ к списку приостановлен.
+            {% elif ru_vpn_active == 'direct' %}Действует прямое подключение.
+            {% elif ru_vpn_active and ru_vpn_active == targets.ru_vpn_tag %}Действует основной VPN-выход — {{ ru_vpn_active }}.
+            {% elif ru_vpn_active %}Действует резервный VPN-выход — {{ ru_vpn_active }}.
+            {% else %}Действующий выход не подтвержден.{% endif %}
+            <button type="button" class="btn btn-sm" onclick="if (confirm('Обновить страницу? Несохраненные изменения будут потеряны.')) location.reload()">Обновить страницу</button>
+          </p>
+        {% endif %}
         <button class="btn btn-sm" type="submit">Сохранить исключения</button>
-        <p class="subtitle">Исключения применяются для клиентов политики XKeen после списков «Блокировать» и «Напрямую». Пустой список отключает исключения. Для выбранного выхода резерв не используется.</p>
+        <p class="subtitle">Исключения применяются для клиентов политики XKeen после списков «Блокировать» и «Напрямую». Пустой список отключает исключения.</p>
       </form>
     </div>
   </div>
@@ -17964,6 +18083,8 @@ function refreshForeignActiveInfo() {
 const CHAIN_TAG_INFO = {{ chain_tag_info|tojson }};
 const CHAIN_MAX = 8;
 const CHAIN_STATE = {
+  ru: { tags: {{ (targets.ru_vpn_failover_tags or [])|tojson }}, label: '.ru',
+        mainSel: 'ru-vpn-tag', mainTag: {{ (targets.ru_vpn_tag or '')|tojson }} },
   ai: { tags: {{ (targets.ai_failover_tags or [])|tojson }}, label: 'AI',
         effective: WATCHDOG_EFFECTIVE_AI, mainSel: 'select-ai',
         mainTag: {{ targets.ai_tag|tojson }} },
@@ -18008,6 +18129,7 @@ function chainRenderCommonView(allowRu) {
 }
 
 function chainAllowRu(kind) {
+  if (kind === 'ru') return true;
   const cb = document.getElementById(kind + '-chain-allow-ru');
   return !!(cb && cb.checked);
 }
@@ -18035,7 +18157,9 @@ function chainRender(kind) {
   }
   const allowRu = chainAllowRu(kind);
   if (!st.tags.length) {
-    box.innerHTML = html + '<div class="chain-empty">' + ((kind === 'foreign' && chainUseCommon())
+    box.innerHTML = html + '<div class="chain-empty">' + (kind === 'ru'
+      ? 'Добавить хотя бы один резервный выход.'
+      : (kind === 'foreign' && chainUseCommon())
       ? 'Собственная цепочка пуста — действует общая цепочка резерва (см. ниже).'
       : 'Цепочка резерва пуста — при падении канала сразу сработает настройка блокировки выше.') + '</div>';
     // Режим «общая цепочка» гасит редактор ПОСЛЕ отрисовки: кнопки списка создаются заново.
@@ -18176,6 +18300,7 @@ document.addEventListener('DOMContentLoaded', () => {
   chainRender('ai');
   chainRender('yt');
   chainRender('foreign');
+  renderRuVpnChain();
   // Старт самодиагностики панели
   refreshDashboardHealth();
   setInterval(refreshDashboardHealth, 15000);
@@ -19969,11 +20094,23 @@ function _formatBytes(b) {
   return v.toFixed(v >= 10 ? 0 : 1) + ' ' + units[i];
 }
 
+function renderRuVpnChain() {
+  const mode = document.getElementById('ru-vpn-mode');
+  if (!mode) return;
+  document.getElementById('ru-vpn-chain-editor').hidden = mode.value !== 'custom';
+  CHAIN_STATE.ru.mainTag = document.getElementById('ru-vpn-tag').value;
+  chainRender('ru');
+}
+
 async function saveRuVpnExceptions(form) {
   const button = form.querySelector('button[type="submit"]');
   button.disabled = true;
   try {
-    const res = await apiCall('/api/xkeen/set-ru-vpn-exceptions', new FormData(form));
+    const data = new FormData(form);
+    if (data.get('ru_chain_mode') === 'custom') {
+      for (const tag of CHAIN_STATE.ru.tags) data.append('ru_reserve', tag);
+    }
+    const res = await apiCall('/api/xkeen/set-ru-vpn-exceptions', data);
     flash(res.ok, res.ok ? res.stdout : 'Исключения .ru не сохранены', res.stderr);
     if (res.ok) {
       setTimeout(() => location.reload(), 1800);

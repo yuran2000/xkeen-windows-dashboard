@@ -1,4 +1,8 @@
 #!/bin/sh
+# XKeen failover watchdog v46 (2026-11-09, собственный резерв для .ru):
+#   • Проверяет TCP-доступность основного выхода и резервов по порядку.
+#   • При недоступности всех выходов блокирует список .ru либо применяет явно заданный direct.
+#
 # XKeen failover watchdog v45 (2026-11-09, исключения .ru через выбранный VPN):
 #   • Выводит правило исключений после DIRECT в существующем шаблоне v13.
 #
@@ -591,8 +595,8 @@ _bg_restart_or_defer() {
 
 # Возвращает "host port" для tag из 04_outbounds.json (или пусто если не найдено).
 get_host_port() {
-  jq -r ".outbounds[] | select(.tag==\"$1\") | \"\(.settings.vnext[0].address) \(.settings.vnext[0].port)\"" \
-    "$OUTBOUNDS_JSON" 2>/dev/null
+  sed '/^[[:space:]]*\/\//d' "$OUTBOUNDS_JSON" | jq -r --arg tag "$1" \
+    '.outbounds[] | select(.tag == $tag) | "\(.settings.vnext[0].address) \(.settings.vnext[0].port)"' 2>/dev/null
 }
 
 # Пинг outbound по tag. Возвращает 0 если живой, 1 если мёртвый.
@@ -610,7 +614,7 @@ _probe_connected() {
   [ -n "$1" ] && [ "$1" != "0" ]
 }
 probe_tag() {
-  local tag="$1" probe_url="$2" _tc
+  local tag="$1" probe_url="$2" probe_mode="${3:-}" _tc
   # v12: direct/block — локальные outbound'ы без удалённого сервера, "пинговать" нечем.
   # Для них "жив" = верно: если direct не работает — упал весь интернет, и failover на VPN
   # это не починит. Без этого watchdog ложно считает primary=direct "упавшим" и шлёт ложные
@@ -632,8 +636,18 @@ probe_tag() {
   [ -z "$hp" ] && return 1
   set -- $hp
   host="$1"; port="$2"
+  if [ "$probe_mode" = "require-connect" ]; then
+    case "$host" in
+      \[*\]) ;;
+      *:*) host="[$host]" ;;
+    esac
+  fi
   _tc=$(curl -sk --connect-timeout 5 --max-time 8 -o /dev/null -w '%{num_connects}' "https://${host}:${port}/" 2>/dev/null)
   rc=$?
+  if [ "$probe_mode" = "require-connect" ]; then
+    _probe_connected "$_tc"
+    return $?
+  fi
   case "$rc" in
     7)  return 1 ;;  # couldn't connect
     28) _probe_connected "$_tc" && return 0  # v32: TCP установлен, не дождались ответа — жив
@@ -1508,6 +1522,56 @@ flush_outbox() {
 # AI_DOMAINS в config через пробел или запятую — например "claude.ai openai.com anthropic.com".
 # Если AI_DOMAINS пуст ИЛИ только из пробелов → AI-sticky выключен: блок заменяется на пустую
 # строку, AI-сайты идут через PRIMARY как обычный трафик.
+ru_vpn_select() {
+  local tag tags best="" prior="${RU_VPN_ACTIVE:-}" prior_configured=0 prior_live=0 fallback=block
+  [ "${RU_VPN_FAIL_DIRECT:-0}" = "1" ] && fallback=direct
+  [ -n "${WD_APPLY_ID:-}" ] && prior=""
+  tags=$(sed '/^[[:space:]]*\/\//d' "$OUTBOUNDS_JSON" | jq -r \
+    --arg reserves "$RU_VPN_FAILOVER_TAGS" --arg main "$RU_VPN_TAG" '
+    [.outbounds[] | select(.protocol == "vless") | .tag] as $available
+    | ([$main] + ($reserves | split(" ") | map(select(. != $main))))[]
+    | select(. != "" and . != "direct" and . != "block")
+    | . as $tag | select($available | index($tag))') || return 1
+  while IFS= read -r tag; do
+    [ -n "$tag" ] || continue
+    if [ "$tag" = "$prior" ]; then
+      prior_configured=1
+    elif [ -n "$best" ]; then
+      continue
+    fi
+    if probe_tag "$tag" "" require-connect; then
+      [ -z "$best" ] && best="$tag"
+      [ "$tag" = "$prior" ] && prior_live=1
+      [ -z "$prior" ] && break
+    fi
+  done <<EOF
+$tags
+EOF
+  best="${best:-$fallback}"
+  RU_VPN_CANDIDATE_TAG="$best"
+  if [ -z "$prior" ] || [ "$best" = "$prior" ]; then
+    return 0
+  fi
+  if [ "$prior_configured" = "1" ] && [ "$prior_live" = "0" ]; then
+    local misses=$(( $(_num "${RU_VPN_MISS:-0}" 0) + 1 ))
+    if [ "$misses" -lt "$FAIL_THRESHOLD" ]; then
+      RU_VPN_CANDIDATE_MISS="$misses"
+      RU_VPN_CANDIDATE_TAG="$prior"
+    fi
+  elif [ "$prior_live" = "1" ] || { [ "$best" != "$fallback" ] && [ "$prior" = "$fallback" ]; }; then
+    local passes=1
+    if [ "$best" = "${RU_VPN_PENDING:-}" ]; then
+      passes=$(( $(_num "${RU_VPN_PASS:-0}" 0) + 1 ))
+    fi
+    if [ "$passes" -lt "$PASS_THRESHOLD" ]; then
+      RU_VPN_CANDIDATE_PENDING="$best"
+      RU_VPN_CANDIDATE_PASS="$passes"
+      RU_VPN_CANDIDATE_TAG="$prior"
+    fi
+  fi
+  return 0
+}
+
 generate_routing() {
   local default_tag="$1" ai_tag="$2" yt_tag="$3" foreign_tag="$4" ipv6_tag="$5"
   [ -f "$TEMPL" ] || { log "ERROR: template $TEMPL not found"; return 1; }
@@ -1697,6 +1761,8 @@ generate_routing() {
 
   # Используем штатную точку DIRECT, чтобы сохранять совместимость с template v13.
   local ru_vpn_rule="" ru_vpn_early_block="" ru_prefix="full:" ru_vpn_target ru_vpn_domains=""
+  RU_VPN_CANDIDATE_TAG=""; RU_VPN_CANDIDATE_PENDING=""
+  RU_VPN_CANDIDATE_MISS=0; RU_VPN_CANDIDATE_PASS=0
   if [ -n "${RU_VPN_DOMAINS:-}" ]; then
     ru_vpn_domains=$(printf '%s' "$RU_VPN_DOMAINS" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')
   fi
@@ -1708,6 +1774,9 @@ generate_routing() {
       log "ERROR: RU VPN exceptions: VLESS outbound missing or unreadable"
       [ -n "${WD_APPLY_ID:-}" ] && return 1
       ru_vpn_target="block"
+    elif [ -n "${RU_VPN_FAILOVER_TAGS:-}" ]; then
+      ru_vpn_select || return 1
+      ru_vpn_target="$RU_VPN_CANDIDATE_TAG"
     fi
     if ! awk '
       /^__BLOCK_RULE_BLOCK__$/ { b=NR; nb++ }
@@ -1721,6 +1790,7 @@ generate_routing() {
       ru_vpn_early_block=1
     fi
     [ "${RU_VPN_SUBDOMAINS:-0}" = "1" ] && ru_prefix="domain:"
+    [ -n "${RU_VPN_FAILOVER_TAGS:-}" ] && RU_VPN_CANDIDATE_TAG="$ru_vpn_target"
     ru_vpn_rule=$(jq -nc --arg domains "$ru_vpn_domains" --arg prefix "$ru_prefix" \
       --arg tag "$ru_vpn_target" '{
         inboundTag: ["redirect", "tproxy"], outboundTag: $tag, type: "field",
@@ -1917,6 +1987,13 @@ generate_routing() {
       return 1
     fi
     rm -f "$_stripped" 2>/dev/null
+  fi
+  if [ -n "$RU_VPN_CANDIDATE_TAG" ]; then
+    # Keep the JSON body valid for the other probes. Identify the applied rule in the header.
+    local marked="$CONFIG_DIR/05_routing.json.new" marker
+    marker=$(printf '%s\n' "${ru_vpn_rule:-$ru_vpn_early_block}" | jq -c '[.outboundTag, .domain]') || return 1
+    { printf '// XKeen .ru VPN %s\n' "$marker"; cat "$marked"; } > "$marked.header" &&
+      mv "$marked.header" "$marked" || return 1
   fi
   return 0
 }
@@ -3527,6 +3604,11 @@ PREV_FOREIGN=$(grep -o 'EFFECTIVE_FOREIGN=\S*' "$STATE_FILE" 2>/dev/null | cut -
 # AI_DOMAINS / AI_TAG / YT_DOMAINS / YT_TAG / шаблона (юзер правит из дашборда).
 # v35: _APPLY_DONE — рестарт в этом тике уже был; _APPLY_RB — причина отказа/отката режима применения.
 _APPLY_DONE=0; _APPLY_RB=""
+RU_VPN_ACTIVE=$(_state_field RU_VPN_ACTIVE "")
+RU_VPN_PENDING=$(_state_field RU_VPN_PENDING "")
+RU_VPN_MISS=$(_state_field RU_VPN_MISS 0)
+RU_VPN_PASS=$(_state_field RU_VPN_PASS 0)
+RU_VPN_ROUTING_OK=0
 if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFFECTIVE_FOREIGN_TAG" "$IPV6_TAG"; then
   if routing_changed; then
     NEW_MD5=$(md5sum < "$CONFIG_DIR/05_routing.json.new" 2>/dev/null | awk '{print $1}')
@@ -3553,6 +3635,7 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
         [ -z "$WD_APPLY_ID" ] && { _traffic_ok_or_heal || :; }
         cp "$CONFIG_DIR/05_routing.json" "$CONFIG_DIR/05_routing.json.lastgood" 2>/dev/null
         LAST_BAD_MD5=""   # успешное применение — снимаем «бракованную» метку
+        RU_VPN_ROUTING_OK=1
         yt_return_notify
         if [ "$NEW_DEFAULT" != "$CUR_DEFAULT" ] && [ "$_pri_main_chg" = "1" ] && [ "$NEW_DEFAULT" = "$PRIMARY_TAG" ] \
            && [ "$CUR_DEFAULT" = "$_pri_main_prev" ]; then
@@ -3650,6 +3733,7 @@ if generate_routing "$NEW_DEFAULT" "$EFFECTIVE_AI_TAG" "$EFFECTIVE_YT_TAG" "$EFF
     fi
   else
     rm -f "$CONFIG_DIR/05_routing.json.new"
+    RU_VPN_ROUTING_OK=1
   fi
 else
   log "ERROR: generate_routing failed"
@@ -3751,6 +3835,12 @@ if [ "$NEW_STATE" = "primary" ] && [ $((NOW_EPOCH - LAST_FULL_PROBE)) -ge 300 ];
 fi
 
 # ---------- Save state ----------
+if [ "$RU_VPN_ROUTING_OK" = "1" ]; then
+  RU_VPN_ACTIVE="$RU_VPN_CANDIDATE_TAG"
+  RU_VPN_PENDING="$RU_VPN_CANDIDATE_PENDING"
+  RU_VPN_MISS="$RU_VPN_CANDIDATE_MISS"
+  RU_VPN_PASS="$RU_VPN_CANDIDATE_PASS"
+fi
 # Формат: "<state> <counter> <default_tag> EFFECTIVE_AI=<tag> EFFECTIVE_YT=<tag> LAST_FULL_PROBE=<epoch> PREV_ALIVE=<n>"
 # То же для счётчиков/таймстампов цепочек AI и YT: ветка могла не выполниться (канал жив,
 # цепочка не задана, блок неактивен) — переносим прежние значения из state, иначе счётчик
@@ -3793,4 +3883,4 @@ DPRI_HOLD=$(_deep_hold "$DPRI_QN"); DYT_HOLD=$(_deep_hold "$DYT_QN"); DFGN_HOLD=
 # PRI_MAIN/YT_MAIN/FGN_MAIN выставляются каждый тик (до блоков ролей) — переносить не нужно.
 # AI_EFF — что РЕАЛЬНО применено для AI в этом тике (основной / резерв цепочки / block).
 # Нужен, чтобы (а) не спамить алертами о переключении, (б) AI-probe отличал blackhole от резерва.
-echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR AI_EFF=$EFFECTIVE_AI_TAG AI_CMISS=$AI_CMISS AI_SW_TS=$AI_SW_TS AI_LEFT_TS=$AI_LEFT_TS YT_EFF=$EFFECTIVE_YT_TAG YT_CMISS=$YT_CMISS YT_SW_TS=$YT_SW_TS FGN_EFF=$EFFECTIVE_FOREIGN_TAG FGN_CMISS=$FGN_CMISS FGN_SW_TS=$FGN_SW_TS DPRI_CTR=$DPRI_CTR DPRI_TS=$DPRI_TS DPRI_DEAF=$DPRI_DEAF DPRI_LEFT=$DPRI_LEFT DPRI_TAG=$DPRI_TAG DYT_CTR=$DYT_CTR DYT_TS=$DYT_TS DYT_DEAF=$DYT_DEAF DYT_LEFT=$DYT_LEFT DYT_TAG=$DYT_TAG DFGN_CTR=$DFGN_CTR DFGN_TS=$DFGN_TS DFGN_DEAF=$DFGN_DEAF DFGN_LEFT=$DFGN_LEFT DFGN_TAG=$DFGN_TAG PRI_MAIN=$PRI_MAIN YT_MAIN=$YT_MAIN FGN_MAIN=$FGN_MAIN DPRI_RES=$DPRI_RES DYT_RES=$DYT_RES DFGN_RES=$DFGN_RES PRI_NOALT=$PRI_NOALT DPRI_FSINCE=$DPRI_FSINCE DYT_NOALT=$DYT_NOALT DFGN_NOALT=$DFGN_NOALT DPRI_QN=$DPRI_QN DPRI_CHK=$DPRI_CHK DPRI_HOLD=$DPRI_HOLD DYT_QN=$DYT_QN DYT_CHK=$DYT_CHK DYT_HOLD=$DYT_HOLD DFGN_QN=$DFGN_QN DFGN_CHK=$DFGN_CHK DFGN_HOLD=$DFGN_HOLD YT_SPD=${YT_SPD:-0} YT_SPD_TS=${YT_SPD_TS:-0} YT_SPD_TAG=$YT_SPD_TAG YT_SPD_CTR=${YT_SPD_CTR:-0} YT_SLOW=${YT_SLOW:-0} YT_SPD_DIR=${YT_SPD_DIR:-0} YT_SLOWQ=$YT_SLOWQ YT_RETURN_TAG=$YT_RETURN_TAG YT_RETURN_TS=${YT_RETURN_TS:-0}" > "$STATE_FILE"
+echo "$NEW_STATE $CTR $NEW_DEFAULT EFFECTIVE_AI=$EFFECTIVE_AI_TAG EFFECTIVE_YT=$EFFECTIVE_YT_TAG EFFECTIVE_FOREIGN=$EFFECTIVE_FOREIGN_TAG LAST_FULL_PROBE=$LAST_FULL_PROBE PREV_ALIVE=$ALIVE_FAILOVER LAST_BAD_MD5=$LAST_BAD_MD5 AI_BLOCKED=$AI_BLOCKED AI_KCTR=$AI_KCTR YT_BLOCKED=$YT_BLOCKED YT_KCTR=$YT_KCTR FOREIGN_BLOCKED=$FOREIGN_BLOCKED FOREIGN_KCTR=$FOREIGN_KCTR AI_EFF=$EFFECTIVE_AI_TAG AI_CMISS=$AI_CMISS AI_SW_TS=$AI_SW_TS AI_LEFT_TS=$AI_LEFT_TS YT_EFF=$EFFECTIVE_YT_TAG YT_CMISS=$YT_CMISS YT_SW_TS=$YT_SW_TS FGN_EFF=$EFFECTIVE_FOREIGN_TAG FGN_CMISS=$FGN_CMISS FGN_SW_TS=$FGN_SW_TS DPRI_CTR=$DPRI_CTR DPRI_TS=$DPRI_TS DPRI_DEAF=$DPRI_DEAF DPRI_LEFT=$DPRI_LEFT DPRI_TAG=$DPRI_TAG DYT_CTR=$DYT_CTR DYT_TS=$DYT_TS DYT_DEAF=$DYT_DEAF DYT_LEFT=$DYT_LEFT DYT_TAG=$DYT_TAG DFGN_CTR=$DFGN_CTR DFGN_TS=$DFGN_TS DFGN_DEAF=$DFGN_DEAF DFGN_LEFT=$DFGN_LEFT DFGN_TAG=$DFGN_TAG PRI_MAIN=$PRI_MAIN YT_MAIN=$YT_MAIN FGN_MAIN=$FGN_MAIN DPRI_RES=$DPRI_RES DYT_RES=$DYT_RES DFGN_RES=$DFGN_RES PRI_NOALT=$PRI_NOALT DPRI_FSINCE=$DPRI_FSINCE DYT_NOALT=$DYT_NOALT DFGN_NOALT=$DFGN_NOALT DPRI_QN=$DPRI_QN DPRI_CHK=$DPRI_CHK DPRI_HOLD=$DPRI_HOLD DYT_QN=$DYT_QN DYT_CHK=$DYT_CHK DYT_HOLD=$DYT_HOLD DFGN_QN=$DFGN_QN DFGN_CHK=$DFGN_CHK DFGN_HOLD=$DFGN_HOLD YT_SPD=${YT_SPD:-0} YT_SPD_TS=${YT_SPD_TS:-0} YT_SPD_TAG=$YT_SPD_TAG YT_SPD_CTR=${YT_SPD_CTR:-0} YT_SLOW=${YT_SLOW:-0} YT_SPD_DIR=${YT_SPD_DIR:-0} YT_SLOWQ=$YT_SLOWQ YT_RETURN_TAG=$YT_RETURN_TAG YT_RETURN_TS=${YT_RETURN_TS:-0} RU_VPN_ACTIVE=$RU_VPN_ACTIVE RU_VPN_PENDING=$RU_VPN_PENDING RU_VPN_MISS=$RU_VPN_MISS RU_VPN_PASS=$RU_VPN_PASS" > "$STATE_FILE"
