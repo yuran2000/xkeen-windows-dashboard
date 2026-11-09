@@ -76,7 +76,10 @@ def main():
     with patch.object(D, "is_keenetic_reachable", return_value=False):
         page = client.get("/xkeen")
         assert page.status_code == 200
-        assert 'id="ru-vpn-exceptions"' in page.get_data(as_text=True)
+        html = page.get_data(as_text=True)
+        assert 'data-xk-sub="🔀 Домены .ru через VPN" data-xk-page-id="ru-vpn"' in html
+        assert html.count('id="ru-vpn-exceptions"') == 1
+        assert 'href="#ru-vpn-exceptions"' in html
 
     print("test_ru_vpn_exceptions: OK")
 

@@ -13232,6 +13232,29 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     </div>
   </div>
 
+  <div class="domain-section" data-xk-sub="🔀 Домены .ru через VPN" data-xk-page-id="ru-vpn">
+    <h3 class="domain-section-header">Домены .ru через VPN</h3>
+    <div class="domain-section-body" style="padding: 12px 16px;">
+      <p class="subtitle">Выбери сайты в зоне .ru, которые должны идти через VPN. Остальные .ru по базовому правилу идут напрямую.</p>
+      <form id="ru-vpn-exceptions" onsubmit="saveRuVpnExceptions(this); return false;">
+        <label for="ru-vpn-domains">Домены .ru, по одному на строку</label>
+        <textarea id="ru-vpn-domains" name="domains" rows="4" style="width: 100%;" placeholder="site.ru">{{ targets.ru_vpn_domains | join('\n') }}</textarea>
+        <label><input type="checkbox" name="subdomains" value="1" {% if targets.ru_vpn_subdomains %}checked{% endif %}> Включая поддомены</label>
+        <label for="ru-vpn-tag">VPN-выход</label>
+        <select id="ru-vpn-tag" name="tag">
+          <option value="">— выбрать VPN-выход —</option>
+          {% for grp in vless_option_groups %}
+            {% for opt in grp.options if not opt.is_direct %}
+              <option value="{{ opt.tag }}" {% if opt.tag == targets.ru_vpn_tag %}selected{% endif %}>{{ grp.name }} · {{ opt.tag }}</option>
+            {% endfor %}
+          {% endfor %}
+        </select>
+        <button class="btn btn-sm" type="submit">Сохранить исключения</button>
+        <p class="subtitle">Исключения применяются для клиентов политики XKeen после списков «Блокировать» и «Напрямую». Пустой список отключает исключения. Для выбранного выхода резерв не используется.</p>
+      </form>
+    </div>
+  </div>
+
   <!-- ===== «🌐 Через IPv6» канал (IPV6_*) — IPv6-only сайты через узел с IPv6-выходом ===== -->
   <div class="row" style="margin-top: 16px;">
     <div class="col" data-xk-sub="🌐 Через IPv6">
@@ -13351,30 +13374,14 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   </div><!-- /col BLOCK -->
   </div><!-- /row DIRECT+BLOCK -->
 
-  <!-- Базовые правила маршрутизации и исключения .ru -->
+  <!-- Базовые правила маршрутизации -->
   <details class="domain-section ds-template-rules" style="margin: 16px 0; padding: 0; border-radius: 4px;">
     <summary style="cursor: pointer; padding: 10px 14px; background: #6c757d; color: #fff; border-radius: 4px; font-weight: 700;">📐 Базовые правила маршрутизации</summary>
     <div style="padding: 12px 16px; background: #fafafa; border: 1px solid #ddd; border-top: 0; border-radius: 0 0 4px 4px;">
       <p class="subtitle" style="margin-top: 0;">
-        По базовым правилам домены .ru идут напрямую. Исключения ниже действуют для клиентов политики XKeen после пользовательских списков «Блокировать» и «Напрямую».
+        По базовым правилам домены .ru идут напрямую. Исключения можно настроить в разделе
+        <a href="#ru-vpn-exceptions" onclick="window.__xkActivatePageForEl?.(document.getElementById('ru-vpn-exceptions'))">Домены .ru через VPN</a>.
       </p>
-      <form id="ru-vpn-exceptions" onsubmit="saveRuVpnExceptions(this); return false;">
-        <h3>Исключения .ru через VPN</h3>
-        <label for="ru-vpn-domains">Домены .ru, по одному на строку</label>
-        <textarea id="ru-vpn-domains" name="domains" rows="4" style="width: 100%;" placeholder="site.ru">{{ targets.ru_vpn_domains | join('\n') }}</textarea>
-        <label><input type="checkbox" name="subdomains" value="1" {% if targets.ru_vpn_subdomains %}checked{% endif %}> Включая поддомены</label>
-        <label for="ru-vpn-tag">VPN-выход</label>
-        <select id="ru-vpn-tag" name="tag">
-          <option value="">— выбрать VPN-выход —</option>
-          {% for grp in vless_option_groups %}
-            {% for opt in grp.options if not opt.is_direct %}
-              <option value="{{ opt.tag }}" {% if opt.tag == targets.ru_vpn_tag %}selected{% endif %}>{{ grp.name }} · {{ opt.tag }}</option>
-            {% endfor %}
-          {% endfor %}
-        </select>
-        <button class="btn btn-sm" type="submit">Сохранить исключения</button>
-        <p class="subtitle">Пустой список отключает исключения. Для выбранного выхода резерв не используется.</p>
-      </form>
       <button class="btn btn-sm" style="background:#6c757d; color:#fff;" onclick="loadRoutingTemplateRules()">🔄 Загрузить правила</button>
       <div id="routing-template-rules-output" style="margin-top: 12px;">
         <p class="subtitle" style="color:#888;">Нажать «Загрузить правила» чтобы прочитать актуальный template с роутера.</p>
@@ -22616,22 +22623,23 @@ async function makeSiteReachable(btn) {
         let full = el.getAttribute('data-xk-sub');
         if (!full) { full = cleanSum(el.querySelector('summary')) || 'Тема'; }
         const label = full;  // CSS обрежет по ширине (ellipsis); шире панель → видно больше; полное — в title
-        const sp = document.createElement('div'); sp.className = 'xk-page'; sp.dataset.page = pi;
+        // Явный идентификатор нового пункта сохраняет номера уже существующих страниц.
+        const pageId = el.dataset.xkPageId || pi++;
+        const sp = document.createElement('div'); sp.className = 'xk-page'; sp.dataset.page = pageId;
         sp.appendChild(el);  // переносим блок в свою страницу
         main.appendChild(sp);
-        const sub = { title: label, full: full, idx: pi, subs: [], group: el.getAttribute('data-xk-group') || '' };
+        const sub = { title: label, full: full, idx: pageId, subs: [], group: el.getAttribute('data-xk-group') || '' };
         // под-под-пункты: вложенные details ПЕРВОГО уровня (напр. Шаг 1/2/3) → навигация + авто-раскрытие
         const nested = [...el.querySelectorAll('details')].filter(d =>
           d.querySelector('summary') && d.parentElement && d.parentElement.closest('details') === el);
         if (nested.length >= 2 && nested.length <= 8) {
           nested.forEach(d => {
             const nf = cleanSum(d.querySelector('summary')) || 'Шаг';
-            sub.subs.push({ title: nf, full: nf, page: pi, el: d });
-            subSubTargets.push({ page: pi, el: d });
+            sub.subs.push({ title: nf, full: nf, page: pageId, el: d });
+            subSubTargets.push({ page: pageId, el: d });
           });
         }
         entry.subs.push(sub);
-        pi++;
       });
       base.querySelectorAll('.row').forEach(r => { if (r.childElementCount === 0) r.remove(); });  // убрать опустевшие ряды
       items.push(entry);
@@ -22817,7 +22825,10 @@ async function makeSiteReachable(btn) {
     document.head.appendChild(css);
 
     let start = 0;
-    try { const s = parseInt(localStorage.getItem('xkActivePage')); if (!isNaN(s) && s >= 0 && s < pi) start = s; } catch(e){}
+    try {
+      const savedPage = localStorage.getItem('xkActivePage');
+      if ([...main.children].some(page => page.dataset.page === savedPage)) start = savedPage;
+    } catch(e){}
     showPage(start);
   } catch(e) { console.error('sidebar build failed', e); }
 })();
