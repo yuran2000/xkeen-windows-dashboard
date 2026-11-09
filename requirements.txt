@@ -5,6 +5,7 @@ qrcode[pil]>=7.4
 # PySocks — режим «через outbound» (SOCKS5-прокси). Без них секция диагностики деградирует,
 # а в portable-EXE фича не соберётся (PyInstaller бандлит только то, что стоит в venv).
 requests>=2.31
+idna>=2.5
 PySocks>=1.7
 # curl-cffi — Chrome-fingerprint fallback для anti-bot сайтов (claude.ai/openai/anthropic):
 # 403 на Python TLS JA3 ≠ блокировка IP, через chrome120-impersonate сайт открывается.

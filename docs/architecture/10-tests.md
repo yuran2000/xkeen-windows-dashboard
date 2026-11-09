@@ -23,6 +23,7 @@
 | `test_probe_tag.py` | `probe_tag`/`_probe_connected` из `.cur` в `sh` с подменным curl: таймаут при установленном TCP = жив, без соединения = мёртв (нет `sh` — SKIP) |
 | `test_wg_disconnect_offline.py` | снятие заворота WG и очистка осиротевшего хука: успех только при удалённых правилах, файле хука и строке cron; живой интерфейс очисткой не снимается |
 | `test_template_ips.py` | `.cur`-template (версия, два IPv4-массива), синк IP эндпоинтов |
+| `test_ru_vpn_exceptions.py` | API исключений .ru, нормализация доменов, штатное применение, диагностика приоритета, защита выхода при удалении, рендер без роутера |
 | `test_wg_clients_offline.py` | выдача WG на имитации Keenetic (RCI, ACL, NAT, маршруты, save, хуки): режимы, ЛВС и подмена адреса, ручной путь, s2s, линки, отзыв (метка save, возврат NAT/маршрута, чужие пиры, заворот), форма правил созданного вручную (`prefill_from_acl`: пресеты, диапазоны в обоих форматах RCI, предупреждения, свой .1 в xray, обратимость), гонка за индекс, откат, битый/занятый реестр, X25519 = RFC 7748, рендер `/xkeen` |
 | `test_csrf_offline.py` | `_csrf_origin_guard`: чужой Origin/Referer/`null`/другой порт → 403 до обработчика, свой хост, без заголовков и GET — проходят, `TRUSTED_ORIGINS`, `SameSite=Lax` |
 | `test_sub_preview_fp_offline.py` | предпросмотр подписки видит смену отпечатка TLS: `_outbound_fp`, `_fp_change_info` (reality/tls/none, поле не задано), ответ preview на моках (`fp_change`, `host_change`, `changed`, `fp_lottery_*`, `fp` новых серверов), вывод отпечатка и 🎲 в JS |

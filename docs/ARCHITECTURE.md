@@ -333,6 +333,11 @@ files: [{path, content}]}`, собирается `jq` на роутере.
 
 ### 3.8. Домены, категории, цепочки
 
+«Исключения .ru через VPN» в базовых правилах маршрутизации сохраняет список, VLESS-выход и
+признак поддоменов через `api_xkeen_set_ru_vpn_exceptions` и `keenetic_apply_commit`.
+Watchdog v45 добавляет правило после списка DIRECT перед штатным правилом .ru → direct в template v13.
+Выбранный выход защищен от одиночного и группового удаления и удаления при синхронизации подписки.
+
 Обработчики `set-*` (§4.3) пишут только через `keenetic_write_watchdog_config`. Категории перед
 записью проверяет `keenetic_validate_route_categories(names, kind)` (мини-`xray run -test` на роутере +
 sentinel `google`/`private`; sentinel не прошёл → fail-open) с текстом `_cat_missing_msg`. IPv6:

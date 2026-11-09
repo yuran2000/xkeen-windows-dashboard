@@ -49,6 +49,7 @@ cron */1 → watchdog.sh: . watchdog.config → пробы → state-машин�
 | `FOREIGN_FAILOVER_TAGS`, `FOREIGN_CHAIN_ALLOW_RU`, `FOREIGN_CHAIN_USE_COMMON` | `""`, `0`, `0` (флаги явно) | set-channel-chain kind=foreign | `foreign_failover_tags`, `foreign_chain_allow_ru`, `foreign_chain_use_common` |
 | `IPV6_TAG`, `IPV6_DOMAINS` | `""` | set-target/ipv6, set-ipv6-domains | `ipv6_tag`, `ipv6_domains` |
 | `DIRECT_DOMAINS`, `BLOCK_DOMAINS` | `""` | set-direct-/set-block-domains | `direct_domains`, `block_domains` |
+| `RU_VPN_DOMAINS`, `RU_VPN_TAG`, `RU_VPN_SUBDOMAINS` | `""`, `""`, `0` | set-ru-vpn-exceptions | `ru_vpn_domains`, `ru_vpn_tag`, `ru_vpn_subdomains` |
 | `PRIMARY_PROBE_URL` | пусто → TCP-проба; запись без ключа — `https://<vpn-domain>:8444/` | set-target/primary (для `vless-reality` URL, иначе пусто) | — |
 | `FAIL_THRESHOLD`, `PASS_THRESHOLD` | `2`, `3` (`_num`) | только вручную | — |
 | `DEEP_PROBE_ENABLE`, `DEEP_PROBE_INTERVAL`, `DEEP_PROBE_THRESHOLD`, `DEEP_RETURN_HOLD` | `1`, `180` с, `2`, `1800` с — все явно | watchdog-settings | `deep_probe_enable`, `deep_probe_interval`, `deep_probe_threshold`, `deep_return_hold` |
@@ -260,6 +261,14 @@ v21, v23) — через `_bg_restart_or_defer`.
 при живом узле (до v32 это давало ложные уходы на резерв и лишние `xkeen -restart`). 🔴
 `%{time_connect}` как признак соединения не годится: при таймауте на этапе TLS curl пишет 0 и для
 установленного TCP. Тест — `tests/test_probe_tag.py`.
+
+Watchdog v45 на отдельной строке `__DIRECT_RULE_BLOCK__` выводит сначала пользовательский DIRECT,
+затем исключения .ru (только `redirect`/`tproxy`). В штатном template v13 эта строка стоит перед
+общим правилом .ru/.su/.рф → direct. Пустой список не добавляет правила. По умолчанию Xray получает
+`full:`, с включенными поддоменами — `domain:`. Версия шаблона остается v13.
+Генератор проверяет порядок BLOCK/DIRECT/общего .ru и существование VLESS-выхода. При сбое
+транзакция отказывается применять изменения, в обычном тике блокируются выбранные .ru,
+а остальные правила продолжают пересобираться.
 
 Плейсхолдеры template: `__DEFAULT_TAG__`, `__BLOCK_RULE_BLOCK__`, `__DIRECT_RULE_BLOCK__`,
 `__AI_RULE_BLOCK__`, `__YT_RULE_BLOCK__`, `__YT_RULE_GEOIP__`, `__FOREIGN_RULE_BLOCK__`,

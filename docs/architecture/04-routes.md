@@ -52,6 +52,7 @@
 | `/api/xkeen/set-failover-chain` | `api_xkeen_set_failover_chain` | `tags` через запятую (≥ 1) → `FAILOVER_TAGS` | WD |
 | `/api/xkeen/set-channel-chain` | `api_xkeen_set_channel_chain` | `kind` ai/yt/foreign, `tags`, опц. `allow_ru`, `use_common` (foreign) | R + WD |
 | `/api/xkeen/set-{direct,block,ai,yt,foreign}-domains` | `api_xkeen_set_{direct,block,ai,yt,foreign}_domains` | `domains` → `*_DOMAINS` | WD |
+| `/api/xkeen/set-ru-vpn-exceptions` | `api_xkeen_set_ru_vpn_exceptions` | `domains` (UTS 46), `tag`, `subdomains=1`; пустой список очищает настройку | До обновления сторожа и после отпечатков проверяет порядок шаблона и VLESS-выход |
 | `/api/xkeen/set-ipv6-domains` | `api_xkeen_set_ipv6_domains` | `domains` или `action=add/remove` + `domain` | WD + ndm (`ip host <d> 198.18.0.1`) |
 | `/api/xkeen/set-{ai,yt,foreign}-fail-block` | `api_xkeen_set_{ai,yt,foreign}_fail_block` | `enabled=1/0` → `*_FAIL_BLOCK` | WD |
 | `/api/xkeen/set-{ai,yt,foreign}-ext-categories` | `api_xkeen_set_{ai,yt,foreign}_ext_categories` | `categories` → `*_EXT_CATEGORIES` (проверка geosite) | R + WD |

@@ -1,5 +1,8 @@
 #!/bin/sh
-# XKeen failover watchdog v44 (2026-10-30, скорость основного YouTube до возврата):
+# XKeen failover watchdog v45 (2026-11-09, исключения .ru через выбранный VPN):
+#   • Выводит правило исключений после DIRECT в существующем шаблоне v13.
+#
+# v44 (2026-10-30, скорость основного YouTube до возврата):
 #   • socks-yt-return → настроенный YT_TAG, пока клиенты остаются на резерве. Карантин и
 #     проверка скорости обязательны при автоматическом возврате с включённым YT_SPEED_ENABLE.
 #   • «YouTube работает» — после подтверждения скорости и успешного применения routing;
@@ -1692,7 +1695,44 @@ generate_routing() {
     fi
   fi
 
-  awk -v dt="$default_tag" -v ai_rule="$ai_rule_block" -v direct_rule="$direct_rule_block" -v yt_rule="$yt_rule_block" -v yt_geoip_rule="$yt_geoip_rule_block" -v foreign_rule="$foreign_rule_block" -v foreign_geoip_rule="$foreign_geoip_rule_block" -v ipv6_rule="$ipv6_rule_block" -v block_rule="$block_rule_block" '
+  # Используем штатную точку DIRECT, чтобы сохранять совместимость с template v13.
+  local ru_vpn_rule="" ru_vpn_early_block="" ru_prefix="full:" ru_vpn_target ru_vpn_domains=""
+  if [ -n "${RU_VPN_DOMAINS:-}" ]; then
+    ru_vpn_domains=$(printf '%s' "$RU_VPN_DOMAINS" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')
+  fi
+  if [ -n "$ru_vpn_domains" ]; then
+    ru_vpn_target="${RU_VPN_TAG:-}"
+    if ! sed '/^[[:space:]]*\/\//d' "$OUTBOUNDS_JSON" | jq -e --arg tag "$ru_vpn_target" \
+      '$tag != "" and $tag != "direct" and $tag != "block"
+       and any(.outbounds[]; .tag == $tag and .protocol == "vless")' >/dev/null 2>&1; then
+      log "ERROR: RU VPN exceptions: VLESS outbound missing or unreadable"
+      [ -n "${WD_APPLY_ID:-}" ] && return 1
+      ru_vpn_target="block"
+    fi
+    if ! awk '
+      /^__BLOCK_RULE_BLOCK__$/ { b=NR; nb++ }
+      /^__DIRECT_RULE_BLOCK__$/ { d=NR; nd++ }
+      !/^[[:space:]]*\/\// && index($0, "\"regexp:^([\\\\w\\\\-\\\\.]+\\\\.)ru$\"") { r=NR; nr++ }
+      END { exit !(nb==1 && nd==1 && nr==1 && b<d && d<r) }
+    ' "$TEMPL"; then
+      log "ERROR: RU VPN exceptions: unsupported routing template order"
+      [ -n "${WD_APPLY_ID:-}" ] && return 1
+      ru_vpn_target="block"
+      ru_vpn_early_block=1
+    fi
+    [ "${RU_VPN_SUBDOMAINS:-0}" = "1" ] && ru_prefix="domain:"
+    ru_vpn_rule=$(jq -nc --arg domains "$ru_vpn_domains" --arg prefix "$ru_prefix" \
+      --arg tag "$ru_vpn_target" '{
+        inboundTag: ["redirect", "tproxy"], outboundTag: $tag, type: "field",
+        domain: ($domains | split(" ") | map(select(length > 0) | $prefix + .))
+      }') || { log "ERROR: cannot generate RU VPN exceptions"; return 1; }
+    if [ -n "$ru_vpn_early_block" ]; then
+      ru_vpn_early_block="$ru_vpn_rule"
+      ru_vpn_rule=""
+    fi
+  fi
+
+  awk -v dt="$default_tag" -v ai_rule="$ai_rule_block" -v direct_rule="$direct_rule_block" -v ru_vpn_rule="$ru_vpn_rule" -v yt_rule="$yt_rule_block" -v yt_geoip_rule="$yt_geoip_rule_block" -v foreign_rule="$foreign_rule_block" -v foreign_geoip_rule="$foreign_geoip_rule_block" -v ipv6_rule="$ipv6_rule_block" -v block_rule="$block_rule_block" '
     /__AI_RULE_BLOCK__/ {
       if (ai_rule == "") next
       else { gsub(/__AI_RULE_BLOCK__/, ai_rule); print; next }
@@ -1718,8 +1758,10 @@ generate_routing() {
       else { gsub(/__IPV6_RULE_BLOCK__/, ipv6_rule); print; next }
     }
     /__DIRECT_RULE_BLOCK__/ {
-      if (direct_rule == "") next
-      else { gsub(/__DIRECT_RULE_BLOCK__/, direct_rule); print; next }
+      is_direct_slot = ($0 == "__DIRECT_RULE_BLOCK__")
+      if (direct_rule != "") { gsub(/__DIRECT_RULE_BLOCK__/, direct_rule); print }
+      if (is_direct_slot && ru_vpn_rule != "") print "      " ru_vpn_rule ","
+      next
     }
     /__BLOCK_RULE_BLOCK__/ {
       if (block_rule == "") next
@@ -1727,6 +1769,17 @@ generate_routing() {
     }
     { gsub(/__DEFAULT_TAG__/, dt); print }
   ' "$TEMPL" > "$CONFIG_DIR/05_routing.json.new"
+
+  if [ -n "$ru_vpn_early_block" ]; then
+    local ru_candidate="$CONFIG_DIR/05_routing.json.new"
+    if sed '/^[[:space:]]*\/\//d' "$ru_candidate" | jq --argjson rule "$ru_vpn_early_block" \
+      '.routing.rules = [$rule] + .routing.rules' > "$ru_candidate.ru-block"; then
+      mv "$ru_candidate.ru-block" "$ru_candidate" || return 1
+    else
+      rm -f "$ru_candidate.ru-block"
+      return 1
+    fi
+  fi
 
   # v14: socks-local-правило (через него watchdog/панель шлют TG-алерты к api.telegram.org) —
   # переписываем outboundTag на АКТУАЛЬНЫЙ канал, через который у юзера реально ходит Telegram,

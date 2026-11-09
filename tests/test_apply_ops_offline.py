@@ -293,6 +293,16 @@ check("синк подписки: одно применение — новый �
 check("синк подписки: ни отдельной записи config, ни второго синка template, ни рестарта панелью",
       not WCFG and not SYNC_CALLS and not any("xkeen -restart" in c for c, _ in SSH_LOG)
       and "одним перезапуском" in resp.get("stdout", ""), (WCFG, SYNC_CALLS))
+COMMITS.clear()
+D.keenetic_get_watchdog_targets = lambda strict=False: None if strict else {}
+resp = client.post("/api/xkeen/subscription-sync", data={"url": SUB, "remove_orphans": "1"}).get_json()
+check("синк подписки: удаление отменено при сбое чтения ролей",
+      not resp.get("ok") and "watchdog.config" in resp.get("stderr", "") and not COMMITS, resp)
+D.keenetic_get_watchdog_targets = lambda strict=False: dict(T2, ru_vpn_tag="Gone")
+resp = client.post("/api/xkeen/subscription-sync", data={"url": SUB, "remove_orphans": "1"}).get_json()
+check("синк подписки: узел исключений .ru защищен",
+      not resp.get("ok") and "Исключения .ru" in resp.get("stderr", "") and not COMMITS, resp)
+D.keenetic_get_watchdog_targets = lambda strict=False: dict(T2)
 
 # ---------- 5. template с рестартом / restore / структура ----------
 D.keenetic_read_file = lambda path, timeout=15: (json.dumps(OBS) if path.endswith("04_outbounds.json")
