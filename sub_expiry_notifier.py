@@ -5,8 +5,8 @@ r"""sub_expiry_notifier.py — ежедневная проверка истеч�
 поле expires_at каждой подписки, шлёт в Telegram если подписка просрочена
 или истекает в ближайшие N дней (по умолчанию N=3).
 
-TG_BOT_TOKEN и TG_CHAT_ID берутся из /opt/etc/xray/watchdog.config на роутере.
-Если пусто — выходим без ошибки (не настроено).
+TG_BOT_TOKEN, TG_CHAT_ID и необязательный TG_MESSAGE_THREAD_ID берутся из
+/opt/etc/xray/watchdog.config. При пустом токене или Chat ID уведомления отключены.
 
 Логика уведомлений:
   • Просрочена (days < 0)        — алерт каждый день
@@ -99,15 +99,21 @@ def days_until(date_str):
         return None
 
 
-def send_telegram(token, chat_id, text):
+def send_telegram(token, chat_id, text, thread_id=""):
     """Отправляет сообщение через Bot API."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({
+    payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": "true",
-    }).encode("utf-8")
+    }
+    if thread_id:
+        if not re.fullmatch(r"[1-9][0-9]*", thread_id):
+            log("ERR Telegram: неверный ID темы")
+            return False
+        payload["message_thread_id"] = thread_id
+    data = urllib.parse.urlencode(payload).encode("utf-8")
     try:
         req = urllib.request.Request(url, data=data)
         with urllib.request.urlopen(req, timeout=20) as resp:
@@ -123,7 +129,7 @@ def send_telegram(token, chat_id, text):
 
 
 def main():
-    # 1. Читаем watchdog.config для TG_BOT_TOKEN/TG_CHAT_ID
+    # 1. Читаем адрес Telegram из watchdog.config
     wcfg_raw = ssh_cat(WATCHDOG_CONFIG)
     if not wcfg_raw:
         log("WARN не удалось прочитать watchdog.config — нет SSH или файла")
@@ -132,6 +138,7 @@ def main():
     wcfg = parse_watchdog_config(wcfg_raw)
     token = wcfg.get("TG_BOT_TOKEN", "").strip()
     chat_id = wcfg.get("TG_CHAT_ID", "").strip()
+    thread_id = wcfg.get("TG_MESSAGE_THREAD_ID", "").strip()
 
     if not token or not chat_id:
         log("INFO TG_BOT_TOKEN или TG_CHAT_ID не настроены в watchdog.config — пропуск")
@@ -207,7 +214,7 @@ def main():
     text = "\n".join(lines)
 
     # 5. Отправляем
-    ok = send_telegram(token, chat_id, text)
+    ok = send_telegram(token, chat_id, text, thread_id)
     if ok:
         log(f"OK отправлено уведомление о {len(alerts)} подписк(е/ах)")
         return 0

@@ -351,6 +351,10 @@ sentinel `google`/`private`; sentinel не прошёл → fail-open) с тек
 
 ### 3.9. `POLICY CLIENTS (v1.7.6)`, routing-template, `KEENETIC CONNECTION SETTINGS`, `BOOTSTRAP CLEAN XKEEN`, `TELEGRAM-BOT SETTINGS`
 
+- Telegram: `api_keenetic_tg_settings` хранит необязательный `TG_MESSAGE_THREAD_ID` (v47).
+  `_keenetic_tg_send` используется для теста и проверки после ремонта. Watchdog и
+  `sub_expiry_notifier.py` передают ID темы отдельным параметром `message_thread_id`.
+
 - Клиенты политики: `_parse_ndmc_hosts`, `_parse_ndmc_policies`, `_parse_host_policies`,
   `_parse_lst_file`, `_parse_xkeen_ports` (`show running-config` — таймаут 45 с + RCI-fallback, не
   уменьшать).

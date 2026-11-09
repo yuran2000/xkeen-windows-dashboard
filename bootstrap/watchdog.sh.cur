@@ -1,4 +1,6 @@
 #!/bin/sh
+# XKeen failover watchdog v47 (2026-11-09, тема для уведомлений Telegram).
+#
 # XKeen failover watchdog v46 (2026-11-09, собственный резерв для .ru):
 #   • Проверяет TCP-доступность основного выхода и резервов по порядку.
 #   • При недоступности всех выходов блокирует список .ru либо применяет явно заданный direct.
@@ -1465,11 +1467,18 @@ _tg_prefix() {
 
 # Низкоуровневая отправка готового HTML-текста. Возврат: 0 = Telegram принял (ok:true).
 _tg_send_raw() {
-  local resp
+  local resp text="$1"
+  set --
+  case "${TG_MESSAGE_THREAD_ID:-}" in
+    "") ;;
+    0*|*[!0-9]*) return 1 ;;
+    *) set -- -d "message_thread_id=$TG_MESSAGE_THREAD_ID" ;;
+  esac
   resp=$(curl -s --connect-timeout 5 --max-time 10 \
     --socks5-hostname 127.0.0.1:10808 \
     -d "chat_id=$TG_CHAT_ID" \
-    --data-urlencode "text=$1" \
+    "$@" \
+    --data-urlencode "text=$text" \
     -d "parse_mode=HTML" \
     "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" 2>/dev/null)
   echo "$resp" | grep -q '"ok":true'

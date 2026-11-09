@@ -224,7 +224,7 @@ import ssh_bin
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.4.2"
+_VERSION_FALLBACK = "1.4.3"
 
 
 def _find_git():
@@ -3160,7 +3160,7 @@ def _build_watchdog_config(d):
         "BLOCK_DOMAINS",
         "PRIMARY_PROBE_URL", "FAIL_THRESHOLD", "PASS_THRESHOLD",
         "DEEP_PROBE_ENABLE", "DEEP_PROBE_INTERVAL", "DEEP_PROBE_THRESHOLD", "DEEP_RETURN_HOLD",
-        "TG_BOT_TOKEN", "TG_CHAT_ID",
+        "TG_BOT_TOKEN", "TG_CHAT_ID", "TG_MESSAGE_THREAD_ID",
         "FORCE_MODE",
     ]
     lines = ["# /opt/etc/xray/watchdog.config — управляется дашбордом xray-dashboard"]
@@ -3284,6 +3284,10 @@ def keenetic_write_watchdog_config(updates, stage_id=None):
     # СНАРУЖИ лока (он долгий, ~30с с health-check; второе сохранение не должно его ждать).
     with _WATCHDOG_CFG_LOCK:
         _wd_sync = keenetic_ensure_watchdog_current()
+        if updates.get("TG_MESSAGE_THREAD_ID"):
+            version = {"current": _wd_sync.get("remote_ver"), "upgraded": _wd_sync.get("to")}
+            if (version.get(_wd_sync.get("action")) or 0) < 47:
+                return {"ok": False, "stderr": "Для отправки в тему нужен watchdog v47 или новее. Обновление watchdog не подтверждено."}
         cur = keenetic_read_watchdog_config()
         if cur is None:
             # Fail-closed: сбой чтения ≠ пустой конфиг. Продолжить = записать
@@ -3353,6 +3357,11 @@ def keenetic_write_watchdog_config(updates, stage_id=None):
         if "FAIL_THRESHOLD" not in cur: cur["FAIL_THRESHOLD"] = "2"
         if "PASS_THRESHOLD" not in cur: cur["PASS_THRESHOLD"] = "3"
         if "FORCE_MODE" not in cur: cur["FORCE_MODE"] = "auto"
+        if "TG_CHAT_ID" in updates and (
+            updates["TG_CHAT_ID"] != cur.get("TG_CHAT_ID", "") or not updates.get("TG_BOT_TOKEN", cur.get("TG_BOT_TOKEN"))
+        ):
+            # Старый клиент может сменить чат без поля темы. ID из прежнего чата не переносим.
+            cur["TG_MESSAGE_THREAD_ID"] = ""
         cur.update(updates)
         new_text = _build_watchdog_config(cur)
         if stage_id:
@@ -8903,6 +8912,7 @@ YT_SPEED_MIN_KBPS="300"
 YT_SPEED_INTERVAL="900"
 TG_BOT_TOKEN=""
 TG_CHAT_ID=""
+TG_MESSAGE_THREAD_ID=""
 FORCE_MODE="auto"
 '''
 
@@ -9506,11 +9516,19 @@ def _bootstrap_deploy_item(item, overwrite_existing):
 
 
 # ============== TELEGRAM-BOT SETTINGS (для алертов watchdog) ==============
+def _tg_thread_id(value):
+    """Пустое значение адресует чат целиком. Тема задается положительным целым."""
+    value = "" if value is None else str(value).strip()
+    if value and not re.fullmatch(r"[1-9][0-9]*", value):
+        raise ValueError("ID темы должен быть положительным целым числом.")
+    return value
+
+
 @app.route("/api/keenetic/tg-settings", methods=["GET", "POST"])
 @requires_auth
 def api_keenetic_tg_settings():
-    """GET — вернуть текущие TG_BOT_TOKEN/TG_CHAT_ID из watchdog.config.
-    POST — записать. Body: {token, chat_id}. Пустые значения = очистить.
+    """GET/POST настройки бота. Body: {token, chat_id, thread_id}.
+    Пустой thread_id отправляет в чат без выбора темы.
     """
     if request.method == "GET":
         cur = keenetic_read_watchdog_config() or {}
@@ -9518,6 +9536,7 @@ def api_keenetic_tg_settings():
             "ok": True,
             "token":   cur.get("TG_BOT_TOKEN", ""),
             "chat_id": cur.get("TG_CHAT_ID", ""),
+            "thread_id": cur.get("TG_MESSAGE_THREAD_ID", ""),
         })
 
     data = request.get_json(silent=True) or {}
@@ -9530,8 +9549,17 @@ def api_keenetic_tg_settings():
     if chat_id and not re.match(r"^(-?\d+|@\w{4,})$", chat_id):
         return jsonify({"ok": False, "error": "chat_id должен быть числом (или @username)."}), 400
 
+    updates = {"TG_BOT_TOKEN": token, "TG_CHAT_ID": chat_id}
+    if "thread_id" in data:
+        try:
+            thread_id = _tg_thread_id(data["thread_id"])
+        except ValueError as ex:
+            return jsonify({"ok": False, "error": str(ex)}), 400
+        if thread_id and not (token and chat_id):
+            return jsonify({"ok": False, "error": "Для темы указать Bot Token и Chat ID."}), 400
+        updates["TG_MESSAGE_THREAD_ID"] = thread_id
     try:
-        r = keenetic_write_watchdog_config({"TG_BOT_TOKEN": token, "TG_CHAT_ID": chat_id})
+        r = keenetic_write_watchdog_config(updates)
     except Exception as ex:
         return jsonify({"ok": False, "error": str(ex)}), 500
     return jsonify({"ok": bool(r.get("ok")), "stderr": r.get("stderr", "")})
@@ -9697,20 +9725,38 @@ def api_xkeen_yt_speed_test():
     return jsonify(out)
 
 
+def _keenetic_tg_send(token, chat_id, text, thread_id=""):
+    import shlex
+
+    thread_id = _tg_thread_id(thread_id)
+    topic_arg = f"-d message_thread_id={thread_id} " if thread_id else ""
+    cmd = (
+        f"curl -sS --max-time 10 --socks5-hostname 127.0.0.1:{SOCKS_LOCAL_PORT} "
+        f"-d chat_id={shlex.quote(chat_id)} {topic_arg}"
+        f"--data-urlencode text={shlex.quote(text)} "
+        f"https://api.telegram.org/bot{shlex.quote(token)}/sendMessage"
+    )
+    return keenetic_ssh(cmd, timeout=15)
+
+
 @app.route("/api/keenetic/tg-test", methods=["POST"])
 @requires_auth
 def api_keenetic_tg_test():
     """Отправить тестовое сообщение через указанный (либо текущий) бот.
-    Body: {token, chat_id} — опционально, иначе берёт из watchdog.config.
+    Body: {token, chat_id, thread_id}. Пропущенное поле темы берется
+    из watchdog.config для сохраненного чата. Пустое поле выбирает чат.
     Шлёт через роутер (curl) — на нём настроен исход через VPN, обходит блокировку api.telegram.org для RU-IP.
     """
     data = request.get_json(silent=True) or {}
     token   = (data.get("token")   or "").strip()
     chat_id = (data.get("chat_id") or "").strip()
-    if not token or not chat_id:
+    thread_id = data.get("thread_id")
+    if not token or not chat_id or "thread_id" not in data:
         cur = keenetic_read_watchdog_config() or {}
         token   = token   or cur.get("TG_BOT_TOKEN", "")
         chat_id = chat_id or cur.get("TG_CHAT_ID", "")
+        if "thread_id" not in data and chat_id == cur.get("TG_CHAT_ID"):
+            thread_id = cur.get("TG_MESSAGE_THREAD_ID")
     if not token or not chat_id:
         return jsonify({"ok": False, "error": "Не задан token или chat_id (ни в форме, ни в watchdog.config)."}), 400
 
@@ -9725,14 +9771,10 @@ def api_keenetic_tg_test():
     # watchdog'овский tg_alert. Прямой curl с роутера к api.telegram.org заблокирован для RU-IP
     # (timeout 28), а socks-local идёт через VPN-выход → доходит. Если socks-inbound не поднят
     # (нет :10808, curl rc 7) — тест честно падает с подсказкой, что канал TG-алертов не настроен.
-    import shlex
-    cmd = (
-        f"curl -sS --max-time 10 --socks5-hostname 127.0.0.1:10808 "
-        f"-d chat_id={shlex.quote(chat_id)} "
-        f"--data-urlencode text={shlex.quote(msg)} "
-        f"https://api.telegram.org/bot{shlex.quote(token)}/sendMessage"
-    )
-    r = keenetic_ssh(cmd, timeout=15)
+    try:
+        r = _keenetic_tg_send(token, chat_id, msg, thread_id)
+    except ValueError as ex:
+        return jsonify({"ok": False, "error": str(ex)}), 400
     if not r["ok"]:
         err = (r["stderr"] or r["stdout"] or "")[:300]
         if "10808" in err or "Failed to connect to 127.0.0.1" in err:
@@ -9748,7 +9790,10 @@ def api_keenetic_tg_test():
     except Exception:
         return jsonify({"ok": False, "error": "Не-JSON ответ от Telegram: " + (r["stdout"] or "")[:300]})
     if resp.get("ok"):
-        return jsonify({"ok": True, "message_id": resp.get("result", {}).get("message_id"), "info": "Сообщение доставлено."})
+        result = resp.get("result", {})
+        actual_topic = result.get("message_thread_id")
+        info = f"Сообщение доставлено в тему {actual_topic}." if actual_topic else "Сообщение доставлено."
+        return jsonify({"ok": True, "message_id": result.get("message_id"), "info": info})
     err = resp.get("description") or "unknown"
     code = resp.get("error_code", "?")
     # типичные ошибки
@@ -9812,21 +9857,17 @@ def api_keenetic_repair_tg_channel():
     chat_id = (wcfg.get("TG_CHAT_ID") or "").strip()
     test_sent = None
     if token and chat_id:
-        import shlex
         _router = getattr(cfg, "KEENETIC_HOST", "") or "роутер"
         msg = (f"🛰 роутер {_router}\n"
                f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} МСК\n\n"
                "🔧 Канал TG-алертов починен из панели — проверка связи.")
-        cmd = (f"curl -sS --max-time 10 --socks5-hostname 127.0.0.1:{SOCKS_LOCAL_PORT} "
-               f"-d chat_id={shlex.quote(chat_id)} --data-urlencode text={shlex.quote(msg)} "
-               f"https://api.telegram.org/bot{shlex.quote(token)}/sendMessage")
-        rt = keenetic_ssh(cmd, timeout=15)
         try:
+            rt = _keenetic_tg_send(token, chat_id, msg, wcfg.get("TG_MESSAGE_THREAD_ID"))
             test_sent = bool(json.loads(rt["stdout"]).get("ok")) if rt.get("ok") else False
         except Exception:
             test_sent = False
         _rec("Тестовое сообщение в Telegram",
-             {"detail": "доставлено" if test_sent else "не ушло (проверить токен/Chat ID)"}, ok=test_sent)
+             {"detail": "доставлено" if test_sent else "не ушло (проверить токен, Chat ID и ID темы)"}, ok=test_sent)
 
     if not foreign_ok:
         summary = ("✅ socks-local поднят, НО на этом роутере нет ни одного канала для Telegram "
@@ -9837,8 +9878,8 @@ def api_keenetic_repair_tg_channel():
     elif test_sent is True:
         summary = "✅ Готово! socks-local поднят, тестовое сообщение доставлено в Telegram. Алерты watchdog заработают."
     elif test_sent is False:
-        summary = ("✅ socks-local поднят и маршрут есть, но тест не ушёл — скорее всего токен/Chat ID. "
-                   "Проверить их и нажать «📨 Отправить тестовое сообщение».")
+        summary = ("✅ socks-local поднят и маршрут есть, но тест не доставлен. "
+                   "Проверить токен, Chat ID и ID темы, затем нажать «📨 Отправить тестовое сообщение».")
     else:
         summary = ("✅ socks-local поднят и маршрут готов. Заполнить Bot Token и Chat ID выше, "
                    "затем нажать «📨 Отправить тестовое сообщение».")
@@ -14694,12 +14735,17 @@ ssh root@{{ keenetic_settings.current.host or '192.168.1.1' }} -p {{ keenetic_se
         <label class="lbl">Chat ID <span class="muted" style="font-weight:400;">— число или @username</span></label>
         <input type="text" name="chat_id" id="tg-chat-id" autocomplete="off" placeholder="123456789" class="input-wide" style="width: 100%;">
       </div>
+      <div class="col" style="flex: 1 1 160px;">
+        <label class="lbl" for="tg-thread-id">ID темы <span class="muted" style="font-weight:400;">(необязательно)</span></label>
+        <input type="text" name="thread_id" id="tg-thread-id" inputmode="numeric" autocomplete="off" placeholder="Например, 42" class="input-wide" style="width: 100%;">
+        <small class="muted">Пустое поле — отправка в чат.</small>
+      </div>
     </div>
 
     <div class="btn-row" style="margin-top: 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
       <button type="button" id="btn-tg-save" class="btn-primary" style="background:#2a7; color:#fff;">💾 Сохранить</button>
       <button type="button" id="btn-tg-test" class="btn-primary" style="background:#29b; color:#fff;">📨 Отправить тестовое сообщение</button>
-      <button type="button" id="btn-tg-clear" class="btn-primary" style="background:#999; color:#fff;" title="Очистить TG_BOT_TOKEN и TG_CHAT_ID — алерты перестанут отправляться">✖ Очистить (отключить)</button>
+      <button type="button" id="btn-tg-clear" class="btn-primary" style="background:#999; color:#fff;" title="Очистить настройки и отключить уведомления Telegram">✖ Очистить (отключить)</button>
       <button type="button" id="btn-tg-repair" class="btn-primary" style="background:#e67e22; color:#fff; display:none;" title="Поднять socks-local inbound и маршрут для TG-алертов на этом роутере (с бэкапом и откатом)">🔧 Починить канал TG-алертов</button>
       <span id="tg-settings-status" class="mono" style="margin-left: 10px; color: #666;"></span>
     </div>
@@ -16255,7 +16301,8 @@ another-server.io   # ✏️</pre>
     <summary>📨 TG-алерты — что приходит в Telegram</summary>
     <div class="help-body">
       <h4>Бот: <strong>Telegram-бот</strong> (любой, заводится в секции «🤖 Telegram-бот для алертов» наверху страницы)</h4>
-      <p>Подойдёт любой бот, созданный через <a href="https://t.me/BotFather" target="_blank">@BotFather</a>. Шлёт алерты от имени <code>XKeen watchdog</code>. Конфиг хранится на роутере в <code>/opt/etc/xray/watchdog.config</code> (поля <code>TG_BOT_TOKEN</code> + <code>TG_CHAT_ID</code>) — НЕ в файлах панели, при передаче панели другу токен не утечёт.</p>
+      <p>Подойдёт любой бот, созданный через <a href="https://t.me/BotFather" target="_blank">@BotFather</a>. Шлёт алерты от имени <code>XKeen watchdog</code>. Конфиг хранится на роутере в <code>/opt/etc/xray/watchdog.config</code> (поля <code>TG_BOT_TOKEN</code>, <code>TG_CHAT_ID</code> и необязательный <code>TG_MESSAGE_THREAD_ID</code>).</p>
+      <p>Для группы с темами можно указать отдельный ID темы. Тестовое сообщение отправляется по значениям из формы. Чтобы применить их для уведомлений, нажать «Сохранить».</p>
       <h4>Какие события вызывают алерт</h4>
       <ul>
         <li>🚦 <strong>PRIMARY → FAILOVER</strong> — &lt;your-vpn&gt; упал, переключились на резерв</li>
@@ -21937,6 +21984,7 @@ async function tgLoad() {
     if (j.ok) {
       document.getElementById('tg-token').value   = j.token   || '';
       document.getElementById('tg-chat-id').value = j.chat_id || '';
+      document.getElementById('tg-thread-id').value = j.thread_id || '';
     }
   } catch (e) { /* silent — может первый раз нет связи с роутером */ }
 }
@@ -22055,6 +22103,7 @@ async function tgSave() {
     const body = {
       token:   document.getElementById('tg-token').value.trim(),
       chat_id: document.getElementById('tg-chat-id').value.trim(),
+      thread_id: document.getElementById('tg-thread-id').value.trim(),
     };
     const res = await fetch('/api/keenetic/tg-settings', {
       method: 'POST',
@@ -22087,6 +22136,7 @@ async function tgTest() {
     const body = {
       token:   document.getElementById('tg-token').value.trim(),
       chat_id: document.getElementById('tg-chat-id').value.trim(),
+      thread_id: document.getElementById('tg-thread-id').value.trim(),
     };
     const res = await fetch('/api/keenetic/tg-test', {
       method: 'POST',
@@ -22168,9 +22218,10 @@ async function syncStructure(btn) {
 }
 
 async function tgClear() {
-  if (!confirm('Очистить TG_BOT_TOKEN и TG_CHAT_ID? Алерты watchdog перестанут отправляться (watchdog продолжит работать, просто молча).')) return;
+  if (!confirm('Очистить настройки Telegram и отключить уведомления?')) return;
   document.getElementById('tg-token').value = '';
   document.getElementById('tg-chat-id').value = '';
+  document.getElementById('tg-thread-id').value = '';
   await tgSave();
 }
 

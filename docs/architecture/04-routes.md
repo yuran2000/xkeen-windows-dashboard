@@ -97,10 +97,10 @@
 | `/api/xkeen/restore` | POST | `api_xkeen_restore` | файл `snapshot` (v7/v6) | W ⟳ один (применение с force) |
 | `/api/keenetic/settings` | GET,POST | `api_keenetic_settings` | override'ы (пусто = снять) | — |
 | `/api/keenetic/test-connection` | POST | `api_keenetic_test_connection` | SSH с переданными параметрами | R |
-| `/api/keenetic/tg-settings` | GET,POST | `api_keenetic_tg_settings` | `{token, chat_id}` | R / WD |
+| `/api/keenetic/tg-settings` | GET,POST | `api_keenetic_tg_settings` | `{token, chat_id, thread_id}`; пустой ID темы отправляет в чат, заполненный требует v47+ | R / WD |
 | `/api/keenetic/watchdog-settings` | GET,POST | `api_keenetic_watchdog_settings` | сквозная проба (§7.6), скорость канала YouTube `yt_speed_*` (§7.7) | R / WD |
 | `/api/xkeen/yt-speed-test` | POST | `api_xkeen_yt_speed_test` | разовый замер: 2 МБ через `socks-deep-yt` и мимо xray → `{ok, tag, kbps, bytes, code, direct_kbps, direct_bytes}` (§7.7) | R |
-| `/api/keenetic/tg-test` | POST | `api_keenetic_tg_test` | тест с роутера | R |
+| `/api/keenetic/tg-test` | POST | `api_keenetic_tg_test` | тест с роутера через `_keenetic_tg_send`; учитывает `thread_id` из формы | R |
 | `/api/keenetic/repair-tg-channel` | POST | `api_keenetic_repair_tg_channel` | self-heal канала алертов | W ⟳ откат |
 | `/api/xkeen/cmd` | POST | `api_xkeen_cmd` | `cmd` ∈ `XKEEN_COMMANDS` | по команде |
 | `/api/xkeen/diagnose` | GET | `api_xkeen_diagnose` | 13 проверок | R |

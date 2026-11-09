@@ -56,6 +56,7 @@ cron */1 → watchdog.sh: . watchdog.config → пробы → state-машин�
 | `DEEP_PROBE_ENABLE`, `DEEP_PROBE_INTERVAL`, `DEEP_PROBE_THRESHOLD`, `DEEP_RETURN_HOLD` | `1`, `180` с, `2`, `1800` с — все явно | watchdog-settings | `deep_probe_enable`, `deep_probe_interval`, `deep_probe_threshold`, `deep_return_hold` |
 | `YT_SPEED_ENABLE`, `YT_SPEED_MIN_KBPS`, `YT_SPEED_INTERVAL` (v41) | `0`, `300` КБ/с, `900` с — все явно | watchdog-settings (поля `yt_speed_*`) | `yt_speed_enable`, `yt_speed_min_kbps`, `yt_speed_interval` |
 | `TG_BOT_TOKEN`, `TG_CHAT_ID` | пусто → алерты выключены | tg-settings | — |
+| `TG_MESSAGE_THREAD_ID` (v47) | пусто → отправка в чат | tg-settings | `thread_id`, положительное целое |
 | `FORCE_MODE` | `auto` | watchdog/&lt;mode&gt; | `force_mode` |
 
 В `targets` числа санитизируются (`_wd_int`), списки режутся по `[,\s]+`, у `*_CHAIN_ALLOW_RU` и
