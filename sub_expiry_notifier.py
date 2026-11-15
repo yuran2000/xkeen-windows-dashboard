@@ -66,7 +66,10 @@ def ssh_cat(remote_path, timeout=10):
         f"cat {remote_path}",
     ]
     try:
-        r = subprocess.run(args, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        r = subprocess.run(args,
+            capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
         if r.returncode != 0:
             return None
         return r.stdout.decode("utf-8", errors="replace")

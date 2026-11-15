@@ -48,7 +48,10 @@ def main():
         "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
         f"{SSH_USER}@{SSH_HOST}", remote_cmd,
     ]
-    r = subprocess.run(ssh, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+    r = subprocess.run(
+        ssh, capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
     if r.returncode != 0:
         sys.stderr.write(f"SSH failed (code {r.returncode}): {r.stderr.decode('utf-8', errors='replace')[:500]}\n")
         sys.exit(1)

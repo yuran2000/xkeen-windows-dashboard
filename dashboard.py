@@ -224,7 +224,7 @@ import ssh_bin
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.4.3"
+_VERSION_FALLBACK = "1.4.4"
 
 
 def _find_git():
@@ -885,6 +885,7 @@ def keenetic_ssh(cmd, timeout=15, stdin_data=None):
         result = subprocess.run(
             _ssh_args(cmd),
             capture_output=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             **_stdin_kw,
         )
         return {
@@ -6836,7 +6837,10 @@ def api_xkeen_migration_backup():
 
     # Pre-check: scp доступен на этом PC?
     try:
-        v = subprocess.run([ssh_bin.ssh_exe("scp"), "-V"], capture_output=True, timeout=5)
+        v = subprocess.run([ssh_bin.ssh_exe("scp"), "-V"],
+            capture_output=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
         # scp -V пишет в stderr, exit code часто != 0 — нам только важно что бинарник нашёлся
     except FileNotFoundError:
         return jsonify({
@@ -6946,7 +6950,10 @@ def api_xkeen_migration_backup():
         local_path,
     ]
     try:
-        scp_r = subprocess.run(scp_args, capture_output=True, timeout=600, stdin=subprocess.DEVNULL)  # большой файл — 10 мин max
+        scp_r = subprocess.run(scp_args,
+            capture_output=True, timeout=600, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )  # большой файл — 10 мин max
     except subprocess.TimeoutExpired:
         keenetic_ssh(f"rm -f {remote_tar}", timeout=10)
         return jsonify({"ok": False, "stage": "scp",
@@ -8783,7 +8790,10 @@ def api_keenetic_test_connection():
         'echo "==CONFIGS=="; ls -1 ' + (data.get("xray_configs") or cfg.KEENETIC_XRAY_CONFIGS) + ' 2>&1 | head -10'
     ]
     try:
-        result = subprocess.run(args, capture_output=True, timeout=12, stdin=subprocess.DEVNULL)
+        result = subprocess.run(args,
+            capture_output=True, timeout=12, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
         stdout = result.stdout.decode("utf-8", errors="replace")
         stderr = result.stderr.decode("utf-8", errors="replace")
         if result.returncode == 0:
