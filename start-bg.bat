@@ -25,8 +25,13 @@ if not errorlevel 1 (
 )
 
 REM Читаем DASHBOARD_PORT из config_local.py (default 5000)
-for /f "delims=" %%p in ('".venv\Scripts\python.exe" -c "import config_local as c; print(getattr(c,'DASHBOARD_PORT',5000))" 2^>nul') do set DPORT=%%p
-if "%DPORT%"=="" set DPORT=5000
+set "DPORT="
+for /f "delims=" %%p in ('.venv\Scripts\python.exe -B -c "import config_local as c; p=int(getattr(c,'DASHBOARD_PORT',5000)); assert 1 <= p <= 65535; print(p)"') do set "DPORT=%%p"
+if not defined DPORT (
+    echo [ERROR] Cannot read DASHBOARD_PORT from config_local.py.
+    pause
+    exit /b 1
+)
 
 REM Проверяем не запущена ли уже панель (есть ли listener на нужном порту)
 powershell -NoProfile -Command "if (Get-NetTCPConnection -LocalPort %DPORT% -State Listen -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"

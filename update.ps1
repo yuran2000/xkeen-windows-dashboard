@@ -7,9 +7,7 @@
 # PowerShell loads the whole .ps1 into memory at start, so changes on disk
 # don't affect the current execution. Bulletproof.
 #
-# update.bat is a thin wrapper that handles UAC elevation if needed (for
-# schtasks /End and /Run) and then runs this script. Almost all the logic
-# lives here.
+# update.bat starts this script. Resolve the task and elevation here before changing files.
 #
 # ASCII only - PowerShell 5.1 on a non-English Windows reads .ps1 in the
 # system ANSI codepage (e.g. cp1251 on RU), not UTF-8. Cyrillic in a
@@ -21,6 +19,65 @@ function Get-SourceHash([string]$Path) {
     try { return ([BitConverter]::ToString($hash.ComputeHash($stream))).Replace('-','') }
     finally { $stream.Dispose(); $hash.Dispose() }
 }
+
+function Get-UpdateTaskState($Folder, [string]$Name) {
+    try {
+        $task = $Folder.GetTask($Name)
+        return 'Present'
+    } catch {
+        switch ($_.Exception.GetBaseException().HResult) {
+            -2147024894 { return 'Missing' }  # HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+            -2147024891 { return 'Denied' }   # E_ACCESSDENIED
+            default { throw }
+        }
+    }
+}
+
+function Get-UpdateMode([string]$TaskState, [bool]$Elevated) {
+    if ($TaskState -eq 'Missing') { return 'Standalone' }
+    if ($TaskState -notin @('Present', 'Denied')) { throw 'Unknown scheduler state.' }
+    if (-not $Elevated) { return 'Elevate' }
+    if ($TaskState -eq 'Denied') { throw 'Access to the dashboard task was denied even as administrator.' }
+    return 'Scheduled'
+}
+
+function Test-StandalonePanel([int]$ProcessId, [string]$Root) {
+    # A venv on Windows can launch a second Python process from the base interpreter.
+    $launchers = @((Join-Path $Root '.venv\Scripts\pythonw.exe'), (Join-Path $Root '.venv\Scripts\python.exe'))
+    $entry = Join-Path $Root 'dashboard.py'
+    $pattern = '(?i)(?:^|\s)"?(?:' + [regex]::Escape($entry) + '|(?:\.\\)?dashboard\.py)"?(?:\s|$)'
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop
+    if (-not $proc -or $proc.Name -notin @('python.exe','pythonw.exe') -or $proc.CommandLine -notmatch $pattern) { return $false }
+    if ($launchers -contains $proc.ExecutablePath) { return $true }
+    $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.ParentProcessId)" -ErrorAction Stop
+    return ($null -ne $parent -and $launchers -contains $parent.ExecutablePath -and
+            $parent.CommandLine -match $pattern -and $parent.CreationDate -le $proc.CreationDate)
+}
+
+function Get-PanelListeners([int]$Port) {
+    Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique
+}
+
+function Test-RunningBuild([int]$Port, [string]$Version) {
+    $request = [Net.HttpWebRequest]::Create("http://127.0.0.1:$Port/login")
+    $request.Method = 'HEAD'
+    $request.Proxy = $null
+    $request.AllowAutoRedirect = $false
+    $request.Timeout = 1800
+    try {
+        $response = $request.GetResponse()
+        try {
+            return ([int]$response.StatusCode -eq 200 -and $response.Headers['X-Dashboard-Version'] -ceq $Version)
+        } finally { $response.Close() }
+    } catch [Net.WebException] {
+        if ($_.Exception.Response) { $_.Exception.Response.Close() }
+        return $false
+    }
+}
+
+# Dot-sourcing exposes the preflight and verification functions without performing an update.
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 $ErrorActionPreference = 'Continue'
 $InstallDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -44,23 +101,37 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# ---- Read DASHBOARD_PORT from config_local.py (default 5000) ----
-$Port = 5000
-$ConfigFile = Join-Path $InstallDir "config_local.py"
-if (Test-Path $ConfigFile) {
-    $portLine = Select-String -Path $ConfigFile -Pattern '^DASHBOARD_PORT\s*=\s*(\d+)' | Select-Object -First 1
-    if ($portLine -and $portLine.Matches[0].Groups[1].Value) {
-        $Port = [int]$portLine.Matches[0].Groups[1].Value
+# Resolve the configured instance and its launch mode before modifying the checkout.
+$python = Join-Path $InstallDir ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python)) { Write-Error "Installation Python missing"; exit 1 }
+try {
+    $port = 5000
+    if (Test-Path -LiteralPath 'config_local.py') {
+        $portText = & $python -B -c "import config_local as c; print(getattr(c, 'DASHBOARD_PORT', 5000))"
+        if ($LASTEXITCODE -ne 0 -or "$portText" -notmatch '^\d+$') { throw 'Invalid configured dashboard port.' }
+        $port = [int]$portText
+        if ($port -lt 1 -or $port -gt 65535) { throw 'Invalid configured dashboard port.' }
     }
+    $TaskName = if ($Port -eq 5000) { 'XrayDashboard' } else { "XrayDashboard-$Port" }
+    $scheduler = New-Object -ComObject Schedule.Service -ErrorAction Stop
+    $scheduler.Connect()
+    $folder = $scheduler.GetFolder('\')
+    $identity = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+    $mode = Get-UpdateMode (Get-UpdateTaskState $folder $TaskName) ($identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
+    if ($mode -eq 'Elevate') {
+        $shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $elevated = Start-Process -FilePath $shell -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath) -Wait -PassThru -ErrorAction Stop
+        exit $elevated.ExitCode
+    }
+} catch {
+    Write-Host "[ERROR] Update preflight failed: $_" -ForegroundColor Red
+    Read-Host 'Press Enter to exit'
+    exit 1
 }
-$TaskName = if ($Port -eq 5000) { "XrayDashboard" } else { "XrayDashboard-$Port" }
-$task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
 # ---- Step 1: verified source update before stopping the running panel ----
 $OldReqHash = ""
 if (Test-Path "requirements.txt") { $OldReqHash = (Get-SourceHash (Join-Path $InstallDir "requirements.txt")) }
-$python = Join-Path $InstallDir ".venv\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $python)) { Write-Error "Installation Python missing"; exit 1 }
 Write-Host "[1/5] Updating source with a recovery copy ..." -ForegroundColor Yellow
 & $python (Join-Path $InstallDir "tools\update_checkout.py") --repo $InstallDir
 if ($LASTEXITCODE -ne 0) {
@@ -92,37 +163,30 @@ if ($LASTEXITCODE -ne 0) { Write-Error "Source validation failed; the running pa
 Write-Host ""
 Write-Host "[2/5] Stopping current instance ..." -ForegroundColor Yellow
 
-# Remember the OLD pythonw PID so we can verify restart actually happened
-$oldPids = @()
-$oldListeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-if ($oldListeners) {
-    $oldPids = $oldListeners.OwningProcess | Sort-Object -Unique
-    Write-Host "  Current process on :$Port -> PID(s): $($oldPids -join ', ')"
-}
-
-if ($task) {
-    schtasks /End /TN $TaskName 2>&1 | Out-Null
-    Write-Host "  Sent schtasks /End to task: $TaskName"
-    Start-Sleep -Seconds 3
-    # Verify task actually stopped - if Task Scheduler auto-restarted, force kill
-    $stillListening = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-    if ($stillListening) {
-        Write-Host "  [WARN] Port :$Port still has a listener after /End - force-killing." -ForegroundColor Yellow
-        $stillListening.OwningProcess | Sort-Object -Unique | ForEach-Object {
-            Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+$versionLine = Select-String -LiteralPath 'dashboard.py' -Pattern '^_VERSION_FALLBACK\s*=\s*"(\d+\.\d+\.\d+)"'
+if (@($versionLine).Count -ne 1) { Write-Error 'Updated build version is missing or ambiguous.'; exit 1 }
+$expectedVersion = $versionLine.Matches[0].Groups[1].Value
+$oldPids = @(Get-PanelListeners $Port)
+try {
+    if ($mode -eq 'Scheduled') {
+        if ($folder.GetTask($TaskName).State -eq 4 -or $oldPids.Count -gt 0) {
+            & schtasks.exe /End /TN $TaskName
+            if ($LASTEXITCODE -ne 0) { throw "Could not stop task $TaskName." }
         }
-        Start-Sleep -Seconds 2
-    }
-} else {
-    if ($oldPids) {
-        $oldPids | ForEach-Object {
-            Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
-            Write-Host "  Stopped PID $_"
-        }
-        Start-Sleep -Seconds 2
     } else {
-        Write-Host "  Not running (no task, nothing listening on :$Port)"
+        foreach ($processId in $oldPids) {
+            if (-not (Test-StandalonePanel $processId $InstallDir)) {
+                throw "Port $Port is occupied by a process outside this installation (PID $processId)."
+            }
+            Stop-Process -Id $processId -Force -ErrorAction Stop
+        }
     }
+    for ($i=0; $i -lt 16 -and @(Get-PanelListeners $Port).Count; $i++) { Start-Sleep -Milliseconds 500 }
+    if (@(Get-PanelListeners $Port).Count) { throw "Port $Port is still in use after stop." }
+} catch {
+    Write-Host "[FAIL] Dashboard restart stopped: $_" -ForegroundColor Red
+    Read-Host 'Press Enter to exit'
+    exit 1
 }
 
 Write-Host "[3/5] Dependencies validated before restart" -ForegroundColor Gray
@@ -154,49 +218,32 @@ else:
 # ---- Step 5: start ----
 Write-Host ""
 Write-Host "[5/5] Starting xray-dashboard on port $Port ..." -ForegroundColor Yellow
-if ($task) {
-    schtasks /Run /TN $TaskName 2>&1 | Out-Null
-    Write-Host "  Started Task Scheduler task: $TaskName"
+if ($mode -eq 'Scheduled') {
+    & schtasks.exe /Run /TN $TaskName
+    if ($LASTEXITCODE -ne 0) { Write-Error "Could not start task $TaskName."; exit 1 }
 } else {
-    if (Test-Path ".\start-bg.bat") {
-        & ".\start-bg.bat"
-        Write-Host "  Started via start-bg.bat (no Task Scheduler task)"
-    } else {
-        Write-Host "  [WARN] No Task Scheduler task and no start-bg.bat - cannot auto-start." -ForegroundColor Yellow
-    }
+    if (-not (Test-Path '.\start-bg.bat')) { Write-Error 'Missing standalone launcher start-bg.bat'; exit 1 }
+    & '.\start-bg.bat'
+    if ($LASTEXITCODE -ne 0) { Write-Error 'Standalone launcher failed'; exit 1 }
 }
 
-Write-Host "  Waiting for dashboard to come up (up to ~30s) ..."
-$listen = $null
-for ($i = 0; $i -lt 15; $i++) {
-    $listen = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-    if ($listen) { break }
+Write-Host "  Waiting for dashboard v$expectedVersion on port $Port ..."
+$ready = $false
+for ($i=0; $i -lt 15; $i++) {
+    $listeners = @(Get-PanelListeners $Port)
+    if ($listeners.Count -gt 0 -and -not @($listeners | Where-Object { $oldPids -contains $_ }).Count -and
+        (Test-RunningBuild $Port $expectedVersion)) {
+        $ready = $true
+        break
+    }
     Start-Sleep -Seconds 2
 }
-if ($listen) {
-    $newPids = $listen.OwningProcess | Sort-Object -Unique
-    Write-Host "  Process on :$Port now -> PID(s): $($newPids -join ', ')"
-    # Compare to old PIDs - if same, process did NOT restart with new code
-    $samePids = $true
-    if (-not $oldPids -or $oldPids.Count -eq 0) { $samePids = $false }
-    else {
-        foreach ($p in $newPids) { if ($oldPids -notcontains $p) { $samePids = $false; break } }
-    }
-    if ($samePids -and $oldPids -and $oldPids.Count -gt 0) {
-        Write-Host "  [FAIL] PIDs unchanged - pythonw was NOT actually restarted." -ForegroundColor Yellow
-        Write-Host "         Browser will still show old version. Try running Restart-Clean.bat" -ForegroundColor Yellow
-        Write-Host "         (right-click -> Run as administrator) to force-restart." -ForegroundColor Yellow
-        Read-Host "Press Enter to exit"
-        exit 1
-    } else {
-        Write-Host "  [OK] Dashboard running on http://localhost:$Port" -ForegroundColor Green
-        Write-Host "       (do Ctrl+F5 in browser to force HTML cache reload)" -ForegroundColor Gray
-    }
-} else {
-    Write-Host "  [FAIL] Not listening on :$Port - try start.bat (in a cmd window) to see errors" -ForegroundColor Red
-    Read-Host "Press Enter to exit"
+if (-not $ready) {
+    Write-Host "[FAIL] Port $Port did not serve the updated dashboard v$expectedVersion from a new process." -ForegroundColor Red
+    Read-Host 'Press Enter to exit'
     exit 1
 }
+Write-Host "  [OK] Dashboard running on http://localhost:$Port (v$expectedVersion)" -ForegroundColor Green
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan

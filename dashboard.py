@@ -224,7 +224,7 @@ import ssh_bin
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.4.5"
+_VERSION_FALLBACK = "1.4.6"
 
 
 def _find_git():
@@ -438,7 +438,9 @@ def login():
             return redirect(nxt)
         else:
             error = "Неверный логин или пароль"
-    return render_template_string(LOGIN_TEMPLATE, error=error)
+    # The updater checks the build loaded by this process, even after Git files change on disk.
+    headers = {"X-Dashboard-Version": _VERSION_FALLBACK} if request.remote_addr in ("127.0.0.1", "::1") else {}
+    return render_template_string(LOGIN_TEMPLATE, error=error), 200, headers
 
 
 # ============== DATA COLLECTORS ==============

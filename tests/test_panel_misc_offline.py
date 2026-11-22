@@ -52,6 +52,12 @@ check("рестарт: /End и /Run своей задачи XrayDashboard-5002",
       "/End /TN XrayDashboard-5002 " in tr and "/Run /TN XrayDashboard-5002 " in tr, tr)
 check("рестарт: одноразовая задача со своим именем", "XrayDashboardRestarter-5002" in create, create)
 
+# Состояние запущенной сборки доступно обновлятору без входа, только с петлевого адреса.
+for addr in ("127.0.0.1", "::1", "192.0.2.1"):
+    resp = c.head("/login", environ_overrides={"REMOTE_ADDR": addr})
+    expected = D._VERSION_FALLBACK if addr in ("127.0.0.1", "::1") else None
+    check(f"версия процесса для {addr}", resp.status_code == 200 and resp.headers.get("X-Dashboard-Version") == expected)
+
 # --- здоровье смотрит свой порт ---
 j = c.get("/api/xkeen/dashboard-health").get_json()
 check("здоровье: сообщение про свой порт :5002", ":5002" in (j.get("msg") or ""), j)
