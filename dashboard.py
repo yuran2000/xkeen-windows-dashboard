@@ -224,7 +224,7 @@ import ssh_bin
 # Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
 # если в репо есть свежий tag (например юзер на main после моего push), увидит его.
 # Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.4.4"
+_VERSION_FALLBACK = "1.4.5"
 
 
 def _find_git():
@@ -13492,11 +13492,12 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('mailru')">📧 Mail.ru</button>
         <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('max')">💬 MAX (мессенджер)</button>
         <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('okko')">🎬 Okko</button>
-        <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('kinopoisk')">🎬 Кинопоиск</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px;" title="Сайт, онлайн-кинотеатр и внешние плееры" onclick="addDirectPreset('kinopoisk')">🎬 Кинопоиск</button>
         <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('gov')">🏛️ Госуслуги</button>
         <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('banks')">💰 Банки (Сбер/ВТБ/Альфа/Тинькофф)</button>
         <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('marketplaces')">🛒 Маркетплейсы (Ozon/WB)</button>
         <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('yandex')">🟡 Yandex (все сервисы)</button>
+        <button type="button" class="btn btn-sm" style="margin: 3px;" onclick="addDirectPreset('Другие')">Другие</button>
         <div style="margin-top: 8px; padding-top: 6px; border-top: 1px solid #ddd;">
           <button type="button" class="btn btn-sm" style="margin: 3px; background:#4a4; color:#fff;" onclick="addAllDirectPresets()">📥 Добавить ВСЕ DIRECT</button>
           <button type="button" class="btn btn-sm btn-secondary" style="margin: 3px;" onclick="clearDirectDomains()">🗑 Очистить</button>
@@ -17256,6 +17257,19 @@ const DOMAIN_SECTIONS = {
   block:  { taId: 'block-domains',  getPresets: () => (typeof BLOCK_PRESETS  !== 'undefined') ? BLOCK_PRESETS  : null, label: 'BLOCK'   },
 };
 
+// Описание показывается только у штатной метки. Общий домен сохраняет принадлежность к пресету Яндекса.
+function displayDomainNote(sectionKey, domain, note) {
+  if (sectionKey !== 'direct') return note;
+  if (note === '📦 Другие' && DIRECT_PRESETS['Другие'].includes(domain)) {
+    return note + ' — напрямую через провайдера';
+  }
+  if (!Object.hasOwn(KINOPOISK_DOMAINS, domain)) return note;
+  if (note === '📦 kinopoisk' || (domain === 'yastatic.net' && note === '📦 yandex')) {
+    return note + ' — ' + KINOPOISK_DOMAINS[domain];
+  }
+  return note;
+}
+
 // Регекс парсинга одной строки textarea: "domain   # note" → [_, "domain", "note"]
 // note может быть пустым или отсутствовать. # внутри note сохраняется.
 const _DOMAIN_LINE_RE = /^\s*(\S+)\s*(?:#\s*(.*?))?\s*$/;
@@ -17265,7 +17279,7 @@ const _DOMAIN_LINE_RE = /^\s*(\S+)\s*(?:#\s*(.*?))?\s*$/;
 // (старый формат типа "youtube.com googlevideo.com ytimg.com") — все они становятся отдельными
 // доменами без note. Это критично потому что watchdog.config исторически хранил domains
 // в shell-формате "d1 d2 d3" — при load jinja отдаёт их в одну строку через пробел.
-function parseDomainsTextarea(value) {
+function parseDomainsTextarea(value, sectionKey) {
   if (!value) return [];
   const result = [];
   const seen = new Set();  // dedup в пределах textarea (раньше дубли проходили в watchdog.config)
@@ -17285,7 +17299,11 @@ function parseDomainsTextarea(value) {
       seen.add(dom);
       // Комментарий в старом мультидоменном формате был на всю строку — относим его
       // к первому домену; остальным пустой note, чтобы не дублировать.
-      result.push({ domain: dom, note: i === 0 ? note : '' });
+      const text = i === 0 ? note : '';
+      const marker = text.split(' — ', 1)[0];
+      // Сортировка и удаление используют метку пресета. Правки пользователя сохраняются дословно.
+      const storedNote = text === displayDomainNote(sectionKey, dom, marker) ? marker : text;
+      result.push({ domain: dom, note: storedNote });
     });
   });
   return result;
@@ -17294,7 +17312,7 @@ function parseDomainsTextarea(value) {
 // Форматирует массив доменов с notes в строку для textarea (выровненные колонки).
 // Если note пустой — строка только из домена (чтобы не плодить пустые # в конце).
 // v1.7.4: гарантия минимум 1 пробел перед # даже если домен длиннее maxLen (не ломает выравнивание).
-function formatDomainsTextarea(items) {
+function formatDomainsTextarea(items, sectionKey) {
   if (!items.length) return '';
   // Ширина колонки = длина самого длинного домена (минимум 20, максимум 50).
   // Учитываем только домены с notes — пустые не влияют на колонку.
@@ -17305,12 +17323,13 @@ function formatDomainsTextarea(items) {
   maxLen = Math.max(20, Math.min(50, maxLen));
   return items.map(it => {
     if (!it.note) return it.domain;
+    const note = displayDomainNote(sectionKey, it.domain, it.note);
     // Если домен короче maxLen — пэддинг пробелами до maxLen+2, потом "# note"
     // Если домен длиннее — хотя бы 1 пробел перед #, иначе строка `domain# note` слипнется
     if (it.domain.length <= maxLen) {
-      return it.domain.padEnd(maxLen + 2, ' ') + '# ' + it.note;
+      return it.domain.padEnd(maxLen + 2, ' ') + '# ' + note;
     }
-    return it.domain + ' # ' + it.note;
+    return it.domain + ' # ' + note;
   }).join('\n');
 }
 
@@ -17319,7 +17338,7 @@ function readSection(sectionKey) {
   const sec = DOMAIN_SECTIONS[sectionKey];
   const ta = document.getElementById(sec.taId);
   if (!ta) return { domains: [], notes: {}, items: [] };
-  const items = parseDomainsTextarea(ta.value);
+  const items = parseDomainsTextarea(ta.value, sectionKey);
   const domains = items.map(it => it.domain);
   const notes = {};
   items.forEach(it => { if (it.note) notes[it.domain] = it.note; });
@@ -17333,7 +17352,7 @@ function writeSection(sectionKey, items) {
   if (!ta) return;
   // Сортировка по умолчанию: пресеты сверху по алфавиту пресета, ручные снизу
   // (если юзер нажал кнопку сортировки — она перепишет порядок).
-  ta.value = formatDomainsTextarea(items);
+  ta.value = formatDomainsTextarea(items, sectionKey);
   // Sync WINDOW_DOMAIN_NOTES
   WINDOW_DOMAIN_NOTES[sectionKey] = {};
   items.forEach(it => { if (it.note) WINDOW_DOMAIN_NOTES[sectionKey][it.domain] = it.note; });
@@ -17347,14 +17366,14 @@ function rerenderSectionFromNotes(sectionKey) {
   const ta = document.getElementById(sec.taId);
   if (!ta) return;
   // Берём существующие домены из textarea (jinja отрендерил их без notes)
-  const items = parseDomainsTextarea(ta.value);
+  const items = parseDomainsTextarea(ta.value, sectionKey);
   // Доклеиваем notes из WINDOW_DOMAIN_NOTES (если есть)
   items.forEach(it => {
     if (!it.note && WINDOW_DOMAIN_NOTES[sectionKey][it.domain]) {
       it.note = WINDOW_DOMAIN_NOTES[sectionKey][it.domain];
     }
   });
-  ta.value = formatDomainsTextarea(items);
+  ta.value = formatDomainsTextarea(items, sectionKey);
 }
 
 // Универсальное добавление пресета: записывает note "📦 <name>" для всех новых доменов.
@@ -17443,7 +17462,7 @@ function highlightDuplicatesBadge(sectionKey) {
     if (otherKey === sectionKey) return;
     const otherTa = document.getElementById(DOMAIN_SECTIONS[otherKey].taId);
     if (!otherTa) return;
-    const otherItems = parseDomainsTextarea(otherTa.value);
+    const otherItems = parseDomainsTextarea(otherTa.value, otherKey);
     otherItems.forEach(it => {
       if (myDomains.has(it.domain)) {
         if (!conflicts[it.domain]) conflicts[it.domain] = [];
@@ -17475,7 +17494,7 @@ async function saveDomainNotesSidecar() {
     allNotes[sectionKey] = {};
     const sec = readSection(sectionKey);
     sec.items.forEach(it => {
-      if (it.note) allNotes[sectionKey][it.domain] = it.note;
+      if (it.note) allNotes[sectionKey][it.domain] = displayDomainNote(sectionKey, it.domain, it.note);
     });
   });
   WINDOW_DOMAIN_NOTES = allNotes;  // sync in-memory
@@ -17532,9 +17551,9 @@ function injectSectionControls(sectionKey) {
   //          Иначе строки типа "domain # note" без выравнивания живут до save и юзер видит «слетевшее» форматирование.
   if (!ta.dataset.autoFormatBound) {
     ta.addEventListener('blur', () => {
-      const items = parseDomainsTextarea(ta.value);
+      const items = parseDomainsTextarea(ta.value, sectionKey);
       if (items.length === 0) return;
-      ta.value = formatDomainsTextarea(items);
+      ta.value = formatDomainsTextarea(items, sectionKey);
       // Sync WINDOW_DOMAIN_NOTES + перепроверка дублей
       WINDOW_DOMAIN_NOTES[sectionKey] = {};
       items.forEach(it => { if (it.note) WINDOW_DOMAIN_NOTES[sectionKey][it.domain] = it.note; });
@@ -19918,6 +19937,15 @@ function resetAIDefaults() {
 // + geosite yandex/vk/category-gov-ru/steam). Пресеты добавляют их в текстовый список для
 // ПРОЗРАЧНОСТИ (видно, что точно идёт direct) + добавляют .com / .net / .tv / .cloud
 // варианты которые regex не ловит.
+const KINOPOISK_DOMAINS = {
+  'kinopoisk.ru':  'карточки фильмов и сериалов на Кинопоиске',
+  'hd.kinopoisk.ru': 'онлайн-кинотеатр Кинопоиска',
+  'yastatic.net':  'статические файлы Яндекса для страниц Кинопоиска',
+  'brogiro.top':   'страница просмотра Flicksbar',
+  'stravers.live': 'внешний плеер Alloha в Flicksbar и KinoSave',
+  'newplayjj.com': 'внешний плеер Alloha в KinoDivBox',
+};
+
 const DIRECT_PRESETS = {
   mailru:       ['mail.ru', 'mailru.ru', 'my.com', 'mycdn.me', 'cdn.mail.ru', 'disk-o.cloud'],
   // VK сервисы (VK Group: ВКонтакте + Одноклассники). Большинство уже покрыто regex *.ru +
@@ -19936,7 +19964,8 @@ const DIRECT_PRESETS = {
   // Зачем direct: MAX блокирует connection с не-RU IP, через VPN не работает.
   max:          ['max.ru', 'web.max.ru', 'oneme.ru', 'cdn.max.ru', 'static.max.ru', 'api.max.ru'],
   okko:         ['okko.tv', 'okko.sh', 'okko-cdn.com', 'okkocdn.com', 'okko-tech.com'],
-  kinopoisk:    ['kinopoisk.ru', 'hd.kinopoisk.ru', 'yastatic.net'],
+  kinopoisk:    Object.keys(KINOPOISK_DOMAINS),
+  'Другие':     ['avito.ru', 'chizhik.club'],
   gov:          ['gosuslugi.ru', 'nalog.ru', 'mos.ru', 'pfr.gov.ru', 'roskazna.gov.ru'],
   banks:        ['sberbank.ru', 'sberbank.com', 'vtb.ru', 'alfabank.ru', 'tinkoff.ru', 'raiffeisen.ru', 'gazprombank.ru', 'rshb.ru'],
   marketplaces: ['ozon.ru', 'wildberries.ru', 'wbstatic.net', 'lamoda.ru', 'market.yandex.ru'],

@@ -149,6 +149,16 @@ D.is_keenetic_reachable = lambda *a, **kw: True
 r = client.get("/xkeen")
 html = r.get_data(as_text=True)
 check("render mock 200", r.status_code == 200, str(r.status_code))
+check("other direct preset button", html.count("addDirectPreset('Другие')") == 1)
+other = re.search(r"'Другие':\s*\[([^\]]+)\]", html)
+check("other direct preset domains", other is not None and
+      set(re.findall(r"'([^']+)'", other.group(1))) == {"avito.ru", "chizhik.club"})
+check("one Kinopoisk button", html.count("addDirectPreset('kinopoisk')") == 1 and "addDirectPreset('kinopoisk_players')" not in html)
+purposes = re.search(r"const KINOPOISK_DOMAINS = \{(.*?)\};", html, re.S)
+expected = {"kinopoisk.ru", "hd.kinopoisk.ru", "yastatic.net", "brogiro.top", "stravers.live", "newplayjj.com"}
+check("Kinopoisk domains have descriptions", purposes is not None and
+      expected <= set(re.findall(r"'([^']+)':\s*'[^']+'", purposes.group(1))))
+
 check("render mock no error", "Ошибка при рендеринге" not in html, html[:500])
 check("render mock foreign chain badge", "📱 резерв Зарубежных №1" in html, "badge missing")
 check("render mock killswitch chain branch", "работает резерв из цепочки — de-1 (#1)" in html, "ks branch missing")
