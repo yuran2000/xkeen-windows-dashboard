@@ -115,7 +115,7 @@ def _paths(text, tp):
 
 
 def harness(t, done=0, rb="", hc_seq="0", xt=0, wait=3, need=0, crash=False, done_before_crash=False, tc=0, force=0,
-            edit_after_swap=False):
+            edit_after_swap=False, probe_rc=7):
     """Скрипт: стабы + настоящие пролог/итог из .cur. Пути роутера → временная папка."""
     tp = t.replace("\\", "/")
     parts = [
@@ -125,6 +125,7 @@ def harness(t, done=0, rb="", hc_seq="0", xt=0, wait=3, need=0, crash=False, don
         "_xk_restart() { echo R >> " + tp + "/restarts; return 0; }",
         "xray_test_live() { return " + str(xt) + "; }",
         "traffic_check() { return " + str(tc) + "; }",
+        f"curl() {{ return {probe_rc}; }}",
         f"WD_APPLY_FORCE={force}",
         "_hc_n=0",
         "health_check() {",
@@ -279,6 +280,12 @@ else:
     check("живые файлы изменились с подготовки (md5 ≠ манифест) → FAIL changed, ничего не подменено",
           o["res"].startswith("FAIL reason=changed restart=0") and files(o) == OLD
           and o["restarts"] == 0 and not o["left"], o)
+
+    o = run_case(probe_rc=127)
+    check("curl сломан до применения: FAIL curl, все живые файлы и маршруты сохранены",
+          o["rc"] == 1 and o["res"].startswith("FAIL reason=curl restart=0")
+          and files(o) == OLD and o["rt"] == "OLD_05_routing_json=1"
+          and o["restarts"] == 0 and not o["left"] and o["lock_after"] is None, o)
 
     o = run_case(bad_cfg=True)
     check("подготовленный config с ошибкой синтаксиса → FAIL badconfig, ничего не подменено",

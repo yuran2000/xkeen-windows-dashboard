@@ -160,13 +160,22 @@ kill-switch, «📋 Лог watchdog», JS-константы (§8.4). `api_xkeen
 `_xk_restart` / `_xk_busy` / `_bg_restart_or_defer` → помощники (`_probe_connected`, `probe_tag`, `_num`, `is_ru_tag`, `killswitch_decide`,
 `_state_field`, `_log_every5`, `xray_busy_eval`, `_ev_run`, `evidence_capture`, `deep_probe_check`, `_yt_speed_kbps`,
 `yt_speed_check`, `_yt_slowq_prune`, `_yt_slowq_has`, `tg_alert`, `generate_routing`, `routing_changed`,
-`validate_routing_xray`, `health_check`) → досыл TG → UDP-залип (v19) → `53` в `port_exclude.lst` (v21)
+`validate_routing_xray`, `health_check`) → откат прерванного применения → `_wd_probe_tool_ready` → досыл TG → UDP-залип (v19) → `53` в `port_exclude.lst` (v21)
 → очистка `YT_GEOIP_CATEGORIES` (v23) → self-heal `socks-ai-check` (v24) → параметры v27/v29/v30 →
 self-heal `socks-deep-*` (v29) → fd-залип (v22) → перегрузка xray (v37, `xray_busy_eval`) → AI-проба (v24/v25) → State → Force-mode → проба
 PRIMARY и state-машина (глухота `DPRI_DEAF` форсирует down) → AI → YT → FOREIGN (kill-switch +
 цепочки) → Apply (`generate_routing <default> <ai> <yt> <foreign> <ipv6>` → `routing_changed` →
 анти-флап → `validate_routing_xray` → `mv` → `_xk_restart` → `health_check` → `.lastgood` или
 `AUTO-ROLLBACK`) → итог режима применения (§6.7) → обход FAILOVER → Save state.
+
+**Локальная проверка curl (v48).** После восстановления прерванного применения и до сетевых проб
+`_wd_probe_tool_ready` запускает curl с `LD_BIND_NOW=1` и SOCKS на loopback. Даже отказ локального
+соединения показывает, что curl смог запуститься и начать пробу. Ошибка загрузчика или сборка без SOCKS
+прерывает тик до смены маршрутов и записи счетчиков. Ошибка `CURL-UNAVAILABLE` пишется не чаще раза
+в 5 минут, `CURL-READY` отмечает восстановление. В режиме `WD_APPLY` проверка идет до подмены файлов.
+При `undefined symbol` проверь пару curl и libcurl в Entware в том же окружении, что у cron.
+Проба из обычного SSH может пропустить несовместимость при отложенном связывании.
+Тесты — `test_probe_tag.py` и `test_apply_once_offline.py`.
 
 **Перегрузка xray (v37, края — v38).** `xray_busy_eval` между тиками меряет долю процессора процесса xray от
 всех ядер (`/proc/<pid>/stat` против строки `cpu` в `/proc/stat` — не зависит от HZ и числа ядер) и трафик
@@ -257,9 +266,10 @@ v21, v23) — через `_bg_restart_or_defer`.
 после карантина — «↩️ … проверяю насквозь», «✅ … проверен» шлёт проба; успех на основном обнуляет
 `D*_QN`. Тест — `tests/test_deep_quarantine.py`.
 
-**`probe_tag` (TCP-проба узла, v32).** curl на `https://host:port/` (или `PRIMARY_PROBE_URL`): код 7 →
-мёртв; код 28 (таймаут) → мёртв **только** при `%{num_connects}` = 0 (`_probe_connected`); прочие коды
-→ жив. Проба — не VLESS: Reality отдаёт её сайту-маскировке (`dest`), и сторонний `dest` может молчать
+**`probe_tag` (TCP-проба узла).** curl на `https://host:port/` подтверждает доступность порта только
+при положительном `%{num_connects}` (`_probe_connected`), в том числе при таймауте после установки TCP.
+Если задан `PRIMARY_PROBE_URL`, допустим и фактический HTTP-код. Пустое значение при ошибке запуска
+curl не подтверждает доступность. Проба — не VLESS: Reality отдаёт её сайту-маскировке (`dest`), и сторонний `dest` может молчать
 при живом узле (до v32 это давало ложные уходы на резерв и лишние `xkeen -restart`). 🔴
 `%{time_connect}` как признак соединения не годится: при таймауте на этапе TLS curl пишет 0 и для
 установленного TCP. Тест — `tests/test_probe_tag.py`.
@@ -294,6 +304,7 @@ Watchdog v45 на отдельной строке `__DIRECT_RULE_BLOCK__` выв
 (по 3 последних на файл, `_apply_prune_baks`; плюс живой `05_routing.json`).
 
 1. Пролог: ждать lock до `WD_APPLY_WAIT` (150 с) → нет — `FAIL reason=lock`, свои `.applynew.<id>` убраны.
+   Локальная проверка curl → `FAIL reason=curl restart=0`, свои подготовленные файлы удалены.
    Сверка md5 живых файлов с манифестом (`_md5_or_dash`) → расхождение — `FAIL reason=changed` (чужая правка
    не затирается); `sh -n` подготовленного config → `FAIL reason=badconfig`. Копии → подмена (`mv`); сбой —
    `FAIL reason=stage`. Ловушка `_apply_on_exit` (EXIT/INT/TERM/HUP): итога нет — откат и `FAIL reason=crash`

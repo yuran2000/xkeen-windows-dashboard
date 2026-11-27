@@ -1,4 +1,8 @@
 #!/bin/sh
+# XKeen failover watchdog v48 (2026-11-27, проверка curl перед переключением):
+#   При сбое загрузчика или отсутствии SOCKS сохраняет действующий маршрут и состояние проб.
+#   TCP-проба подтверждает соединение по num_connects, IPv6-адрес получает корректный URL.
+#
 # XKeen failover watchdog v47 (2026-11-09, тема для уведомлений Telegram).
 #
 # XKeen failover watchdog v46 (2026-11-09, собственный резерв для .ru):
@@ -491,6 +495,34 @@ _apply_prune_baks() {
   done
 }
 
+# Проверяем запуск curl и поддержку SOCKS на loopback, без обращения к узлам.
+# При LD_BIND_NOW=1 загрузчик проверяет также символы, которые curl еще не вызвал.
+_wd_probe_tool_ready() {
+  local _message _rc _now _last _marker
+  _marker="$LOCK.curl-unavailable"
+  _rc=0
+  _message=$(LD_BIND_NOW=1 curl -q --noproxy '' --socks5-hostname 127.0.0.1:1 \
+    --max-time 1 -sS -o /dev/null http://127.0.0.1:1/ 2>&1) || _rc=$?
+  case "$_rc" in
+    # Отказ, таймаут или ответ локального SOCKS означают, что curl начал пробу.
+    0|7|28|97)
+      if [ -f "$_marker" ]; then
+        log "CURL-READY: локальная проверка curl снова проходит"
+        rm -f "$_marker"
+      fi
+      return 0 ;;
+  esac
+  _now=$(date +%s)
+  _last=$(cat "$_marker" 2>/dev/null) || _last=0
+  case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+  if [ "$_last" = 0 ] || [ "$_now" -lt "$_last" ] || [ $((_now - _last)) -ge 300 ]; then
+    _message=$(printf '%s\n' "$_message" | head -n 1)
+    log "CURL-UNAVAILABLE: локальная проверка curl завершилась с rc=$_rc${_message:+: $_message}. Проверьте версии curl и libcurl в Entware."
+    printf '%s\n' "$_now" > "$_marker"
+  fi
+  return 1
+}
+
 if [ -n "$WD_APPLY_ID" ]; then
   _aw=0
   _aw_max=$(echo "${WD_APPLY_WAIT:-150}" | grep -E '^[0-9]+$' || echo 150)
@@ -506,6 +538,11 @@ if [ -n "$WD_APPLY_ID" ]; then
   _APPLY_DONE=0
   trap '_apply_on_exit' EXIT
   trap 'exit 1' INT TERM HUP
+  if ! _wd_probe_tool_ready; then
+    _apply_unstage
+    _apply_result "FAIL reason=curl restart=0"
+    exit 1
+  fi
   # 1) Сверка: всё подготовленное — из манифеста, и живые файлы не менялись с подготовки.
   _changed=""
   for _af in $APPLY_STAGE_LIST; do
@@ -613,10 +650,11 @@ get_host_port() {
 # выходит с 28 при живом порту. 🔴 %{time_connect} для этого НЕ годится: при таймауте на этапе TLS
 # curl 8.x пишет 0.000000 и для установленного TCP (замер на роутере 2026-10-09).
 _probe_connected() {
-  [ -n "$1" ] && [ "$1" != "0" ]
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -gt 0 ]
 }
 probe_tag() {
-  local tag="$1" probe_url="$2" probe_mode="${3:-}" _tc
+  local tag="$1" probe_url="$2" _tc code hp host port
   # v12: direct/block — локальные outbound'ы без удалённого сервера, "пинговать" нечем.
   # Для них "жив" = верно: если direct не работает — упал весь интернет, и failover на VPN
   # это не починит. Без этого watchdog ложно считает primary=direct "упавшим" и шлёт ложные
@@ -627,35 +665,22 @@ probe_tag() {
   if [ -n "$probe_url" ]; then
     _tc=$(curl -sk --connect-timeout 5 --max-time 8 -o /dev/null -w '%{http_code} %{num_connects}' "$probe_url" 2>/dev/null)
     code="${_tc%% *}"; _tc="${_tc#* }"
-    [ -n "$code" ] && [ "$code" != "000" ] && return 0
+    case "$code" in [1-5][0-9][0-9]) return 0 ;; esac
     # v32: HTTP-ответа нет, но TCP установился — узел жив (медленный dest у Reality)
     [ "$code" = "000" ] && _probe_connected "$_tc" && return 0
     return 1
   fi
-  # TCP-probe через curl (HTTPS-запрос — если connect успешен, любой ответ кроме timeout/refused
-  # это "порт открыт", даже SSL-handshake fail)
+  # При ошибке TLS или таймауте тоже нужно подтверждение TCP-соединения от curl.
   hp=$(get_host_port "$tag")
   [ -z "$hp" ] && return 1
   set -- $hp
   host="$1"; port="$2"
-  if [ "$probe_mode" = "require-connect" ]; then
-    case "$host" in
-      \[*\]) ;;
-      *:*) host="[$host]" ;;
-    esac
-  fi
-  _tc=$(curl -sk --connect-timeout 5 --max-time 8 -o /dev/null -w '%{num_connects}' "https://${host}:${port}/" 2>/dev/null)
-  rc=$?
-  if [ "$probe_mode" = "require-connect" ]; then
-    _probe_connected "$_tc"
-    return $?
-  fi
-  case "$rc" in
-    7)  return 1 ;;  # couldn't connect
-    28) _probe_connected "$_tc" && return 0  # v32: TCP установлен, не дождались ответа — жив
-        return 1 ;;  # timeout на connect
-    *)  return 0 ;;  # любой другой — TCP-connect был успешен
+  case "$host" in
+    \[*\]) ;;
+    *:*) host="[$host]" ;;
   esac
+  _tc=$(curl -sk --connect-timeout 5 --max-time 8 -o /dev/null -w '%{num_connects}' "https://${host}:${port}/" 2>/dev/null)
+  _probe_connected "$_tc"
 }
 
 # v27: числовые параметры из watchdog.config могут прийти с «хвостом»: bootstrap-шаблон панели
@@ -1548,7 +1573,7 @@ ru_vpn_select() {
     elif [ -n "$best" ]; then
       continue
     fi
-    if probe_tag "$tag" "" require-connect; then
+    if probe_tag "$tag" ""; then
       [ -z "$best" ] && best="$tag"
       [ "$tag" = "$prior" ] && prior_live=1
       [ -z "$prior" ] && break
@@ -2206,6 +2231,11 @@ _apply_health() {
   traffic_check || { _APPLY_HREASON=traffic; return 1; }
   return 0
 }
+
+# После отката прерванного применения проверяем curl до проб, переключений и записи state.
+if [ -z "$WD_APPLY_ID" ]; then
+  _wd_probe_tool_ready || exit 1
+fi
 
 # ---------- Досыл застрявших TG-алертов (v15) ----------
 # В начале каждого тика пробуем дослать всё, что не ушло из-за упавшего канала.

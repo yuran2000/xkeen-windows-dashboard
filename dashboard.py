@@ -223,7 +223,7 @@ import dashboard_update
 
 # ============== ВЕРСИЯ ПАНЕЛИ ==============
 # Version of the loaded source. The updater also uses it to validate the release tag.
-_VERSION_FALLBACK = "1.4.8"
+_VERSION_FALLBACK = "1.4.9"
 _DASHBOARD_SOURCE_SHA256 = ""
 _DASHBOARD_BUILD = ""
 if not getattr(sys, "frozen", False):
