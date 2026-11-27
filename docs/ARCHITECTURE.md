@@ -29,6 +29,7 @@ Keenetic, `<vpn-domain>` — `cfg.EXTERNAL_DOMAIN`, `<home-domain>` — `cfg.HOM
 | Проверка в «🚑 Диагностике» | `api_xkeen_diagnose` + `XKEEN_AUTO_FIXES` + ветка `api_xkeen_auto_fix` (§3.10) |
 | Файл в бэкапе | `xkeen_backup_paths.STATIC_FILES` / `DYNAMIC_GLOBS` |
 | Проверить / выпустить | §10 / §11 |
+| Обновление из шапки и «Что нового?» | `setupPanelUpdate` → `api_xkeen_panel_update` → `dashboard_update.Worker` (§11) |
 
 ---
 
@@ -96,6 +97,8 @@ pythonw не сохраняется. Разработка: `start.bat` (конс
 | `tests/test_*.py` | офлайн-тесты (§10.3) |
 | `install.bat`, `install_service.bat`/`.ps1`, `start.bat`, `start-bg.bat`, `stop.bat`, `Restart-Clean.bat`, `update.bat`/`.ps1`, `install_toast_alerts.bat`, `uninstall_toast_alerts.bat` | установка, служба, запуск, обновление, toast |
 | `Recover-Update.bat`/`.ps1`, `tools/update_checkout.py` | безопасное обновление и переход старых Git-клонов; `docs/UPDATING.md` |
+| `dashboard_update.py`, `update_release.py`, `tools/update_windows.ps1` | встроенное обновление Git, ZIP и portable. Проверка выпуска, отдельный Windows-процесс, подтверждение запуска и откат |
+| `tools/build_portable_release.py` | сборка portable x64 с независимым обновлятором |
 | `tools/check_public.py` | проверка публичного состава, без личных сигнатур в Git |
 | `release.ps1`, `release_notes_footer.md` | релиз (§11), футер release notes |
 | `portable/build.bat`, `portable/config.ini.template` | portable-exe (PyInstaller), шаблон `config.ini` |
@@ -123,8 +126,9 @@ pythonw не сохраняется. Разработка: `start.bat` (конс
 данные; `_resource_dir()` — вшитые ресурсы (`bootstrap/`, favicon; в onefile `sys._MEIPASS`).
 Frozen-режим: автосоздание `config.ini`, подменный `config_local` из примера. `import config_local as
 cfg` — **весь код читает настройки как `cfg.*`**; поверх ложатся `config.ini` (frozen: `[server]`,
-`[ssh]`, `[auth]`) и `runtime_settings.json`. `_VERSION_FALLBACK` + `get_dashboard_version()`
-(`git describe --tags --abbrev=0`, только `\d+.\d+.\d+` из вывода, кэш 60 с).
+`[ssh]`, `[auth]`) и `runtime_settings.json`. `_VERSION_FALLBACK` задает версию загруженного кода.
+Локальный `HEAD /login` возвращает ее вместе с `X-Dashboard-PID` и загруженным идентификатором.
+Для Python это `X-Dashboard-Source-SHA256`, для portable — `X-Dashboard-Build` из ресурса сборки.
 
 ### 3.2. `RUNTIME SETTINGS`, `AUTH`, `DATA COLLECTORS`
 
@@ -436,7 +440,7 @@ fix_explain)`):
 
 ## 4. Реестр маршрутов → [`docs/architecture/04-routes.md`](architecture/04-routes.md)
 
-Все `@app.route` (92) по группам: метод, функция, что делает, что трогает на роутере (`—` / `R` / `W` / `⟳` /
+Все `@app.route` (96) по группам: метод, функция, что делает, что трогает на роутере (`—` / `R` / `W` / `⟳` /
 `WD` / `ndm`). Подразделы:
 - 4.1. Страницы, служебные, состояние
 - 4.2. Outbound'ы, подписки, мета (все POST, кроме GET `orphan-sub-meta`)
@@ -538,7 +542,7 @@ BusyBox ash, cron раз в минуту); панель пишет его кон
 
 ### 8.1. Компоновка
 
-`<head>`/`<style>` → шапка `<h1>🚦 XKeen` (индикатор xray, версия) → `#flash` → баннер приветствия
+`<head>`/`<style>` → шапка `<h1>🚦 XKeen` (индикатор xray, версия, `panel-update-check`) → `#flash` → баннер приветствия
 (`is_first_run`) → баннер «структура отстала» (`syncStructure(this)`) → разделы `<h2 class="sec-…">` →
 скрипт WG-раздела (`initWg`) → «❓ Помощь» → главный `<script>` → `<footer>`.
 
@@ -764,6 +768,22 @@ headless Chromium (Playwright из `.venv`): 0 `pageerror` и ошибок ко�
 ---
 
 ## 11. Подготовка и публикация выпуска
+
+Встроенное обновление начинается в `setupPanelUpdate`. `UpdateManager` сверяет последнее стабильное
+издание перед пуском. `Worker` получает точный коммит Git или проверенный архив,
+управляет только своим Windows-процессом через `tools/update_windows.ps1` и сохраняет
+итог в `backups/panel-update`. У standalone и Планировщика сохраняется исходный способ запуска.
+Успех требует нового PID, ожидаемой версии и SHA-256 Python-исходника либо идентификатора portable,
+загруженного новым процессом. Нарушение этого условия запускает откат. `setupPanelUpdate`
+открывает `panel-whats-new` после получения подтверждения. Порядок пользователя в `docs/UPDATING.md`.
+
+Раздел «Что нового?» загружает описания стабильных выпусков GitHub при открытии.
+`Releases.history` выбирает краткое описание, `remember_history` сохраняет публичные
+заметки в `backups/panel-update/release-history.json` для чтения при временном сбое связи.
+Параметр `-Message` сценария `release.ps1` задает описание GitHub. Сценарий готовит архивы
+тега и сборку portable x64. Промежуточные файлы PyInstaller размещаются во временной папке
+независимо от пути вывода архива. Сценарий загружает пакеты в черновик, сверяет размер и SHA-256 каждого
+файла и только затем публикует Latest. Ручной workflow архивов предназначен для прежних тегов.
 
 `release.ps1 -Version X.Y.Z -Message "…"` — штатный выпуск; перед ним выполнить §10.
 Параметр `-PrepareOnly` создаёт только локальные коммит, тег и квитанцию в `backups/`,

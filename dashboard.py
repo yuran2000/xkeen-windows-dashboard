@@ -219,16 +219,24 @@ import xkeen_backup_paths
 import xkeen_killswitch
 import wg_clients
 import ssh_bin
+import dashboard_update
 
 # ============== ВЕРСИЯ ПАНЕЛИ ==============
 # Version of the loaded source. The updater also uses it to validate the release tag.
-_VERSION_FALLBACK = "1.4.7"
+_VERSION_FALLBACK = "1.4.8"
 _DASHBOARD_SOURCE_SHA256 = ""
+_DASHBOARD_BUILD = ""
 if not getattr(sys, "frozen", False):
     try:
         with open(__file__, "rb") as _dashboard_source:
             _DASHBOARD_SOURCE_SHA256 = hashlib.sha256(_dashboard_source.read()).hexdigest().upper()
     except OSError:
+        pass
+else:
+    try:
+        with open(os.path.join(_resource_dir(), "release-build.json"), encoding="utf-8") as _build_info:
+            _DASHBOARD_BUILD = json.load(_build_info)["commit"]
+    except (OSError, ValueError, KeyError):
         pass
 
 # ============== RUNTIME SETTINGS (overrides поверх config_local.py) ==============
@@ -401,8 +409,11 @@ def login():
     headers = {}
     if request.remote_addr in ("127.0.0.1", "::1"):
         headers["X-Dashboard-Version"] = _VERSION_FALLBACK
+        headers["X-Dashboard-PID"] = str(os.getpid())
         if _DASHBOARD_SOURCE_SHA256:
             headers["X-Dashboard-Source-SHA256"] = _DASHBOARD_SOURCE_SHA256
+        if _DASHBOARD_BUILD:
+            headers["X-Dashboard-Build"] = _DASHBOARD_BUILD
     return render_template_string(LOGIN_TEMPLATE, error=error), 200, headers
 
 
@@ -5583,6 +5594,47 @@ def _dashboard_task_name():
     return "XrayDashboard" if port == 5000 else f"XrayDashboard-{port}"
 
 
+_PANEL_UPDATE = dashboard_update.UpdateManager(
+    _app_base_dir(), _resource_dir(), _VERSION_FALLBACK, _dashboard_port(),
+    frozen=getattr(sys, "frozen", False),
+)
+
+
+@app.route("/api/xkeen/panel-update", methods=["GET", "POST"])
+@requires_auth
+def api_xkeen_panel_update():
+    try:
+        if request.method == "GET":
+            return jsonify(_PANEL_UPDATE.check())
+        if request.headers.get("X-XKeen-Update") != "1":
+            return jsonify(error="invalid_request"), 403
+        if (request.content_length or 0) > 4096:
+            return jsonify(error="invalid_request"), 413
+        identity = request.get_json(silent=True)
+        if not isinstance(identity, dict):
+            return jsonify(error="invalid_request"), 400
+        return jsonify(_PANEL_UPDATE.queue(identity)), 202
+    except dashboard_update.R.UpdateError as exc:
+        return jsonify(error=exc.code), 409
+    except (OSError, ValueError):
+        return jsonify(error="permission_denied"), 503
+
+
+@app.route("/api/xkeen/panel-update/status")
+@requires_auth
+def api_xkeen_panel_update_status():
+    try:
+        return jsonify(_PANEL_UPDATE.status())
+    except (OSError, ValueError):
+        return jsonify(error="permission_denied"), 503
+
+
+@app.route("/api/xkeen/panel-update/history")
+@requires_auth
+def api_xkeen_panel_update_history():
+    return jsonify(_PANEL_UPDATE.history())
+
+
 @app.route("/api/xkeen/dashboard-health", methods=["GET"])
 @requires_auth
 def api_xkeen_dashboard_health():
@@ -5636,6 +5688,8 @@ def api_xkeen_restart_dashboard():
 
     Раньше создавали .bat в %TEMP% — оставался мусор. Раньше использовали PowerShell +
     DETACHED_PROCESS — залипало (родитель умирал от schtasks /End до запуска ребёнка)."""
+    if _PANEL_UPDATE.status().get("phase") in dashboard_update.PENDING:
+        return jsonify({"ok": False, "stderr": "Обновление панели еще выполняется."})
     task = _dashboard_task_name()
     restarter = task.replace("XrayDashboard", "XrayDashboardRestarter", 1)
     try:
@@ -12642,21 +12696,48 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   .topbar-actions{margin-left:auto;display:flex;align-items:center;flex-wrap:wrap;gap:6px 9px;font-size:0.9em;}
   .topbar-actions a.tb-link{color:#3a6ea5;text-decoration:none;white-space:nowrap;}
   .topbar-actions a.tb-link:hover{text-decoration:underline;}
+  .tb-update{font:inherit;font-weight:700;background:#235b92;color:#fff;border:1px solid #235b92;padding:6px 11px;border-radius:6px;white-space:nowrap;cursor:pointer;}
+  .tb-update:hover{background:#184978;}
+  .topbar > .tb-update{font-size:.88em;font-weight:600;padding:4px 8px;}
+  .panel-update-dialog{max-width:min(460px,calc(100vw - 36px));box-sizing:border-box;border:1px solid #d6dbe0;border-radius:10px;padding:18px 20px;color:#20252b;box-shadow:0 10px 35px #0004;}
+  .panel-update-dialog::backdrop{background:#16273565;}
+  .panel-update-dialog h2{margin:0 0 12px;}
+  .panel-update-dialog menu{display:flex;justify-content:flex-end;gap:8px;margin:16px 0 0;padding:0;}
+  .panel-update-dialog li{margin:5px 0;overflow-wrap:anywhere;}
+  .panel-update-dialog progress{width:100%;}
+  .panel-update-dialog [hidden]{display:none!important;}
+  .release-note{padding:11px 0;border-bottom:1px solid #e4e8ed;}
+  .release-note:last-of-type{border-bottom:0;}
+  .release-note h3{margin:0 0 7px;}
+  .release-note ul{margin:0;padding-left:21px;line-height:1.45;}
 </style>
 <div class="topbar">
   <h1>🚦 XKeen <span class="tb-host" title="Управление XKeen на роутере через SSH · перед каждым изменением создаётся бэкап на роутере">· Keenetic {{ keenetic_settings.current.host }}:{{ keenetic_settings.current.port }}</span></h1>
+  <button type="button" class="tb-update" id="panel-update-check">Проверить обновление</button>
   <span class="topbar-actions">
     {% if not is_client_only %}<a href="/" class="tb-link" title="Локальный мониторинг xray/Caddy/портов на этом PC">← дашборд</a>{% endif %}
     <a href="javascript:restartDashboard()" class="tb-link" title="Перезапустить панель прямо отсюда — запрос на /api/xkeen/restart-dashboard, ~8 сек и обновление страницы. Если не сработает — откроется help с альтернативами.">🔄 рестарт</a>
     <span id="xray-status-badge" class="health-badge xs-pending" title="Состояние xray на роутере — обновляется каждые 60 сек. Клик → секция 📊 Статус XKeen.">⏳ xray ...</span>
     <span id="dashboard-health-badge" class="health-badge health-pending" title="Проверка процесса панели — каждые 15 сек">⏳ проверка...</span>
     {% if is_first_run %}<a href="#section-router-config" class="health-badge" style="background:#fde8c8; color:#7a5500; border:1px solid #e0c878; text-decoration:none; cursor:pointer; animation: blink 1.8s infinite;" title="Роутер не подключён — настроить SSH в разделе внизу страницы">⚠ роутер не подключён</a>{% endif %}
-    <a href="https://github.com/yuran2000/xkeen-windows-dashboard/releases/latest" target="_blank" class="health-badge" style="background:#f0e6ff; color:#5a3a99; border:1px solid #c9b3e0; text-decoration:none;" title="Версия панели. Клик → последний релиз на GitHub. Сравнить с установленной — если есть свежее, обновить через update.bat.">v{{ dashboard_version }}</a>
+    <span id="panel-installed-version" class="health-badge" style="background:#f0e6ff; color:#5a3a99; border:1px solid #c9b3e0;" title="Установленная версия панели">v{{ dashboard_version }}</span>
     <a href="/logout" class="tb-link" title="Выход из аккаунта {{ username }}">⎋ выход</a>
   </span>
 </div>
 
 <div id="flash" class="flash"></div>
+
+<dialog class="panel-update-dialog" id="panel-update-dialog" aria-labelledby="panel-update-title">
+  <h2 id="panel-update-title">Обновление панели</h2>
+  <p id="panel-update-status" role="status" aria-live="polite"></p>
+  <progress id="panel-update-progress" aria-label="Обновление выполняется" hidden></progress>
+  <ul id="panel-update-notes" hidden></ul>
+  <a id="panel-update-release" target="_blank" rel="noopener noreferrer" hidden>Выпуск на GitHub</a>
+  <menu>
+    <form method="dialog"><button type="submit">Закрыть</button></form>
+    <button type="button" class="tb-update" id="panel-update-install" hidden>Установить</button>
+  </menu>
+</dialog>
 
 {% if is_first_run %}
 <!-- ===== WELCOME BANNER (роутер не подключён) ===== -->
@@ -15421,6 +15502,15 @@ Use this token to access the HTTP API:
 })();
 </script>
 
+<details class="section-collapsible" id="panel-whats-new" data-xk-section-id="release-notes">
+<summary><h2 class="sec-help">Что нового?</h2></summary>
+<div class="card">
+  <p id="panel-release-status" role="status" aria-live="polite" hidden></p>
+  <div id="panel-release-history"></div>
+  <p><a href="https://github.com/yuran2000/xkeen-windows-dashboard/releases" target="_blank" rel="noopener noreferrer">Все выпуски на GitHub</a></p>
+</div>
+</details>
+
 <details class="section-collapsible">
 <summary><h2 class="sec-help">❓ Помощь <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— как тут всё устроено и работает</span></h2></summary>
 <div class="card">
@@ -15621,10 +15711,8 @@ Use this token to access the HTTP API:
     <summary>🔄 Обновление панели и синхронизация структуры с роутером</summary>
     <div class="help-body">
       <h4>Как обновлять панель</h4>
-      <ul>
-        <li><strong>Через Git</strong> (если ставил через <code>git clone</code>): <code>cd C:\xray-dashboard</code> + <code>.\update.bat</code> — стянет последний релиз с GitHub, поставит новые зависимости из <code>requirements.txt</code> если он изменился, перезапустит панель в фоне.</li>
-        <li><strong>Без Git</strong> (если ставил из ZIP): скачать свежий ZIP с GitHub → остановить панель (<code>stop.bat</code>) → распаковать архив поверх <code>C:\xray-dashboard</code> с заменой файлов (свои <code>config_local.py</code>, <code>.venv</code>, <code>backups\</code> в архиве нет — не перезапишутся) → <code>install.bat</code> для обновления зависимостей → <code>start-bg.bat</code>.</li>
-      </ul>
+      <p>Нажать «Проверить обновление» в шапке и подтвердить показанную версию. Панель подбирает пакет для Git, ZIP или portable и проверяет запуск установленного выпуска.</p>
+      <p><a href="https://github.com/yuran2000/xkeen-windows-dashboard/blob/main/docs/UPDATING.md" target="_blank" rel="noopener noreferrer">Инструкция по первому переходу и восстановлению</a></p>
 
       <h4>Что синхронизируется на роутер автоматически</h4>
       <ul>
@@ -19457,6 +19545,269 @@ async function restoreSnapshot() {
   }
 }
 
+function setupPanelUpdate() {
+  const byId = id => document.getElementById(id);
+  const check = byId('panel-update-check');
+  const dialog = byId('panel-update-dialog');
+  const install = byId('panel-update-install');
+  const status = byId('panel-update-status');
+  const progress = byId('panel-update-progress');
+  const notes = byId('panel-update-notes');
+  const release = byId('panel-update-release');
+  const historyPanel = byId('panel-whats-new');
+  const historyList = byId('panel-release-history');
+  const historyStatus = byId('panel-release-status');
+  const installed = byId('panel-installed-version').textContent;
+  const url = '/api/xkeen/panel-update';
+  const messages = {
+    github_unavailable: 'Не удалось проверить версию на GitHub. Повторить позже.',
+    rate_limited: 'GitHub ограничил частоту проверок. Повторить позже.',
+    invalid_release: 'GitHub вернул неподходящие сведения о выпуске.',
+    package_unavailable: 'Пакет для этой установки еще не приложен к выпуску.',
+    unsupported_install: 'Для этой установки встроенное обновление недоступно.',
+    bootstrap_required: 'Нужна установка готового portable-пакета из выпуска GitHub.',
+    offer_changed: 'Выпуск изменился. Проверить обновление еще раз.',
+    busy: 'Обновление уже выполняется.',
+    launch_failed: 'Обновлятор Windows не запустился. Подробности в локальном журнале обновления.',
+    permission_denied: 'Не удалось открыть состояние обновления. Проверить права папки установки.',
+    download_failed: 'Не удалось скачать пакет. Повторить позже.',
+    invalid_package: 'Пакет не прошел проверку версии, состава или контрольной суммы.',
+    unsafe_install: 'Структура папки установки не позволяет безопасно заменить файлы.',
+    recovery_required: 'Обнаружены местные изменения или старая история Git. Открыть инструкцию по восстановлению.',
+    foreign_checkout: 'Обновление доступно для основной ветки официального Git-репозитория.',
+    git_missing: 'На компьютере панели не найден Git для Windows.',
+    instance_changed: 'Состояние запущенной панели изменилось. Проверить обновление еще раз.',
+    disk_space: 'Недостаточно свободного места для пакета и отката.',
+    health_failed: 'Новая версия не подтвердила запуск.',
+    interrupted: 'Операция прервана. Проверить локальный журнал обновления и резервную копию.',
+    interrupted_preparation: 'Подготовка прервана до замены файлов. Можно повторить проверку.'
+  };
+  const stages = {
+    queued: 'Обновление поставлено в очередь.',
+    preparing: 'Подготовка и проверка файлов выпуска…',
+    installing: 'Установка новой версии…',
+    starting: 'Перезапуск и проверка панели…',
+    rolling_back: 'Восстановление предыдущей версии…'
+  };
+  let offered = null;
+  let watchTimer = null;
+  let watchedJob = '';
+  let loading = false;
+  let submitting = false;
+  let polling = false;
+  let seenJob = '';
+  let loadingHistory = false;
+  let focusVersion = null;
+
+  function showDialog() {
+    if (!dialog.open) dialog.showModal();
+  }
+
+  function showError(code, rollback) {
+    progress.hidden = true;
+    install.hidden = true;
+    status.textContent = messages[code] || 'Обновление остановлено. Подробности в локальном журнале обновления.';
+    if (rollback === 'restored') status.textContent += ' Предыдущая версия восстановлена и запущена.';
+    if (rollback === 'failed') status.textContent += ' Восстановление не подтверждено. Резерв сохранен.';
+    if (code === 'recovery_required') {
+      release.href = 'https://github.com/yuran2000/xkeen-windows-dashboard/blob/main/docs/UPDATING.md';
+      release.textContent = 'Инструкция по восстановлению';
+      release.hidden = false;
+    }
+  }
+
+  function showWhatsNew(job, version) {
+    let saved = seenJob;
+    try { saved = localStorage.getItem('xkeenSeenUpdate') || saved; } catch (_) {}
+    if (saved === job) return;
+    seenJob = job;
+    try { localStorage.setItem('xkeenSeenUpdate', job); } catch (_) {}
+    if (dialog.open) dialog.close();
+    focusVersion = version;
+    historyPanel.open = true;
+    window.__xkActivatePageForEl?.(historyPanel);
+    loadReleaseHistory();
+  }
+
+  async function getJson(path, options) {
+    const response = await fetch(path, {cache: 'no-store', signal: AbortSignal.timeout(25000), ...options});
+    if (response.redirected || !response.headers.get('Content-Type')?.includes('application/json')) {
+      throw new Error('unavailable');
+    }
+    return response.json();
+  }
+
+  async function loadReleaseHistory() {
+    if (loadingHistory) return;
+    loadingHistory = true;
+    historyStatus.hidden = false;
+    historyStatus.textContent = 'Загрузка описаний выпусков…';
+    try {
+      const data = await getJson(url + '/history');
+      const entries = data.releases || [];
+      historyList.replaceChildren(...entries.map(entry => {
+        const article = document.createElement('article');
+        article.className = 'release-note';
+        article.dataset.release = entry.tag;
+        article.tabIndex = -1;
+        const title = document.createElement('h3');
+        title.textContent = entry.tag;
+        article.append(title);
+        if (entry.notes.length) {
+          const list = document.createElement('ul');
+          entry.notes.forEach(text => {
+            const line = document.createElement('li');
+            line.textContent = text;
+            list.append(line);
+          });
+          article.append(list);
+        }
+        return article;
+      }));
+      historyStatus.hidden = !data.error && entries.length > 0;
+      historyStatus.textContent = data.error
+        ? (entries.length ? 'GitHub временно недоступен. Показаны сохраненные описания.' : messages[data.error] || 'Не удалось загрузить описания.')
+        : 'Нет опубликованных описаний выпусков.';
+    } catch (_) {
+      historyStatus.textContent = 'Не удалось загрузить описания выпусков.';
+    } finally {
+      loadingHistory = false;
+      if (focusVersion) {
+        const entry = Array.from(historyList.children).find(item => item.dataset.release === focusVersion);
+        (entry || historyPanel.querySelector('summary')).focus();
+        focusVersion = null;
+      }
+    }
+  }
+
+  document.addEventListener('xkeen:release-history', loadReleaseHistory);
+  if (historyPanel.open && historyPanel.getClientRects().length) loadReleaseHistory();
+
+  function renderJob(data) {
+    if (!data.job) return false;
+    if (stages[data.phase]) {
+      watchedJob = data.job;
+      status.textContent = data.tag + ' · ' + stages[data.phase];
+      progress.hidden = false;
+      install.hidden = true;
+      return true;
+    }
+    if (data.phase === 'success') {
+      if (installed !== data.tag && watchedJob === data.job) {
+        location.reload();
+      } else if (installed === data.tag) {
+        showWhatsNew(data.job, data.tag);
+      }
+    }
+    if (data.phase === 'failed' && watchedJob === data.job) {
+      showDialog();
+      showError(data.error, data.rollback);
+    }
+    watchedJob = '';
+    return false;
+  }
+
+  async function poll() {
+    if (polling) return;
+    polling = true;
+    clearTimeout(watchTimer);
+    let retry = false;
+    try {
+      const data = await getJson(url + '/status');
+      retry = data.error ? Boolean(watchedJob) : renderJob(data);
+    } catch (_) {
+      if (watchedJob) {
+        status.textContent = 'Панель временно недоступна. Ожидание ответа…';
+        retry = true;
+      }
+    } finally {
+      polling = false;
+      if (retry) watchTimer = setTimeout(poll, 1800);
+    }
+  }
+
+  check.addEventListener('click', async () => {
+    showDialog();
+    if (watchedJob || loading || submitting) return;
+    loading = true;
+    offered = null;
+    status.textContent = 'Проверка последней стабильной версии…';
+    progress.hidden = false;
+    notes.hidden = release.hidden = install.hidden = true;
+    try {
+      const job = await getJson(url + '/status');
+      if (renderJob(job)) {
+        poll();
+        return;
+      }
+      if (job.phase === 'failed' && (job.error === 'interrupted' || job.rollback === 'failed')) {
+        showError(job.error, job.rollback);
+        return;
+      }
+      const data = await getJson(url);
+      if (data.error) {
+        showError(data.error);
+        return;
+      }
+      status.textContent = data.newer ? 'Установлена ' + installed + ' · доступна ' + data.tag
+        : data.tag === installed ? 'Уже установлена последняя версия ' + installed
+        : 'Установленная версия ' + installed + ' новее последнего выпуска ' + data.tag;
+      release.textContent = 'Выпуск на GitHub';
+      release.href = data.link;
+      release.hidden = !data.newer;
+      notes.replaceChildren(...data.notes.map(text => {
+        const line = document.createElement('li');
+        line.textContent = text;
+        return line;
+      }));
+      notes.hidden = !data.newer || !data.notes.length;
+      if (data.blocked) {
+        status.textContent += '. ' + (messages[data.blocked] || 'Установка недоступна.');
+      } else if (data.newer) {
+        offered = {id: data.id, tag: data.tag, kind: data.kind};
+        if (data.asset) offered.asset = data.asset;
+        if (data.commit) offered.commit = data.commit;
+        install.textContent = 'Обновить до ' + data.tag;
+        install.hidden = false;
+      }
+    } catch (_) {
+      showError('github_unavailable');
+    } finally {
+      if (!watchedJob) progress.hidden = true;
+      loading = false;
+    }
+  });
+
+  install.addEventListener('click', async () => {
+    if (!offered || submitting) return;
+    submitting = true;
+    install.hidden = true;
+    progress.hidden = false;
+    status.textContent = 'Запуск обновления…';
+    try {
+      const data = await getJson(url, {method: 'POST', headers: {
+        'Content-Type': 'application/json', 'X-XKeen-Update': '1'
+      }, body: JSON.stringify(offered)});
+      if (data.error) {
+        showError(data.error);
+        if (data.error === 'busy') poll();
+      } else {
+        renderJob(data);
+        poll();
+      }
+    } catch (_) {
+      showError('launch_failed');
+      poll();
+    } finally {
+      submitting = false;
+      offered = null;
+    }
+  });
+  poll();
+}
+
+document.addEventListener('DOMContentLoaded', setupPanelUpdate);
+
 // Активный рестарт панели — кнопка «🔄 рестарт панели» в шапке.
 // Шлёт POST /api/xkeen/restart-dashboard, показывает modal с прогрессом, polling /health
 // каждые 1.5 сек до возврата 200. После 30 сек — fallback на showRestartHelp().
@@ -22808,6 +23159,7 @@ async function makeSiteReachable(btn) {
       if (pg) pg.querySelectorAll('details.section-collapsible, details.help-section, :scope > details').forEach(d => { d.open = true; });
       subSubTargets.forEach(s => { if (s.page == i) { try { s.el.open = true; } catch(e){} } });
       try { localStorage.setItem('xkActivePage', i); } catch(e){}
+      if (i === 'release-notes') document.dispatchEvent(new Event('xkeen:release-history'));
     }
 
     // Мост для внешних ссылок («❓ помощь» / openHelpAnchor): Help-темы и каналы — отдельные
@@ -22826,7 +23178,7 @@ async function makeSiteReachable(btn) {
       if (/основн|резерв|цепочк|failover|outbound|подписк|добав/.test(t)) return 'Каналы';
       if (/бэкап|роутер|управление xkeen|удал[её]нн|wireguard|kill-switch/.test(t)) return 'Обслуживание';
       if (/алерт|восстановлен|диагност|telegram/.test(t)) return 'Диагностика';
-      if (/помощь/.test(t)) return 'Помощь';
+      if (/помощь|что нового/.test(t)) return 'Помощь';
       return 'Прочее';
     };
 
@@ -22834,11 +23186,11 @@ async function makeSiteReachable(btn) {
     const items = [];  // верхнеуровневые разделы: {title, cat, idx, subs:[{title, idx}]}
     let pi = 0;
     groups.forEach(sec => {
-      const base = document.createElement('div'); base.className = 'xk-page'; base.dataset.page = pi;
+      const base = document.createElement('div'); base.className = 'xk-page';
+      base.dataset.page = sec.els[0].dataset.xkSectionId || pi++;
       sec.els.forEach(e => base.appendChild(e));
       main.appendChild(base);
-      const entry = { title: sec.title, full: sec.full, cat: catFor(sec.title), idx: pi, subs: [] };
-      pi++;
+      const entry = { title: sec.title, full: sec.full, cat: catFor(sec.title), idx: base.dataset.page, subs: [] };
       [...base.querySelectorAll('[data-xk-sub], details.help-section, .card > details:not([data-xk-keep-inline])')].forEach(el => {
         let full = el.getAttribute('data-xk-sub');
         if (!full) { full = cleanSum(el.querySelector('summary')) || 'Тема'; }

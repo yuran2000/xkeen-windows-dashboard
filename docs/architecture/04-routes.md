@@ -4,7 +4,7 @@
 > общие для всех файлов: §1–3, 5, 8–12 — в главном файле, §4 — `04-routes.md`, §6 — `06-watchdog.md`,
 > §7 — `07-chains.md`. Правила обновления — §12: правка кода и этого файла — в одном коммите.
 
-92 декоратора `@app.route` на 91 функции; все, кроме «без auth», под `requires_auth`. «Роутер»:
+96 декораторов `@app.route`. Все, кроме «без auth», под `requires_auth`. «Роутер»:
 `—` не трогает; `R` чтение по SSH; `W: …` запись (бэкап `.bak-<ts>`, если не оговорено); `⟳` явный
 `xkeen -restart`; `WD` — `keenetic_write_watchdog_config` (config + внеочередной `watchdog.sh`,
 который может перегенерировать routing и перезапустить xkeen, + авто-обновление `watchdog.sh`);
@@ -27,6 +27,9 @@
 | `/api/xkeen/probe-status` | GET,POST | `api_xkeen_probe_status` | handshake-проба, `?force=1` (по умолчанию) / `0` — кэш | R |
 | `/api/xkeen/dashboard-health` | GET | `api_xkeen_dashboard_health` | LISTEN на :5000 | — |
 | `/api/xkeen/restart-dashboard` | POST | `api_xkeen_restart_dashboard` | перезапуск задачи | — |
+| `/api/xkeen/panel-update` | GET, POST | `api_xkeen_panel_update` | проверить Latest и запустить подтвержденный выпуск. POST требует `X-XKeen-Update` | — |
+| `/api/xkeen/panel-update/status` | GET | `api_xkeen_panel_update_status` | этап обновления и итог запуска или отката | — |
+| `/api/xkeen/panel-update/history` | GET | `api_xkeen_panel_update_history` | описания стабильных выпусков из GitHub, при сбое — последняя сохраненная копия | — |
 
 ### 4.2. Outbound'ы, подписки, мета (все POST, кроме GET `orphan-sub-meta`)
 

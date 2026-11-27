@@ -7,15 +7,12 @@ name: Attach source archives to release
 # через https://github.com/yuran2000/xkeen-windows-dashboard/releases — нужно attach
 # зеркала этих архивов как реальные release-assets.
 #
-# Триггер: при создании (или редактировании) релиза → workflow генерит
-# два архива через `git archive` (только отслеживаемые файлы)
-# и upload'ит их к релизу.
+# Штатные новые выпуски публикует release.ps1 со всеми пакетами.
+# Ручной workflow прикладывает исходники к прежним выпускам.
 #
 # Permissions: contents:write — нужно для upload assets к существующему release.
 
 on:
-  release:
-    types: [created, edited]
   # Для backfill старых релизов вручную: Actions → Run workflow → tag name
   workflow_dispatch:
     inputs:
@@ -40,8 +37,11 @@ jobs:
 
       - name: Determine tag name
         id: tagname
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          TAG="$RELEASE_TAG"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           # Имя архива — xray-dashboard-vX.Y.Z (без слешей)
           NAME="xray-dashboard-$TAG"

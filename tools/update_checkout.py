@@ -10,6 +10,8 @@ import sys
 from datetime import datetime, timezone
 import uuid
 
+GIT_EXE = 'git'
+GIT_OPTIONS = ()
 ORIGINS = {
     'git@github.com:yuran2000/xkeen-windows-dashboard',
     'git@github.com:yuran2000/xkeen-windows-dashboard.git',
@@ -28,8 +30,9 @@ class RecoveryRequired(RuntimeError):
 
 
 def git(repo, *args, check=True):
-    p = subprocess.run(['git', '-C', str(repo), *args], stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE)
+    p = subprocess.run([GIT_EXE, '-C', str(repo), *GIT_OPTIONS, *args], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                       creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     if check and p.returncode:
         raise RuntimeError('git ' + args[0] + ' failed: ' + p.stderr.decode('utf-8', 'replace').strip())
     return p

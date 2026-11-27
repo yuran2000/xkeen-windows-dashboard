@@ -140,6 +140,17 @@ try {
     exit 1
 }
 
+# Share a byte-range lock with the browser worker. The handle closes on exit.
+$lockDir = Join-Path $InstallDir 'backups\panel-update'
+try {
+    [IO.Directory]::CreateDirectory($lockDir) | Out-Null
+    $updateLock = [IO.File]::Open((Join-Path $lockDir 'worker.lock'), 'OpenOrCreate', 'ReadWrite', 'ReadWrite')
+    $updateLock.Lock(0, 1)
+} catch {
+    Write-Error 'Another update is running or the update lock is inaccessible.'
+    exit 1
+}
+
 # ---- Step 1: verified source update before stopping the running panel ----
 $OldReqHash = ""
 if (Test-Path "requirements.txt") { $OldReqHash = Get-SourceHash (Join-Path $InstallDir "requirements.txt") }
@@ -164,6 +175,7 @@ if ($RecoveredCommit) {
     if ($checkoutResult -eq 3) {
         $recovery = Join-Path $InstallDir 'Recover-Update.ps1'
         Write-Host 'The checkout needs recovery. Review the confirmation before changing files.' -ForegroundColor Yellow
+        $updateLock.Dispose()
         & $recovery
         exit $LASTEXITCODE
     }

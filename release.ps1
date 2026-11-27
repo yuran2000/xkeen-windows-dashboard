@@ -1,4 +1,4 @@
-# Prepare or publish one verified release. PowerShell 5.1, ASCII source.
+﻿# Prepare or publish one verified release. PowerShell 5.1, ASCII source.
 param(
     [Parameter(Mandatory=$true)][string]$Version,
     [Parameter(Mandatory=$true)][string]$Message,
@@ -11,6 +11,17 @@ function Get-SourceHash([string]$Path) {
     $stream = [IO.File]::OpenRead($Path)
     try { return ([BitConverter]::ToString($hash.ComputeHash($stream))).Replace('-','') }
     finally { $stream.Dispose(); $hash.Dispose() }
+}
+
+function Find-Release([string]$Repository, [string]$Tag) {
+    $response = & gh api --paginate --slurp "repos/$Repository/releases?per_page=100"
+    if ($LASTEXITCODE -ne 0) { throw 'Could not read the release inventory.' }
+    $pages = ConvertFrom-Json -InputObject ($response -join "`n")
+    foreach ($page in $pages) {
+        foreach ($entry in $page) {
+            if ($entry.tag_name -ceq $Tag) { return $entry }
+        }
+    }
 }
 
 $ErrorActionPreference = 'Stop'
@@ -31,6 +42,7 @@ if (-not (Test-Path -LiteralPath $PythonExe)) { throw 'Installation Python not f
 $receiptDir = Join-Path $repo 'backups'
 $receiptFile = Join-Path $receiptDir "release-prepared-$Version.json"
 $notesFile = Join-Path $receiptDir "release-notes-$Version.md"
+$publicRepo = 'yuran2000/xkeen-windows-dashboard'
 $utf8 = New-Object Text.UTF8Encoding($false)
 
 if ($PublishPrepared) {
@@ -68,9 +80,7 @@ if ($PublishPrepared) {
     if ($LASTEXITCODE -ne 0) { throw 'Commit failed.' }
     & git -C $repo tag -a $tag -F $messageFile
     if ($LASTEXITCODE -ne 0) { throw 'Tag creation failed.' }
-    $notes = $Message
-    $footer = Join-Path $repo 'release_notes_footer.md'
-    if (Test-Path -LiteralPath $footer) { $notes += "`n`n" + [IO.File]::ReadAllText($footer) }
+    $notes = $Message.Trim()
     [IO.File]::WriteAllText($notesFile,$notes,$utf8)
     $head = & git -C $repo rev-parse HEAD
     $receipt = @{version=$Version;tag=$tag;head=$head;message=$Message;notes_sha256=(Get-SourceHash $notesFile);published=$false}
@@ -80,12 +90,52 @@ if ($PrepareOnly) {
     Write-Host "Prepared locally: $tag ($head). No push or GitHub Release was performed." -ForegroundColor Green
     exit 0
 }
+
+# Build and check every advertised install format before promoting a draft.
+$assetsDir = Join-Path $receiptDir "release-assets-$tag-$head"
+New-Item -ItemType Directory -Path $assetsDir -Force | Out-Null
+$sourceZip = Join-Path $assetsDir "xray-dashboard-$tag.zip"
+$sourceTar = Join-Path $assetsDir "xray-dashboard-$tag.tar.gz"
+$portableZip = Join-Path $assetsDir "xray-dashboard-$tag-portable-win-x64.zip"
+$packagePrefix = "xray-dashboard-$tag/"
+& git -C $repo archive --format=zip "--prefix=$packagePrefix" "--output=$sourceZip" $tag
+if ($LASTEXITCODE -ne 0) { throw 'Source ZIP creation failed.' }
+& git -C $repo archive --format=tar.gz "--prefix=$packagePrefix" "--output=$sourceTar" $tag
+if ($LASTEXITCODE -ne 0) { throw 'Source TAR.GZ creation failed.' }
+& $PythonExe -m pip --disable-pip-version-check install 'pyinstaller==6.17.0'
+if ($LASTEXITCODE -ne 0) { throw 'Windows build tooling is unavailable.' }
+& $PythonExe (Join-Path $repo 'tools\build_portable_release.py') --output $assetsDir --commit $head
+if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $portableZip -PathType Leaf)) { throw 'Portable package build failed.' }
+if (& git -C $repo status --porcelain) { throw 'The source tree changed during package preparation.' }
+
 & git -C $repo push origin main
 if ($LASTEXITCODE -ne 0) { throw 'Main push failed; release not created.' }
 & git -C $repo push origin $tag
 if ($LASTEXITCODE -ne 0) { throw 'Tag push failed; release not created.' }
-& gh release create $tag --repo yuran2000/xkeen-windows-dashboard --title $tag --notes-file $notesFile
-if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed; check the remote state before retrying.' }
+$existing = Find-Release $publicRepo $tag
+if (!$existing) {
+    & gh release create $tag --repo $publicRepo --draft --verify-tag --title $tag --notes-file $notesFile
+    if ($LASTEXITCODE -ne 0) { throw 'GitHub release draft creation failed.' }
+} else {
+    if (!$existing.draft) {
+        throw 'The release is already published. Verify remote delivery before retrying.'
+    }
+}
+& gh release upload $tag $sourceZip $sourceTar $portableZip --repo $publicRepo --clobber
+if ($LASTEXITCODE -ne 0) { throw 'Asset upload failed; release remains a draft.' }
+$releaseData = Find-Release $publicRepo $tag
+if (!$releaseData.draft -or $releaseData.tag_name -cne $tag) { throw 'Unexpected release state.' }
+foreach ($assetPath in @($sourceZip,$sourceTar,$portableZip)) {
+    $assetFile = Get-Item -LiteralPath $assetPath
+    $remoteAsset = @($releaseData.assets | Where-Object { $_.name -ceq $assetFile.Name })
+    $localDigest = (Get-SourceHash $assetPath).ToLowerInvariant()
+    if ($remoteAsset.Count -ne 1 -or $remoteAsset[0].state -ne 'uploaded' -or
+        $remoteAsset[0].size -ne $assetFile.Length -or $remoteAsset[0].digest -cne "sha256:$localDigest") {
+        throw "Size or checksum mismatch for $($assetFile.Name); release remains a draft."
+    }
+}
+& gh release edit $tag --repo $publicRepo --draft=false --latest --title $tag --notes-file $notesFile
+if ($LASTEXITCODE -ne 0) { throw 'GitHub publication failed; inspect the draft before retrying.' }
 $receipt.published = $true
 [IO.File]::WriteAllText($receiptFile,($receipt | ConvertTo-Json),$utf8)
 Write-Host "Published: $tag" -ForegroundColor Green
