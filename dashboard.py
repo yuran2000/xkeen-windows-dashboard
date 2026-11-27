@@ -6106,11 +6106,11 @@ def api_xkeen_subscription_preview():
             critical_role = _critical_roles.get(p["tag"])
             failover_pos = _failover_pos.get(p["tag"])
             host_change = (p["host"], p["port"]) != (local.get("host"), local.get("port"))
-            profile_changes = {
+            profile = {
                 field: {"old": local[field], "new": p[field]}
                 for field in ("network", "security", "flow")
-                if local[field] != p[field]
             }
+            profile_changes = {field: pair for field, pair in profile.items() if pair["old"] != pair["new"]}
             # Отпечаток TLS тоже переписывается sync'ом — без сравнения его смена была невидима
             # (preview показывал «нет», а роутер месяцами жил со старым randomized).
             fp_info = _fp_change_info(p, local.get("fp"))
@@ -6121,6 +6121,7 @@ def api_xkeen_subscription_preview():
                 "local_host": f"{local.get('host','?')}:{local.get('port','?')}",
                 "changed": host_change or fp_info["fp_change"] or bool(profile_changes),
                 "host_change": host_change,
+                "profile": profile,
                 "profile_changes": profile_changes,
                 **fp_info,
                 "pbk_change": pbk_change,
@@ -18772,28 +18773,31 @@ async function previewSubscription() {
   // в отличие от ⛔ в секции orphans_local, который сигнализирует «sync отменит удаление».
   if (res.matches && res.matches.length > 0) {
     html += `<strong style="color:#2a7;">✅ Будут обновлены (${res.matches.length}):</strong><table style="margin-top:6px; font-size:0.85em;">`;
-    html += `<tr><th>tag</th><th>host:port в подписке</th><th>host:port на роутере</th><th>изменится?</th><th>pbk / SNI</th></tr>`;
+    html += `<tr><th>tag</th><th>host:port в подписке</th><th>host:port на роутере</th><th>Параметры<br><small>роутер → подписка</small></th><th>изменится?</th><th>pbk / SNI</th></tr>`;
     const profileLabels = {network: 'Транспорт', security: 'Защита', flow: 'flow'};
     res.matches.forEach(m => {
       const chgParts = [];
       if (m.host_change) chgParts.push('адрес');
       if (m.fp_change) chgParts.push('отпечаток');
       const profileChanges = m.profile_changes || {};
-      const profileDetails = Object.keys(profileLabels).filter(field => profileChanges[field]).map(field => {
-        const change = profileChanges[field];
+      if (Object.keys(profileChanges).length) chgParts.push('параметры');
+      const profile = m.profile || profileChanges;
+      const profileDetails = Object.entries(profileLabels).filter(([field]) => profile[field]).map(([field, label]) => {
+        const {old, new: next} = profile[field];
         const formatValue = value => {
           if (field === 'flow') return escapeHtml(value || 'не задан');
           if (value === 'none') return 'нет';
           return escapeHtml(value.toUpperCase());
         };
-        return `<div><strong>${profileLabels[field]}</strong> <span class="mono" style="overflow-wrap:anywhere;">${formatValue(change.old)} → ${formatValue(change.new)}</span></div>`;
+        const oldValue = formatValue(old);
+        const value = old === next
+          ? `<span title="Совпадает на роутере и в подписке">${oldValue}</span>`
+          : `<strong style="color:#994200;">${oldValue} → ${formatValue(next)}</strong>`;
+        return `<div>${label} <span class="mono" style="overflow-wrap:anywhere;">${value}</span></div>`;
       }).join('');
       const chg = m.changed
-        ? `<span style="color:#e80;">⚠️ да${!profileDetails && chgParts.length ? ' (' + chgParts.join(', ') + ')' : ''}</span>`
+        ? `<span style="color:#e80;">⚠️ да${chgParts.length ? ' (' + chgParts.join(', ') + ')' : ''}</span>`
         : '<span style="color:#888;">нет</span>';
-      const details = profileDetails
-        ? `<div class="sub-preview-profile-changes" style="display:grid;gap:3px;margin-top:4px;color:#6d430e;">${profileDetails}</div>`
-        : '';
       let identity = '';
       const rowStyle = m.different_provider ? 'background:#fff0f0;' : '';
       if (m.different_provider) {
@@ -18818,7 +18822,7 @@ async function previewSubscription() {
       } else if (m.in_failover_only) {
         roleBadge = ` <span title="Этот outbound находится в хвосте FAILOVER-цепочки (позиция #${m.failover_position}). Обновление НЕ влияет на роль — tag остаётся в FAILOVER_TAGS." style="background:#fff4d4;color:#a8801c;border:1px solid #e8c878;border-radius:3px;padding:1px 6px;font-size:0.9em;font-weight:600;margin-left:4px;">🔗 FAILOVER #${m.failover_position}</span>`;
       }
-      html += `<tr style="${rowStyle}"><td class="mono"><strong>${m.tag}</strong>${roleBadge}</td><td class="mono">${m.sub_host}</td><td class="mono">${m.local_host}</td><td>${chg}${details}</td><td style="font-size:0.85em;">${identity}</td></tr>`;
+      html += `<tr style="${rowStyle}"><td class="mono"><strong>${m.tag}</strong>${roleBadge}</td><td class="mono">${m.sub_host}</td><td class="mono">${m.local_host}</td><td class="sub-preview-profile-changes" style="min-width:135px;line-height:1.4;">${profileDetails || '—'}</td><td>${chg}</td><td style="font-size:0.85em;">${identity}</td></tr>`;
     });
     html += `</table>`;
   } else {

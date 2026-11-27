@@ -113,6 +113,12 @@ check("S1: смена отпечатка видна, changed=да при том 
       and m["S1"].get("old_fp") == "randomized" and m["S1"].get("new_fp") == "chrome", m.get("S1"))
 check("S1: признак ухода с randomized", m.get("S1", {}).get("fp_lottery_old") and not m["S1"].get("fp_lottery_new"))
 check("S2: без изменений", m.get("S2") and not m["S2"].get("changed") and not m["S2"].get("fp_change"), m.get("S2"))
+check("S2: предпросмотр возвращает все совпавшие параметры",
+      m.get("S2", {}).get("profile") == {
+          "network": {"old": "tcp", "new": "tcp"},
+          "security": {"old": "reality", "new": "reality"},
+          "flow": {"old": "", "new": ""},
+      }, m.get("S2"))
 check("S3: смена адреса, отпечаток тот же",
       m.get("S3", {}).get("host_change") and m["S3"].get("changed") and not m["S3"].get("fp_change"), m.get("S3"))
 for tag, changes in {
@@ -129,6 +135,12 @@ for tag, changes in {
           and not match.get("different_provider"), match)
 check("S8: поля по умолчанию совпадают с явно заданными", m.get("S8", {}).get("profile_changes") == {}
       and not m["S8"].get("changed"), m.get("S8"))
+check("S5: полный профиль включает изменившийся flow и совпавшие параметры",
+      m.get("S5", {}).get("profile") == {
+          "network": {"old": "tcp", "new": "tcp"},
+          "security": {"old": "tls", "new": "tls"},
+          "flow": {"old": "xtls-rprx-vision", "new": ""},
+      }, m.get("S5"))
 o = {x["tag"]: x for x in j.get("orphans_in_sub", [])}
 check("N1: новый сервер с randomized помечен", o.get("N1", {}).get("fp_lottery") and o["N1"].get("fp") == "randomized", o.get("N1"))
 check("N2: без fp в ссылке — chrome, без пометки", o.get("N2", {}).get("fp") == "chrome" and not o["N2"].get("fp_lottery"), o.get("N2"))

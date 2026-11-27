@@ -321,10 +321,11 @@ Windows-клиент включает свой kill-switch), `build_wg_client_co
 (preview и sync обязаны давать одинаковые теги), `_parse_vless_url_dict`, `_build_vless_outbound_dict`;
 preview ничего не пишет (эвристика `_ANTI_DPI_KEYWORDS` намеренно отличается от страницы) и сравнивает у совпавших
 тегов, кроме адреса/pbk/SNI, **отпечаток TLS** так, как его запишет sync: `_outbound_fp` (на роутере) +
-`_fp_change_info` (`old_fp`/`new_fp`/`fp_change`/`fp_lottery_*`). В `profile_changes` хранятся пары
-`old`/`new` только для изменившихся `network`, `security`, `flow`. По умолчанию это `tcp`, `none` и пустой
-`flow`. `changed` учитывает `host_change`, `fp_change` и непустой `profile_changes`. `previewSubscription`
-показывает старые и новые значения в столбце «изменится?».
+`_fp_change_info` (`old_fp`/`new_fp`/`fp_change`/`fp_lottery_*`). В `profile` хранятся пары
+`old`/`new` для всех трех полей `network`, `security`, `flow`. По умолчанию это `tcp`, `none`
+и пустой `flow`. `changed` учитывает `host_change`, `fp_change` и непустой `profile_changes`.
+В отдельной колонке «Параметры» совпавшие значения показаны один раз, а изменившиеся
+показаны парой со стрелкой от роутера к подписке.
 `_FP_LOTTERY` (`randomized` — случайный ClientHello на каждый запуск xray, часть запусков REALITY-сервер отвергает
 alert 47) включает предупреждение 🎲 в `previewSubscription`. У новых серверов есть поля `fp`/`fp_lottery`. Sync —
 pre-check критических ролей → update/add/remove → `.bak-pre-sync-<ts>` → рестарт с откатом → одна
