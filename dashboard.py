@@ -6090,12 +6090,16 @@ def api_xkeen_subscription_preview():
             pass
     local_tags = {o.get("tag") for o in cur_outbounds if o.get("protocol") == "vless"}
     def _extract_full(o):
-        v = (o.get("settings", {}).get("vnext", [{}])[0] or {})
+        v = ((o.get("settings") or {}).get("vnext") or [{}])[0] or {}
+        user = (v.get("users") or [{}])[0] or {}
         ss = o.get("streamSettings", {}) or {}
         rs = ss.get("realitySettings", {}) or {}
         return {
             "host": v.get("address", "?"),
             "port": v.get("port", 0),
+            "network": ss.get("network") or "tcp",
+            "security": ss.get("security") or "none",
+            "flow": user.get("flow") or "",
             "pbk":  rs.get("publicKey", ""),
             "sni":  rs.get("serverName", ""),
             "fp":   _outbound_fp(o),
@@ -6139,6 +6143,11 @@ def api_xkeen_subscription_preview():
             critical_role = _critical_roles.get(p["tag"])
             failover_pos = _failover_pos.get(p["tag"])
             host_change = (p["host"], p["port"]) != (local.get("host"), local.get("port"))
+            profile_changes = {
+                field: {"old": local[field], "new": p[field]}
+                for field in ("network", "security", "flow")
+                if local[field] != p[field]
+            }
             # Отпечаток TLS тоже переписывается sync'ом — без сравнения его смена была невидима
             # (preview показывал «нет», а роутер месяцами жил со старым randomized).
             fp_info = _fp_change_info(p, local.get("fp"))
@@ -6147,8 +6156,9 @@ def api_xkeen_subscription_preview():
                 "sub_host": f"{p['host']}:{p['port']}",
                 "sub_uuid": p["uuid"][:8] + "…",
                 "local_host": f"{local.get('host','?')}:{local.get('port','?')}",
-                "changed": host_change or fp_info["fp_change"],
+                "changed": host_change or fp_info["fp_change"] or bool(profile_changes),
                 "host_change": host_change,
+                "profile_changes": profile_changes,
                 **fp_info,
                 "pbk_change": pbk_change,
                 "sni_change": sni_change,
@@ -6158,7 +6168,7 @@ def api_xkeen_subscription_preview():
                 "old_sni": old_sni,
                 "new_sni": new_sni,
                 # Информационные роль-теги для бейджей в UI. UPDATE не ломает роль
-                # (tag остаётся, меняются только UUID/Reality-ключи внутри outbound'а),
+                # (tag остается, меняются настройки подключения внутри outbound'а),
                 # поэтому бейдж только информирует, не блокирует.
                 "critical_role": critical_role,
                 "in_failover_only": bool(failover_pos and not critical_role),
@@ -18795,24 +18805,40 @@ async function previewSubscription() {
 
   // Совпадения. Информационный бейдж 🎯/🔗 рядом с tag'ом если этот outbound выбран
   // в одной из 6 уникальных dropdown-ролей или в хвосте FAILOVER. UPDATE не ломает роль
-  // (меняются только UUID/Reality-ключи, tag остаётся), так что бейдж только информирует —
+  // (меняются настройки подключения, tag остается), так что бейдж только информирует —
   // в отличие от ⛔ в секции orphans_local, который сигнализирует «sync отменит удаление».
   if (res.matches && res.matches.length > 0) {
     html += `<strong style="color:#2a7;">✅ Будут обновлены (${res.matches.length}):</strong><table style="margin-top:6px; font-size:0.85em;">`;
     html += `<tr><th>tag</th><th>host:port в подписке</th><th>host:port на роутере</th><th>изменится?</th><th>pbk / SNI</th></tr>`;
+    const profileLabels = {network: 'Транспорт', security: 'Защита', flow: 'flow'};
     res.matches.forEach(m => {
       const chgParts = [];
       if (m.host_change) chgParts.push('адрес');
       if (m.fp_change) chgParts.push('отпечаток');
+      const profileChanges = m.profile_changes || {};
+      const profileDetails = Object.keys(profileLabels).filter(field => profileChanges[field]).map(field => {
+        const change = profileChanges[field];
+        const formatValue = value => {
+          if (field === 'flow') return escapeHtml(value || 'не задан');
+          if (value === 'none') return 'нет';
+          return escapeHtml(value.toUpperCase());
+        };
+        return `<div><strong>${profileLabels[field]}</strong> <span class="mono" style="overflow-wrap:anywhere;">${formatValue(change.old)} → ${formatValue(change.new)}</span></div>`;
+      }).join('');
       const chg = m.changed
-        ? `<span style="color:#e80;">⚠️ да${chgParts.length ? ' (' + chgParts.join(', ') + ')' : ''}</span>`
+        ? `<span style="color:#e80;">⚠️ да${!profileDetails && chgParts.length ? ' (' + chgParts.join(', ') + ')' : ''}</span>`
         : '<span style="color:#888;">нет</span>';
+      const details = profileDetails
+        ? `<div class="sub-preview-profile-changes" style="display:grid;gap:3px;margin-top:4px;color:#6d430e;">${profileDetails}</div>`
+        : '';
       let identity = '';
       const rowStyle = m.different_provider ? 'background:#fff0f0;' : '';
       if (m.different_provider) {
         identity = `<span style="color:#c33;" title="Reality pbk меняется — другой провайдер"><strong>🚨 ДРУГОЙ ПРОВАЙДЕР</strong><br><small>pbk: ${m.old_pbk_short || '—'} → ${m.new_pbk_short || '—'}</small>${m.sni_change ? `<br><small>SNI: ${m.old_sni||'—'} → ${m.new_sni||'—'}</small>` : ''}</span>`;
       } else if (m.sni_change) {
-        identity = `<span style="color:#e80;" title="SNI меняется, но pbk тот же"><small>SNI: ${m.old_sni||'—'} → ${m.new_sni||'—'}</small></span>`;
+        identity = `<span style="color:#e80;" title="Меняется имя сервера TLS"><small>SNI: ${m.old_sni||'—'} → ${m.new_sni||'—'}</small></span>`;
+      } else if (profileChanges.security?.old === 'reality' || profileChanges.security?.new === 'reality') {
+        identity = '<span style="color:#888;" title="Сравнение ключа REALITY при смене защиты неприменимо">—</span>';
       } else {
         identity = '<span style="color:#2a7;" title="Тот же провайдер">✓ тот же</span>';
       }
@@ -18822,16 +18848,14 @@ async function previewSubscription() {
       } else if (m.fp_lottery_new) {
         identity += `<br><small style="color:#c33;" title="Случайный отпечаток: часть запусков xray сервер REALITY отвергает">отпечаток: randomized 🎲</small>`;
       }
-      // Информационный бейдж роли. Backtick (template literal) ОБЯЗАТЕЛЬНО — внутри title
-      // встречается апостроф (`dropdown'е`), single-quoted строка бы оборвалась и SyntaxError
-      // снёс бы весь inline-script вместе с sidebar.
+      // Информационный бейдж роли.
       let roleBadge = '';
       if (m.critical_role) {
-        roleBadge = ` <span title="Этот outbound выбран в уникальном dropdown'е «${m.critical_role}» секции «🎯 Основное и резервное подключение». Обновление подписки НЕ ломает роль — поменяются только UUID/Reality-ключи, tag остаётся, watchdog продолжит его использовать." style="background:#e0eef8;color:#1a5490;border:1px solid #a0c8e8;border-radius:3px;padding:1px 6px;font-size:0.9em;font-weight:600;margin-left:4px;">🎯 ${m.critical_role}</span>`;
+        roleBadge = ` <span title="Этот outbound выбран в уникальной роли «${m.critical_role}». При обновлении меняются настройки подключения. Tag и роль сохраняются." style="background:#e0eef8;color:#1a5490;border:1px solid #a0c8e8;border-radius:3px;padding:1px 6px;font-size:0.9em;font-weight:600;margin-left:4px;">🎯 ${m.critical_role}</span>`;
       } else if (m.in_failover_only) {
         roleBadge = ` <span title="Этот outbound находится в хвосте FAILOVER-цепочки (позиция #${m.failover_position}). Обновление НЕ влияет на роль — tag остаётся в FAILOVER_TAGS." style="background:#fff4d4;color:#a8801c;border:1px solid #e8c878;border-radius:3px;padding:1px 6px;font-size:0.9em;font-weight:600;margin-left:4px;">🔗 FAILOVER #${m.failover_position}</span>`;
       }
-      html += `<tr style="${rowStyle}"><td class="mono"><strong>${m.tag}</strong>${roleBadge}</td><td class="mono">${m.sub_host}</td><td class="mono">${m.local_host}</td><td>${chg}</td><td style="font-size:0.85em;">${identity}</td></tr>`;
+      html += `<tr style="${rowStyle}"><td class="mono"><strong>${m.tag}</strong>${roleBadge}</td><td class="mono">${m.sub_host}</td><td class="mono">${m.local_host}</td><td>${chg}${details}</td><td style="font-size:0.85em;">${identity}</td></tr>`;
     });
     html += `</table>`;
   } else {

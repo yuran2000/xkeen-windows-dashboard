@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Офлайн-проверка предпросмотра подписки: смена отпечатка TLS (fingerprint) видна.
+"""Офлайн-проверка смены адреса, отпечатка и параметров подключения в предпросмотре.
 
 Sync переписывает streamSettings целиком, в том числе fingerprint; раньше preview сравнивал только
 адрес/pbk/SNI и для смены randomized → chrome показывал «изменений нет». Здесь: `_outbound_fp`,
@@ -26,8 +26,8 @@ def check(name, cond, extra=""):
         fails += 1
 
 
-def ob(tag, host, port, fp, sec="reality", pbk="PBK1", sni="vk.com"):
-    ss = {"network": "tcp", "security": sec}
+def ob(tag, host, port, fp, sec="reality", pbk="PBK1", sni="vk.com", network="tcp", flow=""):
+    ss = {"network": network, "security": sec}
     if sec == "reality":
         ss["realitySettings"] = {"publicKey": pbk, "serverName": sni, "shortId": "ab"}
         if fp is not None:
@@ -36,14 +36,19 @@ def ob(tag, host, port, fp, sec="reality", pbk="PBK1", sni="vk.com"):
         ss["tlsSettings"] = {"serverName": sni}
         if fp is not None:
             ss["tlsSettings"]["fingerprint"] = fp
+    user = {"id": "u"}
+    if flow:
+        user["flow"] = flow
     return {"tag": tag, "protocol": "vless", "streamSettings": ss,
-            "settings": {"vnext": [{"address": host, "port": port, "users": [{"id": "u"}]}]}}
+            "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]}}
 
 
-def link(tag, host, port, fp=None, sec="reality", pbk="PBK1", sni="vk.com"):
-    q = f"security={sec}&type=tcp&sni={sni}&pbk={pbk}&sid=cd"
+def link(tag, host, port, fp=None, sec="reality", pbk="PBK1", sni="vk.com", network="tcp", flow=""):
+    q = f"security={sec}&type={network}&sni={sni}&pbk={pbk}&sid=cd"
     if fp is not None:
         q += f"&fp={fp}"
+    if flow:
+        q += f"&flow={flow}"
     return f"vless://11111111-2222-3333-4444-555555555555@{host}:{port}?{q}#{tag}"
 
 
@@ -70,12 +75,23 @@ ROUTER = {"outbounds": [
     ob("S1", "vpn.example", 443, "randomized"),
     ob("S2", "vpn.example", 9443, "chrome"),
     ob("S3", "vpn.example", 8444, "chrome"),
+    ob("S4", "vpn.example", 443, "chrome", network="xhttp"),
+    ob("S5", "vpn.example", 443, "chrome", sec="tls", flow="xtls-rprx-vision"),
+    ob("S6", "vpn.example", 443, "chrome"),
+    ob("S7", "vpn.example", 443, "chrome", network="xhttp"),
+    {"tag": "S8", "protocol": "vless",
+     "settings": {"vnext": [{"address": "vpn.example", "port": 443}]}},
     {"tag": "direct", "protocol": "freedom"},
 ]}
 SUB = [
     link("S1", "vpn.example", 443, "chrome"),        # смена отпечатка, адрес тот же
     link("S2", "vpn.example", 9443, "chrome"),       # без изменений
     link("S3", "vpn.example", 8445, "chrome"),       # смена порта
+    link("S4", "vpn.example", 443, "chrome", sec="tls", pbk="", flow="xtls-rprx-vision"),
+    link("S5", "vpn.example", 443, "chrome", sec="tls", pbk=""),
+    link("S6", "vpn.example", 443, "chrome", sec="tls", pbk=""),
+    link("S7", "vpn.example", 443, "chrome"),
+    "vless://11111111-2222-3333-4444-555555555555@vpn.example:443#S8",
     link("N1", "new.example", 443, "randomized"),    # новый сервер с randomized
     link("N2", "new.example", 444),                  # fp нет в ссылке → парсер даёт chrome
 ]
@@ -99,6 +115,20 @@ check("S1: признак ухода с randomized", m.get("S1", {}).get("fp_lot
 check("S2: без изменений", m.get("S2") and not m["S2"].get("changed") and not m["S2"].get("fp_change"), m.get("S2"))
 check("S3: смена адреса, отпечаток тот же",
       m.get("S3", {}).get("host_change") and m["S3"].get("changed") and not m["S3"].get("fp_change"), m.get("S3"))
+for tag, changes in {
+    "S4": {"network": {"old": "xhttp", "new": "tcp"}, "security": {"old": "reality", "new": "tls"},
+           "flow": {"old": "", "new": "xtls-rprx-vision"}},
+    "S5": {"flow": {"old": "xtls-rprx-vision", "new": ""}},
+    "S6": {"security": {"old": "reality", "new": "tls"}},
+    "S7": {"network": {"old": "xhttp", "new": "tcp"}},
+}.items():
+    match = m.get(tag, {})
+    check(f"{tag}: видны смены параметров при прежних адресе и отпечатке",
+          match.get("profile_changes") == changes and match.get("changed")
+          and not match.get("host_change") and not match.get("fp_change")
+          and not match.get("different_provider"), match)
+check("S8: поля по умолчанию совпадают с явно заданными", m.get("S8", {}).get("profile_changes") == {}
+      and not m["S8"].get("changed"), m.get("S8"))
 o = {x["tag"]: x for x in j.get("orphans_in_sub", [])}
 check("N1: новый сервер с randomized помечен", o.get("N1", {}).get("fp_lottery") and o["N1"].get("fp") == "randomized", o.get("N1"))
 check("N2: без fp в ссылке — chrome, без пометки", o.get("N2", {}).get("fp") == "chrome" and not o["N2"].get("fp_lottery"), o.get("N2"))

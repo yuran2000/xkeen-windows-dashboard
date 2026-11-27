@@ -321,9 +321,12 @@ Windows-клиент включает свой kill-switch), `build_wg_client_co
 (preview и sync обязаны давать одинаковые теги), `_parse_vless_url_dict`, `_build_vless_outbound_dict`;
 preview ничего не пишет (эвристика `_ANTI_DPI_KEYWORDS` намеренно отличается от страницы) и сравнивает у совпавших
 тегов, кроме адреса/pbk/SNI, **отпечаток TLS** так, как его запишет sync: `_outbound_fp` (на роутере) +
-`_fp_change_info` (`old_fp`/`new_fp`/`fp_change`/`fp_lottery_*`; `changed` = `host_change` или `fp_change`);
+`_fp_change_info` (`old_fp`/`new_fp`/`fp_change`/`fp_lottery_*`). В `profile_changes` хранятся пары
+`old`/`new` только для изменившихся `network`, `security`, `flow`. По умолчанию это `tcp`, `none` и пустой
+`flow`. `changed` учитывает `host_change`, `fp_change` и непустой `profile_changes`. `previewSubscription`
+показывает старые и новые значения в столбце «изменится?».
 `_FP_LOTTERY` (`randomized` — случайный ClientHello на каждый запуск xray, часть запусков REALITY-сервер отвергает
-alert 47) → предупреждение 🎲 в `previewSubscription`, у новых серверов — `fp`/`fp_lottery`; sync —
+alert 47) включает предупреждение 🎲 в `previewSubscription`. У новых серверов есть поля `fp`/`fp_lottery`. Sync —
 pre-check критических ролей → update/add/remove → `.bak-pre-sync-<ts>` → рестарт с откатом → одна
 запись config с чисткой цепочек → обе meta. Orphan — только outbound с `meta.sub_url == url`.
 Бэкапы: `XKEEN_BACKUP_FILES`, restore валидирует **до записи** (JSON локально, `*.sh` — `sh -n` на
