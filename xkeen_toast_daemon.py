@@ -11,7 +11,7 @@
 4. При остающемся bad — повторяет toast каждые 10 минут.
 5. При восстановлении good → toast «✅ Xray восстановлен» (один раз).
 
-Логирует в xkeen_toast_daemon.log рядом со скриптом.
+Журнал и состояние хранятся в %LOCALAPPDATA%/XKeen/toast.
 
 Регистрация в Task Scheduler:
    install_toast_alerts.bat — создаёт task под текущим юзером с /IT флагом
@@ -41,9 +41,11 @@ from pathlib import Path
 
 # ============== CONFIG ==============
 SCRIPT_DIR = Path(__file__).parent
-LOG_FILE = SCRIPT_DIR / "xkeen_toast_daemon.log"
-STATE_FILE = SCRIPT_DIR / "xkeen_toast_daemon.state.json"
-LOCK_FILE = SCRIPT_DIR / "xkeen_toast_daemon.lock"
+STATE_DIR = Path(os.environ["LOCALAPPDATA"]) / "XKeen" / "toast"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = STATE_DIR / "xkeen_toast_daemon.log"
+STATE_FILE = STATE_DIR / "xkeen_toast_daemon.state.json"
+LOCK_FILE = STATE_DIR / "xkeen_toast_daemon.lock"
 
 # Загружаем config_local.py из той же папки
 sys.path.insert(0, str(SCRIPT_DIR))
