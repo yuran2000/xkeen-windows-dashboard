@@ -1,4 +1,4 @@
-param([string]$PythonExe = 'python.exe')
+﻿param([string]$PythonExe = 'python.exe')
 # Run in Windows PowerShell 5.1. These tests do not change any scheduled task.
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'update.ps1')
@@ -50,6 +50,48 @@ try {
             throw 'Standalone launcher did not detect the configured listener.'
         }
     } finally { Pop-Location }
+
+    # A new process with the same release number must prove it loaded the expected file.
+    $httpFixture = Join-Path $tmp 'fixture_http.py'
+    $readyFile = Join-Path $tmp 'http_port.txt'
+    $serverCode = @'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    hashes = iter((None, 'B' * 64, 'A' * 64))
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header('X-Dashboard-Version', '1.4.6')
+        checksum = next(self.hashes)
+        if checksum:
+            self.send_header('X-Dashboard-Source-SHA256', checksum)
+        self.end_headers()
+
+with HTTPServer(('127.0.0.1', 0), Handler) as server:
+    print(server.server_port, flush=True)
+    for _ in range(3):
+        server.handle_request()
+'@
+    [IO.File]::WriteAllText($httpFixture, $serverCode, [Text.Encoding]::ASCII)
+    $fixturePython = Join-Path $tmp '.venv\Scripts\python.exe'
+    $server = Start-Process $fixturePython -ArgumentList ('"{0}"' -f $httpFixture) -WindowStyle Hidden -RedirectStandardOutput $readyFile -PassThru
+    try {
+        $httpPort = ''
+        for ($i=0; $i -lt 30 -and $httpPort -notmatch '^\d+$'; $i++) {
+            Start-Sleep -Milliseconds 100
+            $httpPort = [string](Get-Content -LiteralPath $readyFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        }
+        if ($httpPort -notmatch '^\d+$') { throw 'HTTP verification fixture did not start.' }
+        $expectedHash = 'A' * 64
+        Assert-Equal (Test-RunningBuild $httpPort '1.4.6' $expectedHash) $false
+        Assert-Equal (Test-RunningBuild $httpPort '1.4.6' $expectedHash) $false
+        Assert-Equal (Test-RunningBuild $httpPort '1.4.6' $expectedHash) $true
+    } finally {
+        if (-not $server.HasExited) { $server.Kill() }
+        $server.WaitForExit()
+        $server.Dispose()
+    }
 } finally {
     $listener.Stop()
     if ((Test-Path -LiteralPath $tmp) -and

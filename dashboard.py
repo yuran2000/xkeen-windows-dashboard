@@ -10,6 +10,7 @@ xray dashboard — локальная веб-панель для монитор�
 from flask import Flask, render_template_string, request, Response, jsonify, session, redirect, url_for, send_from_directory
 from functools import wraps
 from datetime import datetime, timedelta
+import hashlib
 import psutil
 import json
 import re
@@ -220,57 +221,15 @@ import wg_clients
 import ssh_bin
 
 # ============== ВЕРСИЯ ПАНЕЛИ ==============
-# Hardcoded fallback. Обновляется руками при каждом release (см. CONTRIBUTING.md).
-# Динамически пытаемся прочитать через `git describe --tags --abbrev=0` —
-# если в репо есть свежий tag (например юзер на main после моего push), увидит его.
-# Если git недоступен (например запуск из zip) — fallback на _VERSION_FALLBACK.
-_VERSION_FALLBACK = "1.4.6"
-
-
-def _find_git():
-    """Путь к git.exe: сначала PATH, иначе стандартные места установки. Важно для
-    SYSTEM-процесса (Task Scheduler): у него PATH часто БЕЗ git → git describe молча
-    падал и версия откатывалась на устаревший _VERSION_FALLBACK (симптом: дом-панель
-    от SYSTEM показывала старую версию, хотя репо обновлён)."""
-    import shutil
-    g = shutil.which("git")
-    if g:
-        return g
-    for p in (r"C:\Program Files\Git\cmd\git.exe",
-              r"C:\Program Files\Git\bin\git.exe",
-              r"C:\Program Files (x86)\Git\cmd\git.exe"):
-        if os.path.exists(p):
-            return p
-    return "git"
-
-
-def get_dashboard_version():
-    """Версия панели. Сначала git describe (свежее), потом fallback на константу.
-    Кэшируется на 60 сек — git вызов недешёвый."""
-    now = _time_mod.time()
-    cached = getattr(get_dashboard_version, "_cache", None)
-    if cached and now - cached[1] < 60:
-        return cached[0]
-    version = _VERSION_FALLBACK
+# Version of the loaded source. The updater also uses it to validate the release tag.
+_VERSION_FALLBACK = "1.4.7"
+_DASHBOARD_SOURCE_SHA256 = ""
+if not getattr(sys, "frozen", False):
     try:
-        result = subprocess.run(
-            [_find_git(), "describe", "--tags", "--abbrev=0"],
-            cwd=_resource_dir(),
-            capture_output=True, text=True, timeout=2,
-        )
-        if result.returncode == 0 and result.stdout:
-            # Вынимаем ТОЛЬКО номер версии (напр. "1.4.3") regex'ом, а не берём весь
-            # stdout. Иначе в строку версии протекает посторонний мусор: сторонние DLL
-            # (антивирус / EDR-хук) умеют писать диагностику дизассемблера ("ANOMALY:
-            # use of REX.w ...") прямо в stdout дочернего процесса git — .strip() его
-            # не убирает, и он вылезал в шапку панели рядом с версией.
-            m = re.search(r'\d+\.\d+\.\d+', result.stdout)
-            if m:
-                version = m.group(0)
-    except Exception:
+        with open(__file__, "rb") as _dashboard_source:
+            _DASHBOARD_SOURCE_SHA256 = hashlib.sha256(_dashboard_source.read()).hexdigest().upper()
+    except OSError:
         pass
-    get_dashboard_version._cache = (version, now)
-    return version
 
 # ============== RUNTIME SETTINGS (overrides поверх config_local.py) ==============
 # Хранятся отдельным JSON чтобы при обновлении dashboard.py не сбрасывались.
@@ -439,7 +398,11 @@ def login():
         else:
             error = "Неверный логин или пароль"
     # The updater checks the build loaded by this process, even after Git files change on disk.
-    headers = {"X-Dashboard-Version": _VERSION_FALLBACK} if request.remote_addr in ("127.0.0.1", "::1") else {}
+    headers = {}
+    if request.remote_addr in ("127.0.0.1", "::1"):
+        headers["X-Dashboard-Version"] = _VERSION_FALLBACK
+        if _DASHBOARD_SOURCE_SHA256:
+            headers["X-Dashboard-Source-SHA256"] = _DASHBOARD_SOURCE_SHA256
     return render_template_string(LOGIN_TEMPLATE, error=error), 200, headers
 
 
@@ -5267,7 +5230,7 @@ def xkeen_page():
         keenetic_settings=get_keenetic_settings_merged(),
         is_first_run=is_first_run,
         is_client_only=is_client_only,
-        dashboard_version=get_dashboard_version(),
+        dashboard_version=_VERSION_FALLBACK,
         domain_notes_json=json.dumps(domain_notes, ensure_ascii=False),  # v1.7.0
         cfg=cfg,  # доступ к EXTERNAL_DOMAIN/HOME_DOMAIN/LAN_HOST из config_local в шаблонах
         structure=structure,  # дрейф версий watchdog/template — для баннера

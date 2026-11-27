@@ -1,4 +1,4 @@
-# Update logic for xray-dashboard.
+﻿# Update logic for xray-dashboard.
 #
 # Why PowerShell: cmd.exe reads .bat files line-by-line and re-reads during
 # execution. git pull modifies files on disk -> cmd loses its offset -> reads
@@ -12,6 +12,12 @@
 # ASCII only - PowerShell 5.1 on a non-English Windows reads .ps1 in the
 # system ANSI codepage (e.g. cp1251 on RU), not UTF-8. Cyrillic in a
 # UTF-8-without-BOM .ps1 breaks parsing with cryptic errors.
+
+[CmdletBinding(DefaultParameterSetName = 'Update')]
+param(
+    [Parameter(ParameterSetName = 'Recovery')][ValidatePattern('^[a-f0-9]{40}$')][string]$RecoveredCommit,
+    [Parameter(ParameterSetName = 'Restart')][switch]$RestartOnly
+)
 
 function Get-SourceHash([string]$Path) {
     $hash = [Security.Cryptography.SHA256]::Create()
@@ -59,7 +65,7 @@ function Get-PanelListeners([int]$Port) {
         Select-Object -ExpandProperty OwningProcess -Unique
 }
 
-function Test-RunningBuild([int]$Port, [string]$Version) {
+function Test-RunningBuild([int]$Port, [string]$Version, [string]$SourceHash) {
     $request = [Net.HttpWebRequest]::Create("http://127.0.0.1:$Port/login")
     $request.Method = 'HEAD'
     $request.Proxy = $null
@@ -68,7 +74,9 @@ function Test-RunningBuild([int]$Port, [string]$Version) {
     try {
         $response = $request.GetResponse()
         try {
-            return ([int]$response.StatusCode -eq 200 -and $response.Headers['X-Dashboard-Version'] -ceq $Version)
+            return ([int]$response.StatusCode -eq 200 -and
+                    $response.Headers['X-Dashboard-Version'] -ceq $Version -and
+                    $response.Headers['X-Dashboard-Source-SHA256'] -ceq $SourceHash)
         } finally { $response.Close() }
     } catch [Net.WebException] {
         if ($_.Exception.Response) { $_.Exception.Response.Close() }
@@ -90,12 +98,12 @@ Write-Host "============================================================" -Foreg
 Write-Host ""
 
 # ---- Sanity checks ----
-if (-not (Test-Path ".git")) {
+if (-not $RestartOnly -and -not (Test-Path ".git")) {
     Write-Host "[ERROR] Not a git repository. Run update only in a folder cloned from GitHub." -ForegroundColor Red
     Read-Host "Press Enter to exit"
     exit 1
 }
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+if (-not $RestartOnly -and -not (Get-Command git -ErrorAction SilentlyContinue)) {
     Write-Host "[ERROR] git not found in PATH. Install Git for Windows: https://git-scm.com/download/win" -ForegroundColor Red
     Read-Host "Press Enter to exit"
     exit 1
@@ -120,7 +128,10 @@ try {
     $mode = Get-UpdateMode (Get-UpdateTaskState $folder $TaskName) ($identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
     if ($mode -eq 'Elevate') {
         $shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $elevated = Start-Process -FilePath $shell -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath) -Wait -PassThru -ErrorAction Stop
+        $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $PSCommandPath
+        if ($RecoveredCommit) { $arguments += " -RecoveredCommit $RecoveredCommit" }
+        if ($RestartOnly) { $arguments += ' -RestartOnly' }
+        $elevated = Start-Process -FilePath $shell -Verb RunAs -ArgumentList $arguments -Wait -PassThru -ErrorAction Stop
         exit $elevated.ExitCode
     }
 } catch {
@@ -131,22 +142,41 @@ try {
 
 # ---- Step 1: verified source update before stopping the running panel ----
 $OldReqHash = ""
-if (Test-Path "requirements.txt") { $OldReqHash = (Get-SourceHash (Join-Path $InstallDir "requirements.txt")) }
-Write-Host "[1/5] Updating source with a recovery copy ..." -ForegroundColor Yellow
-& $python (Join-Path $InstallDir "tools\update_checkout.py") --repo $InstallDir
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Update stopped. The running panel was not stopped." -ForegroundColor Red
-    Write-Host "For a previous repository history or local changes, run Recover-Update.bat once."
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-
-$NewReqHash = ""
-if (Test-Path "requirements.txt") {
-    $NewReqHash = (Get-SourceHash (Join-Path $InstallDir "requirements.txt"))
+if (Test-Path "requirements.txt") { $OldReqHash = Get-SourceHash (Join-Path $InstallDir "requirements.txt") }
+if ($RecoveredCommit) {
+    $currentCommit = & git rev-parse --verify HEAD
+    if ($LASTEXITCODE -ne 0 -or $currentCommit -cne $RecoveredCommit) {
+        Write-Error 'Recovered checkout changed before restart. The running panel was not stopped.'
+        exit 1
+    }
+    & git diff --quiet $RecoveredCommit --
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error 'Recovered files changed before restart. The running panel was not stopped.'
+        exit 1
+    }
+    Write-Host "[1/5] Recovered source verified" -ForegroundColor Yellow
+} elseif ($RestartOnly) {
+    Write-Host '[1/5] Using the installed source' -ForegroundColor Yellow
+} else {
+    Write-Host "[1/5] Updating source with a recovery copy ..." -ForegroundColor Yellow
+    & $python (Join-Path $InstallDir "tools\update_checkout.py") --repo $InstallDir
+    $checkoutResult = $LASTEXITCODE
+    if ($checkoutResult -eq 3) {
+        $recovery = Join-Path $InstallDir 'Recover-Update.ps1'
+        Write-Host 'The checkout needs recovery. Review the confirmation before changing files.' -ForegroundColor Yellow
+        & $recovery
+        exit $LASTEXITCODE
+    }
+    if ($checkoutResult -ne 0) {
+        Write-Host "Update stopped. The running panel was not stopped." -ForegroundColor Red
+        Read-Host "Press Enter to exit"
+        exit 1
+    }
 }
 
 # Install dependencies and validate source before stopping the old process.
+$NewReqHash = ""
+if (Test-Path "requirements.txt") { $NewReqHash = Get-SourceHash (Join-Path $InstallDir "requirements.txt") }
 if (($OldReqHash -ne $NewReqHash) -or (Test-Path ".update-needs-deps")) {
     & $python -m pip install -r requirements.txt --quiet
     if ($LASTEXITCODE -ne 0) {
@@ -166,6 +196,7 @@ Write-Host "[2/5] Stopping current instance ..." -ForegroundColor Yellow
 $versionLine = Select-String -LiteralPath 'dashboard.py' -Pattern '^_VERSION_FALLBACK\s*=\s*"(\d+\.\d+\.\d+)"'
 if (@($versionLine).Count -ne 1) { Write-Error 'Updated build version is missing or ambiguous.'; exit 1 }
 $expectedVersion = $versionLine.Matches[0].Groups[1].Value
+$expectedSourceHash = Get-SourceHash (Join-Path $InstallDir 'dashboard.py')
 $oldPids = @(Get-PanelListeners $Port)
 try {
     if ($mode -eq 'Scheduled') {
@@ -223,7 +254,7 @@ if ($mode -eq 'Scheduled') {
     if ($LASTEXITCODE -ne 0) { Write-Error "Could not start task $TaskName."; exit 1 }
 } else {
     if (-not (Test-Path '.\start-bg.bat')) { Write-Error 'Missing standalone launcher start-bg.bat'; exit 1 }
-    & '.\start-bg.bat'
+    & '.\start-bg.bat' -NoPause
     if ($LASTEXITCODE -ne 0) { Write-Error 'Standalone launcher failed'; exit 1 }
 }
 
@@ -232,7 +263,7 @@ $ready = $false
 for ($i=0; $i -lt 15; $i++) {
     $listeners = @(Get-PanelListeners $Port)
     if ($listeners.Count -gt 0 -and -not @($listeners | Where-Object { $oldPids -contains $_ }).Count -and
-        (Test-RunningBuild $Port $expectedVersion)) {
+        (Test-RunningBuild $Port $expectedVersion $expectedSourceHash)) {
         $ready = $true
         break
     }
@@ -251,4 +282,5 @@ Write-Host " Update complete!" -ForegroundColor Cyan
 Write-Host " This window can be closed - dashboard runs in background." -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
-Read-Host "Press Enter to close"
+if (-not $RecoveredCommit -and -not [Console]::IsInputRedirected) { Read-Host "Press Enter to close" }
+exit 0

@@ -61,6 +61,7 @@ function Invoke-RecoverElevation([string]$ScriptPath, [string]$InstallDir, $Mess
         0 { Write-Host $Messages.success -ForegroundColor Green }
         2 { Write-Host $Messages.canceled -ForegroundColor Yellow }
         3 { Write-Host $Messages.permissionDenied -ForegroundColor Red }
+        4 { Write-Host $Messages.restartFailed -ForegroundColor Red }
         default { Write-Host $Messages.failed -ForegroundColor Red }
     }
     return [int]$child.ExitCode
@@ -118,6 +119,7 @@ try {
     $helper = Join-Path $env:TEMP ('xkeen-recovery-' + [guid]::NewGuid().ToString('N') + '.py')
     [IO.File]::WriteAllText($helper, ($code -join "`n"), (New-Object Text.UTF8Encoding($false)))
     try {
+        Write-Host $messages.restartNotice -ForegroundColor Yellow
         & $python $helper --repo $InstallDir --target $target --repair
         $result = $LASTEXITCODE
     } finally {
@@ -125,6 +127,17 @@ try {
     }
     if ($result -eq 2) { exit 2 }
     if ($result -ne 0) { throw $messages.failed }
+
+    $updater = Join-Path $InstallDir 'update.ps1'
+    $shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    try {
+        if (-not (Test-Path -LiteralPath $updater -PathType Leaf)) { throw 'update.ps1 missing' }
+        & $shell -NoProfile -ExecutionPolicy Bypass -File $updater -RecoveredCommit $target
+        if ($LASTEXITCODE -ne 0) { throw "update.ps1 exited with code $LASTEXITCODE" }
+    } catch {
+        Write-Host "$($messages.restartFailed) $($_.Exception.Message)" -ForegroundColor Red
+        exit 4
+    }
     Write-Host $messages.success -ForegroundColor Green
 } catch {
     Write-Host $_.Exception.Message -ForegroundColor Red

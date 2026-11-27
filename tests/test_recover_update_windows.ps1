@@ -1,4 +1,4 @@
-param([string]$PythonExe = 'python.exe')
+﻿param([string]$PythonExe = 'python.exe')
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -108,7 +108,9 @@ public static class GitStub {
                         return 0;
                 }
             case "show":
+                Console.WriteLine("import os, sys");
                 Console.WriteLine("print('fixture-helper-ok')");
+                Console.WriteLine("sys.exit(2 if os.environ['XKEEN_TEST_FETCH'] == 'cancel-repair' else 0)");
                 return 0;
             default:
                 return 1;
@@ -125,6 +127,13 @@ public static class GitStub {
     $env:Path = $tmp + ';' + $oldPath
     $env:XKEEN_TEST_LOG = Join-Path $tmp 'fetch.log'
     [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    $updater = @'
+param([string]$RecoveredCommit)
+if ($RecoveredCommit -cne ('a' * 40)) { exit 10 }
+Write-Host 'fixture-updater-called'
+if ($env:XKEEN_TEST_FETCH -eq 'restart-failed') { exit 1 }
+'@
+    [IO.File]::WriteAllText((Join-Path $tmp 'update.ps1'), $updater, [Text.Encoding]::ASCII)
 
     function Invoke-TestLauncher([string]$Command, [string]$Mode) {
         $env:XKEEN_TEST_FETCH = $Mode
@@ -142,6 +151,13 @@ public static class GitStub {
     Assert-Equal $result.Code 0 'Batch success'
     Assert-Text $result.Output $messages.success $messages.elevate
     Assert-Text $result.Output 'fixture-helper-ok' $messages.network
+    Assert-Text $result.Output 'fixture-updater-called' ''
+    $result = Invoke-TestLauncher 'Recover-Update.bat <nul' 'restart-failed'
+    Assert-Equal $result.Code 4 'Checkout succeeds but restart fails'
+    Assert-Text $result.Output $messages.restartFailed $messages.success
+    $result = Invoke-TestLauncher 'Recover-Update.bat <nul' 'cancel-repair'
+    Assert-Equal $result.Code 2 'Checkout canceled'
+    Assert-Text $result.Output 'fixture-helper-ok' 'fixture-updater-called'
     $result = Invoke-TestLauncher 'Recover-Update.bat <nul' 'network'
     Assert-Text $result.Output $messages.network $messages.elevate
     Assert-Equal $result.Code 1 'Batch network failure'

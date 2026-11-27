@@ -5,7 +5,9 @@
 
 Запуск из папки панели:  .venv\\Scripts\\python.exe tests\\test_panel_misc_offline.py
 """
+import hashlib
 import os
+from pathlib import Path
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -53,10 +55,13 @@ check("рестарт: /End и /Run своей задачи XrayDashboard-5002",
 check("рестарт: одноразовая задача со своим именем", "XrayDashboardRestarter-5002" in create, create)
 
 # Состояние запущенной сборки доступно обновлятору без входа, только с петлевого адреса.
+source_hash = hashlib.sha256(Path(D.__file__).read_bytes()).hexdigest().upper()
 for addr in ("127.0.0.1", "::1", "192.0.2.1"):
     resp = c.head("/login", environ_overrides={"REMOTE_ADDR": addr})
-    expected = D._VERSION_FALLBACK if addr in ("127.0.0.1", "::1") else None
-    check(f"версия процесса для {addr}", resp.status_code == 200 and resp.headers.get("X-Dashboard-Version") == expected)
+    loopback = addr in ("127.0.0.1", "::1")
+    check(f"версия процесса для {addr}", resp.status_code == 200
+          and resp.headers.get("X-Dashboard-Version") == (D._VERSION_FALLBACK if loopback else None))
+    check(f"хеш процесса для {addr}", resp.headers.get("X-Dashboard-Source-SHA256") == (source_hash if loopback else None))
 
 # --- здоровье смотрит свой порт ---
 j = c.get("/api/xkeen/dashboard-health").get_json()

@@ -23,6 +23,10 @@ ORIGINS = {
 PROTECTED = {'config_local.py', 'config.ini', 'runtime_settings.json', 'wg_clients.json',
              '.env', '.venv', '.ssh', 'ssh', 'backups', '.update-needs-deps'}
 
+class RecoveryRequired(RuntimeError):
+    """The user must confirm a checkout that preserves local changes in a backup."""
+
+
 def git(repo, *args, check=True):
     p = subprocess.run(['git', '-C', str(repo), *args], stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE)
@@ -66,9 +70,9 @@ def apply_update(repo, target, *, allow_rewrite=False, allow_dirty=False, after_
     ff = git(repo, 'merge-base', '--is-ancestor', old, target, check=False).returncode == 0
     dirty = bool(git(repo, 'status', '--porcelain').stdout)
     if not ff and not allow_rewrite:
-        raise RuntimeError('Нужен разовый переход. Выполнить шаги «Восстановление обновлений» в инструкции. Панель не остановлена.')
+        raise RecoveryRequired('Нужен разовый переход со старой истории. Панель не остановлена.')
     if dirty and not allow_dirty:
-        raise RuntimeError('Найдены местные изменения программы. Нужен переход с резервной копией через Recover-Update.bat.')
+        raise RecoveryRequired('Найдены местные изменения программы. Для продолжения нужна подтверждаемая замена с резервной копией.')
     stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]
     backup = repo / 'backups' / ('update-' + stamp)
     backup.mkdir(parents=True, exist_ok=False)
@@ -142,7 +146,7 @@ def main():
     if a.repair:
         print('Будут обновлены файлы программы. Личные настройки и ключи останутся на месте.')
         print('Сначала будет создана и проверена резервная копия прежних файлов и настроек.')
-        print('Работающая панель и роутер этим переходом не перезапускаются.')
+        print('Во время замены файлов веб-панель и роутер продолжают работать.')
         if input('Продолжить? Ввести английскую y и нажать Enter; для отмены — только Enter: ').strip().lower() != 'y':
             print('Отменено. Установка не изменена.'); return 2
     source = git(a.repo, 'show', target + ':dashboard.py').stdout.decode('utf-8')
@@ -157,16 +161,20 @@ def main():
         raise RuntimeError('Метка выпуска не соответствует обновлению. Файлы не изменены.')
     old_tag = git(a.repo, 'rev-parse', '--verify', 'refs/tags/' + tag, check=False)
     if old_tag.returncode == 0 and old_tag.stdout.decode().strip() != tag_object and not a.repair:
-        raise RuntimeError('Локальная метка версии отличается. Нужен подтверждаемый переход через Recover-Update.bat.')
+        raise RecoveryRequired('Локальная метка версии отличается. Нужен подтверждаемый переход.')
     backup = apply_update(a.repo, target, allow_rewrite=a.repair, allow_dirty=a.repair)
     # Local tags are changed only after the verified bundle preserves previous refs.
     previous = old_tag.stdout.decode().strip() if old_tag.returncode == 0 else '0' * 40
     git(a.repo, 'update-ref', 'refs/tags/' + tag, tag_object, previous)
-    print('ГОТОВО: файлы программы обновлены. Резервная копия: ' + str(backup))
+    print('Файлы программы обновлены. Резервная копия: ' + str(backup))
     return 0
 
 if __name__ == '__main__':
-    try: sys.exit(main())
+    try:
+        sys.exit(main())
+    except RecoveryRequired as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(3)
     except Exception as exc:
         print('ERROR: ' + str(exc), file=sys.stderr)
         sys.exit(1)

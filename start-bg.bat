@@ -6,19 +6,20 @@ cd /d "%~dp0"
 
 if not exist ".venv\Scripts\pythonw.exe" (
     echo [ERROR] venv not found. Run install.bat first.
-    pause
+    if /I not "%~1"=="-NoPause" pause
     exit /b 1
 )
 
 if not exist "config_local.py" (
     echo [ERROR] config_local.py not found. Run install.bat first.
-    pause
+    if /I not "%~1"=="-NoPause" pause
     exit /b 1
 )
 
 findstr /C:"ЗАМЕНИ_МЕНЯ_СВОИМ_ПАРОЛЕМ" config_local.py >nul
 if not errorlevel 1 (
     echo [ERROR] PASSWORD ещё на placeholder. Открываю config_local.py для редактирования...
+    if /I "%~1"=="-NoPause" exit /b 1
     pause
     notepad config_local.py
     exit /b 1
@@ -29,7 +30,7 @@ set "DPORT="
 for /f "delims=" %%p in ('.venv\Scripts\python.exe -B -c "import config_local as c; p=int(getattr(c,'DASHBOARD_PORT',5000)); assert 1 <= p <= 65535; print(p)"') do set "DPORT=%%p"
 if not defined DPORT (
     echo [ERROR] Cannot read DASHBOARD_PORT from config_local.py.
-    pause
+    if /I not "%~1"=="-NoPause" pause
     exit /b 1
 )
 
@@ -39,7 +40,7 @@ if not errorlevel 1 (
     echo Уже запущена! Слушает порт %DPORT%.
     echo Открой http://localhost:%DPORT% в браузере.
     echo Если хочешь перезапустить — закрой панель ^(Task Manager → pythonw^) и запусти start-bg.bat снова.
-    pause
+    if /I not "%~1"=="-NoPause" pause
     exit /b 0
 )
 
@@ -48,7 +49,9 @@ echo  Запускаю xray-dashboard в фоне ^(без окна^) на по�
 echo ============================================================
 echo.
 
+cmd /d /c exit 0
 start "" /B ".venv\Scripts\pythonw.exe" dashboard.py
+if /I "%~1"=="-NoPause" exit /b %errorlevel%
 
 echo  Ждём 3 секунды чтобы убедиться что поднялась...
 timeout /t 3 /nobreak >nul
