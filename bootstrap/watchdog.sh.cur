@@ -1,4 +1,7 @@
 #!/bin/sh
+# XKeen failover watchdog v50 (2026-11-28).
+# Однократное восстановление при длительной перегрузке и очереди TCP у Xray.
+#
 # XKeen failover watchdog v48 (2026-11-27, проверка curl перед переключением):
 #   При сбое загрузчика или отсутствии SOCKS сохраняет действующий маршрут и состояние проб.
 #   TCP-проба подтверждает соединение по num_connects, IPv6-адрес получает корректный URL.
@@ -546,7 +549,12 @@ if [ -n "$WD_APPLY_ID" ]; then
   # 1) Сверка: всё подготовленное — из манифеста, и живые файлы не менялись с подготовки.
   _changed=""
   for _af in $APPLY_STAGE_LIST; do
-    [ -f "$_af.applynew.$WD_APPLY_ID" ] || continue
+    if [ "${WD_APPLY_SCOPE:-}" != client-service ]; then
+      [ -f "$_af.applynew.$WD_APPLY_ID" ] || continue
+    elif [ "$_af" != "$CFG" ] && [ -f "$_af.applynew.$WD_APPLY_ID" ]; then
+      _changed="$_changed $_af"
+      continue
+    fi
     _exp=$(awk -v p="$_af" '$1==p {print $2; exit}' "$APPLY_MANIFEST" 2>/dev/null)
     _act=$(_md5_or_dash "$_af")
     [ -n "$_exp" ] && [ "$_exp" = "$_act" ] || _changed="$_changed $_af"
@@ -627,6 +635,166 @@ _bg_restart_or_defer() {
   fi
   evidence_save_errlog "bg-${1:-restart}" 2>/dev/null   # v40
   /opt/sbin/xkeen -restart >/dev/null 2>&1 &
+  return 0
+}
+
+# One sample is usable only when netstat completed and identified socket owners.
+# A socket has to stay stalled under the same Xray PID in two samples.
+# Only inbound tuples independently seen in the Telegram access log count.
+_telegram_devices_sample() {
+  local state=/tmp/xkeen-telegram-devices pid now oldpid oldtime
+  local access=/opt/var/log/xray/access.log
+  [ -r "$access" ] || return 0
+  pid=$(pidof xray | awk 'NF==1 {print $1}')
+  [ -n "$pid" ] || return 0
+  now=$(date +%s)
+  if [ -s "$state.tuples" ]; then
+    read -r oldpid oldtime < "$state.tuples"
+    if [ "$oldpid" = "$pid" ] && [ $((now - oldtime)) -lt 30 ]; then return 0; fi
+  fi
+  if ! { LC_ALL=C netstat -ntp 2>/dev/null && echo END_NETSTAT; } | awk -v owner="$pid/xray" '
+    $1 ~ /^tcp/ && $7==owner && ($6=="CLOSE_WAIT" || ($6=="ESTABLISHED" && $2>=256)) {
+      peer=$5
+      sub(/^::ffff:/, "", peer)
+      if (peer ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/) print peer
+    }
+    /^END_NETSTAT$/ { complete=1 }
+    END { if (!complete) exit 1 }
+  ' > "$state.sockets"; then return 0; fi
+  printf '%s %s\n' "$pid" "$now" > "$state.tuples.new"
+  if [ -s "$state.sockets" ]; then
+    tail -n 4000 "$access" | awk '
+      function telegram(a,b,c,d) {
+        return (a==149 && b==154 && c>=160 && c<=175) ||
+               (a==91 && b==108 && ((c>=4 && c<=23) || (c>=56 && c<=59))) ||
+               (a==91 && b==105 && c>=192 && c<=193) ||
+               (a==185 && b==76 && c==151)
+      }
+      FILENAME!= "-" { sockets[$1]=1; next }
+      $3=="from" && $5=="accepted" && ($7=="[redirect" || $7=="[tproxy") {
+        peer=$4
+        sub(/^tcp:/,"",peer)
+        sub(/^::ffff:/,"",peer)
+        if (!(peer in sockets) || $6 !~ /^tcp:[0-9]+\./) next
+        dst=$6
+        sub(/^tcp:/,"",dst)
+        sub(/:[0-9]+$/,"",dst)
+        n=split(dst,b,".")
+        if (n==4 && telegram(b[1],b[2],b[3],b[4])) found[peer]=1
+        else delete found[peer]
+      }
+      END { for (peer in found) print peer }
+    ' "$state.sockets" - >> "$state.tuples.new"
+  fi
+  printf '%s\n' "$now" > "$state.new"
+  if [ "$oldpid" = "$pid" ] && [ $((now - oldtime)) -le 240 ]; then
+    awk 'FNR==1 { next }
+      NR==FNR { previous[$1]=1; next }
+      $1 in previous { ip=$1; sub(/:[0-9]+$/, "", ip); stalled[ip]++ }
+      END { for(ip in stalled) if(stalled[ip]>=3) print ip, stalled[ip] }
+    ' "$state.tuples" "$state.tuples.new" >> "$state.new"
+  fi
+  mv -f "$state.tuples.new" "$state.tuples"
+  mv -f "$state.new" "$state"
+  rm -f "$state.sockets"
+}
+
+tcp_stall_count() {
+  { LC_ALL=C netstat -ntp 2>/dev/null && echo END_NETSTAT; } | awk -v owner="$1/xray" -v limit="$TCP_STALL_MIN" '
+    /^Proto/ && /PID\/Program/ { header=1 }
+    /^tcp/ && $6=="CLOSE_WAIT" {
+      if ($7==owner) n++
+      else if ($7=="-" || $7=="") unknown=1
+    }
+    /^END_NETSTAT$/ { complete=1 }
+    END { if (complete && header && (!unknown || n>=limit)) print n+0; else exit 1 }'
+}
+
+tcp_stall_save() {
+  printf '%s\n' "$*" > "$TCP_STALL_STATE.new" && mv -f "$TCP_STALL_STATE.new" "$TCP_STALL_STATE"
+}
+
+# Return success only after taking ownership of this tick (one recovery attempt).
+tcp_stall_tick() {
+  [ "${TCP_STALL_RECOVER:-0}" = 1 ] && [ -z "$WD_APPLY_ID" ] || return 1
+  local pid now prevpid=0 start=0 prev=0 attempted=0 held=0 calm=0 extra count heavy=0
+  local procdir="${XB_PROC:-/proc}"
+  now=$(awk '{print int($1)}' "$procdir/uptime" 2>/dev/null)
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  if [ -e "$TCP_STALL_STATE" ]; then
+    read -r prevpid start prev attempted held calm extra < "$TCP_STALL_STATE" || return 1
+    case "$prevpid:$start:$prev:$attempted:$held:$calm" in *[!0-9:]*|*::*|:*|*:) return 1 ;; esac
+    [ -z "$extra" ] && [ "$held" -le 2 ] && [ "$now" -ge "$prev" ] || return 1
+  fi
+  pid=$(pidof xray 2>/dev/null)
+  case "$pid" in ''|*[!0-9]*)
+    if [ "$start" != 0 ] || [ "$calm" != 0 ]; then
+      tcp_stall_save 0 0 "$now" "$attempted" "$held" 0
+    fi
+    return 1 ;;
+  esac
+  if [ -z "$XRAY_BUSY_PCT" ] || [ "$pid" != "$_xb_pid" ]; then
+    # An extra short tick has no new sample. A genuine gap cannot confirm a stall.
+    if [ "$prev" -gt 0 ] && { [ "$pid" != "$prevpid" ] || [ $((now-prev)) -ge 20 ]; }; then
+      tcp_stall_save "$pid" 0 "$now" "$attempted" "$held" 0
+    fi
+    return 1
+  fi
+  [ "$pid" = "$prevpid" ] && [ $((now-prev)) -le 90 ] || { start=0; calm=0; }
+  if [ "$XRAY_BUSY_PCT" -ge "$XRAY_BUSY_CPU" ] && [ "$XRAY_BUSY_KBIT" -lt $((XRAY_BUSY_PCT * XRAY_BUSY_KBIT_PER_PCT)) ]; then
+    heavy=1
+  fi
+  if [ "$held" -gt 0 ]; then
+    local oldheld="$held"
+    if [ "$heavy" = 0 ] && [ "$XRAY_BUSY_PCT" -lt "$XRAY_BUSY_CPU" ] &&
+       count=$(tcp_stall_count "$pid") && [ "$count" -lt "$TCP_STALL_MIN" ]; then
+      calm=$((calm+1))
+      if [ "$calm" -ge 2 ] && health_check 2 && [ "$(pidof xray)" = "$pid" ]; then
+        held=0; calm=0
+      fi
+    else
+      calm=0
+    fi
+    if [ "$held" = 1 ] && [ $((now-attempted)) -ge 300 ]; then held=2; fi
+    tcp_stall_save "$pid" 0 "$now" "$attempted" "$held" "$calm" || return 1
+    if [ "$held" = 0 ]; then
+      log "TCP-STALL: процесс и DNS отвечают, нагрузка и очередь снизились в двух замерах"
+      tg_alert "✅ Нагрузка и очередь Xray снизились. Процесс и DNS отвечают."
+    elif [ "$held" = 2 ] && [ "$oldheld" = 1 ]; then
+      log "TCP-STALL: через 5 минут восстановление еще не подтверждено"
+      tg_alert "⚠️ Через 5 минут восстановление Xray еще не подтверждено. Сторож продолжает проверку."
+    fi
+    return 1
+  fi
+  if [ "$heavy" = 0 ] || [ $((_xb_fl & 2)) -ne 0 ] ||
+     { [ "$attempted" -gt 0 ] && [ $((now-attempted)) -lt 1800 ]; }; then
+    [ "$start" = 0 ] || tcp_stall_save "$pid" 0 "$now" "$attempted" 0 0
+    return 1
+  fi
+  if ! count=$(tcp_stall_count "$pid") || [ "$count" -lt "$TCP_STALL_MIN" ] || _xk_busy; then
+    [ "$start" = 0 ] || tcp_stall_save "$pid" 0 "$now" "$attempted" 0 0
+    return 1
+  fi
+  [ "$start" -gt 0 ] || start=$now
+  if [ $((now-start)) -lt 180 ]; then
+    tcp_stall_save "$pid" "$start" "$now" "$attempted" 0 0
+    return 1
+  fi
+  # Commit the latch before side effects; keep it even if restart or health fails.
+  tcp_stall_save "$pid" 0 "$now" "$now" 1 0 || return 1
+  if ! XRAY_LOCATION_ASSET="$XRAY_ASSET" "$XRAY_BIN" run -test -confdir "$CONFIG_DIR" >/dev/null 2>&1; then
+    log "TCP-STALL: текущая конфигурация не прошла проверку, перезапуск пропущен"
+    tcp_stall_save "$pid" 0 "$now" "$now" 2 0 && tg_alert "⚠️ Конфигурация Xray не прошла проверку. Сторож сохранил текущий процесс."
+    return 1
+  fi
+  [ "$(pidof xray)" = "$pid" ] && ! _xk_busy || return 1
+  log "TCP-STALL: pid=$pid cpu=$XRAY_BUSY_PCT% kbit=$XRAY_BUSY_KBIT CLOSE_WAIT=$count, один перезапуск с текущей конфигурацией"
+  if _xk_restart && health_check 2; then
+    log "TCP-STALL: новый процесс и DNS отвечают, ожидаю повторных замеров нагрузки и очереди"
+  else
+    log "TCP-STALL: восстановление не подтверждено, повторный перезапуск заблокирован"
+    tcp_stall_save "$pid" 0 "$now" "$now" 2 0 && tg_alert "⚠️ Сторож попытался перезапустить Xray. Запуск или проверка DNS не подтверждены."
+  fi
   return 0
 }
 
@@ -910,7 +1078,9 @@ xray_busy_eval() {
         log "XRAY-BUSY: перегрузка держится $_xb_n замеров подряд$_xb_after — сквозные пробы стоят"
         # После обвинения с действием — мимо кулдауна: иначе не узнать, что уход с виновника не помог.
         if [ "$_xb_cool" = 1 ] || [ $((_xb_fl & 2)) -ne 0 ]; then
-          tg_alert "$_xb_head Держится уже ~$_xb_n мин$_xb_after. Сквозные пробы и переключения по ним стоят, пока не спадёт. $_xb_now_tags Если не пройдёт — перезапусти xray или смени узлы в панели."
+          _xb_advice="Если не пройдет — перезапусти xray или смени узлы в панели."
+          [ "${TCP_STALL_RECOVER:-0}" = 1 ] && _xb_advice="Сторож продолжает автоматическую проверку."
+          tg_alert "$_xb_head Держится уже ~$_xb_n мин$_xb_after. Сквозные пробы и переключения по ним стоят, пока не спадет. $_xb_now_tags $_xb_advice"
           _xb_fl=$((_xb_fl | 1)); _xb_tg="$_xb_now"
         fi
       fi
@@ -1606,6 +1776,105 @@ EOF
   return 0
 }
 
+_client_service_render() {
+  local input="$1" output="$2" strict="$3" allowed tmp="${2}.tg.$$"
+  allowed=$(sed '/^[[:space:]]*\/\//d' "$OUTBOUNDS_JSON" | jq -ec '
+    [.outbounds[] | select(.protocol == "vless" and .streamSettings.network == "grpc") | .tag]') || return 1
+  if ! sed '/^[[:space:]]*\/\//d' "$input" | jq -e \
+      --argjson clients "${CLIENT_SERVICE_ROUTES:-[]}" --argjson allowed "$allowed" --argjson strict "$strict" '
+def owned:
+  (.ruleTag // "") | startswith("xkeen-client-telegram-");
+def has($x): index($x) != null;
+def tgin:
+  (.inboundTag // [] | sort) == ["redirect","tproxy"];
+def telegram_ip: (.ip // [] | has("geoip:telegram"));
+def telegram_domain:
+  (.domain // [] | any(. == "domain:telegram.org" or . == "domain:t.me"));
+def broad:
+  tgin and ((keys - ["inboundTag","outboundTag","type","ip","domain","ruleTag"]) == []);
+def catchall:
+  tgin and ((keys - ["inboundTag","outboundTag","type","ruleTag"]) == []);
+def valid_ip:
+  type == "string" and (split(".") | length == 4 and all(.[]; (tonumber? // -1) as $n |
+    $n >= 0 and $n <= 255 and ($n | tostring) == .));
+if ($clients | type) != "array" or ($clients | length) > 32 or
+  (all($clients[]; (.address | valid_ip) and (.exit | type == "string" and length > 0)) | not) or
+  ([$clients[].address] | length != (unique | length))
+then error("invalid Telegram device settings") else . end
+| .routing.rules |= map(select(owned | not))
+| . as $original
+| [ $clients[] | select(.exit as $t | $allowed | has($t)) |
+    {"type":"field","ruleTag":("xkeen-client-telegram-" + .address),
+     "inboundTag":["redirect","tproxy"],"sourceIP":[.address + "/32"],"network":"tcp",
+     "ip":["geoip:telegram"],"outboundTag":.exit}
+  ] as $specific
+| if $strict and ($specific|length) != ($clients|length) then error("Telegram exit unavailable")
+  elif ($specific|length) == 0 then .
+  else
+    (.routing.rules | to_entries) as $rules
+    | ([$rules[] | select(.value | broad and telegram_ip and .outboundTag != "block" and .outboundTag != "direct")] | last) as $iprule
+    | (([$rules[] | select(.key < ($iprule.key // -1) and
+          (.value | broad and telegram_domain and .outboundTag == $iprule.value.outboundTag))] | last | .key)
+        // $iprule.key // ([$rules[] | select(.value | catchall)] | first | .key)) as $at
+    | if $at == null then error("Telegram insertion point unavailable")
+      else .routing.rules |= (.[:$at] + $specific + .[$at:]) end
+  end
+| if (. | .routing.rules |= map(select(owned | not))) == $original then .
+  else error("unrelated routing changes") end
+' > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  { awk '/^[[:space:]]*{/ {exit} {print}' "$input"; cat "$tmp"; } > "$output"
+  local rc=$?
+  rm -f "$tmp"
+  return "$rc"
+}
+
+_apply_client_service() {
+  local live="$APPLY_ROUTING" cand="$CONFIG_DIR/05_routing.json.new"
+  local normalized="${cand}.tg-current" reason after
+  if [ "$APPLY_FILES" != " $CFG" ] || ! [ -s "$live.bak-apply-$WD_APPLY_ID" ] ||
+     ! _client_service_render "$live" "$cand" true; then
+    rm -f "$cand"
+    _apply_restore
+    _apply_result "FAIL reason=generate restart=0"
+    return 1
+  fi
+  if sed '/^[[:space:]]*\/\//d' "$live" | jq -e . > "$normalized" &&
+     sed '/^[[:space:]]*\/\//d' "$cand" | jq -e . | cmp -s "$normalized" -; then
+    rm -f "$cand" "$normalized"
+    _apply_prune_baks
+    _apply_result "OK routing=same restart=0"
+    return 0
+  fi
+  rm -f "$normalized"
+  if ! validate_routing_xray strict; then
+    rm -f "$cand"
+    _apply_restore
+    _apply_result "FAIL reason=xraytest restart=0"
+    return 1
+  fi
+  if ! mv -f "$cand" "$live"; then
+    _apply_restore
+    _apply_result "FAIL reason=routing_mv restart=0"
+    return 1
+  fi
+  echo "$live $(_md5_or_dash "$live")" >> "$APPLY_SWAPPED"
+  _APPLY_DONE=1
+  if _xk_restart && _apply_health; then
+    cp "$live" "$live.lastgood"
+    _apply_prune_baks
+    _apply_result "OK routing=changed restart=1"
+    return 0
+  fi
+  reason="${_APPLY_HREASON:-health}"
+  _apply_restore
+  if _xk_restart && _apply_health; then after=ok; else after=fail; fi
+  _apply_result "ROLLBACK reason=$reason restart=2 after=$after"
+  return 1
+}
+
 generate_routing() {
   local default_tag="$1" ai_tag="$2" yt_tag="$3" foreign_tag="$4" ipv6_tag="$5"
   [ -f "$TEMPL" ] || { log "ERROR: template $TEMPL not found"; return 1; }
@@ -1992,6 +2261,15 @@ generate_routing() {
     rm -f "$CONFIG_DIR/05_routing.json.yt-return-head" "$CONFIG_DIR/05_routing.json.yt-return-body"
   fi
 
+  if [ -n "${CLIENT_SERVICE_ROUTES:-}" ] && [ "$CLIENT_SERVICE_ROUTES" != "[]" ]; then
+    local base="$CONFIG_DIR/05_routing.json.new" targeted="$CONFIG_DIR/05_routing.json.telegram"
+    if ! _client_service_render "$base" "$targeted" false || ! mv -f "$targeted" "$base"; then
+      rm -f "$targeted"
+      log "ERROR: не удалось восстановить правила Telegram для устройств"
+      return 1
+    fi
+  fi
+
   # v9: валидация JSON перед возвратом. Если awk/template/sed где-то сгенерили
   # битый JSON (например trailing comma, пустой outboundTag) — не применять.
   # Сегодня юзер ловил оба этих кейса.
@@ -2052,18 +2330,20 @@ XRAY_BIN=/opt/sbin/xray
 XRAY_ASSET=/opt/etc/xray/dat
 validate_routing_xray() {
   local cand="$CONFIG_DIR/05_routing.json.new"
-  [ -f "$cand" ] || return 0
-  [ -x "$XRAY_BIN" ] || { log "WARN: $XRAY_BIN не найден — пропускаю xray-test gate (fail-open)"; return 0; }
+  [ -f "$cand" ] || { [ "$1" != strict ]; return $?; }
+  [ -x "$XRAY_BIN" ] || { [ "$1" != strict ] || return 1; log "WARN: $XRAY_BIN не найден — пропускаю xray-test gate (fail-open)"; return 0; }
   local td="/tmp/wd_xraytest.$$"
   rm -rf "$td" 2>/dev/null
-  mkdir -p "$td" || { log "WARN: не создать $td — пропускаю xray-test gate (fail-open)"; return 0; }
-  cp "$CONFIG_DIR"/*.json "$td"/ 2>/dev/null
-  cp "$cand" "$td/05_routing.json" 2>/dev/null
+  mkdir -p "$td" || { [ "$1" != strict ] || return 1; log "WARN: не создать $td — пропускаю xray-test gate (fail-open)"; return 0; }
+  if ! { cp "$CONFIG_DIR"/*.json "$td"/ && cp "$cand" "$td/05_routing.json"; } 2>/dev/null; then
+    if [ "$1" = strict ]; then rm -rf "$td"; return 1; fi
+  fi
   local out rc
   out=$(XRAY_LOCATION_ASSET="$XRAY_ASSET" "$XRAY_BIN" run -test -confdir "$td" 2>&1)
   rc=$?
   rm -rf "$td" 2>/dev/null
   [ "$rc" -eq 0 ] && return 0
+  [ "$1" != strict ] || return 1
   # Не-ноль: блокируем ТОЛЬКО при явной ошибке конфига (не при сбое запуска самого теста).
   if echo "$out" | grep -qiE 'failed to (check code|load|build)|invalid|not found|neither outboundTag'; then
     log "XRAY-TEST FAIL (routing НЕ применён): $(echo "$out" | grep -iE 'failed to|invalid|not found|neither' | head -2 | tr '\n' ' ')"
@@ -2231,6 +2511,11 @@ _apply_health() {
   traffic_check || { _APPLY_HREASON=traffic; return 1; }
   return 0
 }
+
+if [ -n "$WD_APPLY_ID" ] && [ "${WD_APPLY_SCOPE:-}" = client-service ]; then
+  _apply_client_service
+  exit $?
+fi
 
 # После отката прерванного применения проверяем curl до проб, переключений и записи state.
 if [ -z "$WD_APPLY_ID" ]; then
@@ -2666,6 +2951,10 @@ EVIDENCE_MAX_PER_HOUR=$(_num "${EVIDENCE_MAX_PER_HOUR:-6}" 6)   # снимков
 EVIDENCE_DIR=/opt/var/log/xray/evidence
 XRAY_BUSY=0; XRAY_BUSY_N=0; XRAY_BUSY_BLAME=""; XRAY_BUSY_PCT=""; XRAY_BUSY_KBIT=""; XRAY_BUSY_OPENED=0; XRAY_BUSY_WIN=0
 [ -z "$WD_APPLY_ID" ] && xray_busy_eval
+TCP_STALL_STATE=/tmp/xkeen_watchdog.tcpstall
+TCP_STALL_MIN=256
+[ -n "$WD_APPLY_ID" ] || _telegram_devices_sample
+tcp_stall_tick && exit 0
 # ---------- /v37 ----------
 
 # ---------- v24: AI exit-IP probe + RU-leak alert ----------

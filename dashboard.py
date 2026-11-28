@@ -243,7 +243,7 @@ else:
 # Хранятся отдельным JSON чтобы при обновлении dashboard.py не сбрасывались.
 # Перезаписывают атрибуты cfg-модуля → существующий код cfg.KEENETIC_* работает без правок.
 RUNTIME_SETTINGS_FILE = os.path.join(_app_base_dir(), "runtime_settings.json")
-_RUNTIME_LOCK = _threading.Lock()
+_RUNTIME_LOCK = _threading.RLock()
 # Сериализует read-modify-write watchdog.config: при двойном «Сохранить» (PRIMARY сразу за
 # FAILOVER) без него два запроса могут прочитать конфиг одновременно и один затереть правку
 # другого. Лок in-process (хватает для threaded-сервера; на один pythonw-процесс — то что нужно).
@@ -295,20 +295,35 @@ KEENETIC_RUNTIME_KEYS = [
     ("watchdog_log",   "KEENETIC_WATCHDOG_LOG",   "str"),
 ]
 
-def load_runtime_settings():
+def load_runtime_settings(*, strict=False):
     with _RUNTIME_LOCK:
-        if not os.path.exists(RUNTIME_SETTINGS_FILE):
-            return {}
         try:
             with open(RUNTIME_SETTINGS_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Ожидается объект JSON.")
+            return data
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            if strict:
+                raise ValueError("Не удалось прочитать настройки панели.") from exc
             return {}
 
 def save_runtime_settings(data):
     with _RUNTIME_LOCK:
-        with open(RUNTIME_SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        path = os.path.abspath(RUNTIME_SETTINGS_FILE)
+        pending = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                                             prefix=".runtime_settings-", delete=False) as f:
+                pending = f.name
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(pending, path)
+            pending = None
+        finally:
+            if pending is not None:
+                os.unlink(pending)
 
 def apply_runtime_overrides():
     """Перезаписать атрибуты cfg значениями из runtime_settings.json."""
@@ -1046,6 +1061,24 @@ def _strip_json_comments(text):
     if not text:
         return text
     return _JSON_LINE_COMMENT_RE.sub('', text)
+
+
+_ROUTING_TEMPLATE_SLOTS = frozenset({
+    "__AI_RULE_BLOCK__", "__YT_RULE_BLOCK__", "__YT_RULE_GEOIP__",
+    "__FOREIGN_RULE_BLOCK__", "__FOREIGN_RULE_GEOIP__", "__IPV6_RULE_BLOCK__",
+    "__DIRECT_RULE_BLOCK__", "__BLOCK_RULE_BLOCK__",
+})
+
+
+def _parse_routing_template(text):
+    """Проверить JSON-каркас, подставив пустые блоки как в watchdog."""
+    rendered = "\n".join(line for line in _strip_json_comments(text).splitlines()
+                         if line.strip() not in _ROUTING_TEMPLATE_SLOTS)
+    template = json.loads(rendered)
+    routing = template.get("routing") if isinstance(template, dict) else None
+    if not isinstance(routing, dict) or not isinstance(routing.get("rules"), list):
+        raise ValueError("Отсутствует массив routing.rules.")
+    return template
 
 
 def keenetic_load_json(remote_path, timeout=10):
@@ -3775,7 +3808,7 @@ def keenetic_unstage(run_id):
                         + f" /tmp/xkeen_apply.{run_id}.manifest", timeout=10)
 
 
-def keenetic_apply_staged(run_id, fingerprint, force=False, poll_timeout=APPLY_POLL_TIMEOUT, poll_every=3):
+def keenetic_apply_staged(run_id, fingerprint, force=False, poll_timeout=APPLY_POLL_TIMEOUT, poll_every=3, *, client_service=False):
     """Запустить на роутере режим применения watchdog (v35) и дождаться итога.
     Файлы *.applynew.<run_id> уже подготовлены вызывающим; fingerprint — keenetic_apply_fingerprint(),
     снятый ДО их подготовки (уходит манифестом). force — рестарт даже без подменённых файлов
@@ -3791,7 +3824,8 @@ def keenetic_apply_staged(run_id, fingerprint, force=False, poll_timeout=APPLY_P
         return {"ok": False, "status": "FAIL", "reason": "start", "restart": "0", "routing": "", "pending": False,
                 "stderr": "не записался манифест применения (SSH) — подготовленные файлы убраны, ничего не изменено."}
     _force = " WD_APPLY_FORCE=1" if force else ""
-    st = keenetic_ssh(f"WD_APPLY={run_id}{_force} nohup /opt/etc/xray/watchdog.sh >/dev/null 2>&1 & echo APPLY_STARTED",
+    scope = " WD_APPLY_SCOPE=client-service" if client_service else ""
+    st = keenetic_ssh(f"WD_APPLY={run_id}{_force}{scope} nohup /opt/etc/xray/watchdog.sh >/dev/null 2>&1 & echo APPLY_STARTED",
                       timeout=15)
     if "APPLY_STARTED" not in (st.get("stdout") or ""):
         # Ответа нет — но процесс мог стартовать (таймаут SSH). Его итог появится в .res; файлы
@@ -6784,6 +6818,52 @@ def api_xkeen_subscription_sync():
     return jsonify(response_payload)
 
 
+_SNAPSHOT_PANEL_SETTINGS = "panel_settings"
+
+
+def _snapshot_auto_exit(snapshot):
+    """None: старый снимок без настройки. Пустая строка: явно выключено."""
+    if _SNAPSHOT_PANEL_SETTINGS not in snapshot:
+        return None
+    settings = snapshot[_SNAPSHOT_PANEL_SETTINGS]
+    if not isinstance(settings, dict):
+        raise ValueError("Некорректный раздел настроек панели в снимке.")
+    if _CLIENT_SERVICE_AUTO not in settings:
+        return None
+    auto = settings[_CLIENT_SERVICE_AUTO]
+    tag = auto.get("exit") if isinstance(auto, dict) else None
+    if not isinstance(tag, str) or len(tag) > 1024 or any(ord(char) < 32 for char in tag):
+        raise ValueError("Некорректный выход для автодобавления Telegram в снимке.")
+    return tag
+
+
+def _set_client_service_auto_exit(tag):
+    with _RUNTIME_LOCK:
+        runtime = load_runtime_settings(strict=True)
+        current = runtime.get(_CLIENT_SERVICE_AUTO)
+        last_attempt = current.get("last_attempt") if isinstance(current, dict) else None
+        runtime[_CLIENT_SERVICE_AUTO] = {"exit": tag, "last_attempt": last_attempt if isinstance(last_attempt, int) else 0}
+        save_runtime_settings(runtime)
+
+
+def _collect_xkeen_snapshot():
+    result = keenetic_ssh(xkeen_backup_paths.build_snapshot_command(), timeout=30)
+    if not result["ok"]:
+        raise ValueError((result.get("stderr") or "Не удалось прочитать снимок Keenetic.")[:500])
+    try:
+        snapshot = json.loads(result["stdout"])
+        if not isinstance(snapshot, dict) or not snapshot.get("files"):
+            raise ValueError()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Keenetic вернул неполный снимок.") from exc
+    runtime = load_runtime_settings(strict=True)
+    selected = runtime.get(_CLIENT_SERVICE_AUTO, {})
+    tag = selected.get("exit", "") if isinstance(selected, dict) else None
+    snapshot[_SNAPSHOT_PANEL_SETTINGS] = {_CLIENT_SERVICE_AUTO: {"exit": tag}}
+    _snapshot_auto_exit(snapshot)
+    return json.dumps(snapshot, ensure_ascii=False, indent=2)
+
+
 @app.route("/api/xkeen/backup", methods=["GET"])
 @requires_auth
 def api_xkeen_backup():
@@ -6791,17 +6871,15 @@ def api_xkeen_backup():
     Состав — xkeen_backup_paths: xray-конфиги (01-06), шаблоны watchdog, watchdog.sh + config +
     state + aiprobe, sidecar-файлы панели, crontab, authorized_keys, хуки netfilter.d/zz_*.sh."""
     import time as _time
-    # Собираем bundle через jq на роутере — компактно и читаемо: для каждого существующего
-    # файла объект {path, content}; отсутствующие пропускаются.
-    cmd = xkeen_backup_paths.build_snapshot_command()
-    r = keenetic_ssh(cmd, timeout=30)
-    if not r["ok"]:
-        return jsonify({"ok": False, "stderr": r["stderr"][:500]}), 500
+    try:
+        snapshot = _collect_xkeen_snapshot()
+    except ValueError as ex:
+        return jsonify({"ok": False, "stderr": str(ex)}), 500
     # Имя БЕЗ формата ежедневного файла (xkeen-snapshot-<ts>.json): если пользователь положит
     # скачанный файл в backups\, ретеншн xkeen_snapshot_daily.py его не тронет.
     fname = f"xkeen-snapshot-download-{_time.strftime('%Y%m%d-%H%M%S')}.json"
     return Response(
-        r["stdout"],
+        snapshot,
         mimetype="application/json",
         headers={"Content-Disposition": f"attachment; filename={fname}"}
     )
@@ -6814,10 +6892,10 @@ def api_xkeen_backup_to_disk():
     без всплывающего «Save As» диалога. Бэкап такой же как api_xkeen_backup,
     просто пишется на сервер а не отдаётся клиенту."""
     import time as _time
-    cmd = xkeen_backup_paths.build_snapshot_command()
-    r = keenetic_ssh(cmd, timeout=30)
-    if not r["ok"]:
-        return jsonify({"ok": False, "stderr": r["stderr"][:500]})
+    try:
+        snapshot = _collect_xkeen_snapshot()
+    except ValueError as ex:
+        return jsonify({"ok": False, "stderr": str(ex)})
 
     backups_dir = os.path.join(_app_base_dir(), "backups")
     try:
@@ -6830,7 +6908,7 @@ def api_xkeen_backup_to_disk():
     fpath = os.path.join(backups_dir, fname)
     try:
         with open(fpath, "w", encoding="utf-8") as f:
-            f.write(r["stdout"])
+            f.write(snapshot)
         size = os.path.getsize(fpath)
     except Exception as ex:
         return jsonify({"ok": False, "stderr": f"write failed: {ex}"})
@@ -7043,6 +7121,15 @@ def api_xkeen_restore():
     except Exception as ex:
         return jsonify({"ok": False, "stderr": f"некорректный JSON: {ex}"})
 
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "stderr": "Ожидается объект JSON в снимке."})
+    try:
+        auto_exit = _snapshot_auto_exit(data)
+        if auto_exit is not None:
+            load_runtime_settings(strict=True)
+    except ValueError as ex:
+        return jsonify({"ok": False, "stage": "validate", "stderr": str(ex)})
+
     raw_files = data.get("files")
     if not raw_files:
         return jsonify({"ok": False, "stderr": "в snapshot нет поля files"})
@@ -7068,7 +7155,7 @@ def api_xkeen_restore():
             if name in legacy_map:
                 items.append((legacy_map[name], content))
 
-    if not items:
+    if not items or any(not isinstance(path, str) or not isinstance(content, str) for path, content in items):
         return jsonify({"ok": False, "stderr": "snapshot пустой или невалидный формат"})
 
     # SECURITY: разрешаем писать только в whitelist путей (фиксированный список + хуки
@@ -7087,9 +7174,12 @@ def api_xkeen_restore():
         base = os.path.basename(path)
         if path.endswith(".json"):
             try:
-                json.loads(_strip_json_comments(content or ""))
-            except Exception as ex:
-                val_errors.append(f"{base}: невалидный JSON ({str(ex)[:100]})")
+                if path == TEMPLATE_REMOTE_PATH:
+                    _parse_routing_template(content)
+                else:
+                    json.loads(_strip_json_comments(content))
+            except ValueError as ex:
+                val_errors.append(f"{base}: не прошел проверку ({str(ex)[:100]})")
         elif path.endswith(".sh"):
             chk = keenetic_ssh("sh -n", stdin_data=(content or ""), timeout=12)
             if not chk["ok"]:
@@ -7140,20 +7230,28 @@ def api_xkeen_restore():
     # пересобрался. Теперь — режим применения watchdog с WD_APPLY_FORCE: прогон тика (routing из
     # восстановленных файлов) и РОВНО один рестарт с проверкой. Файлы уже записаны — подготовленных нет.
     restart_note = ""
-    apply = {}
     ctx = keenetic_apply_begin()
     if ctx.get("ok"):
         _wd = ctx.get("watchdog_sync") or {}
         if _wd.get("action") == "upgraded":
             restart_note += f"\n🔄 watchdog.sh из снимка (v{_wd.get('from')}) заменён текущим v{_wd.get('to')}."
-        info = keenetic_apply_commit(ctx, force=True)
-        if info.get("ok"):
-            restart_note += "\n" + _apply_note(info)
-        else:
-            restart_note += "\n⚠ Перезапуск после восстановления: " + (info.get("stderr") or "не удался")
+        applied = keenetic_apply_commit(ctx, force=True)
+        if applied.get("ok"):
+            restart_note += "\n" + _apply_note(applied)
     else:
-        apply = keenetic_ssh("/opt/etc/xray/watchdog.sh && xkeen -restart", timeout=30)
+        applied = keenetic_ssh("/opt/etc/xray/watchdog.sh && xkeen -restart", timeout=30)
 
+    if not applied.get("ok"):
+        reason = applied.get("stderr") or "применение не подтвердилось"
+        return jsonify({"ok": False, "stage": "apply", "restored": restored,
+                        "stderr": f"Файлы восстановлены, результат применения не подтвержден: {reason}"})
+    if auto_exit is not None and restored:
+        try:
+            _set_client_service_auto_exit(auto_exit)
+        except (OSError, ValueError):
+            return jsonify({"ok": False, "stage": "panel_settings", "restored": restored,
+                            "stderr": "Файлы Keenetic восстановлены. Настройку автодобавления сохранить не удалось."})
+        restart_note += "\nНастройка автодобавления Telegram восстановлена."
     msg = f"✅ Восстановлено {len(restored)} файлов. Бэкап текущих: *.bak-pre-restore-{ts}" + restart_note
     if skipped:
         msg += f"\n⚠️ Пропущены (не в whitelist): {len(skipped)} — " + ", ".join(skipped[:3])
@@ -7161,7 +7259,7 @@ def api_xkeen_restore():
     return jsonify({
         "ok": True,
         "stdout": msg,
-        "apply_stderr": apply.get("stderr", "")[:300],
+        "apply_stderr": applied.get("stderr", "")[:300],
     })
 
 
@@ -7921,6 +8019,266 @@ def _parse_xkeen_ports(text):
     return ports
 
 
+_CLIENT_SERVICE_KEY = "CLIENT_SERVICE_ROUTES"
+
+
+def _client_service_address(value):
+    import ipaddress
+    try:
+        ip = ipaddress.IPv4Address(value) if isinstance(value, str) else None
+        if ip is not None and not (ip.is_unspecified or ip.is_loopback or ip.is_multicast or
+                                   ip.is_link_local or int(ip) == 0xffffffff):
+            return str(ip)
+    except ValueError:
+        pass
+    return ""
+
+
+def _client_service_choices():
+    outbounds = keenetic_get_outbounds()
+    if outbounds is None:
+        raise ValueError("Не удалось прочитать выходы Keenetic.")
+    return {o["tag"]: o["tag"] + " · gRPC" +
+            (" + REALITY" if o.get("security") == "reality" else "")
+            for o in outbounds if o.get("tag") and o.get("protocol") == "vless" and o.get("network") == "grpc"}
+
+
+def _client_service_records(config):
+    try:
+        records = json.loads(config.get(_CLIENT_SERVICE_KEY) or "[]")
+        if not isinstance(records, list) or len(records) > 32 or not all(
+            isinstance(r, dict) and _client_service_address(r.get("address")) == r.get("address") and
+            isinstance(r.get("exit"), str) and bool(r["exit"]) and
+            isinstance(r.get("computer"), str) for r in records
+        ) or len({r["address"] for r in records}) != len(records):
+            raise ValueError()
+        return records
+    except (TypeError, ValueError):
+        raise ValueError("Сохраненные правила Telegram не удалось прочитать.") from None
+
+
+def _client_service_rows(records, exits):
+    return [{**r, "service": "telegram", "service_label": "Telegram",
+             "exit_label": exits.get(r["exit"], r["exit"] + " (недоступен)"),
+             "rule": {"type": "field", "inboundTag": ["redirect", "tproxy"],
+                      "sourceIP": [r["address"] + "/32"], "network": "tcp",
+                      "ip": ["geoip:telegram"], "outboundTag": r["exit"]}}
+            for r in records]
+
+
+def _client_service_devices():
+    answer = keenetic_ssh('ndmc -c "show ip hotspot"', timeout=8)
+    devices = {}
+    if answer.get("ok"):
+        for host in _parse_ndmc_hosts(answer.get("stdout") or ""):
+            ip = _client_service_address(host["ip"])
+            if ip:
+                devices[ip] = host["name"]
+    return devices
+
+
+def _client_service_config():
+    raw = keenetic_read_file(APPLY_STAGE_FILES[0])
+    if not raw:
+        raise ValueError("Не удалось прочитать настройки сторожа.")
+    return raw, _parse_watchdog_config(raw)
+
+
+def _client_service_update_config(raw, records):
+    encoded = json.dumps(records, ensure_ascii=True, separators=(",", ":"))
+    line = next(l for l in _build_watchdog_config({_CLIENT_SERVICE_KEY: encoded}).splitlines()
+                if l.startswith(_CLIENT_SERVICE_KEY + "="))
+    pattern = r"(?m)^[ \t]*" + _CLIENT_SERVICE_KEY + r"[ \t]*=[^\r\n]*"
+    if re.search(pattern, raw):
+        return re.sub(pattern, lambda _: line, raw)
+    return raw.rstrip("\r\n") + "\n" + line + "\n"
+
+
+def _client_service_update(payload):
+    if payload.get("action") not in ("save", "remove") or payload.get("service") != "telegram":
+        raise ValueError("Выбери правило Telegram.")
+    if not _apply_paths_supported():
+        raise ValueError("У этой установки нестандартные пути конфигурации XKeen.")
+    fp = keenetic_apply_fingerprint()
+    if not fp:
+        raise ValueError("Не удалось проверить текущие файлы Keenetic.")
+    raw, config = _client_service_config()
+    exits = _client_service_choices()
+    records = _client_service_records(config)
+    deleting = payload["action"] == "remove"
+    address = _client_service_address(payload.get("address") if deleting or payload.get("device") == "manual"
+                                      else payload.get("device"))
+    if not address:
+        raise ValueError("Введи один IPv4-адрес устройства.")
+    if payload.get("automatic") is True and any(r["address"] == address for r in records):
+        return {"ok": True, "restart": "0", "rules": _client_service_rows(records, exits)}
+    new = [r for r in records if r["address"] != address]
+    if not deleting:
+        tag = payload.get("exit")
+        if not isinstance(tag, str) or tag not in exits:
+            raise ValueError("Выбери доступный выход gRPC.")
+        name = payload.get("computer")
+        if not isinstance(name, str) or not name.strip():
+            name = next((r["computer"] for r in records if r["address"] == address), address)
+        else:
+            name = " ".join(name.split())[:80]
+        new.append({"address": address, "computer": name, "exit": tag})
+    new.sort(key=lambda r: r["address"])
+    if len(new) > 32:
+        raise ValueError("Можно сохранить до 32 правил Telegram.")
+    if new == records:
+        return {"ok": True, "restart": "0", "rules": _client_service_rows(records, exits)}
+    wd = keenetic_ensure_watchdog_current()
+    version = {"current": wd.get("remote_ver"), "upgraded": wd.get("to")}.get(wd.get("action")) or 0
+    if version < 50:
+        raise ValueError("Сторож v50 не подтвердил готовность к точечному применению.")
+    run_id = _apply_new_id()
+    path = f"{APPLY_STAGE_FILES[0]}.applynew.{run_id}"
+    with _WATCHDOG_CFG_LOCK:
+        result = keenetic_ssh(f"cat > {path}", stdin_data=_client_service_update_config(raw, new), timeout=10)
+    if not result.get("ok"):
+        keenetic_unstage(run_id)
+        raise ValueError("Не удалось подготовить правило на Keenetic.")
+    applied = keenetic_apply_staged(run_id, fp, client_service=True)
+    return {"ok": applied["ok"], "pending": applied["pending"],
+            "error": applied["stderr"], "restart": applied["restart"],
+            "rules": _client_service_rows(new if applied["ok"] else records, exits)}
+
+
+_CLIENT_SERVICE_AUTO = "telegram_device_auto"
+
+
+def _client_service_detections(records):
+    r = keenetic_ssh("date +%s; cat /tmp/xkeen-telegram-devices 2>/dev/null || true", timeout=8)
+    lines = (r.get("stdout") or "").splitlines()
+    if not r.get("ok") or len(lines) < 2 or not all(s.isdecimal() for s in lines[:2]):
+        return None
+    if not 0 <= int(lines[0]) - int(lines[1]) <= 240:
+        return None
+    configured = {row["address"] for row in records}
+    signals = {}
+    for line in lines[2:]:
+        parts = line.split()
+        if len(parts) == 2 and _client_service_address(parts[0]) and parts[1].isdecimal():
+            if parts[0] not in configured and int(parts[1]) >= 3:
+                signals[parts[0]] = int(parts[1])
+    return signals
+
+
+def _client_service_auto_probe(tag):
+    raw = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/05_routing.json")
+    raw_in = keenetic_read_file(f"{cfg.KEENETIC_XRAY_CONFIGS}/03_inbounds.json")
+    try:
+        rules = json.loads(_strip_json_comments(raw or ""))["routing"]["rules"]
+        port = next((i.get("port") for i in json.loads(_strip_json_comments(raw_in or ""))["inbounds"]
+                     if i.get("tag") == "socks-yt-return" and i.get("listen") == "127.0.0.1" and
+                     i.get("protocol") == "socks"), None)
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(port, int) or not 1 <= port <= 65535:
+        return None
+    first = next((rule for rule in rules if "socks-yt-return" in rule.get("inboundTag", [])), {})
+    if first.get("inboundTag") != ["socks-yt-return"] or first.get("outboundTag") != tag:
+        return None
+    r = keenetic_ssh(
+        f"curl -sS -o /dev/null -w '%{{http_code}}' --max-time 7 "
+        f"--socks5-hostname 127.0.0.1:{port} https://api.telegram.org/", timeout=11)
+    return bool(r.get("ok") and re.fullmatch(r"[23]\d\d", (r.get("stdout") or "").strip()))
+
+
+@app.post("/api/xkeen/client-service-auto")
+@requires_auth
+@_apply_locked_route
+def api_xkeen_client_service_auto():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("exit"), str):
+        return jsonify(ok=False, error="Выбери выход для автодобавления."), 400
+    tag = data["exit"]
+    try:
+        if tag and (tag not in _client_service_choices() or not _client_service_auto_probe(tag)):
+            return jsonify(ok=False, error="Автодобавлению нужен выход gRPC с рабочей контрольной пробой Telegram. Сейчас этот выход не прошел проверку."), 400
+        _set_client_service_auto_exit(tag)
+        return jsonify(ok=True, exit=tag)
+    except (OSError, ValueError) as e:
+        return jsonify(ok=False, error=str(e)), 503
+
+
+@_apply_locked
+def _client_service_auto_tick():
+    current = load_runtime_settings().get(_CLIENT_SERVICE_AUTO) or {}
+    tag = current.get("exit")
+    now = int(_time_mod.time())
+    if not tag or now - current.get("last_attempt", 0) < 1800:
+        return
+    _, config = _client_service_config()
+    records = _client_service_records(config)
+    signals = _client_service_detections(records)
+    if not signals:
+        return
+    reserved = keenetic_ssh("""ndmc -c 'show running-config' | awk '$1=="ip" && $2=="dhcp" && $3=="host" && NF==5 {print tolower($4),$5}'""", timeout=30)
+    hosts = keenetic_ssh('ndmc -c "show ip hotspot"', timeout=12)
+    if not reserved.get("ok") or not hosts.get("ok"):
+        return
+    pairs = {tuple(line.split()) for line in (reserved.get("stdout") or "").splitlines()}
+    eligible = [h for h in _parse_ndmc_hosts(hosts.get("stdout") or "")
+                if h["active"] and h["ip"] in signals and (h["mac"], h["ip"]) in pairs]
+    if not eligible or tag not in _client_service_choices() or not _client_service_auto_probe(tag):
+        return
+    host = max(eligible, key=lambda h: (signals[h["ip"]], h["ip"]))
+    with _RUNTIME_LOCK:
+        runtime = load_runtime_settings()
+        runtime[_CLIENT_SERVICE_AUTO] = {"exit": tag, "last_attempt": now}
+        save_runtime_settings(runtime)
+    result = _client_service_update({"action": "save", "service": "telegram", "device": host["ip"],
+                                     "computer": host["name"], "exit": tag, "automatic": True})
+    app.logger.info("Telegram automatic route: applied=%s pending=%s", result["ok"], result.get("pending", False))
+
+
+def _client_service_auto_worker():
+    while True:
+        _time_mod.sleep(90)
+        try:
+            _client_service_auto_tick()
+        except Exception as exc:
+            app.logger.warning("Telegram automatic route: %s", type(exc).__name__)
+
+
+@app.get("/api/xkeen/client-service-routes")
+@requires_auth
+def api_xkeen_client_service_routes():
+    try:
+        _, config = _client_service_config()
+        exits = _client_service_choices()
+        records = _client_service_records(config)
+        devices = {r["address"]: r["computer"] for r in records}
+        devices.update(_client_service_devices())
+        signals = _client_service_detections(records)
+        return jsonify(ok=True, rules=_client_service_rows(records, exits),
+                       detection_ready=signals is not None,
+                       suggestions=[{"address": ip, "computer": devices.get(ip, ip), "count": count}
+                                    for ip, count in sorted((signals or {}).items())],
+                       auto_exit=(load_runtime_settings().get(_CLIENT_SERVICE_AUTO) or {}).get("exit", ""),
+                       services=[{"value": "telegram", "label": "Telegram"}],
+                       devices=[{"value": ip, "label": f"{name} · {ip}" if name != ip else ip, "name": name}
+                                for ip, name in sorted(devices.items(), key=lambda row: row[1].casefold())],
+                       exits=[{"value": t, "label": label} for t, label in exits.items()])
+    except ValueError as e:
+        return jsonify(ok=False, error=str(e)), 503
+
+
+@app.post("/api/xkeen/client-service-routes")
+@requires_auth
+@_apply_locked_route
+def api_xkeen_client_service_update():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(ok=False, error="Не удалось прочитать правило."), 400
+    try:
+        return jsonify(_client_service_update({k: v for k, v in payload.items() if k != "automatic"}))
+    except ValueError as e:
+        return jsonify(ok=False, error=str(e)), 400
+
+
 @app.route("/api/xkeen/policy-clients", methods=["GET"])
 @requires_auth
 def api_xkeen_policy_clients():
@@ -8102,18 +8460,9 @@ def api_xkeen_routing_template_rules():
     if not raw:
         return jsonify({"ok": False, "error": "Не удалось прочитать template с роутера"}), 502
 
-    # Strip // comments (template их содержит для документации) +
-    # snippet-плейсхолдеры на отдельных строках (__BLOCK_RULE_BLOCK__, __DIRECT_RULE_BLOCK__,
-    # __AI_RULE_BLOCK__, __YT_RULE_BLOCK__, __YT_RULE_GEOIP__) — watchdog их подменяет
-    # на JSON-объекты или пустоту. Для парсинга самого template убираем строки целиком.
-    # NB: "__DEFAULT_TAG__" внутри кавычек как string-value остаётся — это валидный JSON.
-    clean = _strip_json_comments(raw)
-    # [A-Z0-9_]: в имени placeholder'а бывает цифра (__IPV6_RULE_BLOCK__) — без неё строка оставалась
-    # и парсинг template падал («Не удалось распарсить template») на любом шаблоне с каналом IPv6.
-    clean = re.sub(r'^\s*__[A-Z0-9_]+__\s*$', '', clean, flags=re.MULTILINE)
     try:
-        tmpl = json.loads(clean)
-    except Exception as ex:
+        tmpl = _parse_routing_template(raw)
+    except ValueError as ex:
         return jsonify({"ok": False, "error": f"Не удалось распарсить template: {ex}", "raw_head": raw[:500]}), 500
 
     rules_list = (tmpl.get("routing") or {}).get("rules", [])
@@ -12685,6 +13034,25 @@ XKEEN_TEMPLATE = r"""<!doctype html>
   .channel-card.cc-failover { border-color: #c89308; }
   .channel-card.cc-ai       { border-color: #6a3;    }
   .channel-card.cc-yt       { border-color: #c33;    }
+
+  .client-service-form { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
+  .client-service-form label { display:grid; align-content:start; gap:6px; font-weight:600; }
+  .client-service-form select, .client-service-form input { width:100%; min-height:38px; box-sizing:border-box; }
+  #client-service-manual[hidden], #client-service-computer[hidden] { display:none; }
+  .client-service-actions { grid-column:1 / -1; }
+  .client-service-list { display:grid; gap:10px; }
+  .client-service-record { display:grid; gap:6px; padding:12px; border:1px solid #d3dadf; border-radius:8px; }
+  .client-service-record p { margin:0; }
+  .client-service-record button { justify-self:start; }
+  .client-service-record pre { white-space:pre-wrap; overflow-wrap:anywhere; margin:8px 0 0; }
+  #client-service-status { min-height:1.25em; }
+  @media (max-width:720px) {
+    .client-service-form { grid-template-columns:minmax(0,1fr); }
+    .client-service-form select { min-width:0; }
+    .xk-layout { display:block !important; }
+    .xk-sidebar { position:static !important; max-height:210px !important; width:100%; box-sizing:border-box; margin-bottom:12px; }
+    .xk-resizer { display:none; }
+  }
 </style>
 </head>
 <body>
@@ -13618,6 +13986,45 @@ XKEEN_TEMPLATE = r"""<!doctype html>
     </div>
   </details>
 
+  <div class="domain-section ds-clients" data-xk-sub="Правила Telegram для устройств" data-xk-page-id="client-service" id="client-service-routes">
+    <h3 class="domain-section-header">Правила Telegram для устройств</h3>
+    <div class="domain-section-body">
+      <p class="subtitle">Если Telegram на одном устройстве регулярно зависает при загрузке видео или файлов, направь его через выход gRPC. Правило действует на TCP-соединения к адресам Telegram с выбранного IPv4.</p>
+      <form id="client-service-form" class="client-service-form">
+        <label>Компьютер
+          <select name="device" id="client-service-device" required></select>
+        </label>
+        <label id="client-service-manual" hidden>IPv4 компьютера в Keenetic
+          <input name="address" id="client-service-address" placeholder="Например, 192.168.1.20" inputmode="decimal">
+        </label>
+        <input name="service" type="hidden" value="telegram">
+        <label id="client-service-computer" hidden>Имя устройства
+          <input name="computer" maxlength="80" placeholder="Например, Рабочий">
+        </label>
+        <label>Выход gRPC
+          <select name="exit" id="client-service-exit" required></select>
+        </label>
+        <div class="client-service-actions">
+          <button type="submit" class="btn-primary" id="client-service-save" disabled>Сохранить правило</button>
+        </div>
+      </form>
+      <p id="client-service-status" role="status" aria-live="polite"></p>
+      <div class="client-service-list" id="client-service-list"></div>
+      <h4>Подсказки сторожа</h4>
+      <p class="subtitle">Сторож ищет зависшие TCP-соединения Telegram. Если они держатся в двух замерах, панель предложит устройство.</p>
+      <div class="client-service-list" id="client-service-suggestions"></div>
+      <details>
+        <summary>Автодобавление</summary>
+        <p class="subtitle">Панель может сама добавить устройство с закрепленным в Keenetic IPv4. Выбери gRPC-выход с включенной контрольной пробой. При применении Xray кратковременно переподключит соединения.</p>
+        <label>Выход для автодобавления
+          <select id="client-service-auto"><option value="">Выключено</option></select>
+        </label>
+        <button type="button" class="btn" id="client-service-auto-save" disabled>Сохранить автодобавление</button>
+        <p id="client-service-auto-status" role="status"></p>
+      </details>
+    </div>
+  </div>
+
   <!-- v1.7.6 — Клиенты в политике XKeen (read-only) -->
   <div class="domain-section ds-clients" data-xk-sub="👥 Клиенты">
     <h3 class="domain-section-header">👥 Клиенты в политике XKeen <span class="subsec-hint">(менять политику прямо в таблице через dropdown)</span> <a href="#help-policy-clients" onclick="openHelpAnchor('help-policy-clients'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; font-weight: normal;" title="Открыть тему справки «👥 Клиенты в политике XKeen»">❓ помощь</a></h3>
@@ -14108,11 +14515,11 @@ XKEEN_TEMPLATE = r"""<!doctype html>
 
 
 <!-- ===== БЭКАП / ВОССТАНОВЛЕНИЕ ===== -->
-<h2 class="sec-backup">💾 Бэкап и восстановление <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— все настройки XKeen одним файлом</span></h2>
+<h2 class="sec-backup">💾 Бэкап и восстановление <span style="font-weight:400; color:#888; font-size:0.7em; margin-left:6px;">— конфиги XKeen одним файлом</span></h2>
 <div class="card">
   <div style="text-align: right; margin: -6px 0 4px;"><a href="#help-backup" onclick="openHelpAnchor('help-backup'); return false;" style="font-size: 0.85em; color: #468; text-decoration: none; font-weight: normal;" title="Открыть тему справки «💾 Бэкап и восстановление»">❓ помощь</a></div>
   <p class="subtitle" style="margin-top: 0;">
-    Сохраняет/восстанавливает <strong>ВСЕ настройки XKeen</strong> одним файлом — конфиги xray, watchdog, sidecar-файлы панели и хуки netfilter.d:
+    Сохраняет конфиги XKeen, правила Telegram для устройств и настройку автодобавления одним файлом.
     <details style="display: inline; margin-left: 4px;" data-xk-keep-inline>
       <summary style="cursor: pointer; display: inline; color: #2a7;">список файлов</summary>
       <div style="margin-top: 6px; padding: 8px; background: #f9f9f4; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.85em;">
@@ -14121,7 +14528,8 @@ XKEEN_TEMPLATE = r"""<!doctype html>
         Watchdog: <code>watchdog.sh</code> · <code>watchdog.config</code> · <code>watchdog.state</code> · <code>watchdog.aiprobe</code><br>
         Sidecar панели: <code>outbound_meta.json</code> · <code>subscription_meta.json</code> · <code>domain_notes.json</code><br>
         Хуки: <code>netfilter.d/zz_*.sh</code> (WG-хуки и kill-switch панели — при восстановлении получают <code>+x</code>)<br>
-        Системное: <code>crontab</code> · <code>dropbear authorized_keys</code>
+        Системное: <code>crontab</code> · <code>dropbear authorized_keys</code><br>
+        Панель: выход для автодобавления Telegram или состояние «Выключено»
       </div>
     </details>
     Использовать перед экспериментами или для переезда на другой роутер.
@@ -19527,7 +19935,7 @@ async function restoreSnapshot() {
     flash(false, 'Нужен .json файл (snapshot)');
     return;
   }
-  if (!confirm(`Восстановить XKeen из файла "${f.name}" (${(f.size/1024).toFixed(1)} KB)?\n\n⚠️ Это перепишет текущие конфиги. Предыдущие версии сохранятся как *.bak-pre-restore-<timestamp> на роутере (можно вернуть через ssh).\n\nПродолжить?`)) return;
+  if (!confirm(`Восстановить XKeen из файла "${f.name}" (${(f.size/1024).toFixed(1)} KB)?\n\n⚠️ Это перепишет текущие конфиги. Предыдущие версии сохранятся как *.bak-pre-restore-<timestamp> на роутере (можно вернуть через ssh). Если в архиве есть настройка автодобавления Telegram, она тоже восстановится.\n\nПродолжить?`)) return;
   flash(true, '🔄 Восстанавливаю...');
   const fd = new FormData();
   fd.append('snapshot', f);
@@ -23092,6 +23500,184 @@ async function makeSiteReachable(btn) {
   } catch(e) {}
 })();
 
+
+(function clientServiceRoutes() {
+  const form = document.getElementById('client-service-form');
+  const device = document.getElementById('client-service-device');
+  const address = document.getElementById('client-service-address');
+  const manual = document.getElementById('client-service-manual');
+  const computer = document.getElementById('client-service-computer');
+  let devices = new Map();
+  const exit = document.getElementById('client-service-exit');
+  const save = document.getElementById('client-service-save');
+  const status = document.getElementById('client-service-status');
+  const list = document.getElementById('client-service-list');
+  const suggestions = document.getElementById('client-service-suggestions');
+  const auto = document.getElementById('client-service-auto');
+  const autoSave = document.getElementById('client-service-auto-save');
+  const autoStatus = document.getElementById('client-service-auto-status');
+
+  function showSuggestions(data) {
+    suggestions.replaceChildren();
+    if (!data.suggestions.length) {
+      const p = document.createElement('p');
+      p.className = 'subtitle';
+      p.textContent = data.detection_ready ? 'Повторно зависших соединений пока не видно.' :
+        'Сторож еще не передал свежий замер.';
+      suggestions.append(p);
+    }
+    for (const row of data.suggestions) {
+      const card = document.createElement('article');
+      card.className = 'client-service-record';
+      const note = document.createElement('p');
+      note.textContent = row.computer + ' · ' + row.address + ' · зависших соединений: ' + row.count;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'btn';
+      button.textContent = 'Подставить в правило';
+      button.addEventListener('click', () => {
+        device.value = devices.has(row.address) ? row.address : 'manual';
+        syncAddress();
+        if (device.value === 'manual') {
+          address.value = row.address;
+          computer.querySelector('input').value = row.computer;
+        }
+        exit.focus();
+      });
+      card.append(note, button);
+      suggestions.append(card);
+    }
+  }
+
+  autoSave.addEventListener('click', async () => {
+    autoSave.disabled = true;
+    autoStatus.textContent = 'Проверяем выход…';
+    try {
+      const resp = await fetch('/api/xkeen/client-service-auto', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ exit: auto.value })
+      });
+      const result = await resp.json();
+      if (!resp.ok || !result.ok) throw new Error(result.error || 'Настройку не удалось сохранить.');
+      autoStatus.textContent = result.exit ? 'Автодобавление включено.' : 'Автодобавление выключено.';
+    } catch (error) {
+      autoStatus.textContent = error.message;
+    } finally {
+      autoSave.disabled = false;
+    }
+  });
+
+  function options(select, items, hint) {
+    select.replaceChildren(new Option(hint, ''), ...items.map(row => new Option(row.label, row.value)));
+    select.options[0].disabled = true;
+    select.value = '';
+  }
+
+  function showRules(rules) {
+    list.replaceChildren();
+    for (const row of rules) {
+      const card = document.createElement('article');
+      card.className = 'client-service-record';
+      const heading = document.createElement('p');
+      const name = document.createElement('strong');
+      name.textContent = [row.computer, row.service_label, row.exit_label].join(' → ');
+      heading.append(name);
+      const scope = document.createElement('p');
+      scope.className = 'subtitle';
+      scope.textContent = 'TCP с ' + row.address + ' на адреса Telegram';
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = 'Условия правила';
+      const code = document.createElement('pre');
+      code.textContent = JSON.stringify(row.rule, null, 2);
+      details.append(summary, code);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'btn btn-sm';
+      remove.textContent = 'Удалить правило';
+      remove.addEventListener('click', () => update({ action: 'remove', address: row.address, service: row.service }));
+      card.append(heading, scope, details, remove);
+      list.append(card);
+    }
+    if (!rules.length) {
+      const p = document.createElement('p');
+      p.className = 'subtitle';
+      p.textContent = 'Правил Telegram для устройств пока нет.';
+      list.append(p);
+    }
+  }
+
+  let busy = false;
+  async function update(payload) {
+    if (busy || !window.confirm('Применить правило? Если маршрут меняется, Xray кратковременно переподключит соединения.')) return;
+    busy = true;
+    save.disabled = true;
+    for (const button of list.querySelectorAll('button')) button.disabled = true;
+    status.textContent = 'Сохраняем…';
+    try {
+      const response = await fetch('/api/xkeen/client-service-routes', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const body = await response.json();
+      if (!response.ok || !body.ok) throw new Error(body.error || 'Правило не удалось сохранить.');
+      showRules(body.rules);
+      status.textContent = payload.action === 'remove' ? 'Правило удалено.' : 'Правило применено.';
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      busy = false;
+      save.disabled = false;
+      for (const button of list.querySelectorAll('button')) button.disabled = false;
+    }
+  }
+
+  function syncAddress() {
+    manual.hidden = device.value !== 'manual';
+    address.required = !manual.hidden;
+    address.disabled = manual.hidden;
+    computer.hidden = manual.hidden;
+    computer.querySelector('input').disabled = manual.hidden;
+  }
+  device.addEventListener('change', syncAddress);
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(form));
+    if (devices.has(data.device)) data.computer = devices.get(data.device);
+    update({ action: 'save', ...data });
+  });
+
+  fetch('/api/xkeen/client-service-routes', { credentials: 'same-origin' })
+    .then(async response => {
+      if (!response.ok) throw new Error('Не удалось загрузить компьютеры и выходы.');
+      const data = await response.json();
+      options(device, [...data.devices, { value: 'manual', label: 'Другой компьютер по IP' }], 'Выбери компьютер');
+      devices = new Map(data.devices.map(row => [row.value, row.name]));
+      options(exit, data.exits, 'Выбери выход');
+      showRules(data.rules);
+      showSuggestions(data);
+      auto.replaceChildren(new Option('Выключено', ''),
+        ...data.exits.map(row => new Option(row.label, row.value)));
+      if (data.auto_exit && !data.exits.some(row => row.value === data.auto_exit)) {
+        auto.add(new Option(data.auto_exit + ' (недоступен)', data.auto_exit));
+      }
+      auto.value = data.auto_exit;
+      autoSave.disabled = false;
+      setInterval(async () => {
+        if (busy || !document.getElementById('client-service-routes').getClientRects().length) return;
+        try {
+          const response = await fetch('/api/xkeen/client-service-routes', { credentials: 'same-origin' });
+          if (!response.ok) return;
+          const latest = await response.json();
+          if (!busy) { showRules(latest.rules); showSuggestions(latest); }
+        } catch (_) {}
+      }, 60000);
+      syncAddress();
+      save.disabled = false;
+    })
+    .catch(error => { status.textContent = error.message; });
+})();
+
 (function buildKeeneticSidebar(){
   try {
     const body = document.body;
@@ -23816,4 +24402,5 @@ if __name__ == "__main__":
     # Для нескольких инстансов панели на одной машине — разные папки с разными DASHBOARD_PORT.
     port = int(getattr(cfg, "DASHBOARD_PORT", 5000))
     print(f"  Логин:    {cfg.USERNAME}    Открыть: http://localhost:{port}{path}")
+    _threading.Thread(target=_client_service_auto_worker, name="telegram-device-auto", daemon=True).start()
     app.run(host="0.0.0.0", port=port, debug=False)

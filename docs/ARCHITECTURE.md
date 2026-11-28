@@ -334,10 +334,20 @@ preview ничего не пишет (эвристика `_ANTI_DPI_KEYWORDS` н
 alert 47) включает предупреждение 🎲 в `previewSubscription`. У новых серверов есть поля `fp`/`fp_lottery`. Sync —
 pre-check критических ролей → update/add/remove → `.bak-pre-sync-<ts>` → рестарт с откатом → одна
 запись config с чисткой цепочек → обе meta. Orphan — только outbound с `meta.sub_url == url`.
-Бэкапы: `XKEEN_BACKUP_FILES`, restore валидирует **до записи** (JSON локально, `*.sh` — `sh -n` на
-роутере), фильтр `is_restorable`, `chmod +x` по `needs_exec_bit`, `crontab <file>`,
-`keenetic_ensure_killswitch()`, `watchdog.sh && xkeen -restart`. Снапшот v7 — `{version, timestamp,
-files: [{path, content}]}`, собирается `jq` на роутере.
+Бэкапы: `xkeen_backup_paths` задает список файлов Keenetic и допустимые пути восстановления.
+`_collect_xkeen_snapshot` используется обеими кнопками ручного экспорта. К полям v7
+`{version, timestamp, files: [{path, content}]}` добавляется
+`panel_settings.telegram_device_auto.exit` с выбранным выходом gRPC или пустой строкой
+для режима «Выключено». Отметка последней автоматической попытки остается на целевой панели.
+Снимки v6, прежние v7 и ежедневные v7 без этой настройки сохраняют текущее значение при восстановлении.
+
+`api_xkeen_restore` до записи проверяет JSON, `*.sh` через `sh -n` и шаблон
+`05_routing.template.json` через `_parse_routing_template`. Для проверки JSON-каркаса
+убираются только известные самостоятельные строки подстановки сторожа. На роутер записывается
+исходный шаблон целиком. После записи используются `chmod +x`, `crontab`, восстановление
+kill-switch и штатное применение с `force=True`. Настройка автодобавления записывается
+после подтвержденного применения. Ошибка применения или записи настройки отображается отдельно.
+Общий парсер шаблона использует и раздел базовых правил.
 
 ### 3.8. Домены, категории, цепочки
 

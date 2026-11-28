@@ -10,6 +10,9 @@ import json
 import os
 import re
 import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import dashboard as D  # noqa: E402
@@ -181,6 +184,58 @@ ROUTER["files"].clear()
 j = client.post("/api/xkeen/restore", data={"snapshot": (io.BytesIO(json.dumps(bad).encode("utf-8")), "b.json")},
                 content_type="multipart/form-data").get_json()
 check("restore rejects invalid", not j.get("ok") and j.get("stage") == "validate" and not ROUTER["files"], str(j)[:200])
+
+# Template validation uses the same known block slots as the watchdog.
+template_path = D.TEMPLATE_REMOTE_PATH
+template = ' // routing template\n{"routing":{"rules":[\n__IPV6_RULE_BLOCK__\n__AI_RULE_BLOCK__\n{"outboundTag":"__DEFAULT_TAG__"}\n]}}\n'
+
+def restore(document):
+    return client.post("/api/xkeen/restore", data={
+        "snapshot": (io.BytesIO(json.dumps(document).encode("utf-8")), "backup.json")
+    }, content_type="multipart/form-data").get_json()
+
+with tempfile.TemporaryDirectory() as settings_dir, patch.object(D, "_app_base_dir", lambda: settings_dir), \
+     patch.object(D, "RUNTIME_SETTINGS_FILE", str(Path(settings_dir) / "runtime_settings.json")):
+    chosen = "тест-gRPC"
+    marker = {"kept": "other panel settings"}
+    D.save_runtime_settings({**marker, "telegram_device_auto": {"exit": chosen, "last_attempt": 42}})
+    downloaded = client.get("/api/xkeen/backup").get_json()
+    saved = client.post("/api/xkeen/backup-to-disk").get_json()
+    stored = json.loads(Path(saved["path"]).read_text(encoding="utf-8"))
+    check("both manual backups include the selected outlet only",
+          downloaded == stored and stored["panel_settings"] == {"telegram_device_auto": {"exit": chosen}})
+    stored["files"].append({"path": template_path, "content": template})
+    D.save_runtime_settings(marker)
+    j = restore(stored)
+    check("stock template slots allowed, original template restored", j.get("ok") and ROUTER["files"].get(template_path) == template)
+    check("restore gRPC choice and keep the other destination settings", D.load_runtime_settings() ==
+          {**marker, "telegram_device_auto": {"exit": chosen, "last_attempt": 0}})
+
+    legacy = {k: v for k, v in stored.items() if k != "panel_settings"}
+    check("legacy v7 keeps auto-add", restore(legacy).get("ok") and
+          D.load_runtime_settings()["telegram_device_auto"]["exit"] == chosen)
+    legacy_v6 = {"version": "v6", "files": {"05_routing.template.json": template}}
+    check("legacy v6 keeps auto-add", restore(legacy_v6).get("ok") and
+          D.load_runtime_settings()["telegram_device_auto"]["exit"] == chosen)
+    stored["panel_settings"]["telegram_device_auto"]["exit"] = ""
+    with patch.object(D, "keenetic_apply_begin", return_value={"ok": True}), \
+         patch.object(D, "keenetic_apply_commit", return_value={"ok": False, "stderr": "failed test apply"}):
+        j = restore(stored)
+    check("failed router apply leaves the local setting intact", not j.get("ok") and j.get("stage") == "apply" and
+          D.load_runtime_settings()["telegram_device_auto"]["exit"] == chosen)
+    check("explicit disabled value is restored", restore(stored).get("ok") and
+          D.load_runtime_settings()["telegram_device_auto"]["exit"] == "")
+    stored["panel_settings"]["telegram_device_auto"]["exit"] = []
+    ROUTER["files"].clear()
+    j = restore(stored)
+    check("invalid auto configuration fails before writes", not j.get("ok") and j.get("stage") == "validate" and not ROUTER["files"])
+    stored["panel_settings"]["telegram_device_auto"]["exit"] = chosen
+    stored["files"][-1]["content"] = template.replace("__IPV6_RULE_BLOCK__", "__UNKNOWN_SLOT__")
+    j = restore(stored)
+    check("unrecognized raw template slot fails before writes", not j.get("ok") and j.get("stage") == "validate" and not ROUTER["files"])
+    stored["files"][-1]["content"] = template.replace('"routing"', '"broken"')
+    j = restore(stored)
+    check("valid JSON without routing.rules fails before writes", not j.get("ok") and j.get("stage") == "validate" and not ROUTER["files"])
 
 # ---------- bootstrap ----------
 ROUTER["hook"] = None; ROUTER["cron"].discard(K.HOOK_PATH)   # чистый роутер: хука ещё нет
